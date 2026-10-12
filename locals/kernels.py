@@ -1,0 +1,882 @@
+"""Metal kernels for the small-M regime on Apple GPUs.
+
+MLX's quantized matrix-vector kernel runs one input row per threadgroup, so M
+rows stream the weights M times; from M >= 6 (on M2 Pro, for large matrices)
+it switches to a 32-row tiled kernel. Both are wasteful for small M, the
+regime of forced spans and small decode batches. ``qmm_small`` reads each
+weight once and dequantizes it once, then applies it to all M rows. Measured
+on M2 Pro it beats MLX for 3 <= M <= 6 on large matrices and loses at M = 8
+(a scalar-FMA kernel cannot match MLX's MMA tiles there), so it is only used
+in that range.
+
+Weight format: MLX affine 4-bit, group size 64. ``w`` is (N, K/8) uint32 with
+the low nibble first; ``scales`` and ``biases`` are (N, K/64).
+"""
+
+from __future__ import annotations
+
+import mlx.core as mx
+import mlx.nn as nn
+
+# v4: dequantize each weight once, reuse it for all M rows. Lane owns 16
+# consecutive K values per 512-block, processed as 4 sub-chunks of 4 so that
+# only R float4 weights and M float4 inputs are live at a time.
+_SOURCE = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const int out_row = (int(threadgroup_position_in_grid.x) * NSG + int(sg)) * R;
+    if (out_row >= N) {
+        return;
+    }
+    constexpr int Kw = K / 8;
+    constexpr int Kg = K / GS;
+    const device uint32_t* wp = w + out_row * Kw + lane * 2;
+    const device T* sc = scales + out_row * Kg + lane / (GS / 16);
+    const device T* bi = biases + out_row * Kg + lane / (GS / 16);
+
+    float acc[M][R];
+    for (int m = 0; m < M; m++) {
+        for (int r = 0; r < R; r++) {
+            acc[m][r] = 0.0f;
+        }
+    }
+
+    for (int k = 0; k < K; k += 512) {
+        const int kk = k + int(lane) * 16;
+        if (kk < K) {
+            uint32_t wv[R][2];
+            float s[R];
+            float b[R];
+            for (int r = 0; r < R; r++) {
+                wv[r][0] = wp[r * Kw];
+                wv[r][1] = wp[r * Kw + 1];
+                s[r] = float(sc[r * Kg]);
+                b[r] = float(bi[r * Kg]);
+            }
+            float sx[M];
+            for (int m = 0; m < M; m++) {
+                sx[m] = 0.0f;
+            }
+            for (int j = 0; j < 4; j++) {
+                float4 q[R];
+                for (int r = 0; r < R; r++) {
+                    uint32_t word = wv[r][j >> 1] >> ((j & 1) * 16);
+                    q[r] = float4(word & 0xf, (word >> 4) & 0xf, (word >> 8) & 0xf, (word >> 12) & 0xf) * s[r];
+                }
+                for (int m = 0; m < M; m++) {
+                    const device T* xm = x + m * K + kk + 4 * j;
+                    float4 xv = float4(xm[0], xm[1], xm[2], xm[3]);
+                    sx[m] += xv.x + xv.y + xv.z + xv.w;
+                    for (int r = 0; r < R; r++) {
+                        acc[m][r] += dot(q[r], xv);
+                    }
+                }
+            }
+            for (int m = 0; m < M; m++) {
+                for (int r = 0; r < R; r++) {
+                    acc[m][r] += b[r] * sx[m];
+                }
+            }
+        }
+        wp += 64;
+        sc += 512 / GS;
+        bi += 512 / GS;
+    }
+
+    for (int m = 0; m < M; m++) {
+        for (int r = 0; r < R; r++) {
+            float v = simd_sum(acc[m][r]);
+            if (lane == 0) {
+                y[m * N + out_row + r] = static_cast<T>(v);
+            }
+        }
+    }
+"""
+
+_KERNEL = mx.fast.metal_kernel(
+    name="locals_qmm_small",
+    input_names=["x", "w", "scales", "biases"],
+    output_names=["y"],
+    source=_SOURCE,
+)
+
+
+def qmm_small(x: mx.array, w: mx.array, scales: mx.array, biases: mx.array, group_size: int = 64, R: int = 4, NSG: int = 2) -> mx.array:
+    M, K = x.shape
+    N = w.shape[0]
+    if N % R:
+        R = 1
+    n_tg = (N + NSG * R - 1) // (NSG * R)
+    (y,) = _KERNEL(
+        inputs=[x, w, scales, biases],
+        template=[("T", x.dtype), ("M", M), ("K", K), ("N", N), ("GS", group_size), ("R", R), ("NSG", NSG)],
+        grid=(n_tg * 32 * NSG, 1, 1),
+        threadgroup=(32 * NSG, 1, 1),
+        output_shapes=[(M, N)],
+        output_dtypes=[x.dtype],
+    )
+    return y
+
+
+# --- autotuned dispatch ------------------------------------------------------
+#
+# For each (N, K, M) the first call benchmarks MLX's kernel, qmm_small, and a
+# few qmm_mma tilings, and caches the fastest choice (also on disk). M ranges
+# over 2..16; larger M stays on MLX's 32-row tiles.
+
+import json as _json
+import os as _os
+import time as _time
+
+MIN_M = 1
+MAX_M = 32
+_TUNE_FILE = "tune_v6_%s.json" % mx.device_info()["architecture"]
+_TUNE_PATH = _os.environ.get("LOCALS_TUNE_CACHE") or _os.path.expanduser("~/.cache/locals/" + _TUNE_FILE)
+_TUNE = None
+_MULTI_CANDIDATES = [(8, 4, 2), (16, 4, 2), (8, 2, 2)]  # (VPT, R, NSG), M <= 4
+_V3_CANDIDATES = [(8, 8, 2), (8, 4, 2), (16, 4, 2), (16, 4, 4), (16, 2, 2)]  # (VPT, R, NSG), 3 <= M <= 6
+_FRAG_CANDIDATES = [(2, 2, 1), (4, 2, 1), (2, 4, 1), (1, 2, 2)]  # (TN, NSG, SPLIT)
+_MMA_CANDIDATES = {
+    8: [(8, 32, 64, 1, 2, 1), (8, 32, 64, 1, 4, 1), (8, 64, 64, 1, 8, 1), (8, 32, 32, 1, 2, 1), (8, 32, 64, 1, 2, 2)],
+    16: [(16, 32, 64, 2, 2, 1), (16, 64, 64, 2, 2, 1), (16, 32, 64, 1, 4, 1), (16, 64, 64, 1, 8, 1)],
+}
+
+
+def _preset_path():
+    """Tuning results shipped with the package for this GPU architecture, if any
+    (``LOCALS_NO_PRESET=1`` hides them: a first start as on a GPU without them)."""
+    if _os.environ.get("LOCALS_NO_PRESET"):
+        return None
+    try:
+        from importlib.resources import files
+
+        p = files("locals").joinpath("presets", _TUNE_FILE)
+        return str(p) if p.is_file() else None
+    except Exception:
+        return None
+
+
+import threading as _threading
+
+_TUNE_LOCK = _threading.RLock()  # tuning and the cache file: one thread at a time (the server has two engines)
+
+
+def _read_tune(path):
+    with open(path) as f:
+        return {k: (v if k.startswith("__") else tuple(v)) for k, v in _json.load(f).items()}
+
+
+def _load_tune():
+    """The tuning choices: the shipped preset for this GPU, overridden by the user's own cache. A
+    cache file that does not parse (a write cut short) is set aside, not silently replaced."""
+    global _TUNE
+    with _TUNE_LOCK:
+        if _TUNE is None:
+            tune = {}
+            preset = _preset_path()
+            if preset:
+                try:
+                    tune.update(_read_tune(preset))
+                except Exception:  # noqa: BLE001
+                    pass
+            user = None
+            if _os.path.exists(_TUNE_PATH):
+                try:
+                    user = _read_tune(_TUNE_PATH)
+                except Exception:  # noqa: BLE001
+                    try:
+                        _os.replace(_TUNE_PATH, _TUNE_PATH + ".bad")
+                    except OSError:
+                        pass
+            tune.update(user or {})
+            _TUNE = tune
+            if user is None and tune:
+                try:
+                    _save_tune()
+                except OSError:
+                    pass
+    return _TUNE
+
+
+def _save_tune():
+    """The cache, written whole and atomically (a crash or a second process never leaves half a file)."""
+    import tempfile
+
+    with _TUNE_LOCK:
+        data = dict(_TUNE)
+        d = _os.path.dirname(_TUNE_PATH)
+        _os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".tune-", suffix=".json")
+        try:
+            with _os.fdopen(fd, "w") as f:
+                _json.dump(data, f)
+            _os.replace(tmp, _TUNE_PATH)
+        except BaseException:
+            try:
+                _os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
+def _time_us(fn, reps=12):
+    for _ in range(3):
+        mx.eval(fn())
+    mx.synchronize()
+    t0 = _time.perf_counter()
+    outs = [fn() for _ in range(reps)]
+    mx.eval(outs)
+    mx.synchronize()
+    return (_time.perf_counter() - t0) / reps * 1e6
+
+
+_LAUNCH = {}
+
+
+def _launcher(choice, M, K, N, dtype):
+    """A cached closure with the kernel's template and grid pre-computed."""
+    key = (choice, M, K, N, dtype)
+    f = _LAUNCH.get(key)
+    if f is not None:
+        return f
+    kind = choice[0]
+    if kind in ("frag", "fragh"):
+        from .qmv_frag import launch, launch_h
+
+        f = (launch if kind == "frag" else launch_h)(M, K, N, dtype, *choice[1:])
+    elif kind == "v3":
+        from .qmv_multi import launch_v3
+
+        f = launch_v3(M, K, N, dtype, *choice[1:])
+    elif kind == "multi":
+        from .qmv_multi import _kernel as _mk, launch_params
+
+        template, grid, tg = launch_params(M, K, N, dtype, *choice[1:])
+        kern = _mk()
+
+        def f(x2, w, sc, bi):
+            (y,) = kern(inputs=[x2, w, sc, bi], template=template, grid=grid, threadgroup=tg,
+                        output_shapes=[(M, N)], output_dtypes=[dtype])
+            return y
+    elif kind == "mma":
+        from .mma_kernel import _kernel
+
+        BM, BN, BK, WM, WN, split = choice[1:]
+        out_dtype = dtype if split == 1 else mx.float32
+        kern = _kernel()
+        template = [("T", dtype), ("U", out_dtype), ("BM", BM), ("BN", BN), ("BK", BK), ("WM", WM), ("WN", WN),
+                    ("K", K), ("N", N), ("M", M), ("SPLIT", split)]
+        grid = (N // BN * 32 * WM * WN, (M + BM - 1) // BM, split)
+        tg = (32 * WM * WN, 1, 1)
+        shapes = [(split * M, N)]
+
+        def f(x2, w, sc, bi):
+            (y,) = kern(inputs=[x2, w, sc, bi], template=template, grid=grid, threadgroup=tg,
+                        output_shapes=shapes, output_dtypes=[out_dtype])
+            if split > 1:
+                y = y.reshape(split, M, N).sum(axis=0).astype(dtype)
+            return y
+    elif kind == "small":
+        R, NSG = small_config(N)
+
+        def f(x2, w, sc, bi):
+            return qmm_small(x2, w, sc, bi, 64, R=R, NSG=NSG)
+    else:
+        def f(x2, w, sc, bi):
+            return mx.quantized_matmul(x2, w, sc, bi, transpose=True, group_size=64, bits=4)
+    _LAUNCH[key] = f
+    return f
+
+
+def _run(choice, x2, mod):
+    M, K = x2.shape
+    return _launcher(choice, M, K, mod["weight"].shape[0], x2.dtype)(x2, mod["weight"], mod["scales"], mod["biases"])
+
+
+_CHOICE = {}
+
+
+# Background tuning: a shape not tuned yet runs on MLX's own kernel instead of being tuned in
+# the middle of a request; the server tunes the pending shapes one by one while it has no work
+# (locals/service.py), and each takes its tuned kernel from then on.
+_DEFER = False
+_TUNING = False  # set while the background tuner itself chooses
+
+
+def _choose(x2, mod):
+    M, K = x2.shape
+    N = mod["weight"].shape[0]
+    dt = str(x2.dtype).split(".")[-1]
+    c = _CHOICE.get((N, K, M, dt))
+    if c is not None:
+        return c
+    key = f"{N}x{K}x{M}" + ("" if dt == "float16" else f"x{dt}")
+    tune = _load_tune()
+    if key in tune:
+        c = tuple(tune[key])
+        if dt != "float16" and c[0] == "fragh":  # computes in fp16: never for bf16 activations
+            c = ("mlx",)
+        _CHOICE[(N, K, M, dt)] = c
+        return c
+    if _DEFER and not _TUNING:
+        return ("mlx",)
+    with _TUNE_LOCK:
+        c = _CHOICE.get((N, K, M, dt))
+        return c if c is not None else _tune_shape(x2, mod, M, K, N, dt, key, tune)
+
+
+def _tune_shape(x2, mod, M, K, N, dt, key, tune):
+    from . import qmv_frag, qmv_multi
+
+    cands = [("mlx",)]
+    if M <= 4:
+        cands += [("multi", *c) for c in _MULTI_CANDIDATES if qmv_multi.supported(M, K, N, c[0], c[1])]
+    if 3 <= M <= 6:  # at M <= 2 it wins in isolation but loses ~1% inside the model
+        cands += [("v3", *c) for c in _V3_CANDIDATES if K % (c[0] * 32) == 0 and N % c[1] == 0]
+    for kind in ("frag", "fragh") if dt == "float16" else ("frag",):  # fragh clamps to fp16's range
+        cands += [(kind, *c) for c in _FRAG_CANDIDATES if qmv_frag.supported(M, K, N, c[0], c[2]) and (c[2] == 1 or K >= 4096)]
+    if M >= 2:
+        if MIN_M_SMALL <= M <= MAX_M_SMALL and (N >= 4096 or K >= 4096):
+            cands.append(("small",))
+        for BM, BN, BK, WM, WN, split in _MMA_CANDIDATES[8 if M <= 8 else 16]:
+            if N % BN or K % (BK * split) or (K // split) % 64 or BN % (8 * WN):
+                continue
+            cands.append(("mma", BM, BN, BK, WM, WN, split))
+    xr = mx.random.normal(x2.shape, key=mx.random.key(M * 131 + K)).astype(x2.dtype)  # not the global random state
+    ref = _run(("mlx",), xr, mod).astype(mx.float32)
+    tol = 0.05 * (1.0 + float(mx.max(mx.abs(ref))))
+    ok = []
+    for c in cands:
+        try:
+            got = _run(c, xr, mod).astype(mx.float32)
+            if c[0] != "mlx" and not (float(mx.max(mx.abs(got - ref))) <= tol):  # a NaN fails too
+                continue
+            ok.append(c)
+        except Exception:
+            continue
+    # Time over enough weight copies (>= 64 MB) that they come from DRAM, as
+    # inside a model, not from the GPU's system cache; interleaved rounds, best
+    # round per candidate, for robustness to machine noise.
+    nbytes = sum(mod[k].nbytes for k in ("weight", "scales", "biases"))
+    ncopy = max(1, min(16, (64 << 20) // max(nbytes, 1)))
+    copies = [{k: mx.array(mod[k]) + 0 if k != "weight" else mx.array(mod[k]) | 0 for k in ("weight", "scales", "biases")}
+              for _ in range(ncopy)]
+    mx.eval(copies)
+
+    def sweep(c):
+        f = _launcher(c, M, K, N, x2.dtype)
+        return [f(xr, cp["weight"], cp["scales"], cp["biases"]) for cp in copies]
+
+    times = {c: float("inf") for c in ok}
+    for _ in range(4):
+        for c in ok:
+            times[c] = min(times[c], _time_us(lambda: sweep(c), reps=max(1, 8 // ncopy)) / ncopy)
+    del copies
+    mlx_t = times[("mlx",)]
+    for fam in {c[0] for c in ok}:
+        tune[f"{key}|{fam}"] = min((c for c in ok if c[0] == fam), key=lambda c: times[c])
+    challenger = min((c for c in ok if c[0] != "mlx"), key=lambda c: times[c], default=None)
+    choice = challenger if challenger is not None and times[challenger] < 0.9 * mlx_t else ("mlx",)
+    best = (times[choice], choice)
+    tune[key] = best[1]
+    _CHOICE[(N, K, M, dt)] = best[1]
+    _save_tune()
+    return best[1]
+
+
+def _tunable(mod) -> bool:
+    """A layer the tuned kernels compute: 4-bit affine quantization in groups of 64 (other group sizes,
+    and mxfp4 and the like, stay on MLX's kernels; tuning them crashed the load)."""
+    return (isinstance(mod, (nn.QuantizedLinear, nn.QuantizedEmbedding)) and getattr(mod, "bits", None) == 4
+            and getattr(mod, "group_size", None) == 64 and getattr(mod, "mode", "affine") == "affine"
+            and mod.get("biases") is not None and (mod["weight"].shape[1] * 8) % 64 == 0)
+
+
+def _eligible(x: mx.array, mod) -> bool:
+    if not _tunable(mod):
+        return False
+    K = x.shape[-1]
+    if K % 64:
+        return False
+    M = x.size // K
+    return MIN_M <= M <= MAX_M and x.dtype in (mx.float16, mx.bfloat16)
+
+
+def _small_matmul(x, mod):
+    shape = x.shape
+    x2 = x.reshape(-1, shape[-1])
+    y = _run(_choose(x2, mod), x2, mod)
+    return y.reshape(*shape[:-1], y.shape[-1])
+
+
+def small_config(N: int):
+    """(rows per simdgroup, simdgroups per threadgroup) for qmm_small."""
+    return (2, 4) if N >= 4096 else (2, 2)
+
+
+MIN_M_SMALL = 3
+MAX_M_SMALL = 6
+
+_orig_linear_call = nn.QuantizedLinear.__call__
+_orig_embed_as_linear = nn.QuantizedEmbedding.as_linear
+_enabled = False
+
+
+# Row packing for right-padded batches: while active, a linear layer applied to
+# the padded (B, L, D) activations runs only on the valid rows and scatters the
+# result back, so padding costs no matmul work.
+_PACK = _threading.local()  # .ctx: (B, L, valid flat indices, count) in the thread building the graph
+
+
+class packed_rows:
+    def __init__(self, B: int, L: int, lengths):
+        self.ctx = (B, L, mx.array([b * L + i for b, n in enumerate(lengths) for i in range(n)], dtype=mx.int32), sum(lengths))
+
+    def __enter__(self):
+        self.prev = getattr(_PACK, "ctx", None)
+        _PACK.ctx = self.ctx
+        return self
+
+    def __exit__(self, *a):
+        _PACK.ctx = self.prev
+
+
+def _maybe_packed(self, x, call):
+    ctx = getattr(_PACK, "ctx", None)
+    if ctx is not None and x.ndim == 3 and x.shape[0] == ctx[0] and x.shape[1] == ctx[1] and ctx[3] < x.shape[0] * x.shape[1]:
+        B, L, idx, R = ctx
+        xs = x.reshape(B * L, -1)[idx][None]
+        ys = call(self, xs)[0]
+        y = mx.zeros((B * L, ys.shape[-1]), ys.dtype)
+        y[idx] = ys
+        return y.reshape(B, L, -1)
+    return call(self, x)
+
+
+PREFILL_M = 128  # from this many rows, dequantize to fp16 and use the dense GEMM
+
+
+DENSE_MAX = 1 << 27  # weights (N x K) dequantized at most: an lm_head of 248k x 2560 would be a 1.3 GB temporary
+
+
+def _dense_ok(x, mod) -> bool:
+    if not _tunable(mod) or mod["weight"].shape[0] * mod["weight"].shape[1] * 8 > DENSE_MAX:
+        return False
+    return x.dtype in (mx.float16, mx.bfloat16) and x.size // x.shape[-1] >= PREFILL_M
+
+
+def _dense_matmul(x, mod):
+    """Large-M 4-bit matmul as dequantize + GEMM in the activations' own type: MLX's dense GEMM runs
+    about 1.5x the throughput of its quantized GEMM on M2-class GPUs, and the dequantized weights
+    cost little traffic next to M x K x N FLOPs. (A bf16 model is not computed in fp16: values past
+    65504 would become inf.)"""
+    w = mx.dequantize(mod["weight"], mod["scales"].astype(x.dtype), mod["biases"].astype(x.dtype), group_size=64, bits=4)
+    return x @ w.T
+
+
+def _linear_call_inner(self, x):
+    if _dense_ok(x, self):
+        y = _dense_matmul(x, self)
+        if "bias" in self:
+            y = y + self["bias"]
+        return y
+    if _eligible(x, self):
+        y = _small_matmul(x, self)
+        if "bias" in self:
+            y = y + self["bias"]
+        return y
+    return _orig_linear_call(self, x)
+
+
+def _linear_call(self, x):
+    return _maybe_packed(self, x, _linear_call_inner)
+
+
+def _linear_call_plain(self, x):
+    return _maybe_packed(self, x, _orig_linear_call)
+
+
+def _embed_as_linear(self, x):
+    if _eligible(x, self):
+        return _small_matmul(x, self)
+    return _orig_embed_as_linear(self, x)
+
+
+def _linear_switch(self, x):
+    return (_linear_call if _enabled else _linear_call_plain)(self, x)
+
+
+def _embed_switch(self, x):
+    return (_embed_as_linear if _enabled else _orig_embed_as_linear)(self, x)
+
+
+_PATCHED: dict = {}  # base class -> its locals subclass
+
+
+def _patched_class(base):
+    if base not in _PATCHED:
+        body = {"as_linear": _embed_switch} if issubclass(base, nn.QuantizedEmbedding) else {"__call__": _linear_switch}
+        _PATCHED[base] = type("Locals" + base.__name__, (base,), body)
+    return _PATCHED[base]
+
+
+def enable_small_m(enabled: bool = True, model=None) -> None:
+    """Route the 4-bit quantized matmuls with few rows of locals's models to the autotuned fastest kernel
+    (MLX, qmm_small, qmm_mma, ...), and their padded batches to row packing; ``enabled=False`` keeps
+    MLX's kernels with the packing. With ``model``, that model's layers become locals's (their class a
+    subclass); without, the switch changes for the models patched so far (an A/B comparison). mlx's
+    own classes are never changed: other models in the process (the server's stock engine, a library
+    user's own) stay as mlx-lm makes them."""
+    global _enabled
+    _enabled = enabled
+    if model is None:
+        return
+    for _, mod in model.named_modules():
+        if type(mod) in (nn.QuantizedLinear, nn.QuantizedEmbedding):  # mlx's own (a subclass may compute differently)
+            mod.__class__ = _patched_class(type(mod))
+
+
+def forward_hidden(model, tokens: mx.array, cache) -> mx.array:
+    """Final normed hidden state of the last position, shape (1, 1, D)."""
+    lm = text_model(model)
+    return lm.model(tokens, cache)[:, -1:, :]
+
+
+def tied_embeddings(lm) -> bool:
+    """Whether the vocabulary projection is the embedding table. Models keep the
+    flag on the instance (Gemma 3, set while loading), in ``args`` (Llama, Qwen),
+    or drop ``lm_head`` altogether."""
+    if not hasattr(lm, "lm_head"):
+        return True
+    t = lm.__dict__.get("tie_word_embeddings") if isinstance(lm.__dict__, dict) else None
+    if t is None:
+        t = getattr(lm, "tie_word_embeddings", None)
+    if t is None:
+        t = getattr(getattr(lm, "args", None), "tie_word_embeddings", False)
+    return bool(t)
+
+
+def head_module(lm):
+    return lm.model.embed_tokens if tied_embeddings(lm) else lm.lm_head
+
+
+def post_logits(lm, out: mx.array) -> mx.array:
+    """What the model's own forward does to the logits after the vocabulary
+    projection: soft-capping (Gemma 2, 3n, 4), a logit scale (Cohere), a
+    logits scaling divisor (Granite). Monotonic, so greedy and constrained
+    choices never depend on it; sampling at temperature > 0 does."""
+    args = getattr(lm, "args", None)
+    cap = getattr(lm, "final_logit_softcapping", None)
+    if cap is None:
+        cap = getattr(args, "final_logit_softcapping", None)
+    if cap:
+        out = mx.tanh(out / cap) * cap
+    mod = type(lm).__module__.rsplit(".", 1)[-1]
+    if mod in ("cohere", "cohere2"):
+        out = out * lm.model.args.logit_scale
+    if mod.startswith("granite") and getattr(lm, "logits_scaling", None):
+        out = out / lm.logits_scaling
+    return out
+
+
+def head_logits(lm, h: mx.array) -> mx.array:
+    """Logits of hidden states ``h`` (..., D), as the model's own forward computes them."""
+    mod = head_module(lm)
+    out = mod.as_linear(h) if mod is lm.model.embed_tokens else mod(h)
+    return post_logits(lm, out)
+
+
+def head_check(model, log=None) -> float:
+    """Max |logit difference| between the model's own forward and body + head_logits
+    on a short probe (0 when they agree; logged when they do not)."""
+    lm = text_model(model)
+    probe = mx.array([[(i * 7919) % 1000 + 100 for i in range(6)]])
+    try:
+        ref = model(probe)[:, -1].astype(mx.float32)
+        ours = head_logits(lm, lm.model(probe))[:, -1].astype(mx.float32)
+        err = float(mx.max(mx.abs(ref - ours)))
+    except Exception as e:  # noqa: BLE001
+        if log:
+            log(f"locals: could not check this model's output layer ({type(e).__name__}: {e})")
+        return float("nan")
+    tol = 0.02 * float(mx.max(mx.abs(ref))) + 0.05
+    if err > tol and log:
+        log(f"locals: this model's forward post-processes logits in a way locals does not reproduce (max diff {err:.3f}); "
+            "greedy and constrained decoding are unaffected, sampling at temperature > 0 may differ")
+    return err
+
+
+def head_dense(model, h: mx.array) -> mx.array:
+    lm = text_model(model)
+    return head_logits(lm, h)[0, -1]
+
+
+def head_rows(model, h: mx.array, ids: mx.array) -> mx.array:
+    """Logits for the vocabulary rows ``ids`` only (exact), shape (len(ids),).
+
+    Constrained decisions often allow a handful of tokens; gathering just
+    those rows of the 4-bit head skips most of its weight traffic."""
+    lm = text_model(model)
+    mod = head_module(lm)
+    if not isinstance(mod, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+        return head_dense(model, h)[ids]
+    w, sc, bi = mod["weight"][ids], mod["scales"][ids], mod.get("biases")
+    bi = bi[ids] if bi is not None else None
+    # the layer's own mode: an mxfp4 head (Mellum2.1's MLX build) has no biases, and affine's call failed
+    out = mx.quantized_matmul(h[0], w, sc, bi, transpose=True, group_size=mod.group_size, bits=mod.bits,
+                              mode=getattr(mod, "mode", "affine"))[-1]
+    return post_logits(lm, out)
+
+
+def text_model(model):
+    """The decoder-only language model inside a (possibly multimodal) wrapper."""
+    return getattr(model, "language_model", model)
+
+
+def forward_last(model, tokens: mx.array, cache) -> mx.array:
+    """Logits for the last position only: run the body on every token but the
+    vocabulary projection on the final hidden state."""
+    model = text_model(model)
+    body = getattr(model, "model", None)
+    args = getattr(model, "args", None)
+    if body is None or args is None:
+        return model(tokens, cache=cache)[:, -1, :]
+    h = body(tokens, cache)[:, -1:, :]
+    return head_logits(model, h)[:, -1, :]
+
+
+def model_tune(model, ms=range(2, MAX_M + 1), families=("v3", "multi", "fragh", "frag", "mma"), steps: int = 16, rounds: int = 5, verbose: bool = False) -> dict:
+    """Pick one kernel family per row count M by timing the real decode step.
+
+    Per-shape timings in isolation miss interactions inside a model (cache
+    reuse across layers, overlap of consecutive kernels): e.g. at M = 4 the
+    scalar v3 kernel loses to fragh on every shape alone yet makes the Qwen3.5-2B
+    step ~4% faster. For each M, every family whose per-shape winner exists for
+    all shapes is timed on a batch-M decode step; the fastest (>= 2% better
+    than the per-shape mix) overrides the per-shape choices."""
+    import time as _t
+
+    lm = text_model(model)
+    shapes = set()
+    for _, mod in model.named_modules():
+        if _tunable(mod):
+            shapes.add((mod["weight"].shape[0], mod["weight"].shape[1] * 8, str(mod["scales"].dtype).split(".")[-1]))
+    tune = _load_tune()
+    import hashlib
+
+    sig = "__model_tuned_pipe__" + hashlib.md5(repr(sorted(shapes)).encode()).hexdigest()[:10]
+    done = list(tune.get(sig, []))
+    picked = {}
+    for M in ms:
+        if M in done:
+            continue
+        keys = {(N, K, dt): f"{N}x{K}x{M}" + ("" if dt == "float16" else f"x{dt}") for N, K, dt in shapes}
+        if not all(k in tune for k in keys.values()):
+            continue
+        base = {sk: tuple(tune[k]) for sk, k in keys.items()}
+        options = {"per-shape": base}
+        for fam in families:
+            fk = {sk: tune.get(f"{k}|{fam}") for sk, k in keys.items()}
+            if all(v is not None for v in fk.values()):
+                options[fam] = {sk: tuple(v) for sk, v in fk.items()}
+        from mlx_lm.models.cache import make_prompt_cache
+
+        cache = make_prompt_cache(lm)
+        lm(mx.array([[(i * 7919 + b) % 20000 + 100 for i in range(64)] for b in range(M)]), cache=cache)
+        mx.eval([c.state for c in cache])
+        x = mx.array([[(b * 31) % 20000 + 50] for b in range(M)])
+        def step():
+            h = lm.model(x, cache)
+            y = head_logits(lm, h)
+            return mx.argmax(y[:, -1], -1)
+
+        res = {name: [] for name in options}
+        for _ in range(rounds):
+            for name, opt in options.items():
+                for (N, K, dt), c in opt.items():
+                    _CHOICE[(N, K, M, dt)] = c
+                # Pipelined, as the engines decode: step s+1 is built and
+                # queued while step s runs. Synchronous timing ranks the
+                # families differently (0.8B, M=8, fp16: sync picked fragh,
+                # 17% slower pipelined than frag).
+                y = step()
+                mx.async_eval(y)
+                mx.eval(y)
+                t0 = _t.perf_counter()
+                for i in range(steps):
+                    y2 = step()
+                    mx.async_eval(y2)
+                    mx.eval(y)
+                    y = y2
+                mx.eval(y)
+                res[name].append((_t.perf_counter() - t0) / steps)
+        med = {name: sorted(v)[len(v) // 2] for name, v in res.items()}
+        best = min(med, key=med.get)
+        if verbose:
+            print(f"model_tune M={M}: " + ", ".join(f"{k} {v * 1e3:.2f} ms" for k, v in sorted(med.items(), key=lambda kv: kv[1])), flush=True)
+        chosen = options[best] if med[best] < 0.98 * med["per-shape"] else base
+        for (N, K, dt), c in chosen.items():
+            _CHOICE[(N, K, M, dt)] = c
+            tune[keys[(N, K, dt)]] = list(c)
+        picked[M] = best if chosen is not base else "per-shape"
+        done.append(M)
+        tune[sig] = done
+        _save_tune()
+        del cache
+    return picked
+
+
+def warmup(model, ms=range(1, 9)) -> int:
+    """Compile the chosen kernel of every matmul shape for M in ``ms`` now,
+    instead of on first use in the middle of a request (each new kernel
+    instance costs ~50 ms of Metal compilation). Returns instances run."""
+    outs, seen, failed = [], set(), set()
+    for _, mod in model.named_modules():
+        if not _tunable(mod):
+            continue
+        N, K = mod["weight"].shape[0], mod["weight"].shape[1] * 8
+        dt = mod["scales"].dtype
+        for M in ms:
+            x = mx.zeros((M, K), dt)
+            c = _choose(x, mod)
+            key = (c, M if c[0] not in ("frag", "fragh") else (M + 7) // 8, K, N, dt)
+            if key in failed:  # the same kernel instance as one that failed (frag shares one across 8 row counts)
+                _CHOICE[(N, K, M, str(dt).split(".")[-1])] = ("mlx",)
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            try:  # each chosen kernel compiled and run once now: one that fails here falls back to MLX's
+                mx.eval(_run(c, x, mod))
+            except Exception:  # noqa: BLE001  # (a cached choice the installed mlx no longer compiles)
+                failed.add(key)
+                _CHOICE[(N, K, M, str(dt).split(".")[-1])] = ("mlx",)
+    return len(seen)
+
+
+def pretune(model, max_m: int = MAX_M, log=None) -> int:
+    """Autotune every quantized matmul shape of ``model`` for M = 2..max_m
+    ahead of time (results are cached on disk). Returns shapes tuned.
+    ``log``: given a progress line now and then (every 10% and 20 s at most)."""
+    tune = _load_tune()
+    seen, work = set(), []
+    for _, mod in model.named_modules():
+        if _tunable(mod):
+            w = mod["weight"]
+            N, K = w.shape[0], w.shape[1] * 8
+            if (N, K) in seen or K % 64:
+                continue
+            seen.add((N, K))
+            dt = mod["scales"].dtype
+            name = str(dt).split(".")[-1]
+            for M in range(MIN_M, max_m + 1):
+                work.append((mod, M, K, dt, f"{N}x{K}x{M}" + ("" if name == "float16" else f"x{name}") not in tune))
+    total, done = sum(w[-1] for w in work), 0
+    t0 = last = _time.perf_counter()
+    for mod, M, K, dt, pending in work:
+        _choose(mx.zeros((M, K), dt), mod)
+        done += pending
+        now = _time.perf_counter()
+        if log and pending and done < total and done * 10 // total > (done - 1) * 10 // total and now - last >= 20:
+            log(f"locals: tuning {done * 100 // total}% ({(now - t0) / 60:.1f} min)")
+            last = now
+    return len(seen)
+
+
+def pending_work(model, max_m: int = 16) -> list:
+    """The (layer, rows) pairs of ``model`` whose matmul shape is not tuned yet, smallest batches first."""
+    tune = _load_tune()
+    seen, work = set(), []
+    for _, mod in model.named_modules():
+        if _tunable(mod):
+            w = mod["weight"]
+            N, K = w.shape[0], w.shape[1] * 8
+            if (N, K) in seen or K % 64:
+                continue
+            seen.add((N, K))
+            name = str(mod["scales"].dtype).split(".")[-1]
+            for M in range(MIN_M, max_m + 1):
+                if f"{N}x{K}x{M}" + ("" if name == "float16" else f"x{name}") not in tune:
+                    work.append((mod, M))
+    return sorted(work, key=lambda w: w[1])
+
+
+def tune_one(mod, M: int) -> tuple:
+    """Tune one (layer, rows) shape now (the background tuner, in the engine's own thread)."""
+    global _TUNING
+    _TUNING = True
+    try:
+        K = mod["weight"].shape[1] * 8
+        return _choose(mx.zeros((M, K), mod["scales"].dtype), mod)
+    finally:
+        _TUNING = False
+
+
+def tune_pending(model, max_m: int = MAX_M) -> int:
+    """How many (matmul shape, batch size) combinations of ``model`` the
+    tuning cache (or the shipped preset) does not cover yet."""
+    tune = _load_tune()
+    seen, missing = set(), 0
+    for _, mod in model.named_modules():
+        if _tunable(mod):
+            w = mod["weight"]
+            N, K = w.shape[0], w.shape[1] * 8
+            if (N, K) in seen or K % 64:
+                continue
+            seen.add((N, K))
+            dt = str(mod["scales"].dtype).split(".")[-1]
+            for M in range(MIN_M, max_m + 1):
+                key = f"{N}x{K}x{M}" + ("" if dt == "float16" else f"x{dt}")
+                missing += key not in tune
+    return missing
+
+
+def tune_model(model, mode: str = "auto", log=None) -> dict:
+    """The one-time kernel autotuning a loaded model goes through.
+
+    ``"auto"``: if the cache or a shipped preset already covers the model, do
+    nothing but compile the chosen kernels (seconds); otherwise run the quick
+    procedure. ``"quick"``: tune every matmul shape for batch sizes up to 16
+    (a few minutes). ``"full"``: every shape up to 32 rows plus whole-step
+    timing per batch size (10--20 minutes; the best batched throughput).
+    ``"off"``: nothing ahead of time (untuned shapes are tuned on first use).
+    Results are cached in ``~/.cache/locals`` (or ``$LOCALS_TUNE_CACHE``)."""
+    import sys as _sys
+
+    log = log or (lambda s: print(s, file=_sys.stderr, flush=True))
+    mode = (mode or "auto").lower()
+    if mode not in ("auto", "background", "quick", "full", "off"):
+        raise ValueError("tune must be one of auto, background, quick, full, off")
+    global _DEFER
+    _DEFER = False  # a later load in this process tunes as its own mode says
+    if mode == "off":
+        return {"mode": "off"}
+    if mode in ("auto", "background"):
+        missing = tune_pending(model, max_m=16)  # the background tuner and the quick procedure go up to 16 rows
+        if missing == 0:  # everything up to 16 rows cached (or shipped): compile the chosen kernels, nothing to tune
+            _DEFER = mode == "background"  # a server never tunes in the middle of a request (more rows stay on MLX's)
+            warmup(model, range(1, 17))
+            return {"mode": "cached"}
+        if mode == "background":
+            _DEFER = True  # serve now on MLX's kernels; the server tunes while it is idle
+            warmup(model, range(1, 17))  # the shapes tuned already (a shipped preset): compiled now, checked
+            pending = len(pending_work(model))
+            log(f"locals: no tuned kernels for this model on {mx.device_info()['architecture']} yet: serving now, and tuning "
+                f"{pending} kernel shapes while the server is idle (cached afterwards). locals tune --model <model> does the "
+                f"full procedure at once (10-20 minutes, the best batched throughput).")
+            return {"mode": "background", "pending": pending}
+        else:
+            mode = "quick"
+        pending = tune_pending(model, max_m=16) if mode == "quick" else 0
+        if pending:  # the quick procedure has work to do
+            log(f"locals: tuning the matrix kernels for this model on {mx.device_info()['architecture']}: {pending} kernel "
+                f"shapes, once (cached afterwards; on an M2 Pro 2 minutes for Qwen3.5-4B, 7 for Gemma 4 E4B). "
+                f"For the full procedure, 10-20 minutes and the best batched throughput: locals tune --model <model>")
+    if mode == "quick":
+        pretune(model, max_m=16, log=log)
+        warmup(model, range(1, 17))
+        return {"mode": "quick"}
+    pretune(model)
+    picked = model_tune(model)
+    warmup(model, range(1, 17))  # compile now, not in the first requests
+    return {"mode": "full", "picked": picked}

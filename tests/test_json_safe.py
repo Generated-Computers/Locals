@@ -1,0 +1,79 @@
+"""Every output a JSON schema allows is JSON, and means what the schema says: patterns are matched
+against the string as JSON writes it (a top-level | used to split the value; "." could write a raw
+quote or newline), {} property schemas are any value (they used to split the object's regex), and
+regex syntax the engine cannot honour is an error, not a different language."""
+
+import json
+import random
+
+import numpy as np
+import pytest
+
+pytest.importorskip("outlines_core")
+
+from outlines_core.json_schema import build_regex_from_schema  # noqa: E402
+
+from locals import regex as rx  # noqa: E402
+from locals.grammar import GrammarError, json_safe_schema  # noqa: E402
+
+
+def _dfa(schema):
+    return rx.compile_dfa(build_regex_from_schema(json.dumps(json_safe_schema(schema)), ""))
+
+
+CASES = [
+    ({"type": "object", "properties": {"a": {"type": "string", "pattern": "x|y"}}, "required": ["a"]},
+     ['{"a":"x"}', '{"a":"y"}'], ['{"a":"x}', '{"a":y"}']),
+    ({"type": "string", "pattern": ".+"}, ['"a"', '"a\\"b"', '"\\\\"', '"\\u0001"', '"é"'], ['"a"b"', '"\\"', '"\x01"', '""']),
+    ({"type": "string", "pattern": "\\s+"}, ['" "', '"\\n"', '"\\t"'], ['"\n"']),
+    ({"type": "string", "pattern": "\""}, ['"\\""'], ['"""']),
+    ({"type": "object", "properties": {"a": {}}, "required": ["a"]}, ['{"a":1}', '{"a":"s"}', '{"a":null}'], ['{"a":true', "null"]),
+    ({"type": "string", "pattern": "[a-z]+@[a-z]+\\.com"}, ['"ab@cd.com"'], ['"ab@cdxcom"']),
+]
+
+
+@pytest.mark.parametrize("schema,good,bad", CASES)
+def test_patterns_and_empty_schemas(schema, good, bad):
+    d = _dfa(schema)
+    assert all(d.matches(g.encode()) for g in good)
+    assert not any(d.matches(b.encode()) for b in bad)
+
+
+def test_every_output_is_json():
+    rnd = random.Random(0)
+    for schema, _, _ in CASES + [({"type": "string", "pattern": "[^a]{2,5}"}, [], [])]:
+        d = _dfa(schema)
+        live = set(np.nonzero(d.accepting)[0].tolist())
+        while True:  # the states from which an accepting one is reachable
+            more = {q for q in range(d.n) if q not in live and any(int(t) in live for t in d.table[q] if t != rx.DEAD)}
+            if not more:
+                break
+            live |= more
+        for _ in range(100):
+            q, out = d.start, bytearray()
+            for _ in range(300):
+                if d.accepting[q] and rnd.random() < 0.3:
+                    break
+                nxt = [b for b in range(256) if int(d.table[q, b]) in live]
+                if not nxt:
+                    break
+                b = rnd.choice(nxt)
+                out.append(b)
+                q = int(d.table[q, b])
+            if d.accepting[q]:
+                json.loads(out.decode("utf-8"))
+
+
+def test_schemas_that_cannot_be_honoured():
+    with pytest.raises(GrammarError):
+        json_safe_schema({"type": "object", "properties": {'a"b': {"type": "string"}}})
+    with pytest.raises(GrammarError):
+        json_safe_schema({"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 1})
+
+
+def test_regex_syntax_is_honoured_or_refused():
+    assert rx.compile_dfa("x{,2}").matches(b"xx") and not rx.compile_dfa("x{,2}").matches(b"xxx")
+    for bad in ("a{3,1}", "[z-a]", "x{100000000}", "\\U00110000"):
+        with pytest.raises(rx.RegexError):
+            rx.compile_dfa(bad)
+    assert issubclass(rx.BudgetExceeded, ValueError)  # a request error (400), not the server's

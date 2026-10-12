@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "properties": {
+    "name": {"type": "string"},
+    "age": {"type": "integer"},
+    "email": {"type": "string"},
+    "status": {"enum": ["pending", "approved", "rejected"]},
+    "tags": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["name", "age", "email", "status", "tags"]
+}

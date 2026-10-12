@@ -1,0 +1,284 @@
+"""The `locals` command's agent configs: the model ids they send must route to the intended engine."""
+
+from locals import app, oai
+
+
+def test_opencode_models_route_to_their_engine():
+    cfg = app.opencode_config("mlx-community/Qwen3.5-4B-MLX-4bit", 8321)
+    for pid, prov in cfg["provider"].items():
+        for model_id in prov["models"]:
+            # OpenCode sends only the model id (not the provider id) to the server
+            assert oai.engine_of(model_id) == pid, (pid, model_id)
+    provider, model_id = cfg["model"].split("/", 1)
+    assert provider == "locals" and model_id in cfg["provider"]["locals"]["models"]
+    assert app.oc_model("mlx", "qwen3.5-4b") == "mlx/mlx/qwen3.5-4b"
+
+
+def test_openclaw_and_hermes_configs_route_to_locals():
+    patch = app.openclaw_patch("mlx-community/Qwen3.5-4B-MLX-4bit", 8321)
+    prov = patch["models"]["providers"]["locals"]
+    model_id = prov["models"][0]["id"]
+    assert oai.engine_of(model_id) == "locals" and prov["baseUrl"] == "http://127.0.0.1:8321/v1"
+    assert patch["agents"]["defaults"]["model"]["primary"] == "locals/" + model_id
+    assert prov["models"][0]["contextWindow"] >= 64000  # what Hermes demands; the server's default limit
+    kv = app.hermes_settings("mlx-community/Qwen3.5-4B-MLX-4bit", 8321)
+    assert oai.engine_of(kv["model.default"]) == "locals" and int(kv["model.context_length"]) >= 64000
+
+
+def test_one_command_helpers(tmp_path, monkeypatch):
+    """`locals code` sets OpenCode up when its config does not serve the model, and
+    `--run` prints the agent's last answer from OpenCode's JSON events."""
+    import json
+
+    cfg_path = tmp_path / "opencode.json"
+    monkeypatch.setattr(app, "OPENCODE_CONFIG", cfg_path)
+    monkeypatch.setattr(app, "opencode_bin", lambda: "/usr/bin/true")
+    assert not app._opencode_ready("mlx-community/Qwen3.5-4B-MLX-4bit")  # no config yet
+    cfg_path.write_text(json.dumps(app.opencode_config("mlx-community/Qwen3.5-4B-MLX-4bit", 8321)))
+    assert app._opencode_ready("mlx-community/Qwen3.5-4B-MLX-4bit")
+    assert not app._opencode_ready("mlx-community/gemma-4-e4b-it-4bit")  # another model: set up again
+    events = "\n".join([json.dumps({"type": "step_start"}), json.dumps({"type": "text", "part": {"type": "text", "text": "first"}}),
+                        "not json", json.dumps({"type": "text", "part": {"type": "text", "text": "The output is 2 3 5."}})])
+    assert app._opencode_answer(events) == "The output is 2 3 5."
+    assert "error" in app._opencode_answer(json.dumps({"type": "error", "error": {"name": "UnknownError"}}))
+
+
+def test_stop_without_a_server_touches_nothing(tmp_path, monkeypatch, capsys):
+    import argparse
+
+    monkeypatch.setattr(app, "LOCALS_DIR", tmp_path)
+    app.cmd_stop(argparse.Namespace(port=8399))
+    assert "no locals server on port 8399" in capsys.readouterr().out
+
+
+def test_model_short_names(tmp_path, monkeypatch):
+    """`--model gemma` (or qwen), before or after the sub-command, means the tested checkpoint."""
+    from locals.defaults import model_id
+
+    assert model_id("gemma") == model_id("Gemma4") == model_id("gemma-4-e4b") == "mlx-community/gemma-4-e4b-it-4bit"
+    assert model_id("qwen") == model_id("qwen3.5-4b") == "mlx-community/Qwen3.5-4B-MLX-4bit"
+    assert model_id("mlx-community/Llama-3.2-3B-Instruct-4bit") == "mlx-community/Llama-3.2-3B-Instruct-4bit"
+    seen = []
+    monkeypatch.setattr(app, "LOCALS_DIR", tmp_path / "locals")
+    monkeypatch.setattr(app, "cmd_status", seen.append)
+    app.main(["status", "--model", "gemma"])
+    app.main(["--model", "qwen", "status"])
+    assert [a.model for a in seen] == ["mlx-community/gemma-4-e4b-it-4bit", "mlx-community/Qwen3.5-4B-MLX-4bit"]
+    (tmp_path / "gemma").mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert model_id("gemma") == "mlx-community/gemma-4-e4b-it-4bit"  # a folder named gemma here does not hide the name
+    assert model_id("./gemma") == str((tmp_path / "gemma").absolute())  # a path is a path, made absolute
+
+
+def test_setup_keeps_the_users_opencode_config(tmp_path):
+    """locals adds its providers to an existing OpenCode config and keeps the user's own file once."""
+    import json
+
+    p = tmp_path / "opencode.json"
+    mine = {"model": "anthropic/claude-x", "provider": {"anthropic": {"options": {"apiKey": "k"}}}, "theme": "dark"}
+    p.write_text(json.dumps(mine))
+    app.write_config(app.opencode_config("mlx-community/gemma-4-e4b-it-4bit", 8321), p)
+    merged = json.loads(p.read_text())
+    assert merged["theme"] == "dark" and {"anthropic", "locals"} <= set(merged["provider"])  # the stock engine only on request
+    assert merged["model"] == "locals/locals/gemma-4-e4b-it"
+    app.write_config(app.opencode_config("mlx-community/Qwen3.5-4B-MLX-4bit", 8321), p)  # a later setup keeps the first copy
+    assert json.loads((tmp_path / "opencode.json.before-locals").read_text()) == mine
+    # the user's own settings of OpenCode's build agent stay; every agent gets the step limit
+    p.write_text(json.dumps(dict(mine, agent={"build": {"model": "anthropic/claude-x", "temperature": 0.1}})))
+    app.write_config(app.opencode_config("mlx-community/Qwen3.5-4B-MLX-4bit", 8321), p)
+    agents = json.loads(p.read_text())["agent"]
+    assert agents["build"] == {"model": "anthropic/claude-x", "temperature": 0.1, "steps": app.AGENT_STEPS}
+    assert all(a["steps"] == app.AGENT_STEPS for a in agents.values())
+
+
+def test_switching_models_restarts_only_our_idle_background_server(tmp_path, monkeypatch):
+    """`locals code --model gemma` with a Qwen server up: the background server locals
+    started is restarted with Gemma when idle; a busy one, or one started by hand, is left alone."""
+    import argparse
+
+    import pytest
+
+    monkeypatch.setattr(app, "LOCALS_DIR", tmp_path)
+    monkeypatch.setattr(app, "server_alive", lambda port: {"ok": True})
+    stats = {"model": "mlx-community/Qwen3.5-4B-MLX-4bit", "active": []}
+    monkeypatch.setattr(app, "get_json", lambda url, timeout=5.0: stats)
+    monkeypatch.setattr(app, "_listener_pid", lambda port: 4242)
+    args = argparse.Namespace(port=8399, model="mlx-community/gemma-4-e4b-it-4bit")
+    with pytest.raises(SystemExit, match="already running"):  # not started by locals
+        app.ensure_server(args)
+    (tmp_path / "server.pid").write_text("4242")
+    stats["active"] = [{"engine": "locals"}]
+    with pytest.raises(SystemExit, match="busy"):
+        app.ensure_server(args)
+    stats["active"] = []
+    killed = []
+
+    def kill(pid, sig):
+        killed.append(pid)
+        monkeypatch.setattr(app, "_listener_pid", lambda port: None)
+
+    class Started(Exception):
+        pass
+
+    def popen(*a, **k):
+        raise Started
+
+    monkeypatch.setattr(app.os, "kill", kill)
+    monkeypatch.setattr(app.subprocess, "Popen", popen)
+    with pytest.raises(Started):  # stopped, then a new server is started for Gemma
+        app.ensure_server(args)
+    assert killed == [4242]
+    app.ensure_server(argparse.Namespace(port=8399, model="mlx-community/Qwen3.5-4B-MLX-4bit"))  # same model: nothing to do
+
+
+def test_agent_setup_without_the_agent_installed(tmp_path, monkeypatch, capsys):
+    """`locals setup openclaw` / `hermes` without the tool: say how to install it and
+    stop there (no download, no server, no "Next: openclaw")."""
+    import argparse
+
+    monkeypatch.setattr(app, "LOCALS_DIR", tmp_path)
+    monkeypatch.setattr(app, "_tool_bin", lambda name, env: None)
+    monkeypatch.setattr(app, "agent_context", lambda model: 65536)
+
+    def boom(*a, **k):
+        raise AssertionError("must not start anything")
+
+    monkeypatch.setattr(app, "fetch_model", boom)
+    monkeypatch.setattr(app, "ensure_server", boom)
+    for target in ("openclaw", "hermes"):
+        app.cmd_setup(argparse.Namespace(target=target, model="mlx-community/gemma-4-e4b-it-4bit", port=8321, context=None,
+                                         output=4096, no_start=False))
+        out = capsys.readouterr().out
+        assert "is not installed" in out and f"locals setup {target}" in out and "Next:" not in out
+
+
+def test_code_run_end_to_end_with_stand_ins(tmp_path, monkeypatch, capsys):
+    """`locals code DIR --run TASK` on a first run: OpenCode set up for the model, the model
+    fetched, the server ensured, the task run headless and its answer printed."""
+    import argparse
+    import json
+    import subprocess
+
+    import pytest
+
+    cfg_path = tmp_path / "oc" / "opencode.json"
+    monkeypatch.setattr(app, "OPENCODE_CONFIG", cfg_path)
+    monkeypatch.setattr(app, "LOCALS_DIR", tmp_path / "locals")
+    monkeypatch.setattr(app, "opencode_bin", lambda: "/bin/echo")
+    monkeypatch.setattr(app, "default_agent", lambda model: "coder")
+    monkeypatch.setattr(app, "model_thinks", lambda model: True)
+    monkeypatch.setattr(app, "agent_context", lambda model: 65536)
+    calls = []
+    monkeypatch.setattr(app, "fetch_model", lambda model: calls.append(("fetch", model)))
+    monkeypatch.setattr(app, "ensure_server", lambda args: calls.append(("server", args.model)))
+    real_run = subprocess.run
+
+    def run(cmd, **kw):
+        if cmd[0] == "/bin/echo" and "--version" in cmd:
+            return real_run(["echo", "1.18.32"], **kw)
+        calls.append(("opencode", cmd[1:]))
+        ev = json.dumps({"type": "text", "part": {"type": "text", "text": "Done: 2 3 5 7"}})
+        return subprocess.CompletedProcess(cmd, 0, ev + "\n", "")
+
+    monkeypatch.setattr(app.subprocess, "run", run)
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.chdir(tmp_path)
+    args = argparse.Namespace(dir=str(project), model="mlx-community/gemma-4-e4b-it-4bit", port=8321, engine=None, agent=None,
+                              logs=False, run="write primes.py", cont=False)
+    with pytest.raises(SystemExit) as e:
+        app.cmd_code(args)
+    assert e.value.code == 0
+    out = capsys.readouterr().out
+    assert "Done: 2 3 5 7" in out and "gemma-4-e4b-it on the locals engine, agent coder" in out
+    assert calls[0] == ("fetch", args.model) and calls[1] == ("server", args.model) and calls[2][0] == "opencode"
+    cfg = json.loads(cfg_path.read_text())
+    assert cfg["model"] == "locals/locals/gemma-4-e4b-it" and cfg["default_agent"] == "coder"
+    assert json.loads((tmp_path / "locals" / "config.json").read_text())["model"] == args.model
+
+
+def test_openclaw_setup_replaces_localss_model_list(tmp_path, monkeypatch, capsys):
+    """A setup for another model replaces the locals provider's model list: OpenClaw refuses
+    a patch that would drop entries (switching from Qwen3.5 to Gemma 4 failed)."""
+    import argparse
+    import subprocess
+
+    monkeypatch.setattr(app, "_tool_bin", lambda name, env: "/opt/openclaw")
+    monkeypatch.setattr(app, "agent_context", lambda model: 65536)
+    seen = []
+    monkeypatch.setattr(app.subprocess, "run", lambda cmd, **kw: seen.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))
+    assert app.setup_openclaw(argparse.Namespace(model="mlx-community/gemma-4-e4b-it-4bit", port=8321, context=None, output=4096))
+    cmd = seen[0]
+    assert cmd[:3] == ["/opt/openclaw", "config", "patch"]
+    assert cmd[cmd.index("--replace-path") + 1] == "models.providers.locals.models"
+    assert "locals/locals/gemma-4-e4b-it" in capsys.readouterr().out
+
+
+def test_a_background_server_on_older_code_is_restarted(tmp_path, monkeypatch):
+    """The same model, but the server started before locals changed (an upgrade): ours and idle,
+    it is restarted; started by hand, it is used with a note."""
+    import argparse
+
+    import pytest
+
+    from locals import defaults
+
+    monkeypatch.setattr(app, "LOCALS_DIR", tmp_path)
+    monkeypatch.setattr(app, "server_alive", lambda port: {"status": "ok", "build": "old-build"})
+    monkeypatch.setattr(app, "get_json", lambda url, timeout=5.0: {"model": "mlx-community/Qwen3.5-4B-MLX-4bit", "active": []})
+    monkeypatch.setattr(defaults, "build_id", lambda: "new-build")
+    monkeypatch.setattr(app, "_listener_pid", lambda port: 4242)
+    args = argparse.Namespace(port=8399, model="mlx-community/Qwen3.5-4B-MLX-4bit")
+    app.ensure_server(args)  # not ours (no pid file): used as it is
+    (tmp_path / "server.pid").write_text("4242")
+    killed = []
+
+    def kill(pid, sig):
+        killed.append(pid)
+        monkeypatch.setattr(app, "_listener_pid", lambda port: None)
+
+    class Started(Exception):
+        pass
+
+    monkeypatch.setattr(app.os, "kill", kill)
+    monkeypatch.setattr(app.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(Started()))
+    with pytest.raises(Started):
+        app.ensure_server(args)
+    assert killed == [4242]
+
+
+def test_stop_never_kills_what_a_stale_pid_file_names(tmp_path, monkeypatch, capsys):
+    """A pid file can outlive its server; its number may then be anyone's process (this test's own here)."""
+    import os
+
+    from locals import app
+
+    monkeypatch.setattr(app, "_listener_pid", lambda port: None)
+    app.LOCALS_DIR.mkdir(parents=True, exist_ok=True)
+    app._pid_file(8321).write_text(str(os.getpid()))
+    killed = []
+    monkeypatch.setattr(os, "kill", lambda *a: killed.append(a))
+    app.cmd_stop(type("A", (), {"port": 8321})())
+    assert not killed and "no locals server" in capsys.readouterr().out
+
+
+def test_a_commented_opencode_config_is_not_rewritten(tmp_path):
+    import pytest
+
+    from locals import app
+
+    path = tmp_path / "opencode.json"
+    text = '{\n  // my providers\n  "provider": {"mine": {}},\n}\n'
+    path.write_text(text)
+    with pytest.raises(SystemExit):
+        app.write_config({"model": "locals/locals/x"}, path)
+    assert path.read_text() == text
+
+
+def test_model_before_a_command_with_its_own_parser(monkeypatch):
+    from locals import app
+
+    seen = []
+    monkeypatch.setattr(app, "_delegate", lambda name: (lambda argv: seen.append((name, argv))) if name == "chat" else None)
+    app.main(["--model", "gemma", "chat", "--temp", "0"])
+    assert seen == [("chat", ["--model", "gemma", "--temp", "0"])]

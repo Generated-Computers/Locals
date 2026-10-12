@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use Locals in your work, please cite it as below."
+title: "Locals: AI coding agents on your Mac, with a local model"
+type: software
+authors:
+  - family-names: Asadulaev
+    given-names: Arip
+version: 0.2.0
+license: MIT
+repository-code: "https://github.com/Generated-Computers/Locals"

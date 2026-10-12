@@ -1,0 +1,1502 @@
+"""OpenAI-compatible HTTP server over the batch service.
+
+    locals serve                      # http://127.0.0.1:8321/v1
+    locals serve --engines locals,mlx  # which engines may be loaded (lazily, on first use)
+
+Endpoints: ``POST /v1/chat/completions`` (streaming and not, tools, JSON
+schema response formats), ``GET /v1/models``, ``GET /health``,
+``GET /stats`` (live counters), ``GET /`` (a small status page).
+
+Two engines serve the same model, chosen by the model id of a request:
+
+  locals/...  our engine: fused layers and small-batch kernels, pipelined
+             continuous batching, prompt cache, and constrained decoding of
+             tool calls (forced tags, valid tool names, budget-closed replies)
+             and of JSON-schema response formats;
+  mlx/...    plain mlx-lm (BatchGenerator, llguidance for JSON schemas): the
+             default MLX stack, for comparison.
+
+A model id containing ``thinking`` opens a <think> block in the reply, which
+is streamed as ``reasoning_content``. Every request is one row of the running
+batch: concurrent agents decode together, and a conversation's growing
+prefix is served from the prompt cache.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import queue
+import re
+import sys
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Dict, List, Optional
+from urllib.parse import urlparse
+
+from . import apis, formats, oai
+
+from . import __version__
+from .defaults import DEFAULT_MODEL, MODEL_HELP, build_id, model_id
+
+BUILD_ID = build_id()  # the code this server runs (locals code / solve restart a background server on older code)
+ENGINE_NAMES = {"locals": "locals", "mlx": "stock"}  # api name -> BatchService engine
+
+
+def _now() -> int:
+    return int(time.time())
+
+
+class ContextTooLong(ValueError):
+    """A prompt longer than the server's context; answered as OpenAI's
+    ``context_length_exceeded`` so agents compact their history and retry."""
+
+
+class BadRequest(ValueError):
+    """A request the engine could not serve as asked (a regex or schema that does not compile): a 400."""
+
+
+MAX_BODY = 64 << 20  # bytes of a request body
+_LOOPBACK = {"localhost", "127.0.0.1", "::1"}
+_APP_SCHEMES = ("app", "file", "tauri", "vscode-webview", "vscode-file",  # desktop apps and VS Code
+                "chrome-extension", "moz-extension", "safari-web-extension")  # browser extensions (as Ollama allows)
+# chat_template_kwargs keys a client may not set: a template of its own (it would run in the server:
+# a loop in it holds a thread and the GIL, as in vLLM's CVE for the same switch) and what the server sets
+_TEMPLATE_DENY = {"chat_template", "tokenizer_kwargs", "documents", "continue_final_message", "return_assistant_tokens_mask",
+                  "tools", "messages", "add_generation_prompt", "tokenize", "return_dict", "padding", "truncation", "max_length",
+                  "return_tensors", "enable_thinking"}
+
+
+def _template_switches(kw) -> dict:
+    """The chat_template_kwargs a template may see: plain switches (a bool, a number, a short string)."""
+    if not isinstance(kw, dict):
+        return {}
+    return {k: v for k, v in kw.items() if isinstance(k, str) and k not in _TEMPLATE_DENY
+            and (isinstance(v, (bool, int, float)) or (isinstance(v, str) and len(v) <= 200))}
+
+
+def _origin_ok(origin: str) -> bool:
+    """Whether a web page from ``origin`` may call the server: one served from this machine
+    (localhost, any port), a desktop app's (app://, file://, tauri://, VS Code webviews), or one in
+    LOCALS_ORIGINS (comma-separated; "*" for any). Without this, any site the user visits could use
+    the model and read the replies (a cross-site request needs no preflight)."""
+    extra = {o.strip() for o in os.environ.get("LOCALS_ORIGINS", "").split(",") if o.strip()}
+    if "*" in extra or origin in extra:
+        return True
+    try:
+        u = urlparse(origin)
+        host = (u.hostname or "").lower()
+    except ValueError:
+        return False
+    if u.scheme in ("http", "https"):
+        return host in _LOOPBACK or host.endswith(".localhost")
+    return u.scheme in _APP_SCHEMES
+
+
+def _host_ok(host_header: Optional[str], bind_host: str) -> bool:
+    """The Host header of a server that listens on this machine only names this machine: a page whose
+    domain was pointed at 127.0.0.1 (DNS rebinding) names its own. This machine's names: localhost and
+    *.localhost, *.local, *.internal (Docker's host.docker.internal: Open WebUI in a container), its
+    host name, loopback and private addresses, 0.0.0.0; LOCALS_HOSTS adds more (comma-separated, "*")."""
+    if bind_host not in _LOOPBACK or not host_header:
+        return True
+    try:
+        name = (urlparse("//" + host_header.strip()).hostname or "").lower().rstrip(".")
+    except ValueError:  # a malformed header ("[::1")
+        return False
+    extra = {h.strip().lower() for h in os.environ.get("LOCALS_HOSTS", "").split(",") if h.strip()}
+    if "*" in extra or name in extra or name in _LOOPBACK or name == "0.0.0.0":
+        return True
+    if name.endswith((".localhost", ".local", ".internal")):
+        return True
+    import ipaddress
+    import socket
+
+    if name in (socket.gethostname().lower(), socket.gethostname().lower().split(".")[0]):
+        return True
+    try:
+        ip = ipaddress.ip_address(name)
+        return ip.is_loopback or ip.is_private
+    except ValueError:
+        return False
+
+
+def _dump_request(req: dict, kind: str = "") -> None:
+    """LOCALS_DEBUG: the request as received, readable by this user only (prompts can hold secrets)."""
+    d = Path(os.environ.get("LOCALS_DEBUG_DIR") or Path.home() / ".cache" / "locals" / "requests")
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    f = d / f"{time.strftime('%Y%m%d-%H%M%S')}_{uuid.uuid4().hex[:6]}{'_' + kind if kind else ''}.json"
+    fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(req, fh, indent=1, ensure_ascii=False)
+
+
+class Server:
+    def __init__(self, model: str = DEFAULT_MODEL, engines=("locals", "mlx"), preload=("locals",), slots: int = 16,
+                 temp: float = 0.2, max_tokens: int = 4096, thinking: bool = False, cache_gb: Optional[float] = None, seed: int = 0,
+                 max_calls: int = 6, walk: bool = False, typed_tools: bool = False, log=None, top_p: float = 0.0, top_k: int = 0,
+                 max_context: int = 65536):
+        self.model_id = model_id(model)  # a short name (qwen, gemma) or any model id
+        # Prompt + reply tokens per request. 64k is the most a 4B model's prefill fits
+        # next to the weights on a 16 GB Mac (peak 9.2 GB at 61k tokens); beyond it a
+        # Metal out-of-memory error would end the whole server, so longer prompts get an error.
+        self.max_context = max_context
+        self.short = self.model_id.split("/")[-1].replace("-MLX-4bit", "").replace("-4bit", "").lower()
+        self.engines = tuple(engines)
+        self.slots, self.temp, self.max_tokens, self.thinking, self.cache_gb, self.seed = slots, temp, max_tokens, thinking, cache_gb, seed
+        self.max_calls = max_calls
+        self.top_p, self.top_k = top_p, top_k  # sampling filters at temp > 0 (Qwen3.5 thinking: temp 0.6, top_p 0.95, top_k 20)
+        self.walk = walk  # constraints by the walk kernel: no token tables, any grammar size
+        self.typed_tools = typed_tools  # tool calls with parameter names and types fixed (needs walk for large tool sets)
+        self.log = log or (lambda s: print(s, file=sys.stderr, flush=True))
+        self._svc: Dict[str, object] = {}
+        self._lock = threading.Lock()  # the stream and raw-reply caches
+        self._loading = {e: threading.Lock() for e in self.engines}
+        self._load_error: Dict[str, tuple] = {}  # engine -> (when, error) of its last failed load
+        self.bind_host = "127.0.0.1"  # set by serve()
+        self.t_start = time.time()
+        self.requests = 0
+        self.errors = 0
+        self.per_engine = {e: {"requests": 0, "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0, "forced_tokens": 0,
+                               "passes": 0, "decode_s": 0.0, "tool_calls": 0} for e in self.engines}
+        self._active: Dict[str, dict] = {}
+        # Exact token streams of recent replies, so a conversation that comes
+        # back re-rendered continues on the tokens the model actually saw and
+        # hits the prompt cache: (rendered prompt text + reply text) -> ids.
+        self._streams: Dict[str, List[dict]] = {e: [] for e in self.engines}
+        self._raw: Dict[str, str] = {}  # tool-call id -> the raw reply text it came from
+        self._fmt: Dict[str, tuple] = {}  # engine -> (tool-call format, thinking style), from the chat template
+        self._ckpt: Dict[str, bool] = {}  # engine -> whether the model's cache needs prompt snapshots
+        for e in preload or ():
+            if e in self.engines:
+                self.service(e)
+                self.format_of(e)
+        self._cap_context()
+
+    # -- the names other APIs' clients use ------------------------------------------------------
+    def chat_model(self, name: str) -> str:
+        """The model id for a name an Ollama client sends: the server has one model, so any name is it
+        (apps ask for what /api/tags lists); mlx/... picks the stock engine, and a name with "think"
+        in it turns thinking on."""
+        engine = oai.engine_of(name) if name else "locals"
+        if engine not in self.engines:
+            engine = self.engines[0]
+        return f"{engine}/{self.short}" + ("-thinking" if oai.thinking_of(name) else "")
+
+    def ollama_name(self, engine: str = "locals") -> str:
+        return f"{self.short}:latest" if engine == "locals" else f"{engine}/{self.short}:latest"
+
+    def ollama_models(self, running: bool = False) -> List[dict]:
+        family = self.short.split("-")[0].split(".")[0]
+        out = []
+        for e in self.engines:
+            if running and e not in self._svc:
+                continue
+            m = apis.ollama_model_entry(self.ollama_name(e), self.short, family, self.max_context)
+            if running:
+                m["expires_at"] = "2099-01-01T00:00:00Z"
+                m["size_vram"] = 0
+            out.append(m)
+        return out
+
+    def ollama_show(self, name: str) -> dict:
+        from . import formats
+
+        family = self.short.split("-")[0].split(".")[0]
+        caps = ["completion", "tools"]
+        loaded = list(self._svc.values())
+        if loaded and formats.offers_thinking(loaded[0].tokenizer):
+            caps.append("thinking")
+        entry = apis.ollama_model_entry(name or self.ollama_name(), self.short, family, self.max_context)
+        return {"license": "", "modelfile": f"# served by locals: {self.model_id}", "parameters": "", "template": "",
+                "details": entry["details"], "capabilities": caps,
+                "model_info": {"general.architecture": family, "general.basename": self.short,
+                               f"{family}.context_length": self.max_context}}
+
+    # -- engines ------------------------------------------------------------------------------
+    def service(self, engine: str):
+        if engine not in self.engines:
+            raise ValueError(f"engine {engine!r} is not enabled on this server (enabled: {', '.join(self.engines)})")
+        svc = self._svc.get(engine)
+        if svc is not None:
+            return svc
+        with self._loading[engine]:  # one load per engine; requests for the other engine go on meanwhile
+            svc = self._svc.get(engine)
+            if svc is not None:
+                return svc
+            failed = self._load_error.get(engine)
+            if failed and time.time() - failed[0] < 60:
+                raise RuntimeError(f"engine {engine} failed to load {time.time() - failed[0]:.0f}s ago: {failed[1]}")
+            from .service import BatchService
+
+            t = time.perf_counter()
+            self.log(f"loading {self.model_id} on engine {engine} ...")
+            try:
+                svc = BatchService(ENGINE_NAMES[engine], self.model_id, slots=self.slots, temp=self.temp, seed=self.seed,
+                                   cache_gb=self.cache_gb, walk=self.walk and engine == "locals", top_p=self.top_p, top_k=self.top_k)
+            except Exception as e:
+                self._load_error[engine] = (time.time(), f"{type(e).__name__}: {e}")
+                raise
+            self._svc[engine] = svc
+            self.log(f"engine {engine} ready in {time.perf_counter() - t:.1f}s")
+            return svc
+
+    def _can_think(self, engine: str, tok) -> bool:
+        if engine not in getattr(self, "_thinks", {}):
+            from . import formats
+
+            self._thinks = {**getattr(self, "_thinks", {}), engine: formats.offers_thinking(tok)}
+        return self._thinks[engine]
+
+    def models(self) -> List[dict]:
+        out = []
+        from . import formats
+
+        loaded = [svc for svc in self._svc.values()]
+        thinks = not loaded or formats.offers_thinking(loaded[0].tokenizer)  # a "-thinking" id only where the model can think
+        for e in self.engines:
+            for suffix in ("", "-thinking") if thinks else ("",):
+                info = {"id": f"{e}/{self.short}{suffix}", "object": "model", "created": int(self.t_start), "owned_by": e,
+                        "context_length": self.max_context, "max_model_len": self.max_context}
+                if e in self._fmt:  # known once the engine is loaded
+                    info["tool_call_format"] = self._fmt[e][0].name
+                    info["parallel_tool_calls"] = self._fmt[e][0].multi
+                out.append(info)
+        return out
+
+    def stats(self) -> dict:
+        import resource
+
+        import mlx.core as mx
+
+        mem = {"gpu_active_mb": mx.get_active_memory() / 1e6, "gpu_peak_mb": mx.get_peak_memory() / 1e6,
+               "gpu_cache_mb": mx.get_cache_memory() / 1e6, "rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6}
+        out = {"model": self.model_id, "uptime_s": time.time() - self.t_start, "requests": self.requests, "errors": self.errors,
+               "active": list(self._active.values()), "memory": mem, "engines": {}}
+        for e in self.engines:
+            d = dict(self.per_engine[e])
+            svc = self._svc.get(e)
+            d["loaded"] = svc is not None
+            if svc is not None:
+                d.update({k: v for k, v in svc.stats().items() if k != "engine"})
+            out["engines"][e] = d
+        return out
+
+    # -- one chat completion ------------------------------------------------------------------
+    def prepare(self, req: dict) -> dict:
+        if os.environ.get("LOCALS_DEBUG"):
+            _dump_request(req)
+        _unsupported(req)
+        model = req.get("model") or f"locals/{self.short}"
+        engine = oai.engine_of(model)
+        thinking = oai.thinking_of(model, self.thinking)
+        kw = req.get("chat_template_kwargs") or {}
+        if isinstance(kw, dict) and isinstance(kw.get("enable_thinking"), bool):  # vLLM / SGLang style switch
+            thinking = kw["enable_thinking"]
+        effort = req.get("reasoning_effort")
+        if effort is None and isinstance(req.get("reasoning"), dict):  # the Responses API's shape
+            effort = req["reasoning"].get("effort")
+        if effort == "none":
+            thinking = False
+        svc = self.service(engine)
+        tok = svc.tokenizer
+        self._cap_context()
+        fmt, style = self.format_of(engine)
+        if style in ("none", "switch"):
+            thinking = False  # no switch, or thoughts in a form the parser does not know
+        rf0 =req.get("response_format") if isinstance(req.get("response_format"), dict) else {}
+        if rf0.get("type") in ("json_object", "json_schema", "regex") or req.get("guided_regex") or oai.response_schema(req):
+            thinking = False  # the grammar writes the JSON from the first token: a think block the prompt opened would hold it
+        if thinking and not self._can_think(engine, tok):
+            thinking = False  # a model without a thinking mode (Qwen3-Instruct-2507) never closes a think block
+        msgs = oai.convert_messages(req.get("messages") or [], raw=self._raw if fmt.replay_raw else None)
+        tools = oai.tool_specs(req.get("tools"))
+        if tools:
+            _cwd_hint(msgs)
+        msgs, tpl_tools = fmt.prepare(msgs, tools)
+        think_kw = {} if style == "none" else {"enable_thinking": thinking}
+        think_kw.update(_template_switches(req.get("chat_template_kwargs")))  # vLLM-style template switches
+        if thinking and isinstance(effort, str) and effort and "reasoning_effort" not in think_kw:
+            think_kw["reasoning_effort"] = effort
+        if isinstance(think_kw.get("reasoning_effort"), str):
+            # the template's own values (Qwen3.8 raises on any but xhigh, medium, low): the nearest one
+            allowed = formats.reasoning_efforts(formats.chat_template(tok))
+            if allowed:
+                think_kw["reasoning_effort"] = formats.effort_for(think_kw["reasoning_effort"], allowed)
+        text = _render(tok, msgs, tpl_tools, add_generation_prompt=True, **think_kw)
+        if style == "always" and not thinking:
+            # the template opens a think block whatever the switch says (LFM2.5): closed empty here, the model
+            # answers at once (a short request answered nothing, every token spent thinking; JSON started in it)
+            text += fmt.think_close
+        prompt = self._tokens_for(engine, tok, text)
+        if len(prompt) >= self.max_context:
+            raise ContextTooLong(f"This model's maximum context length is {self.max_context} tokens. However, your messages "
+                                 f"resulted in {len(prompt)} tokens. Please reduce the length of the messages.")
+        asked = req.get("max_completion_tokens") or req.get("max_tokens")
+        max_tokens = int(asked) if asked is not None and int(asked) > 0 else self.max_tokens  # -1: "no limit"
+        room = self.max_context - len(prompt)
+        if room < min(max_tokens, 256):  # a reply of a few tokens, cut: the client is told to make room instead
+            raise ContextTooLong(f"This model's maximum context length is {self.max_context} tokens. However, your messages "
+                                 f"resulted in {len(prompt)} tokens, which leaves {room} for the reply. Please reduce the "
+                                 f"length of the messages.")
+        max_tokens = max(1, min(max_tokens, self.max_tokens, room))
+        schema = oai.response_schema(req)
+        regex = None
+        rf = req.get("response_format") if isinstance(req.get("response_format"), dict) else {}
+        if rf.get("type") not in (None, "text", "json_object", "json_schema", "regex"):  # never unconstrained by mistake
+            raise ValueError(f"response_format type {rf.get('type')!r} is not one of text, json_object, json_schema, regex")
+        if rf.get("type") == "json_object":
+            schema, regex = None, oai.json_object_regex()
+        elif rf.get("type") == "regex" or req.get("guided_regex"):  # a regular expression (vLLM: guided_regex)
+            schema, regex = None, rf.get("regex") or rf.get("pattern") or req.get("guided_regex")
+            if not isinstance(regex, str) or not regex:
+                raise ValueError("response_format regex needs a 'regex' string")
+        elif engine == "locals" and schema is None and tools:
+            _check_tool_choice(req.get("tool_choice", "auto"), [t["function"]["name"] for t in tools])
+            regex = oai.reply_regex(tools, req.get("tool_choice", "auto"), thinking, typed=self.typed_tools, fmt=fmt, preamble=False,
+                                    parallel=req.get("parallel_tool_calls") is not False)
+        cps = self._checkpoints(tok, msgs, tpl_tools, think_kw, text, prompt) if engine == "locals" and self._needs_checkpoints(engine) else []
+        return {"engine": engine, "thinking": thinking, "svc": svc, "prompt": prompt, "checkpoints": cps, "text": text,
+                "tools": tools, "schema": schema, "regex": regex, "max_tokens": max_tokens, "model": model, "fmt": fmt,
+                "tool_choice": req.get("tool_choice", "auto"), "stop": _stops(req), "temp": _temperature(req)}
+
+    def prepare_text(self, req: dict) -> dict:
+        """A /v1/completions request: a raw prompt (no chat template), as mlx-lm's server encodes it."""
+        if os.environ.get("LOCALS_DEBUG"):
+            _dump_request(req, "text")
+        _unsupported(req)
+        if req.get("echo") or req.get("suffix"):  # the prompt echoed back, or text to fill in before a suffix
+            raise ValueError("echo and suffix are not supported")
+        model = req.get("model") or f"locals/{self.short}"
+        engine = oai.engine_of(model)
+        svc = self.service(engine)
+        tok = svc.tokenizer
+        self._cap_context()
+        prompt = req.get("prompt", "")
+        if isinstance(prompt, list) and prompt and all(type(t) is int for t in prompt):
+            ids = list(prompt)  # token ids, which must be the tokenizer's (an id past the vocabulary reads past the embedding)
+            n_vocab = len(tok._tokenizer)
+            if any(t < 0 or t >= n_vocab for t in ids):
+                raise ValueError(f"token ids must be between 0 and {n_vocab - 1}")
+        else:
+            if isinstance(prompt, list):
+                if len(prompt) > 1:
+                    raise ValueError("only one prompt per request is supported")
+                prompt = prompt[0] if prompt else ""
+            if not isinstance(prompt, str):
+                raise ValueError("prompt must be a string, a list with one string, or a list of token ids")
+            from . import formats
+
+            ids = list(tok.encode(prompt))
+            bos = getattr(tok, "bos_token_id", None)
+            if ids and bos is not None and ids[0] != bos and "bos_token" in formats.chat_template(tok):
+                ids.insert(0, bos)  # the model saw every sequence start with it (Gemma 4, Ministral: encode leaves it out)
+        if not ids:
+            raise ValueError("empty prompt")
+        if len(ids) >= self.max_context:
+            raise ContextTooLong(f"This model's maximum context length is {self.max_context} tokens. However, your prompt "
+                                 f"resulted in {len(ids)} tokens. Please reduce the length of the prompt.")
+        asked = req.get("max_tokens")
+        max_tokens = int(asked) if asked is not None and int(asked) > 0 else 256
+        max_tokens = max(1, min(max_tokens, self.max_tokens, self.max_context - len(ids)))
+        return {"engine": engine, "thinking": False, "svc": svc, "prompt": ids, "checkpoints": [], "text": None, "tools": [],
+                "schema": None, "regex": None, "max_tokens": max_tokens, "model": model, "fmt": None, "stop": _stops(req),
+                "temp": _temperature(req)}
+
+    def text_completion(self, req: dict, p: dict, write=None) -> Optional[dict]:
+        """One /v1/completions request, streamed when ``write`` is given."""
+        t0 = time.perf_counter()
+        cid = "cmpl-" + uuid.uuid4().hex[:24]
+        tok = p["svc"].tokenizer
+        stops = p["stop"]
+        hold = max((len(s) for s in stops), default=1) - 1  # text that may be the start of a stop sequence
+
+        def chunk(text: str, finish=None, usage=None):
+            if write is None:
+                return
+            d = {"id": cid, "object": "text_completion", "created": _now(), "model": p["model"],
+                 "choices": [{"index": 0, "text": text, "finish_reason": finish, "logprobs": None}]}
+            if usage is not None:
+                d["usage"] = usage
+            write(("data: " + json.dumps(d, ensure_ascii=False) + "\n\n").encode())
+
+        key = uuid.uuid4().hex[:8]
+        self._active[key] = {"engine": p["engine"], "prompt_tokens": len(p["prompt"]), "tokens": 0, "started": time.time()}
+        q: "queue.Queue[List[int]]" = queue.Queue()
+        job = p["svc"].submit(p["prompt"], max_tokens=p["max_tokens"], on_token=q.put, temp=p.get("temp"))
+        toks: List[int] = []
+        sent, stopped, last_emit = 0, None, time.perf_counter()
+        last_probe = last_emit
+        try:
+            while True:
+                got = False
+                try:
+                    toks.extend(q.get(timeout=0.25))
+                    got = True
+                    while True:
+                        toks.extend(q.get_nowait())
+                except queue.Empty:
+                    pass
+                if got:
+                    self._active[key]["tokens"] = len(toks)
+                    text = tok.decode(toks)
+                    cut = _stop_cut(text, stops)
+                    if cut is not None:  # every pass: tokens committed after the cancel come after the stop too
+                        text = text[:cut]
+                        if stopped is None:
+                            stopped = "stop"
+                            job.cancel()
+                    upto = len(text) if stopped else len(text) - hold
+                    if not text.endswith("\ufffd") and upto > sent:
+                        chunk(text[sent:upto])
+                        sent, last_emit = upto, time.perf_counter()
+                elif write is not None and time.perf_counter() - last_emit > 15:
+                    write(b": keepalive\n\n")
+                    last_emit = time.perf_counter()
+                if write is None and p.get("alive") is not None and time.perf_counter() - last_probe > 1:
+                    last_probe = time.perf_counter()  # while tokens come too: a client that left frees its row
+                    if not p["alive"]():
+                        job.cancel()
+                        raise ConnectionResetError("the client went away")
+                if job.done and q.empty():
+                    break
+            if job.finish.startswith("invalid:"):
+                raise BadRequest(job.finish[len("invalid:"):].strip())
+            if job.finish.startswith("error"):
+                raise RuntimeError(job.finish)
+            final = job.text
+            cut = _stop_cut(final, stops)
+            if cut is not None:
+                final, stopped = final[:cut], "stop"
+            if len(final) > sent:
+                chunk(final[sent:])
+            usage = self._account(p, job, len(job.tokens), 0, t0, stopped)
+            usage.pop("locals", None)
+            finish = "length" if job.finish in ("length", "exhausted") and not stopped else "stop"
+            if write is not None:
+                chunk("", finish, usage)
+                write(b"data: [DONE]\n\n")
+                return None
+            return {"id": cid, "object": "text_completion", "created": _now(), "model": p["model"],
+                    "choices": [{"index": 0, "text": final, "finish_reason": finish, "logprobs": None}], "usage": usage}
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):  # the client went away
+            job.cancel()
+            return None
+        finally:
+            self._active.pop(key, None)
+
+    def _cap_context(self) -> None:
+        """Lower max_context to the model's own context length (its config), once."""
+        if getattr(self, "_context_capped", False):
+            return
+        self._context_capped = True
+        n = native_context(self.model_id)
+        if n and n < self.max_context:
+            self.log(f"{self.model_id} has a {n}-token context: requests are limited to that (was {self.max_context})")
+            self.max_context = n
+
+    def format_of(self, engine: str):
+        """The tool-call format and thinking style of the model's chat template."""
+        if engine not in self._fmt:
+            from . import formats
+
+            tok = self.service(engine).tokenizer
+            self._fmt[engine] = (formats.detect(tok), formats.thinking_style(tok))
+            self.log(f"[{engine}] tool calls: {self._fmt[engine][0].name}; thinking: {self._fmt[engine][1]}")
+        return self._fmt[engine]
+
+    def _needs_checkpoints(self, engine: str) -> bool:
+        """Whether prompt snapshots pay: only where a cached state cannot be cut
+        back to a shorter prefix (Qwen3.5's recurrent layers, Gemma's sliding
+        windows). A plain KV cache is trimmed to any shared prefix by the prompt
+        cache itself, so snapshots of it would only hold the prompt's KV two more
+        times (5 GB for a 20k-token prompt on an 8B model)."""
+        if engine not in self._ckpt:
+            from mlx_lm.models.cache import KVCache, make_prompt_cache
+
+            model = getattr(getattr(self.service(engine), "_eng", None), "model", None)
+            self._ckpt[engine] = model is None or any(type(c) is not KVCache for c in make_prompt_cache(model))
+        return self._ckpt[engine]
+
+    def _checkpoints(self, tok, msgs: List[dict], tools, think_kw: dict, text: str, prompt: List[int]) -> List[tuple]:
+        """Where to snapshot the prompt's cache on the way (a recurrent GDN
+        cache cannot be cut back afterwards, so only stored prefixes are reused):
+
+        * the end of the system message (tools included): every session of an
+          agent starts with it, so a new session skips its 5-15k tokens; kept
+          longest by the prompt cache ("system").
+        * the start of the last message: the previous turn plus its reply is a
+          prefix of the next request only if the client resends history
+          unchanged, and some (OpenClaw) move a context message to the end on
+          every turn; the history before the last message stays put ("user").
+
+        Both are found by rendering the conversation up to that point with the
+        model's own template; a position is used only where that text is a
+        prefix of the prompt and tokenizes to the prompt's own first tokens."""
+        out = []
+        if len(msgs) < 2:
+            return out
+        hf = tok._tokenizer
+        cands = []
+        if msgs[0]["role"] == "system":
+            # A template may refuse a conversation without a user message (Qwen3.5 does), so the end
+            # of the system part is where two renderings with different user messages part: the
+            # system message, tools included, and the user turn's header, the same in every session.
+            try:
+                a = _render(tok, msgs[:1] + [{"role": "user", "content": "\x01A"}], tools, add_generation_prompt=False, **think_kw)
+                b = _render(tok, msgs[:1] + [{"role": "user", "content": "\x02B"}], tools, add_generation_prompt=False, **think_kw)
+                n = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+                cands.append((a[:n], "system"))
+            except Exception:  # noqa: BLE001
+                pass
+        if len(msgs) > 2 or msgs[0]["role"] != "system":
+            try:
+                cands.append((_render(tok, msgs[:-1], tools, add_generation_prompt=False, **think_kw), "user"))
+            except Exception:  # noqa: BLE001
+                pass
+        for t, kind in cands:
+            if len(t) < 2048 or not text.startswith(t):  # a short prefix is cheaper to prefill again
+                continue
+            ids = hf.encode(t, add_special_tokens=False)
+            # where the prompt's tokens and these part (the last token may merge with what follows): one pass
+            # (backing off a token at a time cost seconds on a 60k-token prompt)
+            n = next((k for k, (a, b) in enumerate(zip(prompt, ids)) if a != b), min(len(prompt), len(ids)))
+            if n >= 1024 and n < len(prompt) and all(n != m for m, _ in out):
+                out.append((n, kind))
+        return out
+
+    def _tokens_for(self, engine: str, tok, text: str) -> List[int]:
+        """Token ids of a rendered prompt: a remembered stream's ids where the
+        text continues one, plus the tokens of the remainder."""
+        best = None
+        with self._lock:
+            for st in self._streams[engine]:
+                if text.startswith(st["text"]) and (best is None or len(st["text"]) > len(best["text"])):
+                    best = st
+        hf = tok._tokenizer
+        if best is None:
+            return list(hf.encode(text, add_special_tokens=False))
+        return list(best["ids"]) + list(hf.encode(text[len(best["text"]):], add_special_tokens=False))
+
+    def _remember(self, engine: str, p: dict, job, calls: List[dict], prefix: str = "", raw: Optional[str] = None,
+                  exact: bool = True) -> None:
+        raw = prefix + job.text if raw is None else raw
+        exact = exact and raw == prefix + job.text
+        ids = list(p["prompt"])
+        if prefix:
+            ids += list(p["svc"].tokenizer._tokenizer.encode(prefix, add_special_tokens=False))
+        with self._lock:
+            for c in calls:
+                self._raw[oai.id_key(c["id"])] = raw
+            if len(self._raw) > 4096:
+                for k in list(self._raw)[:1024]:
+                    del self._raw[k]
+            if exact:
+                st = self._streams[engine]
+                st.append({"text": p["text"] + raw, "ids": ids + list(job.tokens)})
+                del st[:-64]
+
+    def _submit(self, p: dict, on_token=None):
+        return p["svc"].submit(p["prompt"], schema=p["schema"], max_tokens=p["max_tokens"], regex=p["regex"], on_token=on_token,
+                               temp=p.get("temp"),
+                               checkpoints=p.get("checkpoints"))
+
+    def _account(self, p: dict, job, out_tokens: int, calls: int, t0: float, stopped: Optional[str] = None) -> dict:
+        r = getattr(job, "_req", None)
+        d = self.per_engine[p["engine"]]
+        d["requests"] += 1
+        d["prompt_tokens"] += len(p["prompt"])
+        d["cached_tokens"] += job.cached
+        d["completion_tokens"] += out_tokens
+        d["forced_tokens"] += getattr(r, "forced", 0) or 0
+        d["passes"] += getattr(r, "passes", 0) or 0
+        d["decode_s"] += max(0.0, job.t_done - job.t_submit)
+        d["tool_calls"] += calls
+        dt = max(1e-9, job.t_done - job.t_submit)
+        usage = {"prompt_tokens": len(p["prompt"]), "completion_tokens": out_tokens, "total_tokens": len(p["prompt"]) + out_tokens,
+                 "prompt_tokens_details": {"cached_tokens": job.cached},
+                 "locals": {"engine": p["engine"], "forced_tokens": getattr(r, "forced", 0) or 0, "passes": getattr(r, "passes", 0) or 0,
+                           "constrained": p["regex"] is not None or p["schema"] is not None, "wall_s": time.perf_counter() - t0}}
+        self.log(f"[{p['engine']}] prompt {len(p['prompt'])} ({job.cached} cached)  out {out_tokens} tok"
+                 f"{'  forced ' + str(getattr(r, 'forced', 0)) if getattr(r, 'forced', 0) else ''}  {out_tokens / dt:.0f} tok/s"
+                 f"  {calls} call(s)  finish={job.finish}" + (f"  stopped={stopped}" if stopped else ""))
+        return usage
+
+    def _guard(self, toks: List[int], text: str, fmt=None, tools: bool = True) -> Optional[str]:
+        """Why to stop a reply early: enough tool calls, a repeated call, or a
+        token loop (a small model can repeat forever; the grammar cannot see it).
+        A reply may also repeat on purpose: without tools ("write it ten times")
+        and inside a call's arguments (a file of identical lines), so there it
+        takes many more repeats to count as a loop."""
+        in_call = False
+        if text:
+            if fmt is None or fmt.name == "qwen_xml":
+                i = text.find(oai.TOOL_OPEN)
+                found = oai.qwen_calls(text[i:]) if i >= 0 else []  # a "</tool_call>" inside a value is not a call's end
+                n_calls = len(found)
+                blocks = [json.dumps([n, a], sort_keys=True) for n, a, _ in found]
+                in_call = i >= 0
+            else:
+                part = fmt.split(text)[1]
+                found = fmt.parse_calls(part)
+                n_calls = fmt.count_complete(text)
+                blocks = [json.dumps(c, sort_keys=True) for c in found[:n_calls]]
+                in_call = bool(part) or fmt.opener in text
+            if n_calls >= self.max_calls:
+                return "max_calls"
+            if len(blocks) != len(set(blocks)):
+                return "duplicate_call"
+        if in_call:
+            looping = _looping(toks, reps=8, min_span=128, short_span=256)
+        else:
+            looping = _looping(toks) if tools else _looping(toks, reps=12, min_span=96, short_span=256)
+            looping = looping or (tools and _line_looping(text))
+        return "loop" if looping else None
+
+    def _run(self, req: dict, write=None, p: Optional[dict] = None) -> Optional[dict]:
+        """One chat completion. With ``write`` (bytes -> None, raising when the
+        client is gone) the reply is streamed as server-sent events and None is
+        returned; otherwise the completion object is returned."""
+        t0 = time.perf_counter()
+        p = p or self.prepare(req)
+        cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+        head = {"id": cid, "object": "chat.completion.chunk", "created": _now(), "model": p["model"]}
+
+        def chunk(delta: dict, finish=None, usage=None):
+            if write is None:
+                return
+            d = dict(head)
+            d["choices"] = [{"index": 0, "delta": delta, "finish_reason": finish}]
+            if usage is not None:
+                d["usage"] = usage
+            write(("data: " + json.dumps(d, ensure_ascii=False) + "\n\n").encode())
+
+        key = uuid.uuid4().hex[:8]
+        self._active[key] = {"engine": p["engine"], "prompt_tokens": len(p["prompt"]), "tokens": 0, "started": time.time()}
+        prev = self._previous_calls(req) if p["tools"] else {}
+        prefix = ""
+        job = None
+        try:
+            chunk({"role": "assistant", "content": ""})
+            for attempt in range(2):
+                if prefix:  # inside the think block the prompt opened (Qwen3.5 thinking), it is reasoning
+                    chunk({"reasoning_content": prefix} if _in_think(p) else {"content": prefix})
+                job, text, stopped = self._decode(p, prefix, chunk, write, key)
+                if stopped == "max_calls":
+                    text = p["fmt"].cut_after(text, self.max_calls)
+                reasoning, content, calls = oai.parse_reply(text, p["tools"], fmt=p["fmt"], thinking=_in_think(p))
+                if not p["tools"]:  # no tools offered: whatever the reply looks like, it is not a call
+                    reasoning, content = oai.split_reasoning(text, p["fmt"], _in_think(p))
+                    content, calls = content.strip(), []
+                if calls and req.get("tool_choice") == "none":  # only the stock engine can write one here
+                    reasoning, content = oai.split_reasoning(text, p["fmt"], _in_think(p))
+                    content, calls = content.strip(), []
+                if stopped == "duplicate_call":
+                    uniq, keys = [], set()
+                    for c in calls:
+                        k = (c["function"]["name"], c["function"]["arguments"])
+                        if k not in keys:
+                            keys.add(k)
+                            uniq.append(c)
+                    if len(uniq) < len(calls):
+                        text = p["fmt"].cut_after(text, len(uniq))  # what is remembered and replayed: the calls sent
+                    calls = uniq
+                if content:  # held back as a possible call (a code block, a "{"), and text after all: send it now
+                    rest = job.stream.unsent(content[len(prefix):] if content.startswith(prefix) else content)
+                    if rest:
+                        chunk({"content": rest})
+                if calls and self._repeats(calls, prev):
+                    # steering writes text before the calls, which formats whose calls
+                    # are the whole reply (Llama's JSON, Mistral 7B's) cannot hold
+                    if attempt == 0 and p["fmt"].name not in ("llama3_json", "mistral", "mistral_legacy"):
+                        # The model wants to repeat the previous turn's call. Decode
+                        # the turn again with its text started for it (the same grammar,
+                        # less a thought block that would open the reply).
+                        self.log(f"[{p['engine']}] reply repeats the previous call; steering")
+                        prefix = self._steer_text(calls, prev)
+                        # the steered reply should be a different call, not an essay
+                        # (Gemma 4 wrote 4,096 tokens of prose after the steering text)
+                        p = dict(p, max_tokens=min(p["max_tokens"], STEERED_MAX_TOKENS))
+                        lead = p["fmt"].thought_regex() if hasattr(p["fmt"], "thought_regex") else ""
+                        if p["regex"] and lead and p["regex"].startswith(lead):
+                            # the reply has begun with text: no thought block opens it now
+                            # (Gemma 4 went on as if thinking, and wrote <channel|> into its text)
+                            p["regex"] = p["regex"][len(lead):]
+                        continue
+                    # Still repeating: end the turn with a message instead of looping (unless a call is required:
+                    # then the repeated call it is, as asked)
+                    if req.get("tool_choice") == "required" or isinstance(req.get("tool_choice"), dict):
+                        break
+                    self.log(f"[{p['engine']}] reply repeats the previous call again; stopping the turn")
+                    stop = self._stop_text(calls, prev)
+                    chunk({"content": "\n\n" + stop})
+                    content, calls, reasoning = (content + "\n\n" + stop).strip(), [], reasoning
+                break
+            # the reply as the client got it (cut after max_calls, without a duplicate call): the replay of a
+            # tool-call turn is this text, and only an uncut reply is a token stream to continue on
+            self._remember(p["engine"], p, job, calls, prefix, raw=text, exact=stopped is None)
+            for i, c in enumerate(calls):
+                chunk({"tool_calls": [{"index": i, "id": c["id"], "type": "function",
+                                       "function": {"name": c["function"]["name"], "arguments": c["function"]["arguments"]}}]})
+            usage = self._account(p, job, len(job.tokens), len(calls), t0, stopped)
+            finish = "tool_calls" if calls else ("length" if job.finish in ("length", "exhausted") else "stop")
+            chunk({}, finish=finish, usage=usage)
+            if write is not None:
+                write(b"data: [DONE]\n\n")
+                return None
+            msg = {"role": "assistant", "content": content}
+            if reasoning:
+                msg["reasoning_content"] = reasoning
+            if calls:
+                msg["tool_calls"] = calls
+            return {"id": cid, "object": "chat.completion", "created": _now(), "model": p["model"],
+                    "choices": [{"index": 0, "message": msg, "finish_reason": finish}], "usage": usage}
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):  # the client went away
+            if job is not None:
+                job.cancel()
+            self.log(f"[{p['engine']}] client disconnected; cancelled")
+            return None
+        finally:
+            self._active.pop(key, None)
+
+    def _decode(self, p: dict, prefix: str, chunk, write, key: str):
+        """Generate one reply after ``prefix`` (assistant text already
+        written), streaming deltas through ``chunk``; returns (job, reply
+        text including the prefix, why it was stopped early or None)."""
+        tok = p["svc"].tokenizer
+        prompt = list(p["prompt"])
+        if prefix:
+            prompt += list(tok._tokenizer.encode(prefix, add_special_tokens=False))
+        q: "queue.Queue[List[int]]" = queue.Queue()
+        job = p["svc"].submit(prompt, schema=p["schema"], max_tokens=p["max_tokens"], regex=p["regex"], on_token=q.put,
+                              temp=p.get("temp"),
+                              checkpoints=p.get("checkpoints"))
+        job.prefix_tokens = len(prompt) - len(p["prompt"])
+        toks: List[int] = []
+        rs = oai.ReplyStream(p["thinking"] and (not prefix or _in_think(p)), p.get("fmt"))
+        stopped = None
+        stops = [] if p["tools"] else (p.get("stop") or [])  # stop sequences apply to plain replies
+        hold = max((len(s) for s in stops), default=1) - 1
+        last_emit = last_probe = time.perf_counter()
+        while True:
+            got = False
+            try:
+                toks.extend(q.get(timeout=0.25))
+                got = True
+                while True:
+                    toks.extend(q.get_nowait())
+            except queue.Empty:
+                pass
+            if got:
+                self._active[key]["tokens"] = len(toks)
+                text = tok.decode(toks)
+                if stopped is None:
+                    seen = oai.split_reasoning(text, p.get("fmt"), _in_think(p))[1] if p["tools"] else ""  # drafts in thoughts are not calls
+                    stopped = self._guard(toks, seen, p.get("fmt"), bool(p["tools"]))
+                    cut = _stop_cut(text, stops)
+                    if cut is not None:
+                        stopped, text = "stop", text[:cut]
+                    if stopped is not None and not job.done:
+                        job.cancel()
+                elif stopped == "stop":
+                    text = text[:_stop_cut(text, stops)]
+                if stops and stopped is None:
+                    text = text[: max(0, len(text) - hold)]  # what might begin a stop sequence waits
+                if not text.endswith("\ufffd"):
+                    for kind, delta in rs.feed(text):
+                        chunk({"reasoning_content": delta} if kind == "reasoning" else {"content": delta})
+                        last_emit = time.perf_counter()
+            now = time.perf_counter()
+            if write is not None and now - last_emit > 15:
+                # a comment line keeps the connection open through a long prefill, and through a tool
+                # call (sent when it is complete, so nothing else is written meanwhile)
+                write(b": keepalive\n\n")
+                last_emit = now
+            if (write is None or p.get("probe_stream")) and p.get("alive") is not None and now - last_probe > 1:
+                last_probe = now
+                if not p["alive"]():  # a non-streaming client that went away: its slot is freed
+                    job.cancel()
+                    raise ConnectionResetError("the client went away")
+            if job.done and q.empty():
+                break
+        if job.finish.startswith("invalid:"):
+            raise BadRequest(job.finish[len("invalid:"):].strip())
+        if job.finish.startswith("error") and not toks and not p.get("_retried"):
+            # an engine error (a Metal out-of-memory error ends every request in flight) before
+            # this reply wrote anything: the engine has dropped its cache and serves again, so
+            # decode once more instead of failing the client's turn
+            self.log(f"[{p['engine']}] engine error before the reply began; trying once more")
+            p["_retried"] = True
+            return self._decode(p, prefix, chunk, write, key)
+        if job.finish.startswith("error"):
+            raise RuntimeError(job.finish)
+        text = job.text
+        if stopped == "stop" or (stops and _stop_cut(text, stops) is not None):
+            text, stopped = text[:_stop_cut(text, stops)], "stop"
+        if stopped == "max_calls":
+            text = p["fmt"].cut_after(text, self.max_calls)
+        for kind, delta in rs.feed(text):
+            chunk({"reasoning_content": delta} if kind == "reasoning" else {"content": delta})
+        job.stream = rs
+        return job, prefix + text, stopped
+
+    def _previous_calls(self, req: dict) -> dict:
+        """(name, arguments) of the tool calls in the last assistant turn -> the
+        text of their results."""
+        msgs = req.get("messages") or []
+        results = {}
+        out = {}
+        for m in reversed(msgs):
+            if m.get("role") == "tool":
+                results[m.get("tool_call_id")] = oai.text_of(m.get("content"))
+            elif m.get("role") == "assistant":
+                for tc in m.get("tool_calls") or []:
+                    fn = tc.get("function") or {}
+                    key = (fn.get("name"), json.dumps(oai._args_dict(fn.get("arguments")), sort_keys=True))
+                    out[key] = results.get(tc.get("id"), "")
+                return out
+            elif m.get("role") == "user":
+                return out
+        return out
+
+    @staticmethod
+    def _steer_text(calls: List[dict], prev: dict) -> str:
+        for c in calls:
+            key = (c["function"]["name"], json.dumps(json.loads(c["function"]["arguments"]), sort_keys=True))
+            if key in prev:
+                res = " ".join(prev[key].split())[:160]
+                return (f"The {c['function']['name']} call above was already made and returned: {res!r}. "
+                        "Repeating it would give the same result, so I will do something different now: ")
+        return ""
+
+    @staticmethod
+    def _stop_text(calls: List[dict], prev: dict) -> str:
+        c = calls[0]["function"]
+        return (f"I am stuck: I keep wanting to repeat the same {c['name']} call ({c['arguments'][:200]}), whose result is already "
+                "above. Please tell me how to proceed (for example, which command or file to use).")
+
+    def _repeats(self, calls: List[dict], prev: dict) -> bool:
+        return any((c["function"]["name"], json.dumps(json.loads(c["function"]["arguments"]), sort_keys=True)) in prev for c in calls)
+
+    def complete(self, req: dict, p: Optional[dict] = None) -> dict:
+        return self._run(req, p=p)
+
+    def stream(self, req: dict, write, p: Optional[dict] = None) -> None:
+        self._run(req, write, p)
+
+
+_CWD = re.compile(r"Working directory:\s*(\S+)")
+
+
+def _cwd_hint(msgs: List[dict]) -> None:
+    """Small models invent absolute paths (/workspace/x.py). The coding agent's
+    system prompt names the working directory in an <env> block far from the
+    end; repeat it as the last line of the system prompt, where it is attended."""
+    if not msgs or msgs[0]["role"] != "system":
+        return
+    m = _CWD.search(msgs[0]["content"])
+    if m and "Every file path you pass to a tool" not in msgs[0]["content"]:
+        cwd = m.group(1).rstrip("/")
+        msgs[0]["content"] += (f"\n\nThe working directory is {cwd}. Every file path you pass to a tool must start with {cwd}/ "
+                               f"(for example {cwd}/main.py); run commands there with: cd {cwd} && <command>.")
+
+
+# --- HTTP -----------------------------------------------------------------------------------
+
+STATUS_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>locals serve</title>
+<style>body{font:14px -apple-system,Helvetica,sans-serif;margin:2em;color:#222}table{border-collapse:collapse}
+td,th{padding:4px 12px;border-bottom:1px solid #ddd;text-align:right}th:first-child,td:first-child{text-align:left}
+code{background:#f3f3f3;padding:1px 4px}</style></head><body><h2>locals serve</h2><div id=s>loading…</div>
+<script>async function r(){const s=await (await fetch('/stats')).json();let h='<p>model <code>'+s.model+'</code> · uptime '+Math.round(s.uptime_s)+' s · requests '+s.requests+' · active rows '+s.active.length+'</p>';
+h+='<table><tr><th>engine</th><th>loaded</th><th>requests</th><th>prompt tok</th><th>cached</th><th>output tok</th><th>forced</th><th>passes</th><th>tool calls</th><th>tok/s (decode)</th></tr>';
+for(const [e,d] of Object.entries(s.engines)){h+='<tr><td>'+e+'</td><td>'+(d.loaded?'yes':'no')+'</td><td>'+d.requests+'</td><td>'+d.prompt_tokens+'</td><td>'+(d.prompt_tokens?Math.round(100*d.cached_tokens/d.prompt_tokens)+'%':'-')+'</td><td>'+d.completion_tokens+'</td><td>'+d.forced_tokens+'</td><td>'+d.passes+'</td><td>'+d.tool_calls+'</td><td>'+(d.decode_s?(d.completion_tokens/d.decode_s).toFixed(0):'-')+'</td></tr>'}
+h+='</table>';if(s.active.length){h+='<h3>active</h3><table><tr><th>engine</th><th>prompt</th><th>tokens</th><th>seconds</th></tr>';for(const a of s.active){h+='<tr><td>'+a.engine+'</td><td>'+a.prompt_tokens+'</td><td>'+a.tokens+'</td><td>'+Math.round(Date.now()/1000-a.started)+'</td></tr>'}h+='</table>'}
+document.getElementById('s').innerHTML=h}r();setInterval(r,1000)</script></body></html>"""
+
+
+OLLAMA_VERSION = "0.12.6"  # the Ollama API version the endpoints follow (apps check it)
+OLLAMA_POSTS = ("/api/chat", "/api/generate", "/api/show", "/api/embed", "/api/embeddings", "/api/pull")
+OTHER_POSTS = OLLAMA_POSTS
+
+
+def make_handler(server: Server, ollama_root: bool = False):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        timeout = 600  # a client that sends nothing for this long is dropped (its thread is freed)
+
+        def log_message(self, fmt, *args):  # quiet; the server logs per request
+            pass
+
+        def _cors(self):
+            origin = self.headers.get("Origin")
+            if origin and _origin_ok(origin):  # a page allowed to call (see _origin_ok); others get no CORS headers
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+                self.send_header("Access-Control-Allow-Headers", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
+        def _allowed(self) -> bool:
+            """False (with a 403 sent) for a request a web page may not make: from another site's page,
+            or under another name than this machine's (DNS rebinding)."""
+            if not _host_ok(self.headers.get("Host"), getattr(server, "bind_host", "127.0.0.1")):
+                self._error("this server answers to localhost only", 403)
+                return False
+            origin = self.headers.get("Origin")
+            if origin and not _origin_ok(origin):
+                self._error(f"pages from {origin} may not call this server (LOCALS_ORIGINS lists the ones that may)", 403)
+                return False
+            return True
+
+        def _alive(self) -> bool:
+            """Whether the client is still connected (a closed socket reads as end of file)."""
+            import select
+            import socket
+
+            try:
+                ready, _, _ = select.select([self.connection], [], [], 0)
+                return not ready or self.connection.recv(1, socket.MSG_PEEK) != b""
+            except OSError:
+                return False
+
+        def _json(self, obj, status=200):
+            body = json.dumps(obj, ensure_ascii=False).encode()
+            self.send_response(status)
+            self._cors()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _error(self, msg: str, status=400, code=None):
+            server.errors += 1
+            server.log(f"{status} {self.command} {self.path}: {msg[:200]}")
+            self._json({"error": {"message": msg, "type": "invalid_request_error" if status < 500 else "server_error",
+                                  "param": "messages" if code else None, "code": code}}, status)
+
+        def do_OPTIONS(self):
+            if not self._allowed():
+                return
+            self.send_response(204)
+            self._cors()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def _text(self, text: str, status=200):
+            body = text.encode()
+            self.send_response(status)
+            self._cors()
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self._cors()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_GET(self):
+            if not self._allowed():
+                return
+            path = urlparse(self.path).path.rstrip("/") or "/"
+            if path in ("/v1/models", "/models"):
+                return self._json({"object": "list", "data": server.models()})
+            if path == "/" and ollama_root:  # what Ollama answers, and some apps check
+                return self._text("Ollama is running")
+            if path == "/api/version":
+                return self._json({"version": OLLAMA_VERSION})
+            if path in ("/api/tags", "/api/ps"):
+                return self._json({"models": server.ollama_models(running=path == "/api/ps")})
+            if path == "/health":
+                return self._json({"status": "ok", "engines": {e: e in server._svc for e in server.engines},
+                                   "version": __version__, "build": BUILD_ID})
+            if path in ("/stats", "/v1/stats"):
+                return self._json(server.stats())
+            if path == "/":
+                body = STATUS_HTML.encode()
+                self.send_response(200)
+                self._cors()
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self._error("not found", 404)
+
+        def _ollama_raw(self, req: dict, shown: str, model: str, fail):
+            """/api/generate with raw: the prompt untemplated, through /v1/completions."""
+            t0 = time.time()
+            text_req = apis.ollama_to_text(req, model)
+            try:
+                p = server.prepare_text(text_req)
+            except ContextTooLong as e:
+                return fail(str(e), 400)
+            except (ValueError, TypeError, KeyError, AttributeError) as e:
+                return fail(f"{type(e).__name__}: {e}", 400)
+            if not text_req["stream"]:
+                p["alive"] = self._alive
+                resp = server.text_completion(text_req, p)
+                return None if resp is None else self._json(apis.text_to_ollama(resp, shown, t0))
+
+            def write(b: bytes):
+                self.wfile.write(f"{len(b):x}\r\n".encode() + b + b"\r\n")
+                self.wfile.flush()
+
+            out = apis.OllamaStream(write, shown, t0, generate=True)
+            self.send_response(200)
+            self._cors()
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                server.text_completion(text_req, p, out.feed)
+                out.close()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def _other_api(self, path: str, req: dict):
+            """The Ollama API, through the Chat Completions path."""
+            kind = "ollama"
+
+            def fail(msg: str, status: int):
+                server.errors += 1
+                server.log(f"{status} POST {path}: {msg[:200]}")
+                return self._json({"error": msg}, status)
+
+            if os.environ.get("LOCALS_DEBUG"):  # the request as the client sent it (prepare saves the translated one)
+                _dump_request(req, kind)
+            name = req.get("model") or ""
+            if path == "/api/show":
+                return self._json(server.ollama_show(name or req.get("name") or ""))
+            if path == "/api/pull":
+                return self._json({"status": "success"})  # the model is the server's; nothing to pull
+            if path in ("/api/embed", "/api/embeddings"):
+                return fail("embeddings are not served yet", 501)
+            model = server.chat_model(name)
+            if (path == "/api/chat" and not req.get("messages")) or (path == "/api/generate" and not req.get("prompt")):
+                # Ollama's way to load a model (or, with keep_alive 0, unload it): an answer at once, nothing generated
+                reason = "unload" if str(req.get("keep_alive")) in ("0", "0s", "0m") else "load"
+                body = {"model": name or model, "created_at": apis._now_iso(), "done": True, "done_reason": reason}
+                body.update({"message": {"role": "assistant", "content": ""}} if path == "/api/chat" else {"response": ""})
+                return self._json(body)
+            server.requests += 1
+            if path == "/api/generate" and req.get("suffix"):  # fill-in-the-middle: not what this server does
+                return fail(f"{name or model} does not support insert", 400)
+            if path == "/api/generate" and req.get("raw"):  # the prompt as it is (a code completion's prefix)
+                return self._ollama_raw(req, name or model, model, fail)
+            try:
+                chat = apis.ollama_to_chat(req, model, generate=path == "/api/generate")
+                p = server.prepare(chat)
+            except ContextTooLong as e:
+                server.log(f"rejected: {e}")
+                return fail(str(e), 400)
+            except (ValueError, TypeError, KeyError, AttributeError) as e:
+                return fail(f"{type(e).__name__}: {e}", 400)
+            except Exception as e:  # noqa: BLE001
+                import traceback
+
+                traceback.print_exc()
+                return fail(f"{type(e).__name__}: {e}", 500)
+            shown = name or model
+            t0 = time.time()
+            try:
+                if not chat.get("stream"):
+                    p["alive"] = self._alive
+                    resp = server.complete(chat, p)
+                    if resp is None:  # the client went away
+                        return
+                    return self._json(apis.chat_to_ollama(resp, shown, t0, generate=path == "/api/generate"))
+            except BadRequest as e:
+                return fail(str(e), 400)
+            except Exception as e:  # noqa: BLE001
+                import traceback
+
+                traceback.print_exc()
+                return fail(f"{type(e).__name__}: {e}", 500)
+
+            def write(b: bytes):
+                self.wfile.write(f"{len(b):x}\r\n".encode() + b + b"\r\n")
+                self.wfile.flush()
+
+            out = apis.OllamaStream(write, shown, t0, generate=path == "/api/generate")
+            p["alive"], p["probe_stream"] = self._alive, True  # its NDJSON has no keepalive: a client that left is probed
+            self.send_response(200)
+            self._cors()
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                server.stream(chat, out.feed, p)
+                out.close()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:  # noqa: BLE001
+                import traceback
+
+                traceback.print_exc()
+                server.errors += 1
+                try:
+                    out.feed(f"data: {json.dumps({'error': {'message': f'{type(e).__name__}: {e}'}})}\n\n".encode())
+                    out.close()
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        def do_POST(self):
+            if not self._allowed():
+                return
+            path = urlparse(self.path).path.rstrip("/")
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return self._error("invalid Content-Length")
+            if n < 0 or n > MAX_BODY:
+                self.close_connection = True
+                return self._error(f"the request body must be 0 to {MAX_BODY} bytes", 413)
+            try:
+                req = json.loads(self.rfile.read(n) or b"{}")
+            except (ValueError, RecursionError):
+                return self._error("invalid JSON body")
+            if not isinstance(req, dict):
+                return self._error("the request body must be a JSON object")
+            text_api = path in ("/v1/completions", "/completions")
+            if path in OTHER_POSTS:
+                return self._other_api(path, req)
+            if path not in ("/v1/chat/completions", "/chat/completions") and not text_api:
+                return self._error("not found", 404)
+            if not text_api and (not isinstance(req.get("messages"), list) or not req["messages"]):
+                return self._error("messages must be a non-empty list")
+            server.requests += 1
+            try:  # errors in the request answer before any streaming starts
+                p = server.prepare_text(req) if text_api else server.prepare(req)
+            except ContextTooLong as e:
+                server.log(f"rejected: {e}")
+                return self._error(str(e), 400, "context_length_exceeded")
+            except (ValueError, TypeError, KeyError, AttributeError) as e:  # a malformed request (messages, tools, schema)
+                return self._error(f"{type(e).__name__}: {e}", 400)
+            except Exception as e:  # noqa: BLE001  # our bug, not the client's
+                import traceback
+
+                traceback.print_exc()
+                return self._error(f"{type(e).__name__}: {e}", 500)
+            started = False
+
+            def write(b: bytes):
+                self.wfile.write(f"{len(b):x}\r\n".encode() + b + b"\r\n")
+                self.wfile.flush()
+
+            try:
+                if not req.get("stream"):
+                    p["alive"] = self._alive
+                    resp = server.text_completion(req, p) if text_api else server.complete(req, p)
+                    if resp is None:  # the client went away
+                        return
+                    return self._json(resp)
+                self.send_response(200)
+                self._cors()
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                started = True
+                if text_api:
+                    server.text_completion(req, p, write)
+                else:
+                    server.stream(req, write, p)
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:  # noqa: BLE001
+                import traceback
+
+                bad = isinstance(e, BadRequest)  # the request's own fault (a grammar that does not compile)
+                if not bad:
+                    traceback.print_exc()
+                msg = str(e) if bad else f"{type(e).__name__}: {e}"
+                try:
+                    if not started:
+                        self._error(msg, 400 if bad else 500)
+                    else:  # mid-stream: an error event and a clean end, not a second HTTP response
+                        server.errors += 1
+                        server.log(f"500 POST {path} (after the stream began): {msg[:200]}")
+                        err = json.dumps({"error": {"message": msg, "type": "server_error", "param": None, "code": None}})
+                        write(f"data: {err}\n\n".encode())
+                        write(b"data: [DONE]\n\n")
+                        self.wfile.write(b"0\r\n\r\n")
+                        self.wfile.flush()
+                except Exception:  # noqa: BLE001  # the client is gone
+                    pass
+
+    return Handler
+
+
+def _check_tool_choice(tc, names: List[str]) -> None:
+    """A 400 for a tool_choice the server would not honour: an unknown name forced a call to any tool."""
+    if isinstance(tc, dict):
+        name = (tc.get("function") or {}).get("name") or tc.get("name")
+        if tc.get("type") not in (None, "function") or not name:
+            raise ValueError("tool_choice must be auto, required, none, or {\"type\": \"function\", \"function\": {\"name\": ...}}")
+        if name not in names:
+            raise ValueError(f"tool_choice names {name!r}, which is not one of the tools")
+    elif tc not in ("auto", "required", "none", None):
+        raise ValueError("tool_choice must be auto, required, none, or a named function")
+
+
+def _unsupported(req: dict) -> None:
+    """A 400 for what the server would otherwise ignore and the client would rely on."""
+    n = req.get("n")
+    if n is not None and n != 1:
+        raise ValueError("n must be 1: send the request n times instead (they run together in one batch)")
+    if req.get("logprobs") or req.get("top_logprobs"):
+        raise ValueError("logprobs are not supported")
+
+
+def _stops(req: dict) -> List[str]:
+    s = req.get("stop")
+    if isinstance(s, str):
+        s = [s]
+    return [x for x in (s or []) if isinstance(x, str) and x][:16]
+
+
+def _stop_cut(text: str, stops: List[str]) -> Optional[int]:
+    """Where the first stop sequence begins in ``text`` (None if none does)."""
+    found = [i for i in (text.find(s) for s in stops) if i >= 0]
+    return min(found) if found else None
+
+
+def native_context(model_id: str) -> Optional[int]:
+    """The model's context length from its config (max_position_embeddings), if known."""
+    try:
+        path = Path(model_id)
+        if not path.exists():
+            from huggingface_hub import snapshot_download
+
+            path = Path(snapshot_download(model_id, allow_patterns=["config.json"]))
+        cfg = json.loads((path / "config.json").read_text())
+    except Exception:
+        return None
+    for c in (cfg.get("text_config") or {}, cfg):
+        n = c.get("max_position_embeddings")
+        if isinstance(n, int) and n > 0:
+            return n
+    return None
+
+
+def _in_think(p: dict) -> bool:
+    """Whether text written at the start of the reply is inside a think block the
+    prompt opened (Qwen3.5 with thinking on), not content."""
+    return bool(p.get("thinking")) and not getattr(p.get("fmt"), "opens_thinking", False)
+
+
+STEERED_MAX_TOKENS = 2048  # a reply decoded again after it repeated the previous call
+
+
+def _temperature(req: dict) -> Optional[float]:
+    """The request's sampling temperature (0 to 2, as OpenAI's), or None for the server's."""
+    t = req.get("temperature")
+    if t is None or isinstance(t, bool):
+        return None
+    try:
+        return min(2.0, max(0.0, float(t)))
+    except (TypeError, ValueError):
+        raise ValueError("temperature must be a number")
+
+
+def _looping(toks: List[int], reps: int = 3, max_period: int = 256, min_span: int = 24, short_span: int = 128) -> bool:
+    """True if the reply ends in one block of tokens repeated ``reps`` times (any
+    block length up to ``max_period``; the repeats spanning at least ``min_span``
+    tokens): a small model saying the same sentences over and over, which no
+    grammar can see. Gemma 4 E4B looped on a 45-token cycle of "I will execute
+    the edit." lines until the token limit. A block shorter than 8 tokens must repeat over at least
+    ``short_span`` tokens: data repeats a few tokens on purpose ("[0, 0, 0, ...]", a grid of dots),
+    a loop goes on until the limit."""
+    n = len(toks)
+    if n < min_span:
+        return False
+    # a short block repeated is also periodic at its multiples: decide by the smallest period
+    for p in range(1, 8):
+        if n >= 32 and toks[n - 32 + p:] == toks[n - 32:n - p]:
+            span = max(reps * p, min_span, short_span)
+            return span <= n and toks[n - span + p:] == toks[n - span:n - p]
+    last = toks[-1]
+    for p in range(8, min(max_period, n // reps) + 1):
+        if toks[n - 1 - p] != last:  # a period must bring the last token back
+            continue
+        span = max(reps * p, min_span, short_span if p < 8 else 0)
+        if span <= n and toks[n - span + p:] == toks[n - span:n - p]:  # the last ``span`` tokens have period p
+            return True
+    return False
+
+
+def _line_looping(text: str, window: int = 30, distinct: int = 6, min_len: int = 12) -> bool:
+    """True if the last ``window`` sentence-length lines of an agent's reply say at
+    most ``distinct`` different things: a model rephrasing the same intention
+    without acting (Gemma 4, thinking: "I'll use the read tool. / Let's read the
+    file. / I'll proceed with the read call." for 4,000 tokens), which an exact
+    repeat check cannot see because the order of the lines changes."""
+    lines = [ln.strip() for ln in text.splitlines() if len(ln.strip()) >= min_len]
+    return len(lines) >= window and len(set(lines[-window:])) <= distinct
+
+
+def _render(tok, msgs: List[dict], tools, add_generation_prompt: bool, **kw) -> str:
+    """The chat template's text; a template's own error (role order, a field it
+    insists on) is the request's problem, so it surfaces as a 400."""
+    try:
+        return tok.apply_chat_template(msgs, tools=tools or None, add_generation_prompt=add_generation_prompt, tokenize=False, **kw)
+    except Exception as e:  # jinja2's TemplateError and the template's own raise_exception
+        if type(e).__name__ in ("TemplateError", "TemplateSyntaxError", "UndefinedError", "TemplateRuntimeError"):
+            raise ValueError(f"the model's chat template rejected the conversation: {e}") from e
+        raise
+
+
+class _HTTPServer(ThreadingHTTPServer):
+    def __init__(self, addr, handler):
+        import socket
+
+        if ":" in addr[0]:  # an IPv6 address (::1)
+            self.address_family = socket.AF_INET6
+        super().__init__(addr, handler)
+
+    def handle_error(self, request, client_address):
+        import sys
+
+        if isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError)):
+            return  # a client closed its keep-alive connection
+        super().handle_error(request, client_address)
+
+
+def serve(server: Server, host: str = "127.0.0.1", port: int = 8321, ollama_port: int = 0) -> None:
+    server.bind_host = host
+    httpd = _HTTPServer((host, port), make_handler(server))
+    httpd.daemon_threads = True
+    server.log(f"locals serve: http://{host}:{port}/v1  (models: {', '.join(m['id'] for m in server.models())})")
+    server.log(f"  also: the Ollama API at http://{host}:{port}/api")
+    if ollama_port:  # where Ollama listens, for apps that only know Ollama's address
+        side = _HTTPServer((host, ollama_port), make_handler(server, ollama_root=True))
+        side.daemon_threads = True
+        threading.Thread(target=side.serve_forever, daemon=True).start()
+        server.log(f"  and as Ollama at http://{host}:{ollama_port}")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+        for svc in server._svc.values():
+            svc.close()
+
+
+def main(argv=None):
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="locals serve", description="OpenAI-compatible server: our engine and stock mlx-lm side by side.")
+    ap.add_argument("--model", default=DEFAULT_MODEL, type=model_id, help=MODEL_HELP)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8321)
+    ap.add_argument("--ollama-port", type=int, default=0, help="also listen where Ollama does (11434) for apps that only "
+                    "know Ollama's address (default: off; Ollama itself must not be running)")
+    ap.add_argument("--engines", default="locals", help="engines that may be loaded (comma separated): locals, and mlx (stock "
+                    "mlx-lm) for comparisons")
+    ap.add_argument("--preload", default="locals", help="engines loaded at start (comma separated, or 'none')")
+    ap.add_argument("--slots", type=int, default=16, help="maximum batch size per engine")
+    ap.add_argument("--temp", type=float, default=0.2)
+    ap.add_argument("--top-p", type=float, default=0.0, help="nucleus sampling at temp > 0 (0 = off; Qwen3.5 thinking: 0.95)")
+    ap.add_argument("--top-k", type=int, default=0, help="top-k sampling at temp > 0 (0 = off; Qwen3.5 thinking: 20)")
+    ap.add_argument("--max-tokens", type=int, default=4096, help="cap on completion tokens per request")
+    ap.add_argument("--cache-gb", type=float, default=None, help="prompt cache of our engine (default: the GPU memory left "
+                    "after the weights and 4 GB, about 4 GB for a 4B model on 16 GB; the stock engine keeps 1.5)")
+    ap.add_argument("--max-context", type=int, default=65536, help="prompt + reply tokens per request; longer prompts get "
+                    "a context_length_exceeded error (64k fits a 4B model on 16 GB)")
+    ap.add_argument("--thinking", action="store_true", help="think before every reply (also: model ids ending in -thinking)")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--max-calls", type=int, default=6, help="tool calls kept per reply; the reply is cut after that many")
+    ap.add_argument("--walk", action="store_true", help="constraints by the walk kernel (no token tables; any grammar size)")
+    ap.add_argument("--typed-tools", action="store_true", help="tool calls with parameter names and types fixed (use with --walk)")
+    args = ap.parse_args(argv)
+    engines = tuple(e.strip() for e in args.engines.split(",") if e.strip())
+    preload = () if args.preload == "none" else tuple(e.strip() for e in args.preload.split(",") if e.strip())
+    busy = _port_taken(args.host, args.port)  # before loading: a second copy of the model may not fit next to the first
+    if busy:
+        sys.exit(f"locals serve: port {args.port} is already in use by {busy}; "
+                 + ("stop it with `locals stop`, or " if busy.startswith("a locals") else "") + "choose another port with --port")
+    if args.ollama_port:  # checked now too, not after loading the model (minutes on a first start)
+        if args.ollama_port == args.port:
+            sys.exit("locals serve: --ollama-port must differ from --port (the Ollama API is served at --port's /api too)")
+        busy = _port_taken(args.host, args.ollama_port)
+        if busy:
+            sys.exit(f"locals serve: Ollama's port {args.ollama_port} is in use by {busy} (Ollama itself?); quit it, "
+                     "or leave out --ollama (locals answers Ollama's API on its own port too)")
+    from .defaults import gguf_hint, too_big
+
+    why = gguf_hint(args.model) or too_big(args.model, remote=True)  # `locals serve` downloads the model itself: checked before that
+    if why:
+        sys.exit(f"locals serve: {why}")
+    try:
+        srv = Server(args.model, engines=engines, preload=preload, slots=args.slots, temp=args.temp, max_tokens=args.max_tokens,
+                     thinking=args.thinking, cache_gb=args.cache_gb, seed=args.seed, max_calls=args.max_calls, walk=args.walk,
+                     typed_tools=args.typed_tools, top_p=args.top_p, top_k=args.top_k, max_context=args.max_context)
+    except Exception as e:  # noqa: BLE001
+        why = _load_error(args.model, e)
+        if why is None:
+            raise
+        sys.exit(f"locals serve: {why}")
+    serve(srv, args.host, args.port, args.ollama_port)
+
+
+def _port_taken(host: str, port: int) -> Optional[str]:
+    """None if the server can listen on (host, port); else what holds it."""
+    import socket
+
+    try:
+        family = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0][0]  # ::1 is IPv6
+    except OSError as e:
+        return f"nothing it can listen on ({host}: {e})"
+    s = socket.socket(family, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # as the HTTP server binds
+    try:
+        s.bind((host, port))
+        return None
+    except OSError:
+        pass
+    finally:
+        s.close()
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(f"http://{host}:{port}/health", timeout=2) as r:
+            if json.loads(r.read()).get("status") == "ok":
+                return "a locals server"
+    except Exception:  # noqa: BLE001
+        pass
+    return "another program"
+
+
+def _load_error(model: str, e: Exception) -> Optional[str]:
+    """A one-line explanation of why ``model`` could not be loaded, or None for an unexpected error."""
+    name = type(e).__name__
+    if name in ("RepositoryNotFoundError", "GatedRepoError") or (name == "HfHubHTTPError" and "404" in str(e)):
+        return (f"model {model!r} was not found on Hugging Face (or it is private or gated). Use a model id such as "
+                f"mlx-community/Qwen3.5-4B-MLX-4bit, or the path of a local MLX model folder.")
+    if name in ("LocalEntryNotFoundError", "OfflineModeIsEnabled") or isinstance(e, (ConnectionError, TimeoutError)):
+        return f"model {model!r} is not downloaded and Hugging Face cannot be reached ({e})."
+    if isinstance(e, FileNotFoundError):
+        return f"cannot load {model!r}: {e}"
+    if isinstance(e, ValueError) and "not supported" in str(e):
+        return f"mlx-lm cannot load {model!r}: {e}"
+    return None
+
+
+if __name__ == "__main__":
+    main()

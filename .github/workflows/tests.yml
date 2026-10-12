@@ -1,0 +1,40 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  fast:
+    # The fast suite needs MLX (Apple silicon) and one tokenizer; model tests
+    # (marked `model`) need cached weights and run locally: `pytest -m model`.
+    runs-on: macos-14
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Tokenizer for the tests
+        run: |
+          python - <<'EOF'
+          from huggingface_hub import snapshot_download
+          snapshot_download("mlx-community/Qwen2.5-1.5B-Instruct-4bit",
+                            allow_patterns=["*.json", "*.txt", "tokenizer*"])
+          EOF
+      - name: Fast tests
+        run: python -m pytest tests -q -m "not model"
+      - name: Build the wheel
+        run: |
+          python -m build
+          python -m pip install dist/*.whl --no-deps --force-reinstall
+          python -c "import locals; print(locals.__version__)"

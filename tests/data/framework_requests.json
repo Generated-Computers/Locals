@@ -1,0 +1,1333 @@
+{
+ "source": "Requests as sent by pydantic-ai 2.54, smolagents 1.26, openai-agents 0.23, LlamaIndex 0.14, DSPy 3.4, the OpenAI SDK, LangChain, LiteLLM and Instructor and Aider 0.86 (real scenarios run against a scripted server); system prompts truncated.",
+ "conversations": {
+  "pydantic-ai/tools": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a weather assistant. Use the tools to answer; do not guess numbers."
+    },
+    {
+     "role": "user",
+     "content": "What is the weather in Paris right now, in Fahrenheit?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "id": "call_ef08671faafe4e7488e8ce88",
+       "type": "function",
+       "function": {
+        "name": "weather",
+        "arguments": "{\"city\": \"ls\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_ef08671faafe4e7488e8ce88",
+     "content": "{\"error\": \"unknown city\"}"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "weather",
+      "description": "Current weather for a city: temperature in Celsius and the sky.",
+      "parameters": {
+       "additionalProperties": false,
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ],
+       "type": "object"
+      },
+      "strict": true
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "to_f",
+      "description": "Convert a temperature from Celsius to Fahrenheit.",
+      "parameters": {
+       "additionalProperties": false,
+       "properties": {
+        "celsius": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "celsius"
+       ],
+       "type": "object"
+      },
+      "strict": true
+     }
+    }
+   ],
+   "options": {
+    "stream": false,
+    "tool_choice": "auto"
+   }
+  },
+  "pydantic-ai/structured": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Extract the invoice: Invoice no. 4471 from ACME GmbH: consulting in May, total 1,250.50 EUR, due within 30 days."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "final_result",
+      "description": "The final response which ends this conversation",
+      "parameters": {
+       "properties": {
+        "vendor": {
+         "type": "string"
+        },
+        "total": {
+         "type": "number"
+        },
+        "currency": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "vendor",
+        "total",
+        "currency"
+       ],
+       "type": "object",
+       "additionalProperties": false
+      },
+      "strict": true
+     }
+    }
+   ],
+   "options": {
+    "stream": false,
+    "tool_choice": "required"
+   }
+  },
+  "pydantic-ai/stream": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "List the first five prime numbers, separated by commas."
+    }
+   ],
+   "tools": [],
+   "options": {
+    "stream": true,
+    "stream_options": {
+     "include_usage": true
+    }
+   }
+  },
+  "smolagents/tool_agent": {
+   "messages": [
+    {
+     "role": "system",
+     "content": [
+      {
+       "type": "text",
+       "text": "You are an expert assistant who can solve any task using tool calls. You will be given a task to solve as best you can.\nTo do so, you have been given access to some tools.\n\nThe tool call you write is an action: after the tool is executed, you will get the result of the tool call as an \"observation\".\nThis Action/Observation can repeat N times, you should take several steps when needed.\n\nYou can use the result of the previous action as input for the next action.\nThe observation will always be a string: it can represent a file, like \"image_1.jpg\".\nThen you can use it as input for the next action. You can do it for instance as follows:\n\nObservation: \"image_1.jpg\"\n\nAction:\n{\n  \"name\": \"image_transformer\",\n  \"arguments\": {\"image\": \"image_1.jpg\"}\n}\n\nTo provide the final answer to the task, use an action blob with \"name\": \"final_answer\" tool. It is the only way to complete the task, else you will be stuck on a loop. So your final output should look like this:\nAction:\n{\n  \"name\": \"final_answer\",\n  \"arguments\": {\"answer\": \"insert your final answer here\"}\n}\n\n\nHere are a few examples using notional tools:\n---\nTask: \"Generate an image of the oldest person in this document.\"\n\nAction:\n{\n  \"name\": \"document_qa\",\n  \"arguments\": {\"document\": \"document.pdf\", \"question\": \"Who is the oldest person mentioned?\"}\n}\nObservation: \"The oldest person in the document is John Doe, a 55 year old lumberjack living in Newfoundland.\"\n\nAction:\n{\n  \"name\": \"image_generator\",\n  \"arguments\": {\"prompt\": \"A portrait of John Doe, a 55-year-old man living in Canada.\"}\n}\nObservation: \"image.png\"\n\nAction:\n{\n  \"name\": \"final_answer\",\n  \"arguments\": \"image.png\"\n}\n\n---\nTask: \"What is the result of the following operation: 5 + 3 + 1294.678?\"\n\nAction:\n{\n    \"name\": \"python_interpreter\",\n    \"arguments\": {\"code\": \"5 + 3 + 1294.678\"}\n}\nObservation: 1302.678\n\nAction:\n{\n  \"name\": \"final_answer\",\n  \"arguments\": \"1302.678\"\n}\n\n---\nTask: \"Which city has the highest population , Guangzhou or Shanghai?\"\n\nAction:\n{\n    \"name\n[... truncated for the test fixture]"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "New task:\nIs it snowing in Oslo right now? Answer with what the weather tool says."
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "Calling tools:\n[{'id': 'call_7987865682d8439a8475ee06', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': {'city': 'ls'}}}]"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Observation:\n{\"error\": \"unknown city\"}"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "Calling tools:\n[{'id': 'call_2a9a8e0c3f0a4d94b49b4884', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': {'city': 'ls'}}}]"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Observation:\n{\"error\": \"unknown city\"}"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "Calling tools:\n[{'id': 'call_b937f6f50da14a7b94e7f0c7', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': {'city': 'ls'}}}]"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Observation:\n{\"error\": \"unknown city\"}"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "Calling tools:\n[{'id': 'call_3b9e743d586f4f5b801db620', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': {'city': 'ls'}}}]"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Observation:\n{\"error\": \"unknown city\"}"
+      }
+     ]
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city: temperature in Celsius and the sky.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. Paris"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "final_answer",
+      "description": "Provides a final answer to the given problem.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "answer": {
+         "type": "string",
+         "description": "The final answer to the problem"
+        }
+       },
+       "required": [
+        "answer"
+       ]
+      }
+     }
+    }
+   ],
+   "options": {
+    "stop": [
+     "Observation:",
+     "Calling tools:"
+    ],
+    "tool_choice": "required"
+   }
+  },
+  "smolagents/final_answer": {
+   "messages": [
+    {
+     "role": "system",
+     "content": [
+      {
+       "type": "text",
+       "text": "An agent tried to answer a user query but it got stuck and failed to do so. You are tasked with providing an answer instead. Here is the agent's memory:"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "New task:\nIs it snowing in Oslo right now? Answer with what the weather tool says."
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "Calling tools:\n[{'id': 'call_7987865682d8439a8475ee06', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': {'city': 'ls'}}}]"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Observation:\n{\"error\": \"unknown city\"}"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "Calling tools:\n[{'id': 'call_2a9a8e0c3f0a4d94b49b4884', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': {'city': 'ls'}}}]"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Observation:\n{\"error\": \"unknown city\"}"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "Calling tools:\n[{'id': 'call_b937f6f50da14a7b94e7f0c7', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': {'city': 'ls'}}}]"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Observation:\n{\"error\": \"unknown city\"}"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "Calling tools:\n[{'id': 'call_3b9e743d586f4f5b801db620', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': {'city': 'ls'}}}]"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Observation:\n{\"error\": \"unknown city\"}"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "Calling tools:\n[{'id': 'call_0f5a2734654d419180e8a6ef', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': {'city': 'ls'}}}]"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Observation:\n{\"error\": \"unknown city\"}\nBased on the above, please provide an answer to the following user task:\nIs it snowing in Oslo right now? Answer with what the weather tool says."
+      }
+     ]
+    }
+   ],
+   "tools": [],
+   "options": {}
+  },
+  "smolagents/code_agent": {
+   "messages": [
+    {
+     "role": "system",
+     "content": [
+      {
+       "type": "text",
+       "text": "You are an expert assistant who can solve any task using code blobs. You will be given a task to solve as best you can.\nTo do so, you have been given access to a list of tools: these tools are basically Python functions which you can call with code.\nTo solve the task, you must plan forward to proceed in a series of steps, in a cycle of Thought, Code, and Observation sequences.\n\nAt each step, in the 'Thought:' sequence, you should first explain your reasoning towards solving the task and the tools that you want to use.\nThen in the Code sequence you should write the code in simple Python. The code sequence must be opened with '<code>', and closed with '</code>'.\nDuring each intermediate step, you can use 'print()' to save whatever important information you will then need.\nThese print outputs will then appear in the 'Observation:' field, which will be available as input for the next step.\nIn the end you have to return a final answer using the `final_answer` tool.\n\nHere are a few examples using notional tools:\n---\nTask: \"Generate an image of the oldest person in this document.\"\n\nThought: I will proceed step by step and use the following tools: `document_qa` to find the oldest person in the document, then `image_generator` to generate an image according to the answer.\n<code>\nanswer = document_qa(document=document, question=\"Who is the oldest person mentioned?\")\nprint(answer)\n</code>\nObservation: \"The oldest person in the document is John Doe, a 55 year old lumberjack living in Newfoundland.\"\n\nThought: I will now generate an image showcasing the oldest person.\n<code>\nimage = image_generator(\"A portrait of John Doe, a 55-year-old man living in Canada.\")\nfinal_answer(image)\n</code>\n\n---\nTask: \"What is the result of the following operation: 5 + 3 + 1294.678?\"\n\nThought: I will use Python code to compute the result of the operation and then return the final answer using the `final_answer` tool.\n<code>\nresult = 5 + 3 + 1294.678\nfinal_answer(result)\n</code>\n\n---\nTask:\n\"Answer th\n[... truncated for the test fixture]"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "New task:\nWhat is the sum of the squares of the integers from 1 to 20? Compute it with Python."
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "A short summary.</code>"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Error:\nError in code parsing:\nYour code snippet is invalid, because the regex pattern <code>(.*?)</code> was not found in it.\nHere is your code snippet:\nA short summary.</code>\nMake sure to include code with the correct pattern, for instance:\nThoughts: Your thoughts\n<code>\n# Your python code here\n</code>\nMake sure to provide correct code blobs.\nNow let's retry: take care not to repeat previous errors! If you have retried several times, try a completely different approach.\n"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "A short summary.</code>"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Error:\nError in code parsing:\nYour code snippet is invalid, because the regex pattern <code>(.*?)</code> was not found in it.\nHere is your code snippet:\nA short summary.</code>\nMake sure to include code with the correct pattern, for instance:\nThoughts: Your thoughts\n<code>\n# Your python code here\n</code>\nMake sure to provide correct code blobs.\nNow let's retry: take care not to repeat previous errors! If you have retried several times, try a completely different approach.\n"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "A short summary.</code>"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Error:\nError in code parsing:\nYour code snippet is invalid, because the regex pattern <code>(.*?)</code> was not found in it.\nHere is your code snippet:\nA short summary.</code>\nMake sure to include code with the correct pattern, for instance:\nThoughts: Your thoughts\n<code>\n# Your python code here\n</code>\nMake sure to provide correct code blobs.\nNow let's retry: take care not to repeat previous errors! If you have retried several times, try a completely different approach.\n"
+      }
+     ]
+    }
+   ],
+   "tools": [],
+   "options": {
+    "stop": [
+     "Observation:",
+     "Calling tools:",
+     "</code>"
+    ]
+   }
+  },
+  "openai-agents/tools": {
+   "messages": [
+    {
+     "content": "You are a weather assistant. Use the tools to answer; do not guess numbers.",
+     "role": "system"
+    },
+    {
+     "role": "user",
+     "content": "Compare the weather in Tokyo and Oslo right now (in Celsius). Which one is warmer?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "id": "call_573585ea14dc4c54bb7f648f",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"ls\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_573585ea14dc4c54bb7f648f",
+     "content": "{\"error\": \"unknown city\"}"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city: temperature in Celsius and the sky.",
+      "parameters": {
+       "properties": {
+        "city": {
+         "description": "City name, e.g. Paris",
+         "title": "City",
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ],
+       "title": "get_weather_args",
+       "type": "object",
+       "additionalProperties": false
+      },
+      "strict": true
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "celsius_to_fahrenheit",
+      "description": "Convert a temperature from Celsius to Fahrenheit.",
+      "parameters": {
+       "properties": {
+        "celsius": {
+         "description": "Temperature in degrees Celsius",
+         "title": "Celsius",
+         "type": "number"
+        }
+       },
+       "required": [
+        "celsius"
+       ],
+       "title": "celsius_to_fahrenheit_args",
+       "type": "object",
+       "additionalProperties": false
+      },
+      "strict": true
+     }
+    }
+   ],
+   "options": {}
+  },
+  "openai-agents/structured": {
+   "messages": [
+    {
+     "content": "Extract the invoice fields.",
+     "role": "system"
+    },
+    {
+     "role": "user",
+     "content": "Invoice no. 4471 from ACME GmbH: consulting in May, total 1,250.50 EUR, due within 30 days."
+    }
+   ],
+   "tools": [],
+   "options": {
+    "response_format": {
+     "type": "json_schema",
+     "json_schema": {
+      "name": "final_output",
+      "strict": true,
+      "schema": {
+       "properties": {
+        "vendor": {
+         "title": "Vendor",
+         "type": "string"
+        },
+        "total": {
+         "title": "Total",
+         "type": "number"
+        },
+        "currency": {
+         "title": "Currency",
+         "type": "string"
+        }
+       },
+       "required": [
+        "vendor",
+        "total",
+        "currency"
+       ],
+       "title": "Invoice",
+       "type": "object",
+       "additionalProperties": false
+      }
+     }
+    }
+   }
+  },
+  "openai/memory": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a concise assistant."
+    },
+    {
+     "role": "user",
+     "content": "Hi! My name is Darya and I live in Kazan."
+    },
+    {
+     "role": "assistant",
+     "content": "A short summary."
+    },
+    {
+     "role": "user",
+     "content": "What is my name and which city do I live in? Answer in a few words."
+    }
+   ],
+   "tools": [],
+   "options": {
+    "max_tokens": 40
+   }
+  },
+  "openai/tool_loop": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a weather assistant. Use the tools to answer; do not guess numbers."
+    },
+    {
+     "role": "user",
+     "content": "What is the weather in Paris right now, in Fahrenheit?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_3ce466e14d06432f99bd0b63",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"ls\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_3ce466e14d06432f99bd0b63",
+     "content": "{\"error\": \"unknown city\"}"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city: temperature in Celsius and the sky.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. Paris"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "celsius_to_fahrenheit",
+      "description": "Convert a temperature from Celsius to Fahrenheit.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "celsius": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "celsius"
+       ]
+      }
+     }
+    }
+   ],
+   "options": {
+    "max_tokens": 300
+   }
+  },
+  "openai/structured": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Extract the invoice fields. Dates as YYYY-MM-DD."
+    },
+    {
+     "role": "user",
+     "content": "Invoice INV-2026-0471 from Nordlicht Software GmbH. Services rendered in September. Amount due: 1,284.50 EUR, payable by 2026-10-31. Thank you for your business."
+    }
+   ],
+   "tools": [],
+   "options": {
+    "stream": false,
+    "max_tokens": 200,
+    "response_format": {
+     "type": "json_schema",
+     "json_schema": {
+      "schema": {
+       "properties": {
+        "vendor": {
+         "title": "Vendor",
+         "type": "string"
+        },
+        "invoice_number": {
+         "title": "Invoice Number",
+         "type": "string"
+        },
+        "total_eur": {
+         "title": "Total Eur",
+         "type": "number"
+        },
+        "due_date": {
+         "title": "Due Date",
+         "type": "string"
+        }
+       },
+       "required": [
+        "vendor",
+        "invoice_number",
+        "total_eur",
+        "due_date"
+       ],
+       "title": "Invoice",
+       "type": "object",
+       "additionalProperties": false
+      },
+      "name": "Invoice",
+      "strict": true
+     }
+    }
+   }
+  },
+  "llamaindex/chat": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Answer in one short sentence."
+    },
+    {
+     "role": "user",
+     "content": "What is the capital of Australia?"
+    }
+   ],
+   "tools": [],
+   "options": {
+    "max_tokens": 400,
+    "stream": false,
+    "temperature": 0.1
+   }
+  },
+  "llamaindex/agent": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a weather assistant. Use the tools to answer; do not guess numbers."
+    },
+    {
+     "role": "user",
+     "content": "What's the temperature in Tokyo right now?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "weather",
+        "arguments": "{\"city\": \"ls\"}"
+       },
+       "id": "call_f25e0ce07f9941abaeeb5474"
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "{\"error\": \"unknown city\"}",
+     "tool_call_id": "call_f25e0ce07f9941abaeeb5474"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "weather",
+      "description": "weather(city: str) -> str\nCurrent weather for a city: temperature in Celsius and the sky.",
+      "parameters": {
+       "properties": {
+        "city": {
+         "title": "City",
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ],
+       "type": "object",
+       "additionalProperties": false
+      },
+      "strict": false
+     }
+    }
+   ],
+   "options": {
+    "max_tokens": 400,
+    "parallel_tool_calls": true,
+    "stream": true,
+    "temperature": 0.1,
+    "tool_choice": "auto"
+   }
+  },
+  "llamaindex/structured": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Extract the movie: The film Spirited Away was directed by Hayao Miyazaki and released in 2001."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "Movie",
+      "description": "Movie(*args: Any, **kwargs: Any) -> ~Model\nModel function.",
+      "parameters": {
+       "properties": {
+        "title": {
+         "title": "Title",
+         "type": "string"
+        },
+        "year": {
+         "title": "Year",
+         "type": "integer"
+        },
+        "director": {
+         "title": "Director",
+         "type": "string"
+        }
+       },
+       "required": [
+        "title",
+        "year",
+        "director"
+       ],
+       "type": "object",
+       "additionalProperties": false
+      },
+      "strict": false
+     }
+    }
+   ],
+   "options": {
+    "max_tokens": 400,
+    "parallel_tool_calls": false,
+    "stream": false,
+    "temperature": 0.1,
+    "tool_choice": "required"
+   }
+  },
+  "dspy/predict": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Your input fields are:\n1. `question` (str):\nYour output fields are:\n1. `answer` (str):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## question ## ]]\n{question}\n\n[[ ## answer ## ]]\n{answer}\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`."
+    },
+    {
+     "role": "user",
+     "content": "[[ ## question ## ]]\nWhat is the capital of Japan?\n\nRespond with the corresponding output fields, starting with the field `[[ ## answer ## ]]`, and then ending with the marker for `[[ ## completed ## ]]`."
+    }
+   ],
+   "tools": [],
+   "options": {
+    "max_completion_tokens": 600,
+    "temperature": 0.0
+   }
+  },
+  "dspy/typed": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Your input fields are:\n1. `message` (str):\nYour output fields are:\n1. `item` (str): \n2. `quantity` (int):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## message ## ]]\n{message}\n\n[[ ## item ## ]]\n{item}\n\n[[ ## quantity ## ]]\n{quantity}        # note: the value you produce must be a single int value\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Extract the order from the customer's message."
+    },
+    {
+     "role": "user",
+     "content": "[[ ## message ## ]]\nHi! Please send me 12 boxes of green tea to the Berlin office.\n\nRespond with the corresponding output fields, starting with the field `[[ ## item ## ]]`, then `[[ ## quantity ## ]]` (must be formatted as a valid Python int), and then ending with the marker for `[[ ## completed ## ]]`."
+    }
+   ],
+   "tools": [],
+   "options": {
+    "max_completion_tokens": 600,
+    "temperature": 0.0
+   }
+  },
+  "dspy/react": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Your input fields are:\n1. `question` (str): \n2. `trajectory` (str):\nYour output fields are:\n1. `next_thought` (str): \n2. `next_tool_name` (Literal['get_weather', 'finish']): \n3. `next_tool_args` (dict[str, Any]):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## question ## ]]\n{question}\n\n[[ ## trajectory ## ]]\n{trajectory}\n\n[[ ## next_thought ## ]]\n{next_thought}\n\n[[ ## next_tool_name ## ]]\n{next_tool_name}        # note: the value you produce must exactly match (no extra characters) one of: get_weather; finish\n\n[[ ## next_tool_args ## ]]\n{next_tool_args}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"additionalProperties\": true}\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        \n        You are an Agent. In each episode, you will be given the fields `question` as input. And you can see your past trajectory so far.\n        Your goal is to use one or more of the supplied tools to collect any necessary information for producing `answer`.\n        \n        To do this, you will interleave next_thought, next_tool_name, and next_tool_args in each turn, and also when finishing the task.\n        After each tool call, you receive a resulting observation, which gets appended to your trajectory.\n        \n        When writing next_thought, you may reason about the current situation and plan for future steps.\n        When selecting the next_tool_name and its next_tool_args, the tool must be one of:\n        \n        (1) get_weather, whose description is <desc>Current weather for a city: temperature in Celsius and the sky.        Args:          city: City name, e.g. Paris      </desc>. It takes arguments {'city': {'type': 'string'}}.\n        (2) finish, whose description is <desc>Marks the task as complete. That is, signals that all information for producing the outputs, i.e. `answer`, are \n[... truncated for the test fixture]"
+    },
+    {
+     "role": "user",
+     "content": "[[ ## question ## ]]\nIs it snowing in Oslo right now?\n\n[[ ## trajectory ## ]]\n\n\nRespond with the corresponding output fields, starting with the field `[[ ## next_thought ## ]]`, then `[[ ## next_tool_name ## ]]` (must be formatted as a valid Python Literal['get_weather', 'finish']), then `[[ ## next_tool_args ## ]]` (must be formatted as a valid Python dict[str, Any]), and then ending with the marker for `[[ ## completed ## ]]`."
+    }
+   ],
+   "tools": [],
+   "options": {
+    "max_completion_tokens": 600,
+    "temperature": 0.0
+   }
+  },
+  "langchain/tools": {
+   "messages": [
+    {
+     "content": "Is it snowing in Oslo right now? Use the tool.",
+     "role": "user"
+    },
+    {
+     "content": null,
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_4241d69e6b1945b597fd98e2",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"ls\"}"
+       }
+      }
+     ]
+    },
+    {
+     "content": "{\"error\": \"unknown city\"}",
+     "role": "tool",
+     "tool_call_id": "call_4241d69e6b1945b597fd98e2"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city: temperature in Celsius and the sky.",
+      "parameters": {
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ],
+       "type": "object"
+      }
+     }
+    }
+   ],
+   "options": {
+    "max_completion_tokens": 300,
+    "stream": false,
+    "temperature": 0.0
+   }
+  },
+  "langchain/structured": {
+   "messages": [
+    {
+     "content": "The film Spirited Away was directed by Hayao Miyazaki and released in 2001. Extract the movie.",
+     "role": "user"
+    }
+   ],
+   "tools": [],
+   "options": {
+    "max_completion_tokens": 300,
+    "response_format": {
+     "type": "json_schema",
+     "json_schema": {
+      "schema": {
+       "properties": {
+        "title": {
+         "title": "Title",
+         "type": "string"
+        },
+        "year": {
+         "description": "release year",
+         "title": "Year",
+         "type": "integer"
+        },
+        "director": {
+         "title": "Director",
+         "type": "string"
+        }
+       },
+       "required": [
+        "title",
+        "year",
+        "director"
+       ],
+       "title": "Movie",
+       "type": "object",
+       "additionalProperties": false
+      },
+      "name": "Movie",
+      "strict": true
+     }
+    },
+    "stream": false,
+    "temperature": 0.0
+   }
+  },
+  "litellm/tools": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "What's the weather in Tokyo? Use the tool."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city: temperature in Celsius and the sky.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. Paris"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "celsius_to_fahrenheit",
+      "description": "Convert a temperature from Celsius to Fahrenheit.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "celsius": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "celsius"
+       ]
+      }
+     }
+    }
+   ],
+   "options": {
+    "max_tokens": 200
+   }
+  },
+  "instructor/retry": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Extract everyone with their age: Lena (29) met her grandfather Pavel, who is 81, and her friend Tom, aged 31, at the station."
+    },
+    {
+     "role": "assistant",
+     "content": "{\"people\": \"x\"}"
+    },
+    {
+     "role": "user",
+     "content": "Correct your JSON ONLY RESPONSE, based on the following errors:\n1 validation error for People\npeople\n  Input should be a valid array [type=list_type, input_value='x', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.13/v/list_type"
+    }
+   ],
+   "tools": [],
+   "options": {
+    "max_tokens": 300,
+    "response_format": {
+     "type": "json_schema",
+     "json_schema": {
+      "name": "People",
+      "schema": {
+       "$defs": {
+        "Person": {
+         "properties": {
+          "name": {
+           "title": "Name",
+           "type": "string"
+          },
+          "age": {
+           "title": "Age",
+           "type": "integer"
+          }
+         },
+         "required": [
+          "name",
+          "age"
+         ],
+         "title": "Person",
+         "type": "object"
+        }
+       },
+       "properties": {
+        "people": {
+         "items": {
+          "$ref": "#/$defs/Person"
+         },
+         "title": "People",
+         "type": "array"
+        }
+       },
+       "required": [
+        "people"
+       ],
+       "title": "People",
+       "type": "object"
+      }
+     }
+    }
+   }
+  },
+  "smolagents/empty_text_before_calls": {
+   "messages": [
+    {
+     "role": "system",
+     "content": [
+      {
+       "type": "text",
+       "text": "You are an expert assistant who can solve any task using tool calls. You will be given a task to solve as best you can.\nTo do so, you have been given access to some tools.\n\nThe tool call you write is an action: after the tool is executed, you will get the result of the tool call as an \"observation\".\nThis Action/Observation can repeat N times, you should take several steps when needed.\n\nYou can use the result of the previous action as input for the next action.\nThe observation will always be a string: it can represent a file, like \"image_1.jpg\".\nThen you can use it as input for the next action. You can do it for instance as follows:\n\nObservation: \"image_1.jpg\"\n\nAction:\n{\n  \"name\": \"image_transformer\",\n  \"arguments\": {\"image\": \"image_1.jpg\"}\n}\n\nTo provide the final answer to the task, use an action blob with \"name\": \"final_answer\" tool. It is the only way to complete the task, else you will be stuck on a loop. So your final output should look like this:\nAction:\n{\n  \"name\": \"final_answer\",\n  \"arguments\": {\"answer\": \"insert your final answer here\"}\n}\n\n\nHere are a few examples using notional tools:\n---\nTask: \"Generate an image of the oldest person in this document.\"\n\nAction:\n{\n  \"name\": \"document_qa\",\n  \"arguments\": {\"document\": \"document.pdf\", \"question\": \"Who is the oldest person mentioned?\"}\n}\nObservation: \"The oldest person in the document is John Doe, a 55 year old lumberjack living in Newfoundland.\"\n\nAction:\n{\n  \"name\": \"image_generator\",\n  \"arguments\": {\"prompt\": \"A portrait of John Doe, a 55-year-old man living in Canada.\"}\n}\nObservation: \"image.png\"\n\nAction:\n{\n  \"name\": \"final_answer\",\n  \"arguments\": \"image.png\"\n}\n\n---\nTask: \"What is the result of the following operation: 5 + 3 + 1294.678?\"\n\nAction:\n{\n    \"name\": \"python_interpreter\",\n    \"arguments\": {\"code\": \"5 + 3 + 1294.678\"}\n}\nObservation: 1302.678\n\nAction:\n{\n  \"name\": \"final_answer\",\n  \"arguments\": \"1302.678\"\n}\n\n---\nTask: \"Which city has the highest population , Guangzhou or Shanghai?\"\n\nAction:\n{\n    \"name\n[... truncated for the test fixture]"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "New task:\nIs it snowing in Oslo right now? Answer with what the weather tool says."
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": ""
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "Calling tools:\n[{'id': 'call_7987865682d8439a8475ee06', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': {'city': 'ls'}}}]"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Observation:\n{\"error\": \"unknown city\"}"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "Calling tools:\n[{'id': 'call_2a9a8e0c3f0a4d94b49b4884', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': {'city': 'ls'}}}]"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Observation:\n{\"error\": \"unknown city\"}"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "Calling tools:\n[{'id': 'call_b937f6f50da14a7b94e7f0c7', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': {'city': 'ls'}}}]"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Observation:\n{\"error\": \"unknown city\"}"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "Calling tools:\n[{'id': 'call_3b9e743d586f4f5b801db620', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': {'city': 'ls'}}}]"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Observation:\n{\"error\": \"unknown city\"}"
+      }
+     ]
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city: temperature in Celsius and the sky.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. Paris"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "final_answer",
+      "description": "Provides a final answer to the given problem.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "answer": {
+         "type": "string",
+         "description": "The final answer to the problem"
+        }
+       },
+       "required": [
+        "answer"
+       ]
+      }
+     }
+    }
+   ],
+   "options": {
+    "stop": [
+     "Observation:",
+     "Calling tools:"
+    ],
+    "tool_choice": "required"
+   }
+  },
+  "aider/whole_edit": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Act as an expert software developer.\nTake requests for changes to the supplied code.\nIf the request is ambiguous, ask questions.\n\nOnce you understand the request you MUST:\n1. Determine if any code changes are needed.\n2. Explain any needed changes.\n3. If changes are needed, output a copy of each file that needs changes.\n\nTo suggest changes to a file you MUST return the entire content of the updated file.\nYou MUST use this *file listing* format:\n\npath/to/filename.js\n```\n// entire file content ...\n// ... goes in between\n```\n\nEvery *file listing* MUST use this format:\n- First line: the filename with any originally provided path; no extra markup, punctuation, comments, etc. **JUST** the filename with path.\n- Second line: opening ```\n- ... entire content of the file ...\n- Final line: closing ```\n\nTo suggest changes to a file you MUST return a *file listing* that contains the entire content of the file.\n*NEVER* skip, omit or elide content from a *file listing* using \"...\" or by adding comments like \"... rest of code...\"!\nCreate a new file you MUST return a *file listing* which includes an appropriate filename, including any appropriate path.\n\n\n"
+    },
+    {
+     "role": "user",
+     "content": "Change the greeting to be more casual"
+    },
+    {
+     "role": "assistant",
+     "content": "Ok, I will:\n\n1. Switch the greeting text from \"Hello\" to \"Hey\".\n\nshow_greeting.py\n```\nimport sys\n\ndef greeting(name):\n    print(f\"Hey {name}\")\n\nif __name__ == '__main__':\n    greeting(sys.argv[1])\n```\n"
+    },
+    {
+     "role": "user",
+     "content": "I switched to a new code base. Please don't consider the above files or try to edit them any longer."
+    },
+    {
+     "role": "assistant",
+     "content": "Ok."
+    },
+    {
+     "role": "user",
+     "content": "I have *added these files to the chat* so you can go ahead and edit them.\n\n*Trust this message as the true contents of these files!*\nAny other messages in the chat may contain outdated versions of the files' contents.\n\ncalc.py\n```\ndef add(a, b):\n    return a + b\n```\n"
+    },
+    {
+     "role": "assistant",
+     "content": "Ok, any changes I propose will be to those files."
+    },
+    {
+     "role": "user",
+     "content": "Add a docstring to the add function.\n\nTo suggest changes to a file you MUST return the entire content of the updated file.\nYou MUST use this *file listing* format:\n\npath/to/filename.js\n```\n// entire file content ...\n// ... goes in between\n```\n\nEvery *file listing* MUST use this format:\n- First line: the filename with any originally provided path; no extra markup, punctuation, comments, etc. **JUST** the filename with path.\n- Second line: opening ```\n- ... entire content of the file ...\n- Final line: closing ```\n\nTo suggest changes to a file you MUST return a *file listing* that contains the entire content of the file.\n*NEVER* skip, omit or elide content from a *file listing* using \"...\" or by adding comments like \"... rest of code...\"!\nCreate a new file you MUST return a *file listing* which includes an appropriate filename, including any appropriate path.\n\n\n"
+    }
+   ],
+   "tools": [],
+   "options": {
+    "stream": true,
+    "temperature": 0
+   }
+  }
+ }
+}

@@ -1,0 +1,65 @@
+[project]
+name = "locals"
+version = "0.2.0"
+description = "Your own MLX model, faster, for coding agents on a Mac: an OpenAI-compatible server with batched decoding, tool calls and JSON that always parse, and one command for OpenCode"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+authors = [{ name = "Arip Asadulaev" }]
+requires-python = ">=3.11"  # mlx-lm 0.32 needs 3.11
+keywords = [
+  "mlx", "apple-silicon", "llm", "structured-output", "constrained-decoding",
+  "json-schema", "grammar", "tool-calling", "agents", "inference",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "mlx>=0.32,<0.34",
+  "mlx-lm>=0.32,<0.33",  # 0.32 fixed Qwen3.5 q/k normalization; our fused layers match it
+  "numpy>=1.26",
+  "huggingface_hub>=0.30",  # model downloads (locals.app, locals.server); also needed by mlx-lm
+  "llguidance>=1.8",  # the server's stock-MLX engine (mlx/<model>), for side-by-side comparison
+  "outlines-core>=0.2,<0.3",
+  "rich>=13",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "build>=1.2"]
+# locals menubar: the server in the macOS menu bar
+menubar = ["rumps>=0.4"]
+
+[project.urls]
+Homepage = "https://github.com/Generated-Computers/Locals"
+Documentation = "https://github.com/Generated-Computers/Locals#readme"
+Issues = "https://github.com/Generated-Computers/Locals/issues"
+
+[project.scripts]
+locals = "locals.app:main"
+locals-agents = "locals.agents:main"
+locals-chat = "locals.chat:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["locals"]
+
+[tool.setuptools.package-data]
+locals = ["presets/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "model: needs model weights cached locally (slow; `pytest -m 'not model'` for the fast suite)",
+]

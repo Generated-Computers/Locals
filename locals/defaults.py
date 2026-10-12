@@ -1,0 +1,174 @@
+"""Defaults shared by the commands."""
+
+from pathlib import Path
+
+# Short names for the models locals is tested with; any mlx-lm chat model id or
+# local path works as well.
+MODELS = {
+    "qwen3.5-4b": "mlx-community/Qwen3.5-4B-MLX-4bit",
+    "qwen3.5-2b": "mlx-community/Qwen3.5-2B-MLX-4bit",
+    "gemma-4-e4b": "mlx-community/gemma-4-e4b-it-4bit",
+    "qwen3.8-27b": "mlx-community/Qwen3.8-27B-4bit",  # 15 GB of weights: a Mac with 32 GB or more
+    "lfm2.5-2.6b": "LiquidAI/LFM2.5-2.6B-MLX-4bit",  # 1.6 GB: 8 GB Macs
+    "minicpm5-2b": "mlx-community/MiniCPM5-2B-mlx-4Bit",  # 1.4 GB
+}
+
+
+def memory_gb() -> float:
+    """The Mac's memory in GB (0 if it cannot be read)."""
+    import subprocess
+
+    try:
+        return int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5).stdout) / 2**30
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+# GPU memory a model needs next to its weights: the KV cache of a few agents' prompts, the prefill and
+# the server's margins. A model whose weights leave less than this does not run: macOS swaps it, or
+# Metal stops it (and with it, on a 16 GB Mac, once the whole machine: a GPU driver panic).
+HEADROOM_GB = 2.0
+
+
+def gpu_limit_gb() -> float:
+    """The GPU memory MLX may use on this Mac, in GB (0 if unknown)."""
+    try:
+        import mlx.core as mx
+
+        return mx.device_info()["max_recommended_working_set_size"] / 2**30
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def weights_gb(model: str, remote: bool = False) -> "float | None":
+    """The model's weights in GB: its local files (a folder, or the Hugging Face cache), else, with
+    ``remote``, the sizes Hugging Face lists. None if unknown."""
+    path = Path(model).expanduser()
+    if not path.exists():
+        try:
+            from huggingface_hub import snapshot_download
+
+            path = Path(snapshot_download(model, local_files_only=True, allow_patterns=["*.json", "*.safetensors"]))
+        except Exception:  # noqa: BLE001
+            path = None
+    if path is not None:
+        files = list(path.glob("*.safetensors"))
+        if files:
+            return sum(f.stat().st_size for f in files) / 2**30
+    if not remote:
+        return None
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().model_info(model, files_metadata=True)
+        n = sum(s.size or 0 for s in info.siblings or [] if s.rfilename.endswith(".safetensors") and "/" not in s.rfilename)
+        return n / 2**30 if n else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def too_big(model: str, remote: bool = False) -> "str | None":
+    """Why ``model`` cannot run on this Mac (its weights and HEADROOM_GB exceed the GPU memory), or None.
+    LOCALS_IGNORE_MEMORY=1 skips the check."""
+    import os
+
+    if os.environ.get("LOCALS_IGNORE_MEMORY"):
+        return None
+    w, limit = weights_gb(model, remote), gpu_limit_gb()
+    if not w or not limit or w + HEADROOM_GB <= limit:
+        return None
+    return (f"{model} has {w:.1f} GB of weights; this Mac's GPU can use {limit:.1f} GB ({memory_gb():.0f} GB of memory), "
+            f"and the model needs about {HEADROOM_GB:.0f} GB more to run. Choose a smaller model (--model qwen), or set "
+            f"LOCALS_IGNORE_MEMORY=1 to try anyway (macOS may swap, or stop the server).")
+
+
+def gguf_hint(model: str, remote: bool = True) -> "str | None":
+    """If ``model`` is a GGUF model (a .gguf file, a folder or a Hugging Face repo with .gguf weights and
+    no safetensors: llama.cpp's, Ollama's and LM Studio's format), what to use instead: locals runs MLX
+    models (MLX reads only GGUF's rare Q4_0/Q8_0 tensors, under llama.cpp's names; mlx-lm loads none).
+    The MLX versions of the same model on Hugging Face are named. None for any other model."""
+    import re
+
+    path = Path(model).expanduser()
+    if path.is_file() or path.is_dir():
+        files = [path] if path.is_file() else list(path.glob("*.gguf")) + list(path.glob("*.safetensors"))
+        if not any(f.suffix == ".gguf" for f in files) or any(f.suffix == ".safetensors" for f in files):
+            return None
+        name = (path.stem if path.is_file() else path.name)
+    elif remote and "/" in model and model.count("/") == 1:
+        try:
+            from huggingface_hub import HfApi, snapshot_download
+
+            try:  # downloaded already (MLX weights in the cache): no request to Hugging Face, so it starts offline too
+                cached = Path(snapshot_download(model, local_files_only=True, allow_patterns=["*.json", "*.safetensors"]))
+                if any(cached.glob("*.safetensors")):
+                    return None
+            except Exception:  # noqa: BLE001
+                pass
+            names = [s.rfilename for s in HfApi().model_info(model).siblings or []]
+        except Exception:  # noqa: BLE001
+            return None
+        if not any(n.endswith(".gguf") for n in names) or any(n.endswith(".safetensors") for n in names):
+            return None
+        name = model.split("/")[1]
+    else:
+        return None
+    base = re.sub(r"[-_.]?(i1-)?gguf$", "", name, flags=re.I)
+    base = re.sub(r"[-_.](Q\d\w*|IQ\d\w*|F16|BF16|F32)$", "", base, flags=re.I)  # a file's quantization suffix
+    found = []
+    try:
+        from huggingface_hub import HfApi
+
+        for q in dict.fromkeys([base, base.split("_", 1)[-1]]):  # bartowski's "Qwen_Qwen3.5-0.8B"
+            found += [m.id for m in HfApi().list_models(search=q, filter="mlx", sort="downloads", limit=3) if m.id not in found]
+    except Exception:  # noqa: BLE001
+        pass
+    see = (f" MLX versions of it: {', '.join(found[:3])} (--model {found[0]})." if found else
+           " Look for an MLX version of it on Hugging Face (mlx-community), or convert the original weights with "
+           "mlx_lm.convert --hf-path ORIGINAL -q.")
+    return f"{model} is a GGUF model (the format of llama.cpp, Ollama and LM Studio); locals runs MLX models.{see}"
+
+
+def default_model() -> str:
+    """The model for this Mac: Qwen3.5-4B (3 GB of weights, 64k context) from 16 GB of memory up,
+    Qwen3.5-2B on a Mac with less (the 4B and its prompt cache do not fit next to macOS in 8 GB)."""
+    gb = memory_gb()
+    return MODELS["qwen3.5-2b"] if 0 < gb < 12 else MODELS["qwen3.5-4b"]
+
+
+DEFAULT_MODEL = default_model()
+ALIASES = {"qwen": "qwen3.5-4b", "qwen3.5": "qwen3.5-4b", "gemma": "gemma-4-e4b", "gemma4": "gemma-4-e4b",
+           "gemma-4": "gemma-4-e4b", "gemma4-e4b": "gemma-4-e4b", "gemma-4-e4b-it": "gemma-4-e4b", "qwen3.8": "qwen3.8-27b",
+           "lfm": "lfm2.5-2.6b", "lfm2.5": "lfm2.5-2.6b", "minicpm": "minicpm5-2b", "minicpm5": "minicpm5-2b"}
+MODEL_HELP = ("model: qwen (Qwen3.5-4B, the default from 16 GB of memory), qwen3.5-2b (the default below), gemma (Gemma 4 "
+              "E4B), lfm (LFM2.5-2.6B), minicpm (MiniCPM5-2B), qwen3.8 (Qwen3.8-27B, 32 GB of memory or more), or any "
+              "mlx-lm model id or local path")
+
+
+def model_id(name: str) -> str:
+    """The model id for a short name (qwen, gemma, qwen3.5-4b, gemma-4-e4b, ...); a local folder as its
+    absolute path (the background server runs elsewhere, and later commands from other folders);
+    other names unchanged. A short name wins over a folder of the same name in the current one."""
+    name = str(name)  # a Path too, as mlx_lm.load takes
+    key = name.strip().lower()
+    if key in ALIASES or key in MODELS:
+        return MODELS[ALIASES.get(key, key)]
+    path = Path(name).expanduser()
+    if path.exists():
+        return str(path.absolute())  # links kept (a link to a snapshot folder keeps its own name)
+    return name
+
+
+def build_id() -> str:
+    """A fingerprint of the installed locals code (its files' names, sizes and times): a background
+    server started before an upgrade, or before an edit, reports another one."""
+    import hashlib
+
+    here = Path(__file__).resolve().parent
+    h = hashlib.sha1()
+    for f in sorted(here.glob("*.py")):
+        if f.name in ("plan.py", "solve.py"):  # the client side of locals solve: the server does not run them
+            continue
+        st = f.stat()
+        h.update(f"{f.name}:{st.st_size}:{st.st_mtime_ns};".encode())
+    return h.hexdigest()[:12]

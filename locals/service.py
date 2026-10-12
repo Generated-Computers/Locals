@@ -1,0 +1,490 @@
+"""A shared generation service: one model, one batch, many concurrent clients.
+
+Clients (agents, HTTP handlers, ...) call ``submit`` from any thread. One
+background thread owns the model and runs continuous batching, so requests that
+arrive while others decode join the running batch. Two backends:
+
+  locals : our runtime (fused layers, small-M kernels) and HybridBatchEngine's
+          pipelined drip loop; JSON-schema requests use our constraint engine
+          (forced spans, canonical boundaries).
+  stock : plain mlx-lm, i.e. the classical stack: BatchGenerator continuous
+          batching, and llguidance logits processors for JSON-schema requests.
+
+Both keep mlx-lm's LRUPromptCache: a multi-turn client that resubmits its
+growing token stream only prefills what it appended since its last call.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import queue
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional, Tuple
+
+ENGINES = ("locals", "stock")
+
+
+@dataclass
+class Job:
+    prompt: List[int]
+    schema: Optional[dict] = None
+    max_tokens: int = 512
+    regex: Optional[str] = None
+    tokens: List[int] = field(default_factory=list)
+    text: str = ""
+    finish: str = ""
+    cached: int = 0  # prompt tokens served from the prompt cache
+    t_submit: float = 0.0
+    t_done: float = 0.0
+    on_token: Optional[Callable[[List[int]], None]] = None  # called from the worker with each committed token group
+    cancelled: bool = False
+    checkpoints: List[Tuple[int, str]] = field(default_factory=list)  # (prompt position, LRU cache type) also stored
+    temp: Optional[float] = None  # the request's sampling temperature (None: the service's)
+    _event: threading.Event = field(default_factory=threading.Event)
+    _req: object = None
+
+    def wait(self, timeout: Optional[float] = None) -> "Job":
+        self._event.wait(timeout)
+        return self
+
+    def cancel(self) -> None:
+        """Stop generating (the client went away); the job finishes with
+        ``finish == "cancelled"`` at the engine's next commit."""
+        self.cancelled = True
+        r = self._req
+        if r is not None:
+            r.cancel = True
+
+    @property
+    def done(self) -> bool:
+        return self._event.is_set()
+
+
+def _llg_grammar(llguidance, regex: str, specials: dict):
+    """llguidance grammar for a regex whose outer literals may be special tokens.
+
+    llguidance never matches a special token against regex text (it has no
+    bytes), so a native tool-call format such as ``<tool_call>...</tool_call>``
+    must reference those tokens by id in lark: <[id]> MIDDLE <[id]>."""
+    import re
+
+    head = tail = None
+    for text, tid in sorted(specials.items(), key=lambda kv: -len(kv[0])):
+        for lit in (text, re.escape(text), text.replace("/", "\\/")):
+            if head is None and regex.startswith(lit):
+                head, regex = tid, regex[len(lit):]
+            if tail is None and regex.endswith(lit):
+                tail, regex = tid, regex[: -len(lit)]
+    if head is None and tail is None:
+        return llguidance.LLMatcher.grammar_from_regex(regex)
+    mid = regex.replace("/", "\\/")
+    parts = ([f"<[{head}]>"] if head is not None else []) + (["MID"] if regex else []) + ([f"<[{tail}]>"] if tail is not None else [])
+    lark = "start: " + " ".join(parts) + ("\nMID: /" + mid + "/" if regex else "")
+    return llguidance.LLMatcher.grammar_from_lark(lark)
+
+
+def _weights_fingerprint(model_id: str) -> str:
+    """Which weights a model id names now, and the mlx-lm that wrote their caches: an updated
+    repository, another fine-tune in the same folder or another mlx-lm gets other saved prompts
+    (a saved cache of other weights would give wrong output, or fail the batch at its merge)."""
+    import hashlib
+    from pathlib import Path
+
+    import mlx_lm
+
+    parts = [getattr(mlx_lm, "__version__", "")]
+    path = Path(model_id).expanduser()
+    if not path.exists():
+        try:
+            from huggingface_hub import snapshot_download
+
+            path = Path(snapshot_download(model_id, local_files_only=True, allow_patterns=["config.json"]))
+        except Exception:  # noqa: BLE001
+            path = None
+    if path is not None:
+        parts.append(str(path.resolve()))
+        for f in sorted(path.glob("*.json")) + sorted(path.glob("*.safetensors")):
+            try:
+                st = f.stat()
+                parts.append(f"{f.name}:{st.st_size}:{int(st.st_mtime)}")
+            except OSError:
+                pass
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
+
+
+class BatchService:
+    def __init__(self, engine: str, model: str, slots: int = 16, temp: float = 0.0, seed: int = 0, cache_gb: Optional[float] = None,
+                 walk: bool = False, top_p: float = 0.0, top_k: int = 0):
+        if engine not in ENGINES:
+            raise ValueError(f"engine must be one of {ENGINES}")
+        self.engine, self.model_id, self.slots, self.temp, self.seed = engine, model, slots, temp, seed
+        self.top_p, self.top_k = top_p, top_k  # sampling filters at temp > 0, the same rule on both engines
+        self.walk = walk  # locals engine: constraints by the walk kernel (no token tables)
+        # None: our engine sizes its prompt cache from the free GPU memory after loading
+        # (the stock engine keeps 1.5 GB)
+        self.cache_bytes = int(cache_gb * (1 << 30)) if cache_gb else None
+        self._q: "queue.Queue[Job]" = queue.Queue()
+        self._inflight = {}  # id(job) -> job, taken by the worker and not yet finished
+        self._closed = False
+        self._ready = threading.Event()
+        self._error: Optional[BaseException] = None
+        self.tokenizer = None
+        self.active = 0
+        self.tokens_out = 0
+        self.prompt_tokens = 0
+        self.cached_tokens = 0
+        self._thread = threading.Thread(target=self._main, name=f"batch-{engine}", daemon=True)
+        self._thread.start()
+        self._ready.wait()
+        if self._error is not None:
+            raise self._error
+
+    # -- client API -----------------------------------------------------------------
+    def submit(self, prompt: List[int], schema: Optional[dict] = None, max_tokens: int = 512, regex: Optional[str] = None,
+               on_token: Optional[Callable[[List[int]], None]] = None, checkpoints: Optional[List[Tuple[int, str]]] = None,
+               temp: Optional[float] = None) -> Job:
+        """Queue a generation; the output matches ``schema`` (JSON Schema) or ``regex`` if given.
+        ``on_token`` streams committed tokens (called from the worker thread). For
+        each ``(n, kind)`` in ``checkpoints`` the cache of ``prompt[:n]`` is also kept
+        in the prompt cache (our engine) as an entry of type ``kind`` ("system"
+        entries are evicted last, then "user", then finished replies), for a next
+        request that shares only that much. ``temp``: this request's sampling
+        temperature (0: greedy), else the service's."""
+        if not prompt:
+            raise ValueError("empty prompt")
+        job = Job(list(prompt), schema, max_tokens, regex, t_submit=time.perf_counter(), on_token=on_token,
+                  checkpoints=list(checkpoints or []), temp=temp)
+        self._q.put(job)
+        return job
+
+    def prime(self, tokens: List[int]) -> None:
+        """Prefill ``tokens`` once and store them in the prompt cache (e.g. the
+        system prompt and tool definitions every client starts with)."""
+        job = Job(list(tokens), max_tokens=0, t_submit=time.perf_counter())
+        job.prime = True
+        self._q.put(job)
+        job.wait()
+
+    def close(self) -> None:
+        self._closed = True
+        self._thread.join(timeout=30)
+
+    def stats(self) -> dict:
+        out = {"engine": self.engine, "active": self.active, "tokens_out": self.tokens_out,
+               "prompt_tokens": self.prompt_tokens, "cached_tokens": self.cached_tokens}
+        eng = getattr(self, "_eng", None)
+        out.update(getattr(eng, "counters", {}) if eng is not None else {})
+        lru = getattr(self, "_lru", None)
+        if lru is not None:
+            out["prompt_cache_mb"] = lru.nbytes / 1e6
+            out["prompt_cache_entries"] = len(lru)
+            try:  # entries and megabytes per kind (system prompts, request checkpoints, finished replies)
+                out["prompt_cache_by_kind"] = {k: {"entries": v["n_sequences"], "mb": round(v["n_bytes"] / 1e6)}
+                                               for k, v in lru.stats_by_type().items()}
+            except Exception:  # noqa: BLE001
+                pass
+        return out
+
+    # -- worker -----------------------------------------------------------------------
+    def _take(self, block: bool) -> List[Job]:
+        out = []
+        while True:
+            try:
+                job = self._q.get(block=block and not out, timeout=0.05)
+                self._inflight[id(job)] = job
+                out.append(job)
+            except queue.Empty:
+                if block and not out and not self._closed:
+                    self._tune_while_idle()
+                    continue
+                return out
+
+    def _tune_while_idle(self) -> None:
+        """One pending kernel shape, tuned while there is nothing to do (in the engine's own thread,
+        so the GPU is not shared); a request that arrives waits for this one shape at most."""
+        work = getattr(self, "_tune_work", None)
+        if not work:
+            return
+        mod, M = work.pop(0)
+        try:
+            from .kernels import tune_one
+
+            tune_one(mod, M)
+        except Exception:  # noqa: BLE001  # an untunable shape keeps MLX's kernel
+            pass
+        if not work:
+            print("locals: kernel tuning finished; batches now run on the tuned kernels", file=sys.stderr, flush=True)
+
+    def _finish(self, job: Job, tokens, finish: str) -> None:
+        job.tokens = list(tokens)
+        job.text = self.tokenizer.decode(job.tokens)
+        job.finish = finish
+        job.t_done = time.perf_counter()
+        self._inflight.pop(id(job), None)
+        job._event.set()
+
+    def _main(self):
+        try:
+            import mlx.core as mx
+
+            mx.random.seed(self.seed)
+            mx.set_cache_limit(1 << 30)  # MLX keeps freed buffers up to the whole memory limit by default
+            (self._run_locals if self.engine == "locals" else self._run_stock)()
+        except BaseException as e:  # surface load errors to the constructor, others to clients
+            import sys
+            import traceback
+
+            loaded = self._ready.is_set()
+            if loaded:  # a load error is raised again by the constructor
+                traceback.print_exc(file=sys.stderr)
+            self._error = e
+            self._ready.set()
+            if not loaded:
+                return
+            for job in list(self._inflight.values()):
+                job.finish = f"error: {e!r}"
+                job._event.set()
+            while True:
+                for job in self._take(False):
+                    job.finish = f"error: {e!r}"
+                    job._event.set()
+                if self._closed:
+                    return
+                time.sleep(0.05)
+
+    def _run_locals(self):
+        import mlx.core as mx
+
+        from .engine import Controller, LocalsController
+        from .hybrid_batch import HybridBatchEngine, chain_cache
+        from .packed import Request
+        from .runtime import Runtime
+
+        rt = Runtime.load(self.model_id, tune=os.environ.get("LOCALS_TUNE", "background"))
+        self.tokenizer = rt.tokenizer
+        eos = list(rt.vocab.eos_ids)
+        from . import kernels
+
+        if kernels._DEFER:  # tuned while idle, smallest batches first
+            self._tune_work = kernels.pending_work(rt.model)
+
+        class Free(Controller):
+            eos_ids = eos
+
+        eng = HybridBatchEngine(rt.model, rt.tokenizer, n_slots=self.slots)
+        if os.environ.get("LOCALS_DISK_CACHE", "1") != "0":  # system prompts kept across restarts
+            from pathlib import Path
+
+            from .hybrid_batch import DiskPromptCache
+
+            tag = (self.model_id.strip("/").replace("/", "--")[-80:] + "--" + str(getattr(rt, "dtype", "")).split(".")[-1]
+                   + "--" + _weights_fingerprint(self.model_id))
+            root = Path(os.environ.get("LOCALS_DISK_CACHE_DIR") or Path.home() / ".cache" / "locals" / "prompts")
+            try:
+                eng.disk = DiskPromptCache(root / tag, float(os.environ.get("LOCALS_DISK_CACHE_GB", "4")))
+                import shutil
+
+                stem = tag.rsplit("--", 1)[0]  # the same model and dtype, other weights or mlx-lm (or no fingerprint)
+                for old in root.iterdir():
+                    if old.is_dir() and old.name != tag and (old.name == stem or old.name.startswith(stem + "--")):
+                        shutil.rmtree(old, ignore_errors=True)
+            except OSError:
+                eng.disk = None
+        eng.top_p, eng.top_k = self.top_p, self.top_k
+        self._eng = eng
+        limit = int(mx.device_info()["max_recommended_working_set_size"])
+        # MLX keeps up to 1 GB of freed buffers (set_cache_limit); 1.5 GB more covers what the
+        # admission estimate misses (5 concurrent agents peaked 1.1 GB above it on a 16 GB Mac)
+        eng.memory_limit = limit - (5 << 29)
+        if self.cache_bytes is None:  # what is left after the weights and 5 GB for running rows and prefill
+            free = limit - mx.get_active_memory() - (5 << 30)
+            self.cache_bytes = int(min(max(free, 1.5 * (1 << 30)), 16 << 30))
+        lru = chain_cache(max_size=256, max_bytes=self.cache_bytes)
+        self._lru = lru
+        owner = {}
+        self._ready.set()
+
+        def source(block):
+            jobs = self._take(block)
+            reqs = []
+            for job in jobs:
+                # One request's fault (a regex that does not compile, a schema too large or recursive)
+                # is that request's error: it used to escape serve(), fail every request in flight and
+                # leave this one waiting forever.
+                try:
+                    if getattr(job, "prime", False):
+                        if lru.fetch_nearest_cache("locals", job.prompt)[1]:
+                            c, rest = eng._prefill_start(job.prompt, [])
+                            eng._run(c, list(rest))
+                            mx.eval([x.state for x in c])
+                            lru.insert_cache("locals", list(job.prompt), c, cache_type="system")
+                        self._finish(job, [], "primed")
+                        continue
+                    if job.schema is not None or job.regex is not None:
+                        if self.walk:
+                            from .walk import WalkController
+
+                            wc, planner = rt.compile_walk(job.schema) if job.regex is None else rt.compile_walk(regex=job.regex)
+                            ctl = WalkController(wc, planner, True, True)
+                        else:
+                            c = rt.compile(job.schema) if job.regex is None else rt.compile(regex=job.regex)
+                            if getattr(c, "recursive", False):
+                                raise ValueError("recursive JSON schemas ($ref cycles) are not supported by the batch engine")
+                            ctl = LocalsController(c.constraint, c.planner, True, True)
+                    else:
+                        ctl = Free()
+                except Exception as e:  # noqa: BLE001
+                    self._finish(job, [], f"invalid: {type(e).__name__}: {e}")
+                    continue
+                r = Request(job.prompt, ctl, job.max_tokens)
+                r.on_token = job.on_token
+                r.checkpoints = job.checkpoints
+                r.temp = job.temp
+                job._req = r  # before reading job.cancelled: a cancel in between sets r.cancel itself
+                r.cancel = job.cancelled
+                owner[id(r)] = (job, r)
+                reqs.append(r)
+                self.prompt_tokens += len(job.prompt)
+            return reqs
+
+        def done(r):
+            job, _ = owner.pop(id(r))
+            job.cached = getattr(r, "cached_tokens", 0)
+            self.cached_tokens += job.cached
+            self._finish(job, r.out, r.finish)
+
+        orig_launch = eng._launch1
+
+        def launch(*a, **k):  # expose live counters to clients
+            self.active = eng.active if hasattr(eng, "active") else 0
+            self.tokens_out = getattr(eng, "tokens_out", 0)
+            return orig_launch(*a, **k)
+
+        eng._launch1 = launch
+        while not self._closed:
+            try:
+                eng.serve(source, temp=self.temp, lru=lru, on_done=done)
+            except Exception as e:  # noqa: BLE001  # e.g. Metal out of memory: fail what is in flight, keep serving
+                import gc
+                import sys
+                import traceback
+
+                traceback.print_exc(file=sys.stderr)
+                for job in list(self._inflight.values()):  # every job taken, whether or not it reached the batch
+                    job.finish = f"error: {e!r}"
+                    self._inflight.pop(id(job), None)
+                    job._event.set()
+                owner.clear()
+                lru.trim_to(n_bytes=lru.nbytes // 2)
+                gc.collect()
+                mx.clear_cache()
+                print(f"[{self.engine}] engine error, {len(lru)} cache entries kept; serving again", file=sys.stderr, flush=True)
+            self.active = 0
+
+    def _run_stock(self):
+        import mlx.core as mx
+        from mlx_lm import load
+        from mlx_lm.generate import BatchGenerator
+        from mlx_lm.models.cache import ArraysCache, LRUPromptCache
+        from mlx_lm.sample_utils import make_sampler
+
+        model, tok = load(self.model_id)
+        mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+        self.tokenizer = tok
+        lm = getattr(model, "language_model", model)
+        n_vocab = lm.model.embed_tokens.weight.shape[0]
+        eos = sorted(set(tok.eos_token_ids))
+        llg_tok, grammars = None, {}
+        specials = {t: i for t, i in tok._tokenizer.get_added_vocab().items()}
+
+        def processors(schema, regex=None):
+            nonlocal llg_tok
+            if schema is None and regex is None:
+                return []
+            import llguidance
+            import llguidance.hf
+            from outlines_core.json_schema import build_regex_from_schema
+
+            from .llg import LLGProcessor
+
+            if llg_tok is None:
+                llg_tok = llguidance.hf.from_tokenizer(tok._tokenizer, n_vocab=n_vocab, eos_token=eos[0])
+            from .grammar import json_safe_schema
+
+            rx = regex if regex is not None else build_regex_from_schema(json.dumps(json_safe_schema(schema)), "")
+            if rx not in grammars:
+                grammars[rx] = _llg_grammar(llguidance, rx, specials)
+            key = rx
+            return [LLGProcessor(llg_tok, grammars[key])]
+
+        # mlx-lm's prompt processing computes logits at every prompt position; with
+        # a 248k vocabulary a 16 x 2048 prefill chunk needs ~16 GB for them alone,
+        # so prefill runs in batches of <= 4 prompts and 512-token chunks.
+        gen = BatchGenerator(model, stop_tokens=[[t] for t in eos], completion_batch_size=self.slots,
+                             prefill_batch_size=min(self.slots, 4), prefill_step_size=512)
+        lru = LRUPromptCache(max_size=256, max_bytes=self.cache_bytes or int(1.5 * (1 << 30)))
+        self._lru = lru
+        sampler = make_sampler(self.temp, top_p=self.top_p, top_k=self.top_k)
+        live = {}
+        self._ready.set()
+        from mlx_lm.models.cache import make_prompt_cache
+
+        while not self._closed:
+            for job in self._take(block=not live):
+                if getattr(job, "prime", False):
+                    if lru.fetch_nearest_cache("stock", job.prompt)[1]:
+                        c = make_prompt_cache(model)
+                        for i in range(0, len(job.prompt), 2048):
+                            model(mx.array([job.prompt[i : i + 2048]]), cache=c)
+                        mx.eval([x.state for x in c])
+                        lru.insert_cache("stock", list(job.prompt), c)
+                    self._finish(job, [], "primed")
+                    continue
+                cache, rest = lru.fetch_nearest_cache("stock", job.prompt[:-1])
+                rest = list(rest) + job.prompt[-1:]
+                job.cached = len(job.prompt) - len(rest)
+                self.cached_tokens += job.cached
+                self.prompt_tokens += len(job.prompt)
+                s = sampler if job.temp is None else make_sampler(job.temp, top_p=self.top_p, top_k=self.top_k)
+                try:
+                    procs = processors(job.schema, job.regex)
+                except Exception as e:  # noqa: BLE001  # a regex or schema that does not compile: this request's error
+                    self._finish(job, [], f"invalid: {type(e).__name__}: {e}")
+                    continue
+                (uid,) = gen.insert([rest], [job.max_tokens], caches=[cache], all_tokens=[job.prompt[: job.cached]],
+                                    samplers=[s], logits_processors=[procs])
+                live[uid] = (job, [])
+            if not live:
+                continue
+            drop = [uid for uid, (job, _) in live.items() if job.cancelled]
+            for uid in drop:
+                gen.remove([uid])
+                job, toks = live.pop(uid)
+                self._finish(job, toks, "cancelled")
+            if not live:
+                continue
+            for r in gen.next_generated():
+                job, toks = live[r.uid]
+                if r.finish_reason != "stop":
+                    toks.append(r.token)
+                    self.tokens_out += 1
+                    if job.on_token is not None:
+                        job.on_token([r.token])
+                if r.finish_reason is not None:
+                    if r.prompt_cache is not None:
+                        # mlx-lm extracts recurrent-layer rows as views of the whole
+                        # batch buffer; copy them, or each cached conversation pins
+                        # every row's state (~0.3 GB at 16 rows on Qwen3.5-2B).
+                        for c in r.prompt_cache:
+                            if isinstance(c, ArraysCache):
+                                c.cache = [None if a is None else a + 0 for a in c.cache]
+                        mx.eval([c.state for c in r.prompt_cache])
+                        lru.insert_cache("stock", list(r.all_tokens), r.prompt_cache)
+                    del live[r.uid]
+                    self._finish(job, toks, r.finish_reason)
+            self.active = len(live)
+        gen.close()

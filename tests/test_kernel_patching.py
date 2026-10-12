@@ -1,0 +1,136 @@
+"""Fusion and kernel routing on tiny quantized layers (no model): projections fuse only when their
+quantization matches, fusing does not draw from the global random state, routing changes only the
+model it is given, and the tuning cache survives a cut-short file."""
+
+import json
+
+import pytest
+
+mx = pytest.importorskip("mlx.core")
+nn = pytest.importorskip("mlx.nn")
+
+from locals import fuse, kernels  # noqa: E402
+
+
+def _q(out_dims, in_dims=128, bits=4, bias=False):
+    lin = nn.Linear(in_dims, out_dims, bias=bias)
+    return nn.QuantizedLinear.from_linear(lin, group_size=64, bits=bits)
+
+
+def test_mixed_quantization_does_not_fuse():
+    assert fuse._fusable([_q(64), _q(32)])
+    assert not fuse._fusable([_q(64), _q(32, bits=6)])  # mlx-lm's mixed recipes: v_proj at 6 bits
+    assert not fuse._fusable([_q(64, bias=True), _q(32)])
+    with pytest.raises(ValueError):
+        fuse._concat_quantized([_q(64), _q(32, bits=8)])
+
+
+def test_a_fused_layer_computes_what_the_parts_did_and_leaves_the_random_state():
+    a, b = _q(64), _q(32)
+    x = mx.random.normal((2, 128), key=mx.random.key(3))
+    mx.random.seed(7)
+    before = mx.random.uniform(shape=(4,))
+    mx.random.seed(7)
+    fused = fuse._concat_quantized([a, b])
+    after = mx.random.uniform(shape=(4,))
+    assert mx.array_equal(before, after)
+    assert mx.allclose(fused(x), mx.concatenate([a(x), b(x)], axis=-1), atol=1e-4)
+
+
+def test_routing_changes_only_the_model_given():
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = _q(64)
+
+    mine, other = M(), M()
+    kernels.enable_small_m(True, mine)
+    assert type(mine.proj) is not nn.QuantizedLinear and isinstance(mine.proj, nn.QuantizedLinear)
+    assert type(other.proj) is nn.QuantizedLinear and nn.QuantizedLinear.__call__ is kernels._orig_linear_call
+    kernels.enable_small_m(False)  # the switch for the models patched so far (an A/B comparison)
+    assert type(mine.proj).__call__ is kernels._linear_switch and kernels._enabled is False
+    kernels.enable_small_m(True)
+
+
+def test_a_cut_short_tuning_cache_is_set_aside(tmp_path, monkeypatch):
+    path = tmp_path / "tune.json"
+    path.write_text('{"1x64x2": ["mlx"], "2x64')
+    monkeypatch.setattr(kernels, "_TUNE_PATH", str(path))
+    monkeypatch.setattr(kernels, "_TUNE", None)
+    monkeypatch.setattr(kernels, "_preset_path", lambda: None)
+    assert kernels._load_tune() == {}
+    assert (tmp_path / "tune.json.bad").exists()
+    kernels._TUNE["3x64x2"] = ("mlx",)
+    kernels._save_tune()
+    assert json.loads(path.read_text()) == {"3x64x2": ["mlx"]}
+
+
+def test_a_model_that_does_not_fit_fp16_gets_its_own_arrays_back(monkeypatch):
+    from locals import runtime
+
+    class Tiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(2200, 8)
+            self.out = nn.Linear(8, 4)
+
+        def __call__(self, x):
+            return self.out(self.embed(x))
+
+    m = Tiny()
+    m.embed.weight = mx.full((2200, 8), 300.0)
+    m.out.weight = mx.full((4, 8), 300.0)  # 300 * 300 * 8 = 720k: inf in fp16
+    m.out.bias = mx.array([1e-7, 0.0, 0.0, 0.0])  # below fp16's range: lost by a cast there and back
+    m.set_dtype(mx.bfloat16)
+    before = {k: mx.array(v) for k, v in __import__("mlx.utils", fromlist=["tree_flatten"]).tree_flatten(m.parameters())}
+    monkeypatch.setattr(runtime, "native_bf16", lambda: False)
+    monkeypatch.setattr(runtime, "_fp16_special", lambda model: False)
+    assert runtime.set_compute_dtype(m, "auto") == "bfloat16"
+    from mlx.utils import tree_flatten
+
+    for k, v in tree_flatten(m.parameters()):
+        assert v.dtype == mx.bfloat16 and mx.array_equal(v, before[k]), k
+
+
+def test_fusing_a_model_whose_layers_have_no_mlp():
+    """LFM2's layers call their MLP feed_forward: loading it stopped at layer.mlp."""
+    import mlx.nn as nn
+
+    from locals.fuse import fuse_model
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.feed_forward = nn.Linear(4, 4)
+
+    class Body(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [Layer(), Layer()]
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Body()
+
+    assert fuse_model(Model()) == 2
+
+
+def test_head_rows_on_an_mxfp4_head():
+    """Mellum2.1's MLX build is mxfp4: its head has no biases, and head_rows called affine's matmul."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    from locals.kernels import head_rows
+
+    class LM(nn.Module):
+        def __init__(self, mode):
+            super().__init__()
+            self.lm_head = nn.Linear(64, 32, bias=False)
+            nn.quantize(self, group_size=32, bits=4, mode=mode)
+
+    for mode in ("affine", "mxfp4"):
+        m = LM(mode)
+        h = mx.random.normal((1, 1, 64))
+        ids = mx.array([3, 7, 9])
+        assert mx.allclose(head_rows(m, h, ids), m.lm_head(h)[0, -1][ids]), mode
