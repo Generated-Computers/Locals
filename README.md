@@ -76,20 +76,141 @@ From then on it starts in seconds. If you already use the uv package manager,
 you can install with `uv tool install git+https://github.com/Generated-Computers/Locals`
 instead.
 
-## A team of agents on one task
+## Examples
 
-Because many agents cost little more than one, Locals can put a whole team on a
-single task. Each agent works on its own part, in its own copy of your project,
-and your tests check every change. Your project is only updated once the tests
-pass.
+**Work on a project with an assistant.** This opens OpenCode in your project, where
+you can ask for changes in plain words and watch it read, edit and test your code:
 
 ```bash
-locals run "write inventory.py, cli.py and tests for them" --dir ~/my-project
+locals code ~/my-project
 ```
 
-On tasks that span several files, a team of agents solved all eight attempts in
-about three minutes each. A single agent working alone solved four of eight and
-needed about five minutes for each.
+**Give it one task and get the result.** The assistant does the task from start
+to finish without opening a window, and prints what it did:
+
+```bash
+locals code ~/my-project --run "add a --verbose flag to cli.py and run the tests"
+```
+
+**Let a team of agents do a bigger task.** Several agents work on the task at the
+same time, and your tests decide when it is done (more on this below):
+
+```bash
+locals run "write wordcount.py with a function count_words(text) and tests in test_wordcount.py" \
+    --dir ~/my-project --check "python3 -m pytest -q"
+```
+
+**Ask a question about your code.** An agent reads the project and prints the
+answer:
+
+```bash
+locals run "Which function parses dates, and which format does it expect?" --dir ~/my-project
+```
+
+**Chat with the model** in the Terminal, like a private chatbot:
+
+```bash
+locals chat
+```
+
+**Turn text into structured data.** Describe the fields you want in a JSON schema,
+for example in a file called `person.json`:
+
+```json
+{"type": "object",
+ "properties": {"name": {"type": "string"}, "age": {"type": "integer"}, "email": {"type": "string"},
+                "status": {"enum": ["pending", "approved", "rejected"]}, "tags": {"type": "array", "items": {"type": "string"}}},
+ "required": ["name", "age", "email", "status", "tags"]}
+```
+
+Then the answer always follows it, field by field:
+
+```bash
+locals generate --prompt "Ana Silva, 29, ana@example.com, application approved, tags: vip, early" \
+    --schema person.json
+```
+
+```json
+{"name":"Ana Silva","age":29,"email":"ana@example.com","status":"approved","tags":["vip","early"]}
+```
+
+## A team of agents on one task
+
+A single coding agent works step by step: it writes one file, then the next, then
+the tests, and if it makes a mistake early, everything after it suffers. Locals
+can instead split a task into parts and give each part to its own agents, all
+working at the same time. This is practical on a Mac only because Locals answers
+many agents together: six agents at once cost far less than six times one, and
+the instructions they share are read by the model only once.
+
+```bash
+locals run "write wordcount.py with a function count_words(text) and tests in test_wordcount.py" \
+    --dir ~/my-project --check "python3 -m pytest -q"
+```
+
+Here is what happens. First Locals makes a plan. When the task names its files,
+each file becomes a part; otherwise the model proposes the parts. Code comes
+first and tests come after the code they test. Then each part gets several
+agents at once, three for each piece of code by default, and each of them works
+in its own copy of your project and tries the part in a slightly different way.
+Two more agents try the whole task on their own, racing the team, which helps
+when the task turns out to be small.
+
+After every file an agent writes, your tests (or the command you give with
+`--check`) run in that agent's copy, and the agent sees the result right away,
+so it can fix its mistakes as it goes. The first copy that passes wins. If none
+passes on its own, Locals combines the best version of each part and tests them
+together. When the tests still fail, it reads which part they point at and sends
+fresh agents to repair just that part, for a few rounds.
+
+```
+                         your task
+                             |
+           plan: wordcount.py  ->  test_wordcount.py
+                 |                       |
+       3 agents write the code   4 agents write the tests once the code exists
+                 |                       |
+      2 more agents try the whole task alone, racing the team
+                             |
+     your tests run after every change; the first copy that passes wins
+                             |
+                  your project is updated
+```
+
+This is the output of that command on a MacBook Pro with 16 GB. The agents
+named `s` tried the whole task, `w` wrote the code and `t` wrote the tests:
+
+```
+  plan (0s): [0] wordcount.py; [1] test_wordcount.py after [0]
+
+  s0     test_wordcount.py, wordcount.py     3 steps   24.4s
+  s1     test_wordcount.py, wordcount.py     3 steps   24.6s
+  w0.0   wordcount.py                        4 steps   16.0s
+  w0.1   wordcount.py                        3 steps   15.8s
+  w0.2   wordcount.py                        3 steps   15.1s
+  t1.0   test_wordcount.py                   2 steps   14.9s
+  t1.1   test_wordcount.py                   3 steps   12.7s
+  t1.2   test_wordcount.py                   3 steps   14.8s
+  t1.3   test_wordcount.py                   2 steps   14.0s
+
+  the check passes; 33s in all, 9 agents, 6 at once at most
+  written into the project: test_wordcount.py, wordcount.py
+```
+
+Your project stays safe throughout. The agents only ever work in copies, your
+project is changed only when the tests pass, and if a run fails, its best attempt
+is kept in `~/.locals/runs` for you to look at. The commands agents run can only
+change files in their own copy. Your existing tests are what the agents must
+pass, so they do not edit them, unless your task asks for new or changed tests.
+
+On four tasks that each span several files, a team of agents solved all eight
+attempts in about three minutes each. A single agent in the same setup solved
+four of eight and needed about five minutes for each.
+
+You can tune the team. `--versions 4` gives each part four agents instead of
+three, `--race 0` leaves out the agents that try the whole task alone,
+`--workers 1` lets a single agent do everything (useful to compare), and
+`--rounds` sets how many repair rounds follow a failed check.
 
 ## Use it in the Terminal
 
@@ -178,7 +299,11 @@ run here, but Locals will point you to a version of the same model that does.
 
 Locals understands the same requests as the OpenAI and Ollama services, so
 programs written for them work with it unchanged, and many of them at once get
-the same speed-up. Start Locals with `locals start`, then point your program at it:
+the same speed-up. Start Locals with `locals start`, then point your program at
+`http://127.0.0.1:8321`. The examples below use the official `openai` Python
+package; any language with an OpenAI library works the same way.
+
+**A simple question.**
 
 ```python
 from openai import OpenAI
@@ -191,8 +316,98 @@ reply = client.chat.completions.create(
 print(reply.choices[0].message.content)
 ```
 
-The [examples](examples) folder has more, including structured answers in JSON
-and tool calls.
+**Words as they are written**, instead of waiting for the whole answer:
+
+```python
+stream = client.chat.completions.create(
+    model="locals/qwen3.5-4b",
+    messages=[{"role": "user", "content": "Explain what a Python list is in two sentences."}],
+    stream=True,
+)
+for chunk in stream:
+    print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
+
+**Answers in a fixed format.** Give a JSON schema, and the answer always follows it:
+
+```python
+import json
+
+schema = {
+    "type": "object",
+    "properties": {"name": {"type": "string"}, "age": {"type": "integer"}, "city": {"type": "string"}},
+    "required": ["name", "age", "city"],
+}
+reply = client.chat.completions.create(
+    model="locals/qwen3.5-4b",
+    messages=[{"role": "user", "content": "Maria Gonzalez is 34 and lives in Madrid."}],
+    response_format={"type": "json_schema", "json_schema": {"name": "person", "schema": schema}},
+)
+print(json.loads(reply.choices[0].message.content))
+# {'name': 'Maria Gonzalez', 'age': 34, 'city': 'Madrid'}
+```
+
+**Letting the model use your functions.** Describe a function, and the model
+answers with a call to it, which your program then carries out:
+
+```python
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "The current weather in a city.",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+    },
+}]
+reply = client.chat.completions.create(
+    model="locals/qwen3.5-4b",
+    messages=[{"role": "user", "content": "Do I need an umbrella in Paris today?"}],
+    tools=tools,
+)
+call = reply.choices[0].message.tool_calls[0]
+print(call.function.name, call.function.arguments)  # get_weather {"city": "Paris"}
+```
+
+**Many requests at once.** This is where Locals is fastest. Send your requests
+together, from threads or with an async client, and Locals answers them as one
+batch. Here eight answers came back in 1.5 seconds:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+def ask(question):
+    reply = client.chat.completions.create(
+        model="locals/qwen3.5-4b",
+        messages=[{"role": "user", "content": question}],
+    )
+    return reply.choices[0].message.content
+
+questions = [f"Write a one-line Python function that returns the square of {n}." for n in range(8)]
+with ThreadPoolExecutor(max_workers=8) as pool:
+    answers = list(pool.map(ask, questions))
+```
+
+**With the Ollama library**, or from any app that speaks Ollama's language:
+
+```python
+import ollama
+
+reply = ollama.Client(host="http://127.0.0.1:8321").chat(
+    model="qwen3.5-4b", messages=[{"role": "user", "content": "Say hello in French."}]
+)
+print(reply["message"]["content"])
+```
+
+**From the Terminal**, with no programming at all:
+
+```bash
+curl http://127.0.0.1:8321/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model": "locals/qwen3.5-4b", "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+Libraries built on OpenAI's interface, such as LangChain, LlamaIndex, pydantic-ai
+and the OpenAI Agents SDK, work the same way: give them the address above and the
+model name. The [examples](examples) folder has more.
 
 ## Privacy and safety
 
