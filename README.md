@@ -5,7 +5,7 @@
 <h1 align="center">Locals</h1>
 
 <p align="center">
-  AI coding assistants on your Mac, powered by a model that runs on your Mac.
+  Run many AI agents at once on your Mac, about three times faster.
 </p>
 
 <p align="center">
@@ -15,17 +15,42 @@
 
 ## What it is
 
-Locals lets you use AI coding assistants such as OpenCode, Cline or Aider with an
-AI model that runs entirely on your own Mac. Your code and your questions never
-leave your computer, there is no account to create and nothing to pay per
-request, and once the model is downloaded it runs without an internet
-connection.
+Locals runs AI models on your own Mac and makes them fast when many requests
+arrive at the same time. That is exactly how today's AI agents work: a coding
+assistant runs several helpers in parallel, and a team of agents can work on one
+task together. Locals answers all of these requests together on your Mac's
+graphics chip instead of one after another, so the whole team gets its answers
+about three times faster than with the standard way of running models on a Mac.
 
-Modern assistants rarely ask one thing at a time. They run several helpers in
-parallel, and some tasks use a whole team of agents. Locals answers all of
-these requests together instead of one after another, which makes it about
-three times faster than the usual way of running models on a Mac when several
-requests arrive at once.
+It works with the coding assistants you may already use, such as OpenCode,
+Cline, Aider and OpenHands, and with any app or program that talks to OpenAI or
+Ollama. Everything stays on your computer.
+
+## How much faster
+
+We measured Locals against mlx-lm, the standard way to run models on Apple
+silicon, with the same model (Qwen3.5-4B) on a MacBook Pro with an M2 Pro chip
+and 16 GB of memory. Speed is the number of tokens, roughly word pieces, the
+model writes per second for all requests together.
+
+| Requests at the same time | mlx-lm | Locals | Faster by |
+|---|---|---|---|
+| 1 | 61 tokens/s | 64 tokens/s | about the same |
+| 2 | 82 tokens/s | 116 tokens/s | 1.4x |
+| 4 | 87 tokens/s | 160 tokens/s | 1.8x |
+| 8 | 87 tokens/s | 271 tokens/s | 3.1x |
+| 16 | 157 tokens/s | 341 tokens/s | 2.2x |
+
+With one request Locals is as fast as mlx-lm. The more requests arrive together,
+the bigger the difference: mlx-lm gains almost nothing between four and eight
+requests, while Locals keeps adding speed. In practice, eight agents working at once finish in
+about the time two agents would need one after the other.
+
+The same holds on real work. Sixteen coding agents that call tools, running on
+the smaller Qwen3.5-2B, finished in 29 seconds instead of 75, and forty programming problems solved eight at a time
+took 8 minutes instead of 20. Each agent also starts its next step in under a
+second, because Locals remembers the conversation it has already read instead of
+reading it again. The answers are the same as mlx-lm's.
 
 ## Getting started
 
@@ -39,7 +64,7 @@ Open the Terminal app and run:
 curl -LsSf https://raw.githubusercontent.com/Generated-Computers/Locals/main/install.sh | sh
 ```
 
-Then start the coding assistant on one of your projects:
+Then start a coding assistant on one of your projects:
 
 ```bash
 locals code ~/my-project
@@ -51,10 +76,24 @@ From then on it starts in seconds. If you already use the uv package manager,
 you can install with `uv tool install git+https://github.com/Generated-Computers/Locals`
 instead.
 
+## A team of agents on one task
+
+Because many agents cost little more than one, Locals can put a whole team on a
+single task. Each agent works on its own part, in its own copy of your project,
+and your tests check every change. Your project is only updated once the tests
+pass.
+
+```bash
+locals run "write inventory.py, cli.py and tests for them" --dir ~/my-project
+```
+
+On tasks that span several files, a team of agents solved all eight attempts in
+about three minutes each. A single agent working alone solved four of eight and
+needed about five minutes for each.
+
 ## Use it with your tools
 
-Locals works with the assistants and apps you may already have. For each one,
-a single command starts Locals and connects the tool to it.
+For each tool, a single command starts Locals and connects the tool to it.
 
 | If you use | Run |
 |---|---|
@@ -68,59 +107,36 @@ a single command starts Locals and connects the tool to it.
 
 For an editor, `locals launch editor` shows the address and model name to enter
 in its AI settings. To see every supported tool, run `locals launch list`.
+Locals keeps running in the background after you close a tool: `locals status`
+shows what it is doing and `locals stop` stops it.
 
-Locals keeps running in the background after you close a tool. Run
-`locals status` to see what it is doing and `locals stop` to stop it.
-
-## Choosing a model
+## Models
 
 Locals picks a model that fits your Mac's memory, so most people never need to
-change it. If you want to try another one, add `--model` with its name:
+change it. To try another one, add `--model` with its name, for example
+`locals code ~/my-project --model lfm`. Every model below runs about three times
+faster with Locals when eight requests arrive at once:
 
-```bash
-locals code ~/my-project --model lfm
-```
+| Model | Name to use | Download size | mlx-lm, 8 requests | Locals, 8 requests |
+|---|---|---|---|---|
+| Qwen3.5-4B (the default) | `qwen` | 2.8 GB | 87 tokens/s | 271 tokens/s |
+| LFM2.5-2.6B | `lfm` | 1.6 GB | 144 tokens/s | 404 tokens/s |
+| MiniCPM5-2B | `minicpm` | 1.4 GB | 160 tokens/s | 478 tokens/s |
+| Gemma 4 E4B | `gemma` | 4.8 GB | 80 tokens/s | 224 tokens/s |
 
-We gave each model the same thirteen everyday coding tasks, such as fixing a
-bug, adding a command to a program, or writing a report from a spreadsheet:
-
-| Model | Name to use | Download size | Tasks solved |
-|---|---|---|---|
-| Qwen3.5-4B (the default) | `qwen` | 2.8 GB | 11 of 13 |
-| LFM2.5-2.6B | `lfm` | 1.6 GB | 11 of 13 |
-| MiniCPM5-2B | `minicpm` | 1.4 GB | 9 of 13 |
-| Gemma 4 E4B | `gemma` | 4.8 GB | 8 of 13 |
-| Qwen3.8-27B | `qwen3.8` | 15 GB | needs 32 GB of memory |
-
-The smaller models are good choices for a Mac with 8 GB of memory. LFM2.5
-reached its score with its thinking mode on, which you get by choosing the
-model name ending in `-thinking` in your tool.
-
-You can also use other models published for Apple silicon on
+The smaller models are good choices for a Mac with 8 GB of memory. You can also
+use other models published for Apple silicon on
 [Hugging Face](https://huggingface.co/mlx-community), for example
 `--model mlx-community/Qwen3.5-2B-MLX-4bit`. If a model is too big for your Mac,
 Locals tells you before downloading it. Models in the GGUF format, which Ollama
 and LM Studio use, do not run here, but Locals will point you to a version of
 the same model that does.
 
-## A team of agents on one task
-
-Locals can also put several agents to work on a single task at the same time.
-Each agent works on its own copy of your project, your tests check every change
-they make, and your project is only updated once the tests pass.
-
-```bash
-locals run "write inventory.py, cli.py and tests for them" --dir ~/my-project
-```
-
-On tasks that span several files, a team solved all eight attempts in about
-three minutes each, while a single agent solved four of eight and took longer.
-
 ## Using it from your own code
 
 Locals understands the same requests as the OpenAI and Ollama services, so
-programs and libraries written for them work with it unchanged. Start Locals
-with `locals start`, then point your program at it:
+programs written for them work with it unchanged, and many of them at once get
+the same speed-up. Start Locals with `locals start`, then point your program at it:
 
 ```python
 from openai import OpenAI

@@ -8,7 +8,6 @@ MODELS = {
     "qwen3.5-4b": "mlx-community/Qwen3.5-4B-MLX-4bit",
     "qwen3.5-2b": "mlx-community/Qwen3.5-2B-MLX-4bit",
     "gemma-4-e4b": "mlx-community/gemma-4-e4b-it-4bit",
-    "qwen3.8-27b": "mlx-community/Qwen3.8-27B-4bit",  # 15 GB of weights: a Mac with 32 GB or more
     "lfm2.5-2.6b": "LiquidAI/LFM2.5-2.6B-MLX-4bit",  # 1.6 GB: 8 GB Macs
     "minicpm5-2b": "mlx-community/MiniCPM5-2B-mlx-4Bit",  # 1.4 GB
 }
@@ -138,10 +137,10 @@ def default_model() -> str:
 
 DEFAULT_MODEL = default_model()
 ALIASES = {"qwen": "qwen3.5-4b", "qwen3.5": "qwen3.5-4b", "gemma": "gemma-4-e4b", "gemma4": "gemma-4-e4b",
-           "gemma-4": "gemma-4-e4b", "gemma4-e4b": "gemma-4-e4b", "gemma-4-e4b-it": "gemma-4-e4b", "qwen3.8": "qwen3.8-27b",
+           "gemma-4": "gemma-4-e4b", "gemma4-e4b": "gemma-4-e4b", "gemma-4-e4b-it": "gemma-4-e4b",
            "lfm": "lfm2.5-2.6b", "lfm2.5": "lfm2.5-2.6b", "minicpm": "minicpm5-2b", "minicpm5": "minicpm5-2b"}
 MODEL_HELP = ("model: qwen (Qwen3.5-4B, the default from 16 GB of memory), qwen3.5-2b (the default below), gemma (Gemma 4 "
-              "E4B), lfm (LFM2.5-2.6B), minicpm (MiniCPM5-2B), qwen3.8 (Qwen3.8-27B, 32 GB of memory or more), or any "
+              "E4B), lfm (LFM2.5-2.6B), minicpm (MiniCPM5-2B), or any "
               "mlx-lm model id or local path")
 
 
