@@ -32,6 +32,7 @@ def _merge(caches):
 
 
 _MEMLOG = bool(os.environ.get("LOCALS_MEMLOG"))  # print GPU memory around each admission
+_MIXLOG = bool(os.environ.get("LOCALS_MIXLOG"))  # print each mixed pass (locals/mixed.py)
 
 # Query x key positions one prefill chunk may score per attention head. A
 # chunk of c tokens after n cached ones builds (rows x c x (n + c)) scores per
@@ -40,6 +41,11 @@ _MEMLOG = bool(os.environ.get("LOCALS_MEMLOG"))  # print GPU memory around each 
 # 48k, 128 beyond 100k. Without this, a 47k-token prompt's last chunks needed
 # 3.5 GB above the model and a 64k one did not fit next to it on 16 GB.
 PREFILL_SCORES = 1 << 24
+# Tokens of all rows in one prefill forward. Its activations grow with them (Qwen3.5-4B: about 1 GB
+# at 2048, 4.3 GB at 8 rows x 1024, past the GPU's memory at 16 x 1024: sixteen requests arriving
+# together failed with a Metal out-of-memory error); the prefill rate is the same from ~1k tokens up
+# (750 tok/s for 1 x 2048, 8 x 256, 16 x 128 or 32 x 64), so more rows take shorter chunks.
+PREFILL_TOKENS = 2048
 
 
 def _reserve(cache, upto: int) -> None:
@@ -85,6 +91,43 @@ def _only_row(c):
         k.offset = c._idx - pad
         return k
     return c.extract(0)
+
+
+def _copies(r) -> int:
+    """Copies of a request's prompt cache its checkpoints keep (a "reply" one keeps only recurrent state)."""
+    return sum(1 for _, kind in getattr(r, "checkpoints", None) or [] if kind != "reply")
+
+
+def _replies(r) -> int:
+    return sum(1 for _, kind in getattr(r, "checkpoints", None) or [] if kind == "reply")
+
+
+def _keep_reply_state(r, n: int, cache) -> None:
+    """At a "reply" checkpoint (``n``: where the reply starts as the next request renders the
+    conversation): keep a copy of the cache layers that cannot be cut back to a prefix (recurrent
+    state, a few MB per layer); _reply_entry adds the KV prefix of the finished row to them."""
+    r.reply_state = (n, [copy.deepcopy(c) if not isinstance(c, (KVCache, BatchKVCache)) else None for c in cache])
+
+
+def _reply_entry(r, row):
+    """The prompt-cache entry for ``r.prompt[:n]`` (see _keep_reply_state): the finished row's KV cut
+    to n positions (views of its buffers: no copy) and the recurrent state kept at n. None if the
+    request kept none or a layer is of another kind (a rotating window cannot be cut back)."""
+    state = getattr(r, "reply_state", None)
+    if state is None:
+        return None
+    n, kept = state
+    out = []
+    for c, k in zip(row, kept):
+        if k is not None:
+            out.append(k)
+        elif type(c) is KVCache and c.keys is not None and c.offset >= n:
+            v = KVCache()
+            v.keys, v.values, v.offset = c.keys[..., :n, :], c.values[..., :n, :], n
+            out.append(v)
+        else:
+            return None
+    return out
 
 
 def _grow_one_layer_at_a_time(cls) -> None:
@@ -232,6 +275,8 @@ def prefill_chunk(done: int, rows: int = 1, base: int = 2048) -> int:
     c = base
     while c > 128 and rows * c * (done + c) > PREFILL_SCORES:
         c //= 2
+    while c > 16 and rows * c > PREFILL_TOKENS:
+        c //= 2
     return c
 
 
@@ -282,6 +327,13 @@ def chain_cache(max_size: int, max_bytes: int):
 
 class HybridBatchEngine(BatchEngine):
     def __init__(self, model, tokenizer, n_slots: int = 16, share_prefix: bool = True, min_share: int = 64, tail_ok: int = 32):
+        # rows of a mixed pass, decode rows and prompt tokens (locals/mixed.py; 0: a new prompt is prefilled
+        # while the rows wait). 1024: as fast as a prefill on its own; the rows get a token every pass (1.5 s on
+        # a 4B model on an M2 Pro) instead of none for the whole prefill (12 s for 8k tokens).
+        self.mix_chunk = int(os.environ.get("LOCALS_MIX_CHUNK", "1024"))
+        self._reply_bytes = 0  # a kept reply state's size (recurrent layers), once one was kept
+        self._mix_ok = None
+        self._fill_eval = []
         self.tail_ok = tail_ok
         self.model = model
         self.tokenizer = tokenizer
@@ -401,13 +453,28 @@ class HybridBatchEngine(BatchEngine):
         self._kv_bytes_per_token()  # sets _kv_layers
         return after - n * top + after // self._kv_layers
 
+    def _keep_reply(self, r, n: int, cache) -> None:
+        _keep_reply_state(r, n, cache)
+        self._reply_bytes = max(self._reply_bytes, sum(c.nbytes for c in r.reply_state[1] if c is not None))
+
+    def _room_for_copy(self, lru, positions: int) -> bool:
+        """Whether a checkpoint's copy of a request's cache can be kept: the copy shares the request's KV
+        buffers, so the request's next write copies them, and ``positions`` (its prompt) of KV then exist
+        twice. Near the context limit that is past the GPU's memory; the copy is then left out (it is only
+        a prompt-cache entry)."""
+        if not self.memory_limit:
+            return True
+        need = positions * self._kv_bytes_per_token() + (1536 << 20)
+        self._trim_for(lru, need)
+        return mx.get_active_memory() + need <= self.memory_limit
+
     def _fits(self, lru, r, held: int) -> bool:
         """Whether admitting ``r`` (its whole prompt uncached, at worst) can fit
         under ``memory_limit`` once the prompt cache is emptied."""
         if not self.memory_limit:
             return True
-        copies = len(getattr(r, "checkpoints", None) or [])
-        need = (len(r.prompt) * (1 + copies) + held) * self._kv_bytes_per_token() + (1536 << 20)
+        copies = _copies(r)
+        need = (len(r.prompt) * (1 + copies) + held) * self._kv_bytes_per_token() + (1536 << 20) + _replies(r) * self._reply_bytes
         return need <= self.memory_limit - (mx.get_active_memory() - (lru.nbytes if lru is not None else 0))
 
     def _make_room(self, lru, tokens: int, copies: int, held: int) -> None:
@@ -683,6 +750,67 @@ class HybridBatchEngine(BatchEngine):
         h = self.lm.model(x[:, None], cache)
         return self._pick(self._head(h[:, -1:, :]), g, temp, budget)
 
+    def _launch(self, cache, x: mx.array, g, temp: float, budget, filling: List[dict], lru, lru_key) -> mx.array:
+        """The next step: a plain decode step, or, while a prompt is being prefilled (``filling``), a
+        mixed pass with its next chunk (locals/mixed.py). ``self._fill_eval``: what the caller evaluates
+        with the step (the filling cache)."""
+        e = next((e for e in filling if e["pos"] < e["end"]), None)
+        if e is None:
+            self._fill_eval = []
+            return self._launch1(cache, x, g, temp, budget)
+        from .mixed import forward
+
+        r, c = e["r"], e["cache"]
+        stop = e["cps"][0][0] if e["cps"] else e["end"]
+        if e["reserved"] < stop and any(isinstance(l, KVCache) and l.keys is not None for l in c):
+            _reserve(c, stop)  # the KV buffers for the prompt (or up to its next checkpoint) at once
+            e["reserved"] = stop
+        # the pass's rows (decode rows and prompt tokens) a whole number of matmul tiles: one row past
+        # a multiple of 32 or 64 costs a whole tile more, more than the decode step the pass saves
+        n = min(self.mix_chunk - int(x.shape[0]), stop - e["pos"], prefill_chunk(e["pos"], 1, self.mix_chunk))
+        n = max(n, 1)
+        h = forward(self.lm.model, x[:, None], cache, mx.array([r.prompt[e["pos"]: e["pos"] + n]]), c)
+        out = self._pick(self._head(h), g, temp, budget)
+        e["pos"] += n
+        self.counters["mixed_steps"] = self.counters.get("mixed_steps", 0) + 1
+        self.counters["prefill_tokens"] += n
+        self._fill_eval = [a for l in c for a in (getattr(l, "keys", None), getattr(l, "values", None), *(getattr(l, "cache", None) or []))
+                           if isinstance(a, mx.array)]
+        if e["cps"] and e["pos"] == e["cps"][0][0]:
+            mx.eval(out, self._fill_eval)
+            self._checkpoint(e, lru, lru_key)
+        if _MIXLOG:
+            now = time.perf_counter()
+            print(f"[mix] rows {int(x.shape[0])} + {n} prompt tokens (at {e['pos'] - n} of {e['end']}), "
+                  f"{(now - getattr(self, '_mix_t', now)) * 1000:.0f} ms since the last pass", flush=True)
+            self._mix_t = now
+        return out
+
+    def _checkpoint(self, e: dict, lru, lru_key) -> None:
+        """A filling request reached its next checkpoint: keep a copy of its cache there."""
+        cp, kind = e["cps"].pop(0)
+        while e["cps"] and e["cps"][0][0] <= cp:  # one snapshot per position
+            e["cps"].pop(0)
+        r, c = e["r"], e["cache"]
+        if kind == "reply":
+            self._keep_reply(r, cp, c)
+            return
+        if not self._room_for_copy(lru, len(r.prompt)):
+            return
+        lru.insert_cache(lru_key, list(r.prompt[:cp]), copy.deepcopy(c), cache_type=kind)
+        if kind == "system" and self.disk is not None:
+            self.disk.save(list(r.prompt[:cp]), c)
+        if os.environ.get("LOCALS_PREFILL_LOG"):
+            print(f"[checkpoint] {kind} at {cp} (mixed; disk {'on' if self.disk is not None else 'off'})", flush=True)
+
+    def _fill_checkpoints(self, e: dict, lru, lru_key) -> None:
+        """Prefill a filling request up to its remaining checkpoints at once (no rows decode alongside)."""
+        while e["cps"]:
+            cp = e["cps"][0][0]
+            self._run(e["cache"], list(e["r"].prompt[e["pos"]:cp]))
+            e["pos"] = cp
+            self._checkpoint(e, lru, lru_key)
+
     def run_drip(self, requests: List[Request], temp: float = 0.0) -> BatchStats:
         """Pipelined continuous batching with one token per row per step.
 
@@ -818,6 +946,14 @@ class HybridBatchEngine(BatchEngine):
         queue: List[Request] = []
         self._check_controllers = True
         rows: List[Request] = []
+        # Requests whose prompts are prefilled in mixed passes, a chunk per step, while the rows decode
+        # (locals/mixed.py): each {"r", "cache", "pos", "end", "cps", "reserved"}, joined once complete.
+        filling: List[dict] = []
+        self._fill_eval = []
+        if getattr(self, "_mix_ok", None) is None:
+            from . import mixed
+
+            self._mix_ok = self.mix_chunk > 0 and mixed.supported(self.lm.model)
         dead: set = set()
         cache, g, cur = None, None, None  # g: states masking the in-flight sample
         steps = nrows = 0
@@ -856,21 +992,62 @@ class HybridBatchEngine(BatchEngine):
                     if isinstance(c, ArraysCache):
                         c.cache = [None if a is None else a + 0 for a in c.cache]
                 mx.eval([c.state for c in row])
-                lru.insert_cache(lru_key, list(r.prompt[:-1]) + r.fed, row)
+                reply = _reply_entry(r, row)
+                if reply is None:
+                    lru.insert_cache(lru_key, list(r.prompt[:-1]) + r.fed, row)
+                else:
+                    # where the next request continues instead of the whole row: the template writes the reply
+                    # differently from the open turn, so the row is no prefix of the next request; and its KV,
+                    # views of the row's buffers, would count twice in the prompt cache's bytes next to the row
+                    lru.insert_cache(lru_key, list(r.prompt[: r.reply_state[0]]), reply, cache_type="assistant")
+                r.reply_state = None
             if on_done is not None:
                 on_done(r)
 
+        def attach(new, merged, tp, count):
+            """Join prefilled requests (their caches ``merged``, a batch of them) to the running rows."""
+            nonlocal cache, g, rows, xs, prefill_s
+            old = self._table_add([r.controller for r in rows + new])
+            if old is not None and g is not None:  # the table was rebuilt: the running rows' states move
+                offs = self._tab[3]
+                g = g + mx.array([offs[id(r.controller.c)] - old[id(r.controller.c)]
+                                  if isinstance(r.controller, LocalsController) else 0 for r in rows], dtype=g.dtype)
+            if cache is None:
+                cache = merged
+            else:
+                _append_rows(cache, merged)
+            mx.eval([c.state for c in cache])
+            prefill_s += time.perf_counter() - tp
+            self.counters["prefill_s"] += time.perf_counter() - tp
+            self.counters["admissions"] += 1
+            if _MEMLOG:
+                print(f"[mem] admitted {[len(r.prompt) for r in new]} (cached {[r.cached_tokens for r in new]}): active "
+                      f"{mx.get_active_memory() / 1e9:.2f} GB, peak {mx.get_peak_memory() / 1e9:.2f} GB, "
+                      f"prompt cache {lru.nbytes / 1e9 if lru is not None else 0:.2f} GB", flush=True)
+                mx.reset_peak_memory()
+            if count:  # (mixed passes count their chunks as they go)
+                self.counters["prefill_tokens"] += sum(len(r.prompt) - 1 - getattr(r, "cached_tokens", 0) for r in new)
+            gn = mx.array([self._gstate(r) for r in new], dtype=mx.int32)
+            g = gn if g is None else mx.concatenate([g, gn])
+            rows = rows + new
+            xs = xs + [r.prompt[-1] for r in new]
+            for r in new:
+                r.fed.append(r.prompt[-1])
+
+        xs: List[int] = []
         while True:
             queue += arrive(False)
-            if not rows and not queue and cur is None:
+            if not rows and not queue and cur is None and not filling:
                 # idle: the combined tables (which only grow) start again from the next requests' constraints
                 self._tab = self._otab = self._walk = self._wtab = self._wrows = None
+                self._fill_eval = []
                 got = arrive(True)
                 if not got:
                     break
                 queue += got
             self.active = len(rows)
-            boundary = cur is None or dead or (queue and len(rows) < self.n_slots)
+            boundary = cur is None or dead or (queue and len(rows) + len(filling) < self.n_slots) or (
+                filling and (filling[0]["pos"] >= filling[0]["end"] or any(getattr(e["r"], "cancel", False) for e in filling)))
             if boundary:
                 ys = cur.tolist() if cur is not None else []
                 # Feeds are decided before committing, as in a chained step: a
@@ -909,11 +1086,39 @@ class HybridBatchEngine(BatchEngine):
                     q.finish = "cancelled"
                     if on_done is not None:
                         on_done(q)
+                gone = [e for e in filling if getattr(e["r"], "cancel", False)]  # their clients left during the prefill
+                for e in gone:
+                    filling.remove(e)
+                    e["r"].finish = "cancelled"
+                    if on_done is not None:
+                        on_done(e["r"])
+                if gone:
+                    self._fill_eval = []  # (the next step sets it again)
+                if filling and not rows:  # no rows decode alongside any more: the rest of the prompts at once
+                    tp = time.perf_counter()
+                    ready, filling[:] = list(filling), []
+                    self.counters["prefill_tokens"] += sum(e["end"] - e["pos"] for e in ready)  # mixed passes counted the rest
+                    for e in ready:
+                        self._fill_checkpoints(e, lru, lru_key)
+                    attach([e["r"] for e in ready], self._prefill_batch(
+                        [e["r"].prompt[:-1] for e in ready], [], starts=[(e["cache"], list(e["r"].prompt[e["pos"]:e["end"]])) for e in ready]),
+                        tp, count=False)
+                    del ready
+                # a for-loop variable outlives its loop: it would hold a cancelled or joined request's cache
+                e = gone = None
+                if filling and filling[0]["pos"] >= filling[0]["end"]:  # prefilled in mixed passes: join the batch
+                    tp = time.perf_counter()
+                    ready = []
+                    while filling and filling[0]["pos"] >= filling[0]["end"]:
+                        ready.append(filling.pop(0))
+                    attach([e["r"] for e in ready], self._prefill_batch(
+                        [e["r"].prompt[:-1] for e in ready], [], starts=[(e["cache"], []) for e in ready]), tp, count=False)
+                    del ready
                 new = []
-                while queue and len(rows) + len(new) < self.n_slots:
+                while queue and len(rows) + len(filling) + len(new) < self.n_slots:
                     # a request that would not fit next to the running rows waits for one to finish
-                    held0 = self._merge_tokens(rows, [len(q.prompt) for q in new + [queue[0]]])
-                    if (rows or new) and not self._fits(lru, queue[0], held0 + sum(len(q.prompt) for q in new)):
+                    held0 = self._merge_tokens(rows, [len(e["r"].prompt) for e in filling] + [len(q.prompt) for q in new + [queue[0]]])
+                    if (rows or new or filling) and not self._fits(lru, queue[0], held0 + sum(len(q.prompt) for q in new)):
                         self.counters["deferred"] = self.counters.get("deferred", 0) + 1
                         break
                     new.append(queue.pop(0))
@@ -923,11 +1128,6 @@ class HybridBatchEngine(BatchEngine):
                         print(f"[mem] before admission: active {mx.get_active_memory() / 1e9:.2f} GB, peak since last "
                               f"{mx.get_peak_memory() / 1e9:.2f} GB, rows {len(rows)}", flush=True)
                         mx.reset_peak_memory()
-                    old = self._table_add([r.controller for r in rows + new])
-                    if old is not None and g is not None:  # the table was rebuilt: the running rows' states move
-                        offs = self._tab[3]
-                        g = g + mx.array([offs[id(r.controller.c)] - old[id(r.controller.c)]
-                                          if isinstance(r.controller, LocalsController) else 0 for r in rows], dtype=g.dtype)
                     starts = []
                     found = []
                     for r in new:  # every cached prefix first: making room for one must not drop the next one's
@@ -937,46 +1137,53 @@ class HybridBatchEngine(BatchEngine):
                         r.cached_tokens = len(r.prompt) - 1 - len(rest) if c0 is not None else 0
                         found.append((c0, rest))
                     # each request's cached prefix is a lazy copy, made during the prefill: the whole prompt counts
-                    self._make_room(lru, sum(len(r.prompt) + len(rest) * len(getattr(r, "checkpoints", None) or [])
+                    self._make_room(lru, sum(len(r.prompt) + len(rest) * _copies(r)
+                                             + _replies(r) * self._reply_bytes // max(1, self._kv_bytes_per_token())
                                              for r, (_, rest) in zip(new, found)), 0,
-                                    self._merge_tokens(rows, [len(r.prompt) for r in new]))
+                                    self._merge_tokens(rows, [len(e["r"].prompt) for e in filling] + [len(r.prompt) for r in new]))
+                    if self._mix_ok and rows and sum(len(rest) for _, rest in found) > self.mix_chunk:
+                        # the running rows decode on while these prompts are prefilled, a chunk in each step. Prompts
+                        # that fit one pass are prefilled together at once instead: the rows would get a single token
+                        # meanwhile, and one batch prefills several prompts faster than passes one after another.
+                        for r, (c0, rest) in zip(new, found):
+                            end = len(r.prompt) - 1
+                            cps = {}  # one snapshot per position, the first kind in sorted order (as below)
+                            for cp, kind in sorted(getattr(r, "checkpoints", None) or []):
+                                if kind == "reply" and lru is not None and c0 is not None and cp == end - len(rest):
+                                    self._keep_reply(r, cp, c0)  # the cached prefix ends there (a regenerated reply)
+                                elif lru is not None and end - len(rest) < cp < end:
+                                    cps.setdefault(cp, kind)
+                            filling.append({"r": r, "cache": c0 if c0 is not None else make_prompt_cache(self.model),
+                                            "pos": end - len(rest), "end": end, "reserved": 0, "cps": sorted(cps.items())})
+                        new, found = [], []
                     for r, (c0, rest) in zip(new, found):
                         done = r.cached_tokens
                         for cp, kind in sorted(getattr(r, "checkpoints", None) or []):
+                            if kind == "reply" and lru is not None and c0 is not None and cp == done:
+                                self._keep_reply(r, cp, c0)  # the cached prefix ends there (a regenerated reply)
+                                continue
                             if lru is None or not done < cp < len(r.prompt) - 1:
                                 continue
                             # prefill to the checkpoint, keep a copy, go on from there
                             c0 = c0 if c0 is not None else make_prompt_cache(self.model)
                             self._run(c0, list(r.prompt[done:cp]))
-                            lru.insert_cache(lru_key, list(r.prompt[:cp]), copy.deepcopy(c0), cache_type=kind)
+                            if kind == "reply":
+                                self._keep_reply(r, cp, c0)
+                            elif self._room_for_copy(lru, len(r.prompt)):
+                                lru.insert_cache(lru_key, list(r.prompt[:cp]), copy.deepcopy(c0), cache_type=kind)
                             if kind == "system" and self.disk is not None:
                                 self.disk.save(list(r.prompt[:cp]), c0)
                             if os.environ.get("LOCALS_PREFILL_LOG"):
                                 print(f"[checkpoint] {kind} at {cp} (disk {'on' if self.disk is not None else 'off'})", flush=True)
                             done, rest = cp, list(r.prompt[cp:-1])
                         starts.append((c0, rest) if c0 is not None else None)
-                    merged = self._prefill_batch([r.prompt[:-1] for r in new], [q.prompt[:-1] for q in queue], starts=starts)
-                    if cache is None:
-                        cache = merged
-                    else:
-                        _append_rows(cache, merged)
-                    mx.eval([c.state for c in cache])
-                    del merged, starts, found, c0  # the per-request prefill caches: merged copies now live in the batch
-                    prefill_s += time.perf_counter() - tp
-                    self.counters["prefill_s"] += time.perf_counter() - tp
-                    self.counters["admissions"] += 1
-                    if _MEMLOG:
-                        print(f"[mem] admitted {[len(r.prompt) for r in new]} (cached {[r.cached_tokens for r in new]}): active "
-                              f"{mx.get_active_memory() / 1e9:.2f} GB, peak {mx.get_peak_memory() / 1e9:.2f} GB, "
-                              f"prompt cache {lru.nbytes / 1e9 if lru is not None else 0:.2f} GB", flush=True)
-                        mx.reset_peak_memory()
-                    self.counters["prefill_tokens"] += sum(len(r.prompt) - 1 - getattr(r, "cached_tokens", 0) for r in new)
-                    gn = mx.array([self._gstate(r) for r in new], dtype=mx.int32)
-                    g = gn if g is None else mx.concatenate([g, gn])
-                    rows = rows + new
-                    xs = xs + [r.prompt[-1] for r in new]
-                    for r in new:
-                        r.fed.append(r.prompt[-1])
+                    if new:
+                        merged = self._prefill_batch([r.prompt[:-1] for r in new], [q.prompt[:-1] for q in queue], starts=starts)
+                        attach(new, merged, tp, count=True)
+                        del merged
+                    # the per-request prefill caches: merged copies now live in the batch (a name left bound here
+                    # would hold its request's whole KV next to the batch's copy for as long as it decodes)
+                    starts = found = c0 = rest = None
                 if not rows:
                     cur = None
                     continue
@@ -986,8 +1193,8 @@ class HybridBatchEngine(BatchEngine):
                 # A row's next committed sample follows exactly the tokens it has
                 # fed after its prompt, so out has len(fed) - 1 tokens then.
                 left = [r.max_tokens - (len(r.fed) - 1) for r in rows]
-                cur = self._launch1(cache, mx.array(xs, dtype=mx.int32), None if free else g, temp, (rows, left))
-                mx.async_eval(cur, g)
+                cur = self._launch(cache, mx.array(xs, dtype=mx.int32), None if free else g, temp, (rows, left), filling, lru, lru_key)
+                mx.async_eval(cur, g, self._fill_eval)
                 steps += 1
                 nrows += len(rows)
                 self.counters["steps"] += 1
@@ -1004,8 +1211,8 @@ class HybridBatchEngine(BatchEngine):
                 x = cur.astype(mx.int32)
             g2 = g if free else self._advance(rows, x, g)
             left = [r.max_tokens - len(r.fed) for r in rows]  # this step's feed is appended below
-            nxt = self._launch1(cache, x, None if free else g2, temp, (rows, left))
-            mx.async_eval(nxt, g2)
+            nxt = self._launch(cache, x, None if free else g2, temp, (rows, left), filling, lru, lru_key)
+            mx.async_eval(nxt, g2, self._fill_eval)
             steps += 1
             nrows += len(rows)
             self.counters["steps"] += 1

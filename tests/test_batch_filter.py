@@ -33,3 +33,17 @@ def test_append_rows_matches_mlx_lm():
     b.extend(new)
     assert mx.array_equal(a.keys, b.keys) and mx.array_equal(a.values, b.values)
     assert a.left_padding.tolist() == b.left_padding.tolist() and a.offset.tolist() == b.offset.tolist()
+
+
+def test_prefill_chunks_bound_the_tokens_of_a_forward():
+    """Sixteen 1k-token prompts arriving together were prefilled in 16 x 1024-token chunks; the activations
+    of one such forward ran a 16 GB Mac's GPU out of memory. Rows share PREFILL_TOKENS per forward."""
+    from locals.hybrid_batch import PREFILL_SCORES, PREFILL_TOKENS, prefill_chunk
+
+    assert prefill_chunk(0, 1, 2048) == 2048  # one prompt: as before
+    for rows in (1, 2, 4, 8, 16, 32, 64):
+        for done in (0, 1000, 30000):
+            c = prefill_chunk(done, rows, 1024)
+            assert rows * c <= max(PREFILL_TOKENS, rows * 16)
+            assert c <= 128 or rows * c * (done + c) <= PREFILL_SCORES
+    assert prefill_chunk(0, 16, 1024) == 128

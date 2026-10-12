@@ -326,3 +326,145 @@ def test_steered_gemma_reply_cannot_open_a_thought_block(monkeypatch):
     assert [c["name"] for c in calls] == ["read"]
     rx = compile_dfa(fmt.free_text(), 100_000)
     assert rx.matches(b"plain words") and not rx.matches(b"thinking\n<channel|>\nmore")
+
+
+def test_ignore_eos_and_usage_chunk_on_text_completions():
+    """Benchmarks (InferenceX, vLLM's, aiperf) send ignore_eos for fixed output lengths and read the
+    token count from a last chunk with no choices (stream_options.include_usage, as OpenAI streams it)."""
+    import json
+    import time
+    from types import SimpleNamespace
+
+    from locals.server import Server, _include_usage
+
+    assert _include_usage({"stream_options": {"include_usage": True}})
+    assert not _include_usage({"stream_options": "yes"}) and not _include_usage({})
+
+    class Tok:
+        def decode(self, toks):
+            return "".join(chr(97 + t % 26) for t in toks)
+
+    class Svc:
+        tokenizer = Tok()
+
+        def submit(self, prompt, max_tokens=16, on_token=None, temp=None, ignore_eos=False, **kw):
+            self.asked = {"max_tokens": max_tokens, "ignore_eos": ignore_eos}
+            toks = list(range(max_tokens))
+            on_token(toks)
+            t = time.perf_counter()
+            return SimpleNamespace(done=True, finish="length", tokens=toks, text=Tok().decode(toks), cached=0,
+                                   t_submit=t, t_done=t, cancel=lambda: None)
+
+    srv = Server.__new__(Server)
+    srv._active, srv.log = {}, (lambda s: None)
+    srv.per_engine = {"locals": {k: 0 for k in ("requests", "prompt_tokens", "cached_tokens", "completion_tokens",
+                                                 "forced_tokens", "passes", "decode_s", "tool_calls")}}
+    for include in (True, False):
+        svc = Svc()
+        p = {"engine": "locals", "svc": svc, "prompt": [1, 2, 3], "max_tokens": 5, "model": "locals/m", "stop": [],
+             "temp": 0.0, "ignore_eos": True, "include_usage": include, "regex": None, "schema": None}
+        out = []
+        srv.text_completion({}, p, write=out.append)
+        events = [e[6:] for e in b"".join(out).decode().split("\n\n") if e.startswith("data: ")]
+        assert svc.asked == {"max_tokens": 5, "ignore_eos": True}
+        assert events[-1] == "[DONE]"
+        chunks = [json.loads(e) for e in events[:-1]]
+        assert "".join(c["choices"][0]["text"] for c in chunks if c["choices"]) == "abcde"
+        last = chunks[-1]
+        if include:
+            assert last["choices"] == [] and last["usage"]["completion_tokens"] == 5
+        else:
+            assert last["choices"] and all(c["choices"] for c in chunks)
+
+
+def test_keepalive_is_a_blank_line(monkeypatch):
+    """A stream quiet for 15 s (a long prefill) writes a keepalive that strict clients skip: InferenceX's and
+    vLLM's benchmark clients json-parse every non-empty line, and failed on the ": keepalive" comment."""
+    import json
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    from locals import server as srv_mod
+    from locals.server import Server
+
+    clock = [0.0]
+    real = time.perf_counter
+
+    def fake_clock():
+        clock[0] += 4.0  # every reading 4 s later: the stream looks quiet for 15 s within a few polls
+        return real() + clock[0]
+
+    class Svc:
+        tokenizer = SimpleNamespace(decode=lambda toks: "".join(chr(97 + t % 26) for t in toks))
+
+        def submit(self, prompt, max_tokens=16, on_token=None, temp=None, ignore_eos=False, **kw):
+            job = SimpleNamespace(done=False, finish="length", tokens=[0, 1], text="ab", cached=0, t_submit=0.0, t_done=0.0,
+                                  cancel=lambda: None)
+
+            def later():
+                time.sleep(1.2)  # a few 0.25 s polls without tokens
+                on_token([0, 1])
+                job.done = True
+
+            threading.Thread(target=later, daemon=True).start()
+            return job
+
+    monkeypatch.setattr(srv_mod.time, "perf_counter", fake_clock)
+    srv = Server.__new__(Server)
+    srv._active, srv.log = {}, (lambda s: None)
+    srv.per_engine = {"locals": {k: 0 for k in ("requests", "prompt_tokens", "cached_tokens", "completion_tokens",
+                                                 "forced_tokens", "passes", "decode_s", "tool_calls")}}
+    p = {"engine": "locals", "svc": Svc(), "prompt": [1], "max_tokens": 2, "model": "locals/m", "stop": [], "temp": 0.0,
+         "ignore_eos": False, "include_usage": True, "regex": None, "schema": None}
+    out = []
+    srv.text_completion({}, p, write=out.append)
+    assert srv_mod.KEEPALIVE in out[: out.index(next(o for o in out if o.startswith(b"data: ")))]
+    text = ""
+    for line in b"".join(out).split(b"\n"):  # as InferenceX's client reads the stream
+        line = line.strip()
+        if not line:
+            continue
+        chunk = line.decode().removeprefix("data: ")
+        if chunk != "[DONE]":
+            d = json.loads(chunk)
+            text += "".join(c["text"] for c in d["choices"])
+    assert text == "ab"
+
+
+def test_context_limit_is_what_fits_in_memory(monkeypatch):
+    """With no --max-context, requests may be as long as the KV cache that fits next to the model (at
+    least 64k, at most the model's own context); an explicit --max-context is kept."""
+    from types import SimpleNamespace
+
+    from locals import server as srv_mod
+    from locals.server import Server
+    from locals.service import BatchService
+
+    svc = BatchService.__new__(BatchService)
+    svc._eng = SimpleNamespace(memory_limit=int(8.17 * 2**30), _kv_bytes_per_token=lambda: 32768)
+    svc.weights_bytes = int(2.21 * 2**30)
+    fit = svc.context_fit()
+    assert fit % 1024 == 0 and 140_000 < fit < 150_000  # Qwen3.5-4B on a 16 GB Mac
+
+    def server(max_context, native, fit_tokens):
+        s = Server.__new__(Server)
+        s.log, s.model_id, s.engines = (lambda m: None), "m", ("locals",)
+        s._auto_context = max_context is None
+        s.max_context = max_context or 65536
+        s._svc = {"locals": SimpleNamespace(context_fit=lambda: fit_tokens)}
+        monkeypatch.setattr(srv_mod, "native_context", lambda model: native)
+        s._cap_context()
+        return s.max_context
+
+    assert server(None, 262144, fit) == fit
+    assert server(None, 32768, fit) == 32768  # the model's own limit
+    monkeypatch.setattr(srv_mod, "native_context", lambda model: 262144)
+    s = Server.__new__(Server)  # the stock engine (no memory guard) keeps the old limit
+    s.log, s.model_id, s.engines = (lambda m: None), "m", ("locals", "mlx")
+    s._auto_context, s.max_context, s._stock_context = True, 65536, 65536
+    s._svc = {"locals": SimpleNamespace(context_fit=lambda: fit)}
+    s._cap_context()
+    assert s.context_for("locals") == fit and s.context_for("mlx") == 65536
+    assert server(None, 262144, 20480) == 65536  # a small Mac: never below what it was
+    assert server(40000, 262144, fit) == 40000  # asked for

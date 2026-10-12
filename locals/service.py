@@ -44,6 +44,7 @@ class Job:
     cancelled: bool = False
     checkpoints: List[Tuple[int, str]] = field(default_factory=list)  # (prompt position, LRU cache type) also stored
     temp: Optional[float] = None  # the request's sampling temperature (None: the service's)
+    ignore_eos: bool = False  # run to max_tokens: end-of-sequence tokens do not end the reply (a benchmark option)
     _event: threading.Event = field(default_factory=threading.Event)
     _req: object = None
 
@@ -146,18 +147,19 @@ class BatchService:
     # -- client API -----------------------------------------------------------------
     def submit(self, prompt: List[int], schema: Optional[dict] = None, max_tokens: int = 512, regex: Optional[str] = None,
                on_token: Optional[Callable[[List[int]], None]] = None, checkpoints: Optional[List[Tuple[int, str]]] = None,
-               temp: Optional[float] = None) -> Job:
+               temp: Optional[float] = None, ignore_eos: bool = False) -> Job:
         """Queue a generation; the output matches ``schema`` (JSON Schema) or ``regex`` if given.
         ``on_token`` streams committed tokens (called from the worker thread). For
         each ``(n, kind)`` in ``checkpoints`` the cache of ``prompt[:n]`` is also kept
         in the prompt cache (our engine) as an entry of type ``kind`` ("system"
         entries are evicted last, then "user", then finished replies), for a next
         request that shares only that much. ``temp``: this request's sampling
-        temperature (0: greedy), else the service's."""
+        temperature (0: greedy), else the service's. ``ignore_eos``: generate ``max_tokens``
+        tokens whatever the model ends with (benchmarks' fixed output lengths, as vLLM's option)."""
         if not prompt:
             raise ValueError("empty prompt")
         job = Job(list(prompt), schema, max_tokens, regex, t_submit=time.perf_counter(), on_token=on_token,
-                  checkpoints=list(checkpoints or []), temp=temp)
+                  checkpoints=list(checkpoints or []), temp=temp, ignore_eos=ignore_eos)
         self._q.put(job)
         return job
 
@@ -172,6 +174,17 @@ class BatchService:
     def close(self) -> None:
         self._closed = True
         self._thread.join(timeout=30)
+
+    def context_fit(self) -> Optional[int]:
+        """Prompt + reply tokens one request can have on this Mac (our engine): the KV cache that fits under
+        the engine's memory limit next to the weights and a prefill's activations. None if unknown."""
+        eng = getattr(self, "_eng", None)
+        weights = getattr(self, "weights_bytes", None)
+        if eng is None or not weights or not getattr(eng, "memory_limit", None):
+            return None
+        kv = eng._kv_bytes_per_token()
+        free = eng.memory_limit - weights - (3 << 29)  # the admission estimate's 1.5 GB for a prefill's activations
+        return int(free // kv) // 1024 * 1024 if kv and free > 0 else None
 
     def stats(self) -> dict:
         out = {"engine": self.engine, "active": self.active, "tokens_out": self.tokens_out,
@@ -265,6 +278,7 @@ class BatchService:
         from .runtime import Runtime
 
         rt = Runtime.load(self.model_id, tune=os.environ.get("LOCALS_TUNE", "background"))
+        self.weights_bytes = mx.get_active_memory()
         self.tokenizer = rt.tokenizer
         eos = list(rt.vocab.eos_ids)
         from . import kernels
@@ -274,6 +288,9 @@ class BatchService:
 
         class Free(Controller):
             eos_ids = eos
+
+        class Endless(Controller):  # ignore_eos
+            eos_ids = ()
 
         eng = HybridBatchEngine(rt.model, rt.tokenizer, n_slots=self.slots)
         if os.environ.get("LOCALS_DISK_CACHE", "1") != "0":  # system prompts kept across restarts
@@ -300,9 +317,12 @@ class BatchService:
         # MLX keeps up to 1 GB of freed buffers (set_cache_limit); 1.5 GB more covers what the
         # admission estimate misses (5 concurrent agents peaked 1.1 GB above it on a 16 GB Mac)
         eng.memory_limit = limit - (5 << 29)
-        if self.cache_bytes is None:  # what is left after the weights and 5 GB for running rows and prefill
-            free = limit - mx.get_active_memory() - (5 << 30)
-            self.cache_bytes = int(min(max(free, 1.5 * (1 << 30)), 16 << 30))
+        if self.cache_bytes is None:  # what is left after the weights and 5 GB for running rows and prefill,
+            free = limit - mx.get_active_memory() - (5 << 30)  # and at least one conversation as long as fits
+            # (its follow-up question then continues from it: 1.5 s instead of 137 s at 60k tokens). The memory
+            # guard empties the prompt cache for running rows as they need it.
+            longest = (self.context_fit() or 0) * eng._kv_bytes_per_token()
+            self.cache_bytes = int(min(max(free, longest, 1.5 * (1 << 30)), 16 << 30))
         lru = chain_cache(max_size=256, max_bytes=self.cache_bytes)
         self._lru = lru
         owner = {}
@@ -336,7 +356,7 @@ class BatchService:
                                 raise ValueError("recursive JSON schemas ($ref cycles) are not supported by the batch engine")
                             ctl = LocalsController(c.constraint, c.planner, True, True)
                     else:
-                        ctl = Free()
+                        ctl = Endless() if job.ignore_eos else Free()
                 except Exception as e:  # noqa: BLE001
                     self._finish(job, [], f"invalid: {type(e).__name__}: {e}")
                     continue
@@ -357,14 +377,14 @@ class BatchService:
             self.cached_tokens += job.cached
             self._finish(job, r.out, r.finish)
 
-        orig_launch = eng._launch1
+        orig_launch = eng._launch
 
-        def launch(*a, **k):  # expose live counters to clients
+        def launch(*a, **k):  # expose live counters to clients (every step, mixed passes too)
             self.active = eng.active if hasattr(eng, "active") else 0
             self.tokens_out = getattr(eng, "tokens_out", 0)
             return orig_launch(*a, **k)
 
-        eng._launch1 = launch
+        eng._launch = launch
         while not self._closed:
             try:
                 eng.serve(source, temp=self.temp, lru=lru, on_done=done)
@@ -379,6 +399,7 @@ class BatchService:
                     self._inflight.pop(id(job), None)
                     job._event.set()
                 owner.clear()
+                eng._fill_eval = []  # a prompt that was being prefilled in mixed passes: its cache goes too
                 lru.trim_to(n_bytes=lru.nbytes // 2)
                 gc.collect()
                 mx.clear_cache()
@@ -455,8 +476,13 @@ class BatchService:
                 except Exception as e:  # noqa: BLE001  # a regex or schema that does not compile: this request's error
                     self._finish(job, [], f"invalid: {type(e).__name__}: {e}")
                     continue
+                more = {}
+                if job.ignore_eos and not procs:  # no stop tokens for this row (a grammar's end still ends it)
+                    from mlx_lm.generate import StopSequences
+
+                    more["stop_sequences"] = [StopSequences()]
                 (uid,) = gen.insert([rest], [job.max_tokens], caches=[cache], all_tokens=[job.prompt[: job.cached]],
-                                    samplers=[s], logits_processors=[procs])
+                                    samplers=[s], logits_processors=[procs], **more)
                 live[uid] = (job, [])
             if not live:
                 continue

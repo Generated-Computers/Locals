@@ -46,6 +46,13 @@ the bigger the difference: mlx-lm gains almost nothing between four and eight
 requests, while Locals keeps adding speed. In practice, eight agents working at once finish in
 about the time two agents would need one after the other.
 
+We checked these numbers with the client from SemiAnalysis's InferenceX benchmark,
+where every request reads 1,000 tokens and writes 1,000. With eight requests at
+once Locals wrote 177 tokens per second and mlx-lm 69, 2.6 times as many; with
+four, 125 against 70. When a request with a long prompt arrives, the requests
+already answering keep streaming while Locals reads it, instead of stopping until
+it is done.
+
 The same holds on real work. Sixteen coding agents that call tools, running on
 the smaller Qwen3.5-2B, finished in 29 seconds instead of 75, and forty programming problems solved eight at a time
 took 8 minutes instead of 20. Each agent also starts its next step in under a
@@ -252,7 +259,7 @@ fields:
 | Base URL | `http://127.0.0.1:8321/v1` |
 | API key | any text, for example `local` |
 | Model | the model's name from the table below, for example `locals/qwen3.5-4b` |
-| Context window | `65536`, if the extension asks for it |
+| Context window | the number `locals launch editor` prints, if the extension asks for it |
 
 **Continue, Zed and JetBrains** have the same kind of setting, usually called an
 OpenAI-compatible provider, and take the same four values. Run
@@ -286,6 +293,16 @@ arrive at once. The third column is the name to enter in an editor or app.
 Each model also has a thinking mode, in which it reasons before it answers. To use
 it, add `-thinking` to the name in your editor, for example
 `locals/lfm2.5-2.6b-thinking`. LFM2.5 works best this way.
+
+How long a conversation can be depends on your Mac's memory. Locals lets a request
+be as long as fits next to the model: about 145,000 tokens for Qwen3.5-4B on a
+16 GB Mac, a few hundred pages of text. `locals launch editor` prints the number
+for your Mac, and `--max-context` sets another one. In our test the model found a
+sentence placed in the middle of a 139,000-token document. Reading a long prompt
+for the first time takes a while, about 600 tokens per second for short prompts
+and under 300 per second past 100,000 tokens, so those 139,000 tokens took eight
+minutes. A follow-up question about the same document started in 2.4 seconds,
+because Locals keeps what it has already read.
 
 The smaller models are good choices for a Mac with 8 GB of memory. You can also
 use other models published for Apple silicon on

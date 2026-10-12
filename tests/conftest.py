@@ -14,6 +14,7 @@ MODEL_TEST_FILES = {
     "test_engine_model.py",
     "test_lm.py",
     "test_lookup.py",
+    "test_mixed_prefill.py",
     "test_pda.py",
     "test_prefix_cache.py",
     "test_q35_kernels.py",

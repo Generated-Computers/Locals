@@ -1347,7 +1347,7 @@ def main(argv=None):
         p.add_argument("--max-tokens", dest="max_tokens", type=int, default=None, help="cap on completion tokens (default 4096)")
         p.add_argument("--cache-gb", dest="cache_gb", type=float, default=None, help="prompt cache of our engine (default: sized from free GPU memory)")
         p.add_argument("--max-context", dest="max_context", type=int, default=None,
-                       help="prompt + reply tokens per request (default 65536)")
+                       help="prompt + reply tokens per request (default: what fits in memory, at least 65536)")
         p.add_argument("--thinking", action="store_true", help="think before every reply")
         p.add_argument("--max-calls", dest="max_calls", type=int, default=None, help="tool calls kept per reply (default 6)")
         p.add_argument("--walk", action="store_true", help="constraints by the walk kernel: no token tables, any grammar size")

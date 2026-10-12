@@ -24,3 +24,22 @@ First public release.
   format.
 - **Safe defaults.** The server answers only apps on your Mac, and agents'
   commands can write only inside their own copy of the project.
+- **Long conversations.** A request can be as long as fits in your Mac's
+  memory next to the model, instead of a fixed 64k tokens: about 145,000 tokens
+  for Qwen3.5-4B on a 16 GB Mac (`--max-context` still sets it). The next turn
+  continues from where the previous reply began, so a follow-up question about
+  a 139,000-token document starts in 2.4 seconds; it used to read the whole
+  conversation again (eight minutes), and agents re-read their last tool result
+  on every turn. Four multi-turn conversations at once now take 83% of their
+  prompts from memory instead of 28%, and finish 36 turns in four minutes
+  instead of 23.
+- **No pause while a long prompt is read.** When a new request with a long
+  prompt arrives, the requests already answering keep streaming: their next
+  tokens are computed in the same passes over the model as the new prompt,
+  instead of waiting for all of it (12 seconds for 8,000 tokens on a 4B model).
+- **Works with benchmark tools.** `ignore_eos` and
+  `stream_options.include_usage` as vLLM and OpenAI handle them, so InferenceX,
+  vLLM's and aiperf's clients measure Locals as they measure other servers.
+- **Fixed:** sixteen long requests arriving at once no longer run the GPU out
+  of memory, and a stream that waits for a long prompt no longer sends a line
+  that strict clients failed to read.

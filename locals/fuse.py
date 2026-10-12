@@ -113,10 +113,14 @@ class FusedGatedDeltaNet(nn.Module):
     whole single-token step after it as one kernel."""
 
     def __call__(self, inputs, mask=None, cache=None):
+        return self.out_proj(self._mix(self.in_proj_all(inputs), mask, cache))
+
+    def _mix(self, proj, mask=None, cache=None):
+        """Everything between the input projection (``proj``: in_proj_all of the inputs) and the
+        output projection; locals/mixed.py runs the projections of two groups of rows together."""
         from mlx_lm.models.gated_delta import gated_delta_update
 
-        B, S, _ = inputs.shape
-        proj = self.in_proj_all(inputs)
+        B, S, _ = proj.shape
         if (
             USE_GDN_KERNEL
             and (S <= _GDN_MAX_S or (getattr(cache, "want_states", False) and S <= 16))
@@ -144,7 +148,7 @@ class FusedGatedDeltaNet(nn.Module):
                 cache.token_conv = (cache[0], proj[..., : self.conv_dim])
             cache[0], cache[1] = outs[1], outs[2]
             cache.advance(S)
-            return self.out_proj(y)
+            return y
         c, v = self.conv_dim, self.value_dim
         qkv = proj[..., :c]
         z = proj[..., c : c + v].reshape(B, S, self.num_v_heads, self.head_v_dim)
@@ -154,7 +158,7 @@ class FusedGatedDeltaNet(nn.Module):
         if cache is not None and cache[0] is not None:
             conv_state = cache[0]
         else:
-            conv_state = mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=inputs.dtype)
+            conv_state = mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=proj.dtype)
         if mask is not None:
             qkv = mx.where(mask[..., None], qkv, 0)
         conv_input = mx.concatenate([conv_state, qkv], axis=1)
@@ -187,18 +191,21 @@ class FusedGatedDeltaNet(nn.Module):
             cache[1] = state
             cache.advance(S)
         out = self.norm(out, z)
-        return self.out_proj(out.reshape(B, S, -1))
+        return out.reshape(B, S, -1)
 
 
 class FusedGatedAttention(nn.Module):
     """Qwen3-Next/3.5 gated attention with q/k/v as one matmul."""
 
     def __call__(self, x, mask=None, cache=None):
+        return self.o_proj(self._mix(self.qkv_proj(x), mask, cache))
+
+    def _mix(self, proj, mask=None, cache=None):
+        """Between the q/k/v projection (``proj``) and the output projection (see FusedGatedDeltaNet._mix)."""
         from mlx_lm.models.base import scaled_dot_product_attention as sdpa
 
-        B, L, D = x.shape
+        B, L, _ = proj.shape
         h, kv, hd = self.num_attention_heads, self.num_key_value_heads, self.head_dim
-        proj = self.qkv_proj(x)
         q_out = proj[..., : 2 * h * hd]
         keys = proj[..., 2 * h * hd : 2 * h * hd + kv * hd]
         values = proj[..., 2 * h * hd + kv * hd :]
@@ -216,7 +223,7 @@ class FusedGatedAttention(nn.Module):
             keys = self.rope(keys)
         output = sdpa(queries, keys, values, cache=cache, scale=self.scale, mask=mask)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output * mx.sigmoid(gate))
+        return output * mx.sigmoid(gate)
 
 
 USE_ADD_RMS = False  # fused residual add + RMS norm (norm_kernel.py): measured no faster than MLX's two kernels, off

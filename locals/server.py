@@ -138,12 +138,16 @@ class Server:
     def __init__(self, model: str = DEFAULT_MODEL, engines=("locals", "mlx"), preload=("locals",), slots: int = 16,
                  temp: float = 0.2, max_tokens: int = 4096, thinking: bool = False, cache_gb: Optional[float] = None, seed: int = 0,
                  max_calls: int = 6, walk: bool = False, typed_tools: bool = False, log=None, top_p: float = 0.0, top_k: int = 0,
-                 max_context: int = 65536):
+                 max_context: Optional[int] = None):
         self.model_id = model_id(model)  # a short name (qwen, gemma) or any model id
-        # Prompt + reply tokens per request. 64k is the most a 4B model's prefill fits
-        # next to the weights on a 16 GB Mac (peak 9.2 GB at 61k tokens); beyond it a
-        # Metal out-of-memory error would end the whole server, so longer prompts get an error.
-        self.max_context = max_context
+        # Prompt + reply tokens per request; longer prompts get a context_length_exceeded error (past
+        # what fits, a Metal out-of-memory error would end every request in flight). None: what fits
+        # this Mac's GPU memory next to the model (service.context_fit: 140k tokens for Qwen3.5-4B on
+        # 16 GB), at least 64k and at most the model's own context, set once our engine is loaded.
+        self._auto_context = max_context is None
+        self.max_context = max_context or 65536
+        # the stock engine (mlx/...) has no memory guard: never sized from our engine's memory model
+        self._stock_context = max_context or 65536
         self.short = short_name(self.model_id)
         self.engines = tuple(engines)
         self.slots, self.temp, self.max_tokens, self.thinking, self.cache_gb, self.seed = slots, temp, max_tokens, thinking, cache_gb, seed
@@ -195,7 +199,7 @@ class Server:
         for e in self.engines:
             if running and e not in self._svc:
                 continue
-            m = apis.ollama_model_entry(self.ollama_name(e), self.short, family, self.max_context)
+            m = apis.ollama_model_entry(self.ollama_name(e), self.short, family, self.context_for(e))
             if running:
                 m["expires_at"] = "2099-01-01T00:00:00Z"
                 m["size_vram"] = 0
@@ -210,11 +214,12 @@ class Server:
         loaded = list(self._svc.values())
         if loaded and formats.offers_thinking(loaded[0].tokenizer):
             caps.append("thinking")
-        entry = apis.ollama_model_entry(name or self.ollama_name(), self.short, family, self.max_context)
+        ctx = self.context_for(oai.engine_of(name) if name else "locals")
+        entry = apis.ollama_model_entry(name or self.ollama_name(), self.short, family, ctx)
         return {"license": "", "modelfile": f"# served by locals: {self.model_id}", "parameters": "", "template": "",
                 "details": entry["details"], "capabilities": caps,
                 "model_info": {"general.architecture": family, "general.basename": self.short,
-                               f"{family}.context_length": self.max_context}}
+                               f"{family}.context_length": ctx}}
 
     # -- engines ------------------------------------------------------------------------------
     def service(self, engine: str):
@@ -260,7 +265,7 @@ class Server:
         for e in self.engines:
             for suffix in ("", "-thinking") if thinks else ("",):
                 info = {"id": f"{e}/{self.short}{suffix}", "object": "model", "created": int(self.t_start), "owned_by": e,
-                        "context_length": self.max_context, "max_model_len": self.max_context}
+                        "context_length": self.context_for(e), "max_model_len": self.context_for(e)}
                 if e in self._fmt:  # known once the engine is loaded
                     info["tool_call_format"] = self._fmt[e][0].name
                     info["parallel_tool_calls"] = self._fmt[e][0].multi
@@ -332,14 +337,15 @@ class Server:
             # answers at once (a short request answered nothing, every token spent thinking; JSON started in it)
             text += fmt.think_close
         prompt = self._tokens_for(engine, tok, text)
-        if len(prompt) >= self.max_context:
-            raise ContextTooLong(f"This model's maximum context length is {self.max_context} tokens. However, your messages "
+        limit = self.context_for(engine)
+        if len(prompt) >= limit:
+            raise ContextTooLong(f"This model's maximum context length is {limit} tokens. However, your messages "
                                  f"resulted in {len(prompt)} tokens. Please reduce the length of the messages.")
         asked = req.get("max_completion_tokens") or req.get("max_tokens")
         max_tokens = int(asked) if asked is not None and int(asked) > 0 else self.max_tokens  # -1: "no limit"
-        room = self.max_context - len(prompt)
+        room = limit - len(prompt)
         if room < min(max_tokens, 256):  # a reply of a few tokens, cut: the client is told to make room instead
-            raise ContextTooLong(f"This model's maximum context length is {self.max_context} tokens. However, your messages "
+            raise ContextTooLong(f"This model's maximum context length is {limit} tokens. However, your messages "
                                  f"resulted in {len(prompt)} tokens, which leaves {room} for the reply. Please reduce the "
                                  f"length of the messages.")
         max_tokens = max(1, min(max_tokens, self.max_tokens, room))
@@ -355,13 +361,17 @@ class Server:
             if not isinstance(regex, str) or not regex:
                 raise ValueError("response_format regex needs a 'regex' string")
         elif engine == "locals" and schema is None and tools:
-            _check_tool_choice(req.get("tool_choice", "auto"), [t["function"]["name"] for t in tools])
-            regex = oai.reply_regex(tools, req.get("tool_choice", "auto"), thinking, typed=self.typed_tools, fmt=fmt, preamble=False,
-                                    parallel=req.get("parallel_tool_calls") is not False)
+            tc = req.get("tool_choice", "auto")
+            _check_tool_choice(tc, [t["function"]["name"] for t in tools])
+            # ignore_eos (a benchmark's fixed reply length): free text past the end of turn, unless a call is required
+            if not req.get("ignore_eos") or tc == "required" or isinstance(tc, dict):
+                regex = oai.reply_regex(tools, tc, thinking, typed=self.typed_tools, fmt=fmt, preamble=False,
+                                        parallel=req.get("parallel_tool_calls") is not False)
         cps = self._checkpoints(tok, msgs, tpl_tools, think_kw, text, prompt) if engine == "locals" and self._needs_checkpoints(engine) else []
         return {"engine": engine, "thinking": thinking, "svc": svc, "prompt": prompt, "checkpoints": cps, "text": text,
                 "tools": tools, "schema": schema, "regex": regex, "max_tokens": max_tokens, "model": model, "fmt": fmt,
-                "tool_choice": req.get("tool_choice", "auto"), "stop": _stops(req), "temp": _temperature(req)}
+                "tool_choice": req.get("tool_choice", "auto"), "stop": _stops(req), "temp": _temperature(req),
+                "ignore_eos": bool(req.get("ignore_eos")), "include_usage": _include_usage(req)}
 
     def prepare_text(self, req: dict) -> dict:
         """A /v1/completions request: a raw prompt (no chat template), as mlx-lm's server encodes it."""
@@ -396,15 +406,16 @@ class Server:
                 ids.insert(0, bos)  # the model saw every sequence start with it (Gemma 4, Ministral: encode leaves it out)
         if not ids:
             raise ValueError("empty prompt")
-        if len(ids) >= self.max_context:
-            raise ContextTooLong(f"This model's maximum context length is {self.max_context} tokens. However, your prompt "
+        limit = self.context_for(engine)
+        if len(ids) >= limit:
+            raise ContextTooLong(f"This model's maximum context length is {limit} tokens. However, your prompt "
                                  f"resulted in {len(ids)} tokens. Please reduce the length of the prompt.")
         asked = req.get("max_tokens")
         max_tokens = int(asked) if asked is not None and int(asked) > 0 else 256
-        max_tokens = max(1, min(max_tokens, self.max_tokens, self.max_context - len(ids)))
+        max_tokens = max(1, min(max_tokens, self.max_tokens, limit - len(ids)))
         return {"engine": engine, "thinking": False, "svc": svc, "prompt": ids, "checkpoints": [], "text": None, "tools": [],
                 "schema": None, "regex": None, "max_tokens": max_tokens, "model": model, "fmt": None, "stop": _stops(req),
-                "temp": _temperature(req)}
+                "temp": _temperature(req), "ignore_eos": bool(req.get("ignore_eos")), "include_usage": _include_usage(req)}
 
     def text_completion(self, req: dict, p: dict, write=None) -> Optional[dict]:
         """One /v1/completions request, streamed when ``write`` is given."""
@@ -426,7 +437,8 @@ class Server:
         key = uuid.uuid4().hex[:8]
         self._active[key] = {"engine": p["engine"], "prompt_tokens": len(p["prompt"]), "tokens": 0, "started": time.time()}
         q: "queue.Queue[List[int]]" = queue.Queue()
-        job = p["svc"].submit(p["prompt"], max_tokens=p["max_tokens"], on_token=q.put, temp=p.get("temp"))
+        job = p["svc"].submit(p["prompt"], max_tokens=p["max_tokens"], on_token=q.put, temp=p.get("temp"),
+                              ignore_eos=p.get("ignore_eos", False))
         toks: List[int] = []
         sent, stopped, last_emit = 0, None, time.perf_counter()
         last_probe = last_emit
@@ -454,7 +466,7 @@ class Server:
                         chunk(text[sent:upto])
                         sent, last_emit = upto, time.perf_counter()
                 elif write is not None and time.perf_counter() - last_emit > 15:
-                    write(b": keepalive\n\n")
+                    write(KEEPALIVE)
                     last_emit = time.perf_counter()
                 if write is None and p.get("alive") is not None and time.perf_counter() - last_probe > 1:
                     last_probe = time.perf_counter()  # while tokens come too: a client that left frees its row
@@ -477,7 +489,9 @@ class Server:
             usage.pop("locals", None)
             finish = "length" if job.finish in ("length", "exhausted") and not stopped else "stop"
             if write is not None:
-                chunk("", finish, usage)
+                chunk("", finish, None if p.get("include_usage") else usage)  # (asked for: only in a chunk of its own)
+                if p.get("include_usage"):
+                    write(_usage_chunk({"id": cid, "object": "text_completion", "created": _now(), "model": p["model"]}, usage))
                 write(b"data: [DONE]\n\n")
                 return None
             return {"id": cid, "object": "text_completion", "created": _now(), "model": p["model"],
@@ -489,14 +503,37 @@ class Server:
             self._active.pop(key, None)
 
     def _cap_context(self) -> None:
-        """Lower max_context to the model's own context length (its config), once."""
+        """Set max_context once: what fits in memory (unless --max-context was given; once our engine is
+        loaded), then at most the model's own context length (its config)."""
         if getattr(self, "_context_capped", False):
             return
+        if not hasattr(self, "_native_ctx"):
+            self._native_ctx = native_context(self.model_id)  # once (it may ask Hugging Face)
+        n = self._native_ctx
+        if n:  # the model's own limit applies at once, whatever the rest waits for
+            self._stock_context = min(getattr(self, "_stock_context", self.max_context), n)
+        auto = getattr(self, "_auto_context", False) and "locals" in self.engines
+        if auto:
+            svc = self._svc.get("locals")
+            if svc is None:
+                if n and n < self.max_context:
+                    self.max_context = n
+                return  # the fit: again when our engine is loaded
+            fit = svc.context_fit() if hasattr(svc, "context_fit") else None
+            if fit and fit > self.max_context:
+                self.max_context = fit
         self._context_capped = True
-        n = native_context(self.model_id)
         if n and n < self.max_context:
-            self.log(f"{self.model_id} has a {n}-token context: requests are limited to that (was {self.max_context})")
+            if not auto:
+                self.log(f"{self.model_id} has a {n}-token context: requests are limited to that (was {self.max_context})")
             self.max_context = n
+        if auto:
+            self.log(f"requests up to {self.max_context} tokens (what fits in GPU memory next to the model, "
+                     f"up to its own context; --max-context sets it)")
+
+    def context_for(self, engine: str) -> int:
+        """Prompt + reply tokens a request may have on ``engine``."""
+        return self.max_context if engine == "locals" else min(self.max_context, getattr(self, "_stock_context", self.max_context))
 
     def format_of(self, engine: str):
         """The tool-call format and thinking style of the model's chat template."""
@@ -537,11 +574,11 @@ class Server:
         model's own template; a position is used only where that text is a
         prefix of the prompt and tokenizes to the prompt's own first tokens."""
         out = []
-        if len(msgs) < 2:
+        if not msgs:
             return out
         hf = tok._tokenizer
         cands = []
-        if msgs[0]["role"] == "system":
+        if len(msgs) >= 2 and msgs[0]["role"] == "system":
             # A template may refuse a conversation without a user message (Qwen3.5 does), so the end
             # of the system part is where two renderings with different user messages part: the
             # system message, tools included, and the user turn's header, the same in every session.
@@ -552,11 +589,26 @@ class Server:
                 cands.append((a[:n], "system"))
             except Exception:  # noqa: BLE001
                 pass
-        if len(msgs) > 2 or msgs[0]["role"] != "system":
+        if len(msgs) > 2 or (len(msgs) == 2 and msgs[0]["role"] != "system"):
             try:
                 cands.append((_render(tok, msgs[:-1], tools, add_generation_prompt=False, **think_kw), "user"))
             except Exception:  # noqa: BLE001
                 pass
+        # * where this reply starts as the next request renders it ("reply", the recurrent state only: the
+        #   engine keeps the reply's KV prefix from the finished row). The prompt itself is no prefix of the
+        #   next request: templates write an earlier reply differently from the open turn (Qwen3.5 drops the
+        #   empty think block), so the conversation was read again from the last checkpoint on every turn
+        #   (a follow-up question on a 60k-token document: 137 s).
+        try:
+            if os.environ.get("LOCALS_REPLY_CHECKPOINT", "1") == "0":
+                raise LookupError("off")
+            follow = [{"role": "user", "content": "\x03"}]
+            a = _render(tok, msgs + [{"role": "assistant", "content": "\x01A"}] + follow, tools, add_generation_prompt=False, **think_kw)
+            b = _render(tok, msgs + [{"role": "assistant", "content": "\x02B"}] + follow, tools, add_generation_prompt=False, **think_kw)
+            n = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+            cands.append((a[:n], "reply"))
+        except Exception:  # noqa: BLE001
+            pass
         for t, kind in cands:
             if len(t) < 2048 or not text.startswith(t):  # a short prefix is cheaper to prefill again
                 continue
@@ -601,7 +653,7 @@ class Server:
 
     def _submit(self, p: dict, on_token=None):
         return p["svc"].submit(p["prompt"], schema=p["schema"], max_tokens=p["max_tokens"], regex=p["regex"], on_token=on_token,
-                               temp=p.get("temp"),
+                               temp=p.get("temp"), ignore_eos=p.get("ignore_eos", False),
                                checkpoints=p.get("checkpoints"))
 
     def _account(self, p: dict, job, out_tokens: int, calls: int, t0: float, stopped: Optional[str] = None) -> dict:
@@ -665,9 +717,14 @@ class Server:
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         head = {"id": cid, "object": "chat.completion.chunk", "created": _now(), "model": p["model"]}
 
+        role = [True]
+
         def chunk(delta: dict, finish=None, usage=None):
             if write is None:
                 return
+            if role[0]:  # with the first delta, after the prefill (as vLLM and SGLang): sent before it, clients
+                role[0] = False  # that time the first chunk measured no time to first token at all
+                delta = {"role": "assistant", **delta}
             d = dict(head)
             d["choices"] = [{"index": 0, "delta": delta, "finish_reason": finish}]
             if usage is not None:
@@ -680,7 +737,6 @@ class Server:
         prefix = ""
         job = None
         try:
-            chunk({"role": "assistant", "content": ""})
             for attempt in range(2):
                 if prefix:  # inside the think block the prompt opened (Qwen3.5 thinking), it is reasoning
                     chunk({"reasoning_content": prefix} if _in_think(p) else {"content": prefix})
@@ -743,8 +799,10 @@ class Server:
                                        "function": {"name": c["function"]["name"], "arguments": c["function"]["arguments"]}}]})
             usage = self._account(p, job, len(job.tokens), len(calls), t0, stopped)
             finish = "tool_calls" if calls else ("length" if job.finish in ("length", "exhausted") else "stop")
-            chunk({}, finish=finish, usage=usage)
+            chunk({}, finish=finish, usage=None if p.get("include_usage") else usage)
             if write is not None:
+                if p.get("include_usage"):
+                    write(_usage_chunk(head, usage))
                 write(b"data: [DONE]\n\n")
                 return None
             msg = {"role": "assistant", "content": content}
@@ -772,7 +830,7 @@ class Server:
             prompt += list(tok._tokenizer.encode(prefix, add_special_tokens=False))
         q: "queue.Queue[List[int]]" = queue.Queue()
         job = p["svc"].submit(prompt, schema=p["schema"], max_tokens=p["max_tokens"], regex=p["regex"], on_token=q.put,
-                              temp=p.get("temp"),
+                              temp=p.get("temp"), ignore_eos=p.get("ignore_eos", False),
                               checkpoints=p.get("checkpoints"))
         job.prefix_tokens = len(prompt) - len(p["prompt"])
         toks: List[int] = []
@@ -794,8 +852,9 @@ class Server:
                 self._active[key]["tokens"] = len(toks)
                 text = tok.decode(toks)
                 if stopped is None:
-                    seen = oai.split_reasoning(text, p.get("fmt"), _in_think(p))[1] if p["tools"] else ""  # drafts in thoughts are not calls
-                    stopped = self._guard(toks, seen, p.get("fmt"), bool(p["tools"]))
+                    if not p.get("ignore_eos"):  # a benchmark's reply runs to its length, loops too
+                        seen = oai.split_reasoning(text, p.get("fmt"), _in_think(p))[1] if p["tools"] else ""  # drafts in thoughts are not calls
+                        stopped = self._guard(toks, seen, p.get("fmt"), bool(p["tools"]))
                     cut = _stop_cut(text, stops)
                     if cut is not None:
                         stopped, text = "stop", text[:cut]
@@ -811,9 +870,9 @@ class Server:
                         last_emit = time.perf_counter()
             now = time.perf_counter()
             if write is not None and now - last_emit > 15:
-                # a comment line keeps the connection open through a long prefill, and through a tool
-                # call (sent when it is complete, so nothing else is written meanwhile)
-                write(b": keepalive\n\n")
+                # keeps the connection open through a long prefill, and through a tool call (sent when
+                # it is complete, so nothing else is written meanwhile); a client that left fails the write
+                write(KEEPALIVE)
                 last_emit = now
             if (write is None or p.get("probe_stream")) and p.get("alive") is not None and now - last_probe > 1:
                 last_probe = now
@@ -1263,6 +1322,24 @@ def _unsupported(req: dict) -> None:
         raise ValueError("logprobs are not supported")
 
 
+# What a stream writes after 15 s without a token: an empty line, which SSE readers skip (an event ends
+# with one; a second one dispatches nothing). It was a ": keepalive" comment, which benchmark clients
+# that json-parse every non-empty line (InferenceX's, vLLM's benchmark_serving) failed on: every
+# request of 16 arriving together failed, as their prefill took over 15 s.
+KEEPALIVE = b"\n"
+
+
+def _include_usage(req: dict) -> bool:
+    """stream_options.include_usage: the usage also in a last chunk of its own, with no choices (OpenAI's
+    stream; clients such as vLLM's and InferenceX's benchmarks read it only there)."""
+    so = req.get("stream_options")
+    return isinstance(so, dict) and bool(so.get("include_usage"))
+
+
+def _usage_chunk(head: dict, usage: dict) -> bytes:
+    return ("data: " + json.dumps(dict(head, choices=[], usage=usage), ensure_ascii=False) + "\n\n").encode()
+
+
 def _stops(req: dict) -> List[str]:
     s = req.get("stop")
     if isinstance(s, str):
@@ -1417,8 +1494,9 @@ def main(argv=None):
     ap.add_argument("--max-tokens", type=int, default=4096, help="cap on completion tokens per request")
     ap.add_argument("--cache-gb", type=float, default=None, help="prompt cache of our engine (default: the GPU memory left "
                     "after the weights and 4 GB, about 4 GB for a 4B model on 16 GB; the stock engine keeps 1.5)")
-    ap.add_argument("--max-context", type=int, default=65536, help="prompt + reply tokens per request; longer prompts get "
-                    "a context_length_exceeded error (64k fits a 4B model on 16 GB)")
+    ap.add_argument("--max-context", type=int, default=None, help="prompt + reply tokens per request; longer prompts get "
+                    "a context_length_exceeded error (default: what fits in GPU memory next to the model, at least 65536, "
+                    "at most the model's own context)")
     ap.add_argument("--thinking", action="store_true", help="think before every reply (also: model ids ending in -thinking)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-calls", type=int, default=6, help="tool calls kept per reply; the reply is cut after that many")

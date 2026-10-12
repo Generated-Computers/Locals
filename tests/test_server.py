@@ -121,3 +121,55 @@ def test_tool_choice_none_and_context_limit(server):
             server.prepare({"model": f"locals/{SHORT}", "messages": [{"role": "user", "content": "word " * 200}]})
     finally:
         server.max_context = limit
+
+
+def test_ignore_eos_runs_to_max_tokens(server):
+    """ignore_eos (vLLM's option, which InferenceX and aiperf send): the reply runs to max_tokens on
+    both endpoints, past the model's end of turn and the loop guard."""
+    req = {"model": f"locals/{SHORT}", "max_tokens": 48, "messages": [{"role": "user", "content": "Reply with only the word hi."}]}
+    short = server.complete(dict(req))
+    assert short["usage"]["completion_tokens"] < 48 and short["choices"][0]["finish_reason"] == "stop"
+    full = server.complete(dict(req, ignore_eos=True))
+    assert full["usage"]["completion_tokens"] == 48 and full["choices"][0]["finish_reason"] == "length"
+    text = {"model": f"locals/{SHORT}", "prompt": "The capital of France is", "max_tokens": 40, "ignore_eos": True}
+    r = server.text_completion(text, server.prepare_text(text))
+    assert r["usage"]["completion_tokens"] == 40 and r["choices"][0]["finish_reason"] == "length"
+
+
+def test_ignore_eos_on_the_stock_engine():
+    from huggingface_hub import snapshot_download
+
+    try:
+        snapshot_download(MODEL, local_files_only=True)
+    except Exception:
+        pytest.skip("model not cached")
+    from locals.server import Server
+
+    srv = Server(MODEL, engines=("mlx",), preload=("mlx",), slots=2, temp=0.0, log=lambda s: None)
+    try:
+        req = {"model": f"mlx/{SHORT}", "max_tokens": 40, "messages": [{"role": "user", "content": "Reply with only the word hi."}]}
+        assert srv.complete(dict(req))["usage"]["completion_tokens"] < 40
+        assert srv.complete(dict(req, ignore_eos=True))["usage"]["completion_tokens"] == 40
+    finally:
+        for svc in srv._svc.values():
+            svc.close()
+
+
+def test_follow_up_turn_continues_from_the_reply_start(server):
+    """A conversation's next turn continues from where the previous reply started (a snapshot of the
+    recurrent state there, the KV of the finished row): the template writes an earlier reply without
+    the open turn's empty think block, so the previous prompt is no prefix of the next one, and every
+    follow-up question read the whole conversation again. The answer equals a fresh read's."""
+    doc = "\n".join(f"Shelf {i}: {i % 13} boxes of item {i * 7 % 101}, counted on day {i % 28}." for i in range(260))
+    turn1 = [{"role": "user", "content": doc + "\n\nHow many boxes are on shelf 40? Answer with the number only."}]
+    r1 = server.complete({"model": f"locals/{SHORT}", "max_tokens": 12, "messages": turn1})
+    a1 = r1["choices"][0]["message"]["content"]
+    turn2 = turn1 + [{"role": "assistant", "content": a1}, {"role": "user", "content": "And on shelf 41? The number only."}]
+    req2 = {"model": f"locals/{SHORT}", "max_tokens": 12, "messages": turn2}
+    r2 = server.complete(dict(req2))
+    p1 = r1["usage"]["prompt_tokens"]
+    assert r2["usage"]["prompt_tokens_details"]["cached_tokens"] >= p1 - 8, (r2["usage"], p1)
+    server.service("locals")._lru.trim_to(n_bytes=0)
+    fresh = server.complete(dict(req2))
+    assert fresh["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+    assert r2["choices"][0]["message"]["content"] == fresh["choices"][0]["message"]["content"]
