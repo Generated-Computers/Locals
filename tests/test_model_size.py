@@ -46,3 +46,13 @@ def test_a_gguf_model_is_named_as_such(tmp_path, monkeypatch):
     (tmp_path / "model.safetensors").write_bytes(b"")
     assert d.gguf_hint(str(tmp_path)) is None  # MLX weights there too
     assert d.gguf_hint("mlx-community/Qwen3.5-4B-MLX-4bit", remote=False) is None
+
+
+def test_the_name_a_model_has_in_the_api():
+    """locals/<name>: the repository or folder name without its 4-bit suffix, in any capitalization."""
+    assert d.short_name("mlx-community/Qwen3.5-4B-MLX-4bit") == "qwen3.5-4b"
+    assert d.short_name("mlx-community/MiniCPM5-2B-mlx-4Bit") == "minicpm5-2b"
+    assert d.short_name("LiquidAI/LFM2.5-2.6B-MLX-4bit") == "lfm2.5-2.6b"
+    assert d.short_name("mlx-community/gemma-4-e4b-it-4bit") == "gemma-4-e4b-it"
+    assert d.short_name("mlx-community/Qwen3-0.6B-8bit") == "qwen3-0.6b-8bit"  # other precisions keep theirs
+    assert d.short_name("/Users/me/models/FrogNano-4B/") == "frognano-4b"

@@ -157,16 +157,17 @@ def pair_budget(out: Adj, kappa: Sequence[Sequence[int]], s: int, t: int) -> Bud
     return root_budget(lifted, rho, flat, [s * n + t])
 
 
-def locals_sf(out: Adj, s: int, t: int, k: int) -> bool:
-    """Membership in LOCALSsf (Def. 2.3) via the lift, total on every input."""
+def st_connectivity_sf(out: Adj, s: int, t: int, k: int) -> bool:
+    """Membership in strongly-few s-t connectivity (Def. 2.3) via the lift, total on every input."""
     if k <= 0 or len(out) == 0:
         return False
     n = len(out)
     return pair_budget(out, [[k] * n for _ in range(n)], s, t).accept
 
 
-def locals_sf_capped(out: Adj, s: int, t: int, k: int) -> bool:
-    """DECIDE-LOCALS-sf (Listings 1 and 2, Thm 3.8): depth cap nk, node cap nk."""
+def st_connectivity_sf_capped(out: Adj, s: int, t: int, k: int) -> bool:
+    """The decision procedure for strongly-few s-t connectivity (Listings 1 and 2, Thm 3.8): depth cap nk,
+    node cap nk."""
     n = len(out)
     if k <= 0 or n == 0:
         return False

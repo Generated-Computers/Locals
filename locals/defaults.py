@@ -144,6 +144,14 @@ MODEL_HELP = ("model: qwen (Qwen3.5-4B, the default from 16 GB of memory), qwen3
               "mlx-lm model id or local path")
 
 
+def short_name(model: str) -> str:
+    """The name a model has in the API (``locals/<short name>``): its repository or folder name without the
+    4-bit suffix, in any capitalization ("MiniCPM5-2B-mlx-4Bit" -> "minicpm5-2b"), lower case."""
+    import re
+
+    return re.sub(r"(-mlx)?-4bit$", "", str(model).rstrip("/").split("/")[-1], flags=re.I).lower()
+
+
 def model_id(name: str) -> str:
     """The model id for a short name (qwen, gemma, qwen3.5-4b, gemma-4-e4b, ...); a local folder as its
     absolute path (the background server runs elsewhere, and later commands from other folders);

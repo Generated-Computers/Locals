@@ -17,8 +17,8 @@ from locals.core import (
     reaches_via_intervals,
     root_budget,
     serial_diamonds,
-    locals_sf,
-    locals_sf_capped,
+    st_connectivity_sf,
+    st_connectivity_sf_capped,
     through_counts,
     unfolding_occurrences,
     unrank_path,
@@ -72,7 +72,7 @@ def true_counts(out):
     return C
 
 
-def reference_locals_sf(out, s, t, k):
+def reference_st_connectivity_sf(out, s, t, k):
     C = true_counts(out)
     n = len(out)
     return all(C[u][v] <= k for u in range(n) for v in range(n)) and C[s][t] >= 1
@@ -96,15 +96,15 @@ def test_serial_diamonds_count():
 
 
 @pytest.mark.parametrize("seed", range(40))
-def test_locals_sf_matches_reference(seed):
+def test_st_connectivity_sf_matches_reference(seed):
     rng = random.Random(seed)
     n = rng.randint(1, 6)
     out = random_graph(n, rng.random() * 0.7, rng, acyclic=rng.random() < 0.7, multi=rng.random() < 0.3)
     for k in range(0, 5):
         s, t = rng.randrange(n), rng.randrange(n)
-        want = reference_locals_sf(out, s, t, k)
-        assert locals_sf(out, s, t, k) == want
-        assert locals_sf_capped(out, s, t, k) == want
+        want = reference_st_connectivity_sf(out, s, t, k)
+        assert st_connectivity_sf(out, s, t, k) == want
+        assert st_connectivity_sf_capped(out, s, t, k) == want
 
 
 @pytest.mark.parametrize("seed", range(30))

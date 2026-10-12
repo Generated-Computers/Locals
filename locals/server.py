@@ -40,7 +40,7 @@ from urllib.parse import urlparse
 from . import apis, formats, oai
 
 from . import __version__
-from .defaults import DEFAULT_MODEL, MODEL_HELP, build_id, model_id
+from .defaults import DEFAULT_MODEL, MODEL_HELP, build_id, model_id, short_name
 
 BUILD_ID = build_id()  # the code this server runs (locals code / solve restart a background server on older code)
 ENGINE_NAMES = {"locals": "locals", "mlx": "stock"}  # api name -> BatchService engine
@@ -144,7 +144,7 @@ class Server:
         # next to the weights on a 16 GB Mac (peak 9.2 GB at 61k tokens); beyond it a
         # Metal out-of-memory error would end the whole server, so longer prompts get an error.
         self.max_context = max_context
-        self.short = self.model_id.split("/")[-1].replace("-MLX-4bit", "").replace("-4bit", "").lower()
+        self.short = short_name(self.model_id)
         self.engines = tuple(engines)
         self.slots, self.temp, self.max_tokens, self.thinking, self.cache_gb, self.seed = slots, temp, max_tokens, thinking, cache_gb, seed
         self.max_calls = max_calls

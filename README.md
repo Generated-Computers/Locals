@@ -91,46 +91,88 @@ On tasks that span several files, a team of agents solved all eight attempts in
 about three minutes each. A single agent working alone solved four of eight and
 needed about five minutes for each.
 
-## Use it with your tools
+## Use it in the Terminal
 
-For each tool, a single command starts Locals and connects the tool to it.
+For each of these tools, one command starts Locals and connects the tool to it.
 
 | If you use | Run |
 |---|---|
 | OpenCode | `locals code ~/my-project` |
 | OpenHands | `locals launch openhands` |
-| Cline or Kilo Code in the terminal | `locals launch cline` or `locals launch kilo` |
+| Cline or Kilo Code | `locals launch cline` or `locals launch kilo` |
 | OpenClaw or Hermes Agent | `locals launch openclaw` or `locals launch hermes` |
 | Aider | `locals launch aider` |
-| An editor: VS Code, Zed or JetBrains | `locals launch editor` |
-| An app that works with Ollama | `locals launch ollama` |
 
-For an editor, `locals launch editor` shows the address and model name to enter
-in its AI settings. To see every supported tool, run `locals launch list`.
-Locals keeps running in the background after you close a tool: `locals status`
-shows what it is doing and `locals stop` stops it.
+To see every supported tool, run `locals launch list`. Locals keeps running in
+the background after you close a tool: `locals status` shows what it is doing
+and `locals stop` stops it.
+
+## Use it in the OpenCode app, VS Code and other editors
+
+Locals works just as well in apps with windows and buttons. First start it with
+the model you want. It keeps running in the background, so you only do this once:
+
+```bash
+locals start --model qwen
+```
+
+**The OpenCode app.** Run `locals setup --model qwen` once. It adds Locals to
+OpenCode's settings, which the OpenCode desktop app, its editor extension and its
+Terminal version all share. Then open OpenCode and choose Locals in the model
+list. If you later switch to another model, run `locals setup` again with that
+model's name.
+
+**Kilo Code, Cline and Roo Code in VS Code.** Open the extension's settings and
+choose the API provider called "OpenAI Compatible". Then fill in these four
+fields:
+
+| Setting | What to enter |
+|---|---|
+| Base URL | `http://127.0.0.1:8321/v1` |
+| API key | any text, for example `local` |
+| Model | the model's name from the table below, for example `locals/qwen3.5-4b` |
+| Context window | `65536`, if the extension asks for it |
+
+**Continue, Zed and JetBrains** have the same kind of setting, usually called an
+OpenAI-compatible provider, and take the same four values. Run
+`locals launch editor` to print them for the model that is running, together
+with ready-made settings for Continue and Zed.
+
+**Apps that work with Ollama**, such as Open WebUI or Raycast, need no settings:
+run `locals launch ollama`, and Locals answers at the address where these apps
+look for Ollama.
 
 ## Models
 
 Locals picks a model that fits your Mac's memory, so most people never need to
-change it. To try another one, add `--model` with its name, for example
-`locals code ~/my-project --model lfm`. Every model below runs about three times
-faster with Locals when eight requests arrive at once:
+change it. To use another one, start Locals with its name. Locals runs one model
+at a time, and starting it with another name switches to that model:
 
-| Model | Name to use | Download size | mlx-lm, 8 requests | Locals, 8 requests |
-|---|---|---|---|---|
-| Qwen3.5-4B (the default) | `qwen` | 2.8 GB | 87 tokens/s | 271 tokens/s |
-| LFM2.5-2.6B | `lfm` | 1.6 GB | 144 tokens/s | 404 tokens/s |
-| MiniCPM5-2B | `minicpm` | 1.4 GB | 160 tokens/s | 478 tokens/s |
-| Gemma 4 E4B | `gemma` | 4.8 GB | 80 tokens/s | 224 tokens/s |
+```bash
+locals start --model lfm
+```
+
+Every model below runs about three times faster with Locals when eight requests
+arrive at once. The third column is the name to enter in an editor or app.
+
+| Model | Start it with | Name in your editor | Download size | mlx-lm, 8 requests | Locals, 8 requests |
+|---|---|---|---|---|---|
+| Qwen3.5-4B (the default) | `--model qwen` | `locals/qwen3.5-4b` | 2.8 GB | 87 tokens/s | 271 tokens/s |
+| LFM2.5-2.6B | `--model lfm` | `locals/lfm2.5-2.6b` | 1.6 GB | 144 tokens/s | 404 tokens/s |
+| MiniCPM5-2B | `--model minicpm` | `locals/minicpm5-2b` | 1.4 GB | 160 tokens/s | 478 tokens/s |
+| Gemma 4 E4B | `--model gemma` | `locals/gemma-4-e4b-it` | 4.8 GB | 80 tokens/s | 224 tokens/s |
+
+Each model also has a thinking mode, in which it reasons before it answers. To use
+it, add `-thinking` to the name in your editor, for example
+`locals/lfm2.5-2.6b-thinking`. LFM2.5 works best this way.
 
 The smaller models are good choices for a Mac with 8 GB of memory. You can also
 use other models published for Apple silicon on
 [Hugging Face](https://huggingface.co/mlx-community), for example
-`--model mlx-community/Qwen3.5-2B-MLX-4bit`. If a model is too big for your Mac,
-Locals tells you before downloading it. Models in the GGUF format, which Ollama
-and LM Studio use, do not run here, but Locals will point you to a version of
-the same model that does.
+`--model mlx-community/Qwen3.5-2B-MLX-4bit`; its name in your editor is then
+`locals/qwen3.5-2b`. If a model is too big for your Mac, Locals tells you before
+downloading it. Models in the GGUF format, which Ollama and LM Studio use, do not
+run here, but Locals will point you to a version of the same model that does.
 
 ## Using it from your own code
 

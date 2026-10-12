@@ -20,7 +20,7 @@
 
 Models (--model): qwen (Qwen3.5-4B, the default), gemma (Gemma 4 E4B), or any mlx-lm
 chat model id or local path; the last one used is remembered.
-In OpenCode, /models switches between "LOCALS engine" and "MLX default";
+In OpenCode, /models switches between "Locals" and "MLX default";
 Tab switches between the primary agents.
 """
 
@@ -49,7 +49,7 @@ OPENCODE_VERSION = "1.18.32"  # the version this integration was built and teste
 DEFAULT_PORT = 8321
 
 PROVIDERS = {
-    "locals": ("LOCALS engine (ours)", "constrained + batched on our kernels"),
+    "locals": ("Locals", ""),
     "mlx": ("MLX default (mlx-lm)", "plain mlx-lm, for comparison"),
 }
 
@@ -217,7 +217,9 @@ def _is_locals_server(pid: int) -> bool:
 
 
 def model_short(model: str) -> str:
-    return model.split("/")[-1].replace("-MLX-4bit", "").replace("-4bit", "").lower()
+    from .defaults import short_name
+
+    return short_name(model)
 
 
 def oc_model(engine: str, short: str) -> str:
@@ -258,7 +260,8 @@ def opencode_config(model: str, port: int, default_engine: str = "locals", defau
     for pid, (name, note) in [(k, v) for k, v in PROVIDERS.items() if k == "locals" or k == default_engine]:
         models = {}
         for suffix, label in (("", ""), ("-thinking", " · thinking")) if thinking else (("", ""),):
-            models[f"{pid}/{short}{suffix}"] = {"name": f"{short}{label}  ({note})", "tool_call": True, "reasoning": suffix != "",
+            models[f"{pid}/{short}{suffix}"] = {"name": f"{short}{label}" + (f"  ({note})" if note else ""), "tool_call": True,
+                                                "reasoning": suffix != "",
                                       "temperature": True, "limit": {"context": context, "output": output}}
         prov[pid] = {"npm": "@ai-sdk/openai-compatible", "name": name, "options": {"baseURL": base_url(port) + "/v1", "apiKey": "local"},
                      "models": models}
@@ -880,7 +883,7 @@ def cmd_launch(args) -> None:
             ctx = int(get_json(base + "/v1/models", timeout=5)["data"][0]["context_length"])
         except Exception:  # noqa: BLE001
             ctx = 65536
-        print(f"""Point the editor's OpenAI-compatible (or Ollama) provider at locals:
+        print(f"""Point the editor's OpenAI-compatible (or Ollama) provider at Locals:
 
   base URL        {base}/v1          (Ollama-style settings: {base})
   model           locals/{short}
@@ -888,7 +891,7 @@ def cmd_launch(args) -> None:
   context window  {ctx} tokens  (Cline, Roo and Kilo ask for it: a larger one gets requests the server refuses)
 
   Continue  (~/.continue/config.yaml)   models: - provider: openai, model: locals/{short}, apiBase: {base}/v1
-  Cline / Roo                           API provider "OpenAI Compatible", base URL and model as above
+  Cline / Roo / Kilo Code               API provider "OpenAI Compatible", base URL and model as above
   Zed       (settings.json)             "language_models": {{"openai_compatible": {{"locals": {{"api_url": "{base}/v1",
                                           "available_models": [{{"name": "locals/{short}", "max_tokens": {ctx}}}]}}}}}}
   JetBrains AI Assistant                Third-party AI providers -> OpenAI-compatible, URL {base}/v1
