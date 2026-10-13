@@ -1,6 +1,7 @@
 """Interactive chat on the locals engine.
 
-    python -m locals.chat --model mlx-community/Qwen3.5-2B-MLX-4bit
+    locals chat                       # on the background server (started if it is not running)
+    locals chat --local --model mlx-community/Qwen3.5-2B-MLX-4bit   # the model in this process
 
 With a ChatML template (Qwen) the conversation is kept as one token stream
 whose KV (and recurrent state) stays in the cache, so every turn only prefills
@@ -87,7 +88,7 @@ def parallel_replies(rt, ids, n, max_tokens, temp, top_p):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="locals chat")
-    ap.add_argument("--model", default=DEFAULT_MODEL, type=model_id, help=MODEL_HELP)
+    ap.add_argument("--model", default=None, type=model_id, help=MODEL_HELP + " (default: the model used last)")
     ap.add_argument("--system", default=None)
     ap.add_argument("--temp", type=float, default=0.7)
     ap.add_argument("--top-p", type=float, default=0.9)
@@ -95,9 +96,17 @@ def main(argv=None):
     ap.add_argument("--think", action="store_true", help="let the model think before answering")
     ap.add_argument("--no-stats", action="store_true")
     ap.add_argument("--dtype", default="auto", choices=["auto", "bfloat16", "float16"],
-                    help="compute dtype; auto = float16 on M1/M2 GPUs (no native bf16)")
+                    help="compute dtype; auto = float16 on M1/M2 GPUs (no native bf16); implies --local")
+    ap.add_argument("--local", action="store_true",
+                    help="load the model in this process instead of using the background server (stop the server first)")
     args = ap.parse_args(argv)
+    args.local = args.local or args.dtype != "auto"
 
+    if not args.local:  # on the background server: one copy of the model in memory, kept between commands
+        from .client import chat
+
+        return chat(args)
+    args.model = args.model or DEFAULT_MODEL
     print(f"loading {args.model} ...", file=sys.stderr, flush=True)
     rt = Runtime.load(args.model, dtype=args.dtype)
     tok = rt.tokenizer

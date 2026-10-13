@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import threading
 import time
 import urllib.request
@@ -78,11 +79,44 @@ def _rel(path: str) -> Optional[str]:
     return p.rstrip("/")
 
 
-def _chat(base_url: str, body: dict, timeout: float = 900) -> dict:
-    req = urllib.request.Request(base_url + "/v1/chat/completions", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+def _chat(base_url: str, body: dict, timeout: float = 900, stop: Optional[threading.Event] = None) -> dict:
+    """One chat completion. With ``stop``, setting it closes the connection, and the server stops decoding
+    the reply (it cancels a request whose client left): a stopped agent used to finish its reply (a
+    3,000-token write_file is over a minute at batch speed), and the next stage waited for it."""
+    if stop is None:
+        req = urllib.request.Request(base_url + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    import http.client
+    import socket
+    import urllib.parse
+
+    u = urllib.parse.urlsplit(base_url)
+    conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
+    done = threading.Event()
+
+    def watch():
+        while not done.wait(0.25):
+            if stop.is_set():
+                try:
+                    if conn.sock is not None:
+                        conn.sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                return
+
+    threading.Thread(target=watch, daemon=True).start()
+    try:
+        conn.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json"})
+        r = conn.getresponse()
+        data = r.read()
+        if r.status >= 400:
+            raise RuntimeError(f"HTTP {r.status}: {data[:300].decode(errors='replace')}")
+        return json.loads(data)
+    finally:
+        done.set()
+        conn.close()
 
 
 class Agent:
@@ -109,9 +143,26 @@ class Agent:
         self.verified = False  # the check agreed that the part (or, for a whole-task agent, the task) is done
         self.won_files: Optional[Dict[str, str]] = None  # a whole-task agent's files as they passed the check
 
+    def _relpath(self, p: str) -> Optional[str]:
+        """_rel, and an absolute path inside the agent's own copy as relative: tracebacks print
+        /private/var/folders/.../w/inventory.py, small models pass that on, and "no such file" cost them steps."""
+        p = (p or "").strip()
+        if p.startswith("/"):
+            for root in {str(self.root), str(self.root.resolve())}:
+                for r in (root, "/private" + root if root.startswith("/var/") else root):
+                    if p == r or p.startswith(r.rstrip("/") + "/"):
+                        return _rel(p[len(r.rstrip("/")) + 1:])
+        return _rel(p)
+
+    def _clean(self, text: str) -> str:
+        """Output shown to the agent, with its copy's folder written as the project's (a relative path)."""
+        for root in sorted({str(self.root), str(self.root.resolve())}, key=len, reverse=True):
+            text = text.replace(root.rstrip("/") + "/", "")
+        return text
+
     def _path(self, p: str) -> Optional[Path]:
-        """The path inside the agent's copy, or None if it is not (absolute, "..", or through a link out)."""
-        rel = _rel(p)
+        """The path inside the agent's copy, or None if it is not (absolute elsewhere, "..", or through a link out)."""
+        rel = self._relpath(p)
         if rel is None:
             return None
         q = (self.root / rel).resolve()
@@ -134,7 +185,7 @@ class Agent:
             text = p.read_text(errors="replace")
             return text if len(text) <= 6000 else text[:6000] + f"\n... ({len(text) - 6000} more characters)"
         if name == "write_file":
-            rel = _rel(args.get("path") or "")
+            rel = self._relpath(args.get("path") or "")
             if not rel:
                 return "not written: give the file's path, relative to the project"
             if rel in self.readonly:
@@ -153,7 +204,7 @@ class Agent:
                 self.wrote.append(rel)
             return f"wrote {rel} ({len(content)} characters)"
         if name == "edit_file":
-            rel = _rel(args.get("path") or "")
+            rel = self._relpath(args.get("path") or "")
             if not rel:
                 return "not changed: give the file's path, relative to the project"
             if rel in self.readonly:
@@ -200,7 +251,16 @@ class Agent:
                         "parallel_tool_calls": False, "max_tokens": 3000}
                 if self.temperature is not None:
                     body["temperature"] = self.temperature
-                resp = _chat(self.base_url, body)
+                try:
+                    resp = _chat(self.base_url, body, stop=self.stop)
+                except Exception:  # noqa: BLE001
+                    if self.stop.is_set():  # its connection closed by the stop
+                        self.trace.append("stopped during a reply")
+                        break
+                    raise
+                if self.stop.is_set():  # stopped while the reply was written: its call is not carried out
+                    self.trace.append("stopped during a reply")
+                    break
                 self.tokens += (resp.get("usage") or {}).get("completion_tokens") or 0
                 msg = (resp.get("choices") or [{}])[0].get("message") or {}
                 calls = msg.get("tool_calls") or []
@@ -229,7 +289,7 @@ class Agent:
                         self.refused += 1
                         self.trace.append(f"finish refused: {why[-120:]!r}")
                         self.messages.append({"role": "tool", "tool_call_id": call.get("id"),
-                                              "content": f"Not finished: the check still fails in your part.\n{why}\nFix it, then finish."})
+                                              "content": self._clean(f"Not finished: the check still fails in your part.\n{why}\nFix it, then finish.")})
                         continue
                     self.summary = str(args.get("summary") or "")[:2000]  # a question's answer, too
                     self.messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": "done"})
@@ -246,6 +306,7 @@ class Agent:
                     word = self.after_write(self)
                     if word:
                         result += "\n" + word
+                result = self._clean(result)
                 if len(last) >= 3 and len(set(last[-3:])) == 1:  # the same call three times: a loop
                     result += "\n(the same call three times: change your approach, or finish)"
                 elif len(last) >= 4 and last[-1] == last[-3] and last[-2] == last[-4]:  # two calls in turn, again and again
@@ -510,6 +571,9 @@ class Run:
         self.agents: List[Agent] = []
         self.report: dict = {}
         self.solved = threading.Event()  # some agent's copy passes the whole check: every agent stops
+        # whether the check passing means the task is done: not when it passed before any change (a feature added
+        # to a project whose tests pass), where it only guards that nothing breaks
+        self.check_ends = True
         self.won = threading.Event()  # a whole-task agent's copy passes the check: the run is done
         self.solo: List[Agent] = []
         self.solos = race  # whole-task agents racing the parts (a task one agent does fast is not slowed by the split)
@@ -601,6 +665,8 @@ class Run:
             ok, out, _ = run_check(self.check, a.root, keep=6000)
             if time.time() - t > 30:  # a slow check: once is enough
                 a.after_write = None
+            if ok and not self.check_ends:
+                return "The project's check still passes."
             if ok:
                 a.verified = True
                 self.solved.set()
@@ -638,6 +704,8 @@ class Run:
         ok, out, _ = run_check(self.check, a.root, keep=6000)
         if time.time() - t > 30:
             a.after_write = None
+        if ok and not self.check_ends:
+            return "The project's check still passes."
         if ok:
             if a.won_files is None:  # its files as they passed (the agent may go on and change them)
                 names = sorted({f for p in self._parts for f in p["files"]} | set(a.wrote))
@@ -812,7 +880,12 @@ class Run:
             later = [i for i in range(n) if i not in code]
             if self.check:
                 self.report["passed_before"] = run_check(self.check, self.root, keep=2000)[0]
-            if self.workers != 1 and self.check and n > 1 and self.solos:
+                if self.report["passed_before"]:
+                    # every first write would "pass": the agents stopped at once and a half-done task was written
+                    self.check_ends = False
+                    self.log("the check passes before any change: it keeps the project from breaking, but cannot tell "
+                             "when the task is done, so the agents finish their parts")
+            if self.workers != 1 and self.check and n > 1 and self.solos and self.check_ends:
                 solo = self._start_solo(parts, digest)
             # A head start: the whole-task agents alone, at the batch's full speed per stream (off by default:
             # it helped neither Qwen3.5 nor Gemma 4)
@@ -835,7 +908,9 @@ class Run:
                 vers = self._versions(parts, later, self._more(2),
                                       lambda i, v: worker_prompt(self.task, parts, i, digest, self.check, self.root), "t")
                 cur = self._current(parts)
-                options = [[cur[i]] + vers.get(i, []) if i in later else [cur[i]] for i in range(n)]
+                # the part as it is first, unless that passes anyway: then the new tests the task asked for came last
+                options = [([cur[i]] + vers.get(i, []) if self.check_ends else vers.get(i, []) + [cur[i]])
+                           if i in later else [cur[i]] for i in range(n)]
                 if self.check:
                     ok, out = self._pick(parts, options, None)
                 else:
@@ -1012,6 +1087,12 @@ def cmd_run(args) -> None:
     root = Path(args.dir).expanduser().resolve()
     if not root.is_dir():
         sys.exit(f"no such directory: {root}")
+    if args.check:  # before the model loads and the agents start: a check that cannot run would fail them all
+        from .solve import check_cannot_run
+
+        why = check_cannot_run(args.check, root)
+        if why:
+            sys.exit(f"locals run: {why}")
     app.fetch_model(args.model)
     app.ensure_server(args)
     app.remember(model=args.model, port=args.port)
@@ -1021,15 +1102,31 @@ def cmd_run(args) -> None:
     model = f"{getattr(args, 'engine', None) or 'locals'}/{app.model_short(args.model)}"
     t0 = time.time()
     last = [""]
+    rows = {"n": "?", "at": 0.0}
+    tty = sys.stdout.isatty()
 
     def status(agents):
-        try:
-            rows = len(app.get_json(app.base_url(args.port) + "/stats", timeout=2)["active"])
-        except Exception:  # noqa: BLE001
-            rows = "?"
-        line = f"\r  {time.time() - t0:5.0f}s  " + "  ".join(f"{a.name}:{a.state[0]}{a.steps}" for a in agents) + f"  | batch rows {rows}   "
-        if line != last[0]:
-            print(line, end="", flush=True)
+        """One line, redrawn: the time, how many agents work, are done or failed, the working ones with their
+        steps, and the server's batch. It listed every agent of the run (30 and more), wrapped, and filled the
+        terminal with half lines; /stats was asked twice a second."""
+        if time.time() - rows["at"] > 2:
+            try:
+                rows["n"] = len(app.get_json(app.base_url(args.port) + "/stats", timeout=2)["active"])
+            except Exception:  # noqa: BLE001
+                rows["n"] = "?"
+            rows["at"] = time.time()
+        working = [a for a in agents if a.state == "working"]
+        done = sum(a.state == "done" for a in agents)
+        failed = sum(a.state == "failed" for a in agents)
+        head = f"  {time.time() - t0:4.0f}s  {len(working)} working, {done} done" + (f", {failed} failed" if failed else "")
+        tail = f"  | batch {rows['n']} rows"
+        names = "  " + " ".join(f"{a.name}:{a.steps}" for a in working)
+        width = shutil.get_terminal_size((100, 20)).columns - 1
+        if len(head) + len(names) + len(tail) > width:
+            names = names[: max(0, width - len(head) - len(tail) - 3)] + "..."
+        line = head + names + tail
+        if line != last[0] and tty:
+            print("\r\x1b[2K" + line, end="", flush=True)
             last[0] = line
 
     print(f"locals run in {root}\n  model {model}; check: {check or 'none (the workers check their own parts)'}", flush=True)
@@ -1043,7 +1140,8 @@ def cmd_run(args) -> None:
     try:
         report = run.go()
     except KeyboardInterrupt:
-        sys.exit("\n  stopped; the project was not changed")
+        kept = run.report.get("kept")
+        sys.exit("\n  stopped; the project was not changed" + (f"; the work so far is in {kept}" if kept else ""))
     except Exception as e:  # noqa: BLE001
         if args.report:
             Path(args.report).write_text(json.dumps({**run.report, "error": f"{type(e).__name__}: {e}"}, indent=1))

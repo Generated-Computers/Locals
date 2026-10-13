@@ -1,27 +1,25 @@
-"""locals: your MLX model behind an OpenAI-compatible server, faster.
+"""locals: run many AI agents at once on your Mac, about three times faster.
 
-    locals code [DIR]        OpenCode on a project; the first time it installs OpenCode, downloads
-                            the model and starts the server (--run TASK: one task, no interface)
-    locals solve "TASK"      several agents race on one task in copies of the project; the first
-                            whose result passes the check (--check, or the project's tests) wins
-    locals setup openclaw    connect OpenClaw and start the server in the background
-    locals setup hermes      the same for Hermes Agent
-    locals serve             the OpenAI-compatible server in this terminal (http://127.0.0.1:8321/v1)
-    locals start | stop      the server in the background | stop it
-    locals status            the server's requests, prompt cache and memory
-    locals setup             only install OpenCode (if needed) and write its config: providers
-                            locals (our engine) and mlx (stock mlx-lm), and the multi-agent team
-    locals generate ...      one structured output from the command line (--prompt, --schema | --regex)
-    locals chat              an interactive chat with /json <schema> and /n N
-    locals agents ...        run many tool-using agents in parallel on one model (built-in suite)
-    locals swarm ...         run many OpenCode agents at once on a list of tasks (one batch)
-    locals bench             our engine against stock mlx-lm through the same API, concurrently
-    locals tune --model M    the full one-time kernel autotuning for a model (optional, 10-20 minutes)
+    locals code [DIR]          a coding assistant (OpenCode) on a project; the first time it installs
+                               OpenCode, downloads the model and starts the server (--run TASK: one task)
+    locals run "TASK" --dir DIR --check "CMD"
+                               a team of agents on one task, each in its own copy of the project; the
+                               project is changed only when the check passes
+    locals launch TOOL         another coding tool or app on the local model (locals launch list)
+    locals chat                an interactive chat (/json <schema>, /n N, /reset)
+    locals generate ...        one answer from the command line (--prompt, --schema | --regex, --n)
+    locals start | stop        the server in the background | stop it
+    locals status              what the server is doing: requests, prompt cache, memory
+    locals serve               the server in this terminal (http://127.0.0.1:8321/v1)
+    locals setup [TOOL]        only configure OpenCode (or openclaw, hermes) for the model
 
-Models (--model): qwen (Qwen3.5-4B, the default), gemma (Gemma 4 E4B), or any mlx-lm
-chat model id or local path; the last one used is remembered.
-In OpenCode, /models switches between "Locals" and "MLX default";
-Tab switches between the primary agents.
+  More: locals solve (agents race on a task), locals swarm (OpenCode agents on a list of tasks),
+  locals agents, locals bench (our engine against stock mlx-lm), locals tune (full kernel tuning),
+  locals menubar. Each has --help.
+
+Models (--model): qwen (Qwen3.5-4B, the default from 16 GB of memory; Qwen3.5-2B below), qwen3.5-2b,
+gemma (Gemma 4 E4B), lfm (LFM2.5-2.6B), minicpm (MiniCPM5-2B), or any mlx-lm model id or local path;
+the last one used is remembered.
 """
 
 from __future__ import annotations
@@ -473,12 +471,11 @@ def fetch_model(model: str) -> None:
         return
     from huggingface_hub import snapshot_download
 
+    from .defaults import cached_snapshot
+
     patterns = ["*.json", "model*.safetensors", "*.py", "tokenizer.model", "*.tiktoken", "tiktoken.model", "*.txt", "*.jsonl", "*.jinja"]
-    try:
-        snapshot_download(model, allow_patterns=patterns, local_files_only=True)
+    if cached_snapshot(model, patterns) is not None:
         return
-    except Exception:  # noqa: BLE001  # not downloaded yet
-        pass
     print(f"downloading {model} (first run only) ...", flush=True)
     try:
         snapshot_download(model, allow_patterns=patterns)
@@ -516,6 +513,11 @@ def remember(**kw) -> None:
 
 
 def cmd_serve(args) -> None:
+    loading = _starting_pid(args.port)
+    if loading is not None:  # a background server loading the model: a second one would load it twice
+        sys.exit(f"a locals server is starting on port {args.port} (pid {loading}); wait for it (locals status), "
+                 f"or stop it (locals stop) first")
+    fetch_model(args.model)  # a model that cannot run is refused here, before it becomes the default
     remember(model=args.model, port=args.port)  # `locals setup` / `locals code` then use the same model
     os.execv(python(), server_cmd(args))
 
@@ -586,6 +588,14 @@ def _ensure_server(args, wait_s: float) -> None:
         sys.exit(f"port {args.port} is in use by another program (pid {holder}); choose another port with --port")
     LOCALS_DIR.mkdir(exist_ok=True)
     log_path = LOCALS_DIR / "server.log"
+    loading = _starting_pid(args.port)
+    if loading is not None:
+        # started by an earlier command (one stopped with Ctrl-C while it waited) and still loading the model:
+        # a second server here would load the model a second time next to it
+        print(f"the locals server on port {args.port} is starting already (pid {loading}); waiting for it ...", flush=True)
+        _wait_for_server(args, lambda: _is_locals_server(loading), log_path, log_path.stat().st_size if log_path.exists() else 0,
+                         wait_s)
+        return _ensure_server(args, wait_s)  # up now: the same checks as for any running server (its model, its code)
     if log_path.exists() and log_path.stat().st_size > 50 << 20:  # the log of earlier runs, kept once
         os.replace(log_path, log_path.with_suffix(".log.1"))
     start = log_path.stat().st_size if log_path.exists() else 0
@@ -594,7 +604,29 @@ def _ensure_server(args, wait_s: float) -> None:
                          cwd=str(Path(__file__).resolve().parent.parent))
     _pid_file(args.port).write_text(str(p.pid))
     print(f"starting the locals server for {args.model} on port {args.port} (log {log_path}) ...", flush=True)
+    _wait_for_server(args, lambda: p.poll() is None, log_path, start, wait_s)
+
+
+def _starting_pid(port: int) -> Optional[int]:
+    """A locals server started in the background on this port that is still loading (running, not listening yet)."""
+    pid = _saved_pid(port)
+    if pid and _is_locals_server(pid) and _listener_pid(port) is None:
+        return pid
+    return None
+
+
+def _wait_for_server(args, running, log_path: Path, start: int, wait_s: float) -> None:
+    """Wait for the server on args.port to answer, showing what its log says on the way (loading, tuning);
+    ``running()``: whether its process is still alive. Ctrl-C stops the waiting, not the server."""
     t0, seen = time.time(), start
+    try:
+        _follow(args, running, log_path, start, t0, seen, wait_s)
+    except KeyboardInterrupt:
+        sys.exit(f"\nstopped waiting; the server keeps starting in the background (locals status shows it, "
+                 f"locals stop stops it)")
+
+
+def _follow(args, running, log_path: Path, start: int, t0: float, seen: int, wait_s: float) -> None:
     while time.time() - t0 < wait_s:
         try:
             with open(log_path, "rb") as f:
@@ -606,7 +638,7 @@ def _ensure_server(args, wait_s: float) -> None:
                     print("  " + line.strip()[:200], flush=True)
         except OSError:
             pass
-        if p.poll() is not None:
+        if not running():
             # ``start`` counts bytes (the log has multi-byte progress bars), so slice before decoding
             tail = log_path.read_bytes()[start:].decode(errors="replace").strip().splitlines()[-15:] if log_path.exists() else []
             sys.exit("the server stopped:\n  " + "\n  ".join(tail))
@@ -643,9 +675,9 @@ def _listener_pid(port: int) -> Optional[int]:
 
 def cmd_start(args) -> None:
     """The server in the background, for agents other than OpenCode (or several at once)."""
-    remember(model=args.model, port=args.port)
-    fetch_model(args.model)
+    fetch_model(args.model)  # checked (and downloaded) before it becomes the default of later commands
     ensure_server(args)
+    remember(model=args.model, port=args.port)
     print(f"locals serves {args.model} at {base_url(args.port)}/v1 in the background (locals status, locals stop)")
 
 
@@ -683,7 +715,9 @@ def cmd_stop(args) -> None:
 def cmd_status(args) -> None:
     st = server_alive(args.port)
     if not st:
-        print(f"no server on port {args.port}")
+        loading = _starting_pid(args.port)
+        print(f"the locals server on port {args.port} is starting (pid {loading}); log: {LOCALS_DIR / 'server.log'}"
+              if loading else f"no server on port {args.port}")
         return
     s = get_json(base_url(args.port) + "/stats")
     print(f"model {s['model']}  uptime {s['uptime_s']:.0f}s  requests {s['requests']}  active rows {len(s['active'])}")
@@ -908,36 +942,73 @@ def cmd_code(args) -> None:
     d = Path(args.dir).expanduser().resolve()
     if not d.is_dir():
         sys.exit(f"no such directory: {d}")
+    fetch_model(args.model)  # checked (and downloaded) before OpenCode's settings name it
     if not _opencode_ready(args.model, args.port) or (args.engine == "mlx" and not _has_provider("mlx")):
         print(f"setting up OpenCode for {args.model} ...", flush=True)
         setup_opencode(args)
     oc = opencode_bin()
-    fetch_model(args.model)
     ensure_server(args)
     remember(model=args.model, port=args.port)
     cfg = json.loads(OPENCODE_CONFIG.read_text())
     short = model_short(args.model)
-    changed = False
-    if args.engine and cfg.get("model") != oc_model(args.engine, short):
-        cfg["model"] = cfg["small_model"] = oc_model(args.engine, short)
-        changed = True
-    if args.agent and cfg.get("default_agent") != args.agent:
+    if args.agent and cfg.get("default_agent") != args.agent:  # OpenCode's default agent, kept for later launches
         cfg["default_agent"] = args.agent
-        changed = True
-    if changed:  # OpenCode's defaults, kept for later launches too
         _write_atomic(OPENCODE_CONFIG, json.dumps(cfg, indent=2) + "\n")
+    # The model is given on OpenCode's command line on every launch: a model set by a project's own opencode.json
+    # (or a global .jsonc) would otherwise win over ours, and could send the project to a cloud model. An engine
+    # asked for here (--engine mlx) is for this launch only: later servers start without the stock engine.
+    ref = oc_model(args.engine or "locals", short)
     env = dict(os.environ, OPENCODE_DISABLE_AUTOUPDATE="1", PWD=str(d))  # OpenCode reads its project directory from $PWD
     os.chdir(d)
-    shown = f"{short} on the {cfg['model'].split('/')[0]} engine, agent {cfg.get('default_agent')}"
+    shown = f"{short} on the {args.engine or 'locals'} engine, agent {args.agent or cfg.get('default_agent')}"
     if args.run:
         print(f"opencode in {d}: running the task ({shown}) ...", flush=True)
-        p = subprocess.run([oc, "run", "--format", "json", *(["-c"] if args.cont else []), args.run], env=env,
-                           capture_output=True, text=True)
-        answer = _opencode_answer(p.stdout)
-        print(answer or (p.stdout[-2000:] + p.stderr[-2000:]))
-        sys.exit(p.returncode)
+        sys.exit(_opencode_run([oc, "run", "--format", "json", "-m", ref, *(["-c"] if args.cont else []), args.run], env))
     print(f"opencode in {d}  ({shown}; /models switches the engine, Tab the agent)")
-    os.execve(oc, [oc, str(d)] + (["--print-logs"] if args.logs else []), env)
+    os.execve(oc, [oc, str(d), "-m", ref] + (["--print-logs"] if args.logs else []), env)
+
+
+def _opencode_run(cmd: List[str], env: dict) -> int:
+    """`opencode run` with a line per action as it happens, then the agent's answer; its exit code. Its stdin
+    is closed: `opencode run` reads a piped stdin into the task and waited forever when locals ran from a script."""
+    import threading
+
+    p = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    err: List[str] = []
+    t = threading.Thread(target=lambda: err.append(p.stderr.read()), daemon=True)
+    t.start()
+    out: List[str] = []
+    try:
+        for line in p.stdout:
+            out.append(line)
+            step = _opencode_step(line)
+            if step:
+                print("  " + step, flush=True)
+        p.wait()
+    except KeyboardInterrupt:
+        p.terminate()
+        print("\nstopped")
+        return 130
+    t.join(timeout=5)
+    answer = _opencode_answer("".join(out))
+    print("\n" + (answer or ("".join(out)[-2000:] + "".join(err)[-2000:])))
+    return p.returncode
+
+
+def _opencode_step(line: str) -> str:
+    """A short line for a tool call in `opencode run --format json` output ("bash: pytest -q"), else ""."""
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        return ""
+    part = ev.get("part") or {}
+    state = part.get("state") or {}
+    if ev.get("type") != "tool_use" or state.get("status") not in ("completed", "error"):
+        return ""
+    args = state.get("input") or {}
+    what = next((str(args[k]) for k in ("command", "filePath", "path", "pattern", "description", "url", "query") if args.get(k)), "")
+    what = what.replace("\n", " ")
+    return f"{part.get('tool')}: {what[:100]}" + (" (failed)" if state.get("status") == "error" else "")
 
 
 def _opencode_answer(stdout: str) -> str:
@@ -1314,6 +1385,9 @@ def main(argv=None):
         i += step
     if i < len(argv) and _delegate(argv[i]) is not None:
         return _delegate(argv[i])((lead if argv[i] != "menubar" else []) + argv[i + 1:])  # its own options last: they win
+    if not argv:  # `locals` alone: what it can do, not a usage error
+        print(__doc__.strip())
+        return
     saved = _load_saved()
     ap = argparse.ArgumentParser(prog="locals", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     from . import __version__

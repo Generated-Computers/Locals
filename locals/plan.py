@@ -135,12 +135,32 @@ def _file_name(f: str, project: Optional[Path]) -> bool:
     return True
 
 
+def _existing(project: Path, name: str) -> List[str]:
+    """The project's files with this name, as paths relative to it (virtualenvs, node_modules and the like skipped)."""
+    from .solve import SKIP_DIRS
+
+    out = []
+    for q in project.rglob(name):
+        rel = q.relative_to(project)
+        if q.is_file() and not (set(rel.parts[:-1]) & SKIP_DIRS):
+            out.append(str(rel))
+    return sorted(out)
+
+
 def cover(parts: List[dict], task: str, project: Optional[Path] = None) -> List[dict]:
     """Every code file the task names belongs to a part: one the plan left out gets a part of its own
     (Qwen3.5 once planned one part for a task naming three files)."""
     have = {f for p in parts for f in p["files"]}
     for raw in dict.fromkeys(_CODE_FILE.findall(task)):
         f = _clean(raw)
+        if f and project is not None and "/" not in f and not (project / f).exists():
+            # "fix parser.py" for src/mylib/parser.py: the existing file of that name. A part for a new parser.py at
+            # the top owned the only file the agents could edit, and the real one was out of their reach. A name
+            # several files have is left to the plan.
+            found = _existing(project, f)
+            if len(found) > 1:
+                continue
+            f = found[0] if found else f
         if f and f not in have and _file_name(f, project):
             parts.append({"title": f"write {f}", "files": [f], "needs": [],
                           "instructions": f"Write {f} as the task asks: everything the task says about {f}."})
@@ -237,7 +257,10 @@ def make_plan(base_url: str, model: str, task: str, digest: str, max_tokens: int
     safe (normalize, writable, cover). A plan that does not parse (the server's loop guard cut one
     whose instructions went round in circles) is asked for once more; then there is no plan."""
     named = protect_tests(cover([], task, project), task, project)  # files the task names, new or existing
-    if named:  # the task names its files: a part each, no planning call (10-15 s, and the 4B planner chained
+    ambiguous = project is not None and any(
+        "/" not in f and not (project / f).exists() and len(_existing(project, f)) > 1
+        for f in (_clean(raw) for raw in _CODE_FILE.findall(task)) if f)
+    if named and not ambiguous:  # (a name several files have: which one is the plan's call)  # the task names its files: a part each, no planning call (10-15 s, and the 4B planner chained
         log(f"  the task names its files: a part for each ({', '.join(q['files'][0] for q in named)})")  # parts, dropped files)
         return named
     body = {"model": model, "max_tokens": max_tokens,

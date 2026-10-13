@@ -273,6 +273,49 @@ def run_shell(cmd: str, cwd: Path, timeout: float, confine: Optional[Path] = Non
 _NO_TESTS = re.compile(r"^Ran 0 tests\b|^NO TESTS RAN\b|\bno tests ran\b", re.M)
 
 
+# test runners and linters a check runs as python -m: never the project's own module, which the task may create
+_TOOLS = {"pytest", "nose2", "tox", "nox", "mypy", "ruff", "flake8", "pylint", "black", "isort", "coverage", "hypothesis",
+          "behave", "green"}
+_BUILTINS = {"cd", "export", "set", "unset", "source", ".", "true", "false", "test", "[", "echo", "exit", "eval", "exec",
+             "env", "time", "command", "builtin", "pushd", "popd", "ulimit", "umask", "printf", "read", "trap", "wait"}
+
+
+def check_cannot_run(cmd: str, cwd: Path) -> Optional[str]:
+    """Why the check command cannot run at all here (its test runner or a program missing), or None.
+    Its failing is what the agents work against; a check that fails before any code exists only because
+    pytest is not installed kept 17 agents busy for three minutes, and the run then said only that the
+    check fails. Commands are split at ;, &&, || and |, assignments (VAR=value) and shell builtins skipped.
+    Programs given as paths (./run_tests.sh) and the project's own modules are not judged: the task may
+    create them."""
+    for part in re.split(r"&&|\|\||;|\|", cmd):
+        try:
+            words = shlex.split(part)
+        except ValueError:
+            return None  # quoting we do not follow: the shell will tell
+        while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
+            words = words[1:]
+        if not words or words[0] in _BUILTINS:
+            continue
+        exe = words[0]
+        found = shutil.which(exe, path=os.environ.get("PATH"))
+        if not found:
+            if "/" in exe:
+                continue
+            return f"`{exe}` is not installed or not on PATH, so the check `{cmd}` cannot run."
+        if re.match(r"^python(\d+(\.\d+)?)?$", Path(exe).name) and "-m" in words[1:-1]:
+            module = words[words.index("-m", 1) + 1]
+            if module.split(".")[0] not in _TOOLS:
+                continue
+            probe = subprocess.run([found, "-c", "import importlib.util, sys; "
+                                    f"sys.exit(0 if importlib.util.find_spec({module.split('.')[0]!r}) else 3)"],
+                                   cwd=cwd, capture_output=True, text=True, timeout=60)
+            if probe.returncode == 3:
+                return (f"`{exe}` has no module named {module.split('.')[0]}, so the check `{cmd}` cannot run. Install it "
+                        f"({exe} -m pip install {module.split('.')[0]}), or give the command your project's tests run with "
+                        f"(--check).")
+    return None
+
+
 def run_check(cmd: str, cwd: Path, timeout: float = 300, keep: int = 2000) -> Tuple[bool, str, float]:
     """(passed, the end of the output, seconds). A run that ran no tests is a failure: unittest's
     discovery that finds nothing exits 0 ("Ran 0 tests ... OK"), and would pass every attempt."""

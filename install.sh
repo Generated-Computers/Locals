@@ -2,7 +2,7 @@
 # locals installer: an Apple-silicon Mac, uv (installed if missing), then locals.
 #
 #   curl -LsSf https://raw.githubusercontent.com/Generated-Computers/Locals/main/install.sh | sh
-#   LOCALS_SOURCE=locals sh install.sh     # or a wheel path, instead of the GitHub repository
+#   LOCALS_SOURCE=locals sh install.sh     # or a wheel or folder path, instead of GitHub's archive
 #
 # Afterwards:  locals code ~/my-project   (sets up OpenCode, downloads the model, starts
 # the server and opens the agent; the first run takes a minute or two; --model gemma for Gemma 4).
@@ -22,17 +22,25 @@ if ! command -v uv >/dev/null 2>&1; then
     PATH="$HOME/.local/bin:$PATH"
   else
     say "installing uv (the Python package manager locals is installed with) ..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh || fail "could not install uv; see https://docs.astral.sh/uv/"
+    UV_SH="$(mktemp)"
+    # downloaded first: piped into sh, a failed download looked like a finished install ("uv is not on PATH")
+    curl -LsSf https://astral.sh/uv/install.sh -o "$UV_SH" || fail "could not download uv's installer; check the network"
+    sh "$UV_SH" || fail "could not install uv; see https://docs.astral.sh/uv/"
+    rm -f "$UV_SH"
     PATH="$HOME/.local/bin:$PATH"
   fi
 fi
 command -v uv >/dev/null 2>&1 || fail "uv is not on PATH after installing it; open a new terminal and run this again."
 
-SOURCE="${LOCALS_SOURCE:-git+https://github.com/Generated-Computers/Locals}"  # PyPI ("locals") after the first release
+# GitHub's archive of the main branch: no git needed (a Mac without the Command Line Tools has none; installing
+# from git+https then failed); PyPI ("locals") after the first release
+SOURCE="${LOCALS_SOURCE:-locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz}"
 say "installing locals from $SOURCE ..."
-uv tool install --force "$SOURCE" || fail "uv tool install $SOURCE failed (locals needs Python 3.11 or newer; uv fetches one)."
-
 BIN="$(uv tool dir --bin 2>/dev/null || printf '%s' "$HOME/.local/bin")"
+# with its folder on PATH, uv does not warn that it is not; the PATH is explained once, below
+PATH="$BIN:$PATH" uv tool install --force "$SOURCE" \
+  || fail "uv tool install $SOURCE failed; its message is above (check the network, or report it on GitHub)."
+
 case ":$ORIG_PATH:" in
   *":$BIN:"*) ;;
   *)
@@ -45,7 +53,7 @@ case ":$ORIG_PATH:" in
 esac
 say ""
 say "$("$BIN/locals" --version 2>/dev/null || echo locals) is ready. Next:"
-say "  locals code ~/my-project                 # OpenCode on your project, with Qwen3.5-4B on this Mac"
-say "  locals code ~/my-project --model gemma   # the same with Gemma 4 E4B"
-say "  locals setup openclaw                    # or OpenClaw (locals setup hermes: Hermes Agent)"
-say "  locals serve                             # or only the OpenAI-compatible server, http://127.0.0.1:8321/v1"
+say "  locals code ~/my-project      # a coding assistant (OpenCode) on your project"
+say "  locals run \"a task\" --dir ~/my-project --check \"python3 -m pytest -q\"   # a team of agents"
+say "  locals launch list            # the other coding tools and apps it works with"
+say "  locals start                  # only the server, for your own programs: http://127.0.0.1:8321/v1"

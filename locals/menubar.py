@@ -1,7 +1,7 @@
 """locals in the macOS menu bar: the server's state at a glance, start and stop, and the
 tools opened on it, without a terminal.
 
-    locals menubar          (needs the menu-bar extra: uv tool install 'locals[menubar]')
+    locals menubar          (needs rumps: uv tool install --force --with rumps 'locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz')
 
 The icon shows whether the server runs (●), is starting (◐) or is stopped (○); the menu
 shows the model and the requests running, and opens OpenCode or the status page.
@@ -28,7 +28,8 @@ def main(argv=None) -> None:
     try:
         import rumps
     except ImportError:
-        sys.exit("the menu-bar app needs rumps: uv tool install 'locals[menubar]'   (or: pip install rumps)")
+        sys.exit("the menu-bar app needs rumps; add it to the locals install with:\n"
+                 "  uv tool install --force --with rumps 'locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz'")
     from .app import DEFAULT_PORT, _load_saved, base_url, get_json, server_alive
 
     saved = _load_saved()
@@ -43,7 +44,8 @@ def main(argv=None) -> None:
                            capture_output=True, text=True)
         folder = p.stdout.strip()
         if p.returncode == 0 and folder:
-            _osascript_terminal(f"cd {shlex.quote(folder)} && locals code .")
+            # this Python, not a `locals` the new Terminal may not find on its PATH
+            _osascript_terminal(f"cd {shlex.quote(folder)} && {' '.join(shlex.quote(a) for a in locals)} code .")
 
     class App(rumps.App):
         def __init__(self):

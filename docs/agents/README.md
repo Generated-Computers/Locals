@@ -22,17 +22,20 @@ locals run "write inventory.py, cli.py and test_inventory.py: ..." --dir PROJECT
 
 ## One run, step by step
 
+Before any of this, `cmd_run` checks that a given `--check` can run at all (`solve.check_cannot_run`): a test runner run as `python -m` (pytest, mypy, ruff and similar) that the Python lacks, or a program not on the PATH, stops the command at once with what to install. Programs given as paths and the project's own modules are not judged, since the task may create them. Without this, `--check "python3 -m pytest -q"` on a Mac without pytest kept 17 agents busy for three minutes and then said only that the check fails.
+
 `Run.go()` runs these steps in order:
 
 1. **Staging copy.** Makes a staging copy of the project (`_copy("stage", self.project)`) and records the project's files with `manifest` (a sha1 for each file).
 2. **Plan.** `Run.plan` produces a list of parts. Each part has `title`, `files`, `instructions` and `needs`.
-3. **Racers.** Starts the whole-task racers `s0`, `s1`, ... (`_start_solo`). This happens only when there is a check, the plan has more than one part, `--race` is above 0 and `--workers` is not 1.
-4. **Stage 1, code.** The code parts (empty `needs`) get `k` agents each (capped by `room`, see below), named `w{i}.{v}`. Then, with a check, `_pick` stages the best combination. Without a check, each part's first version is staged.
-5. **Stage 2, tests.** The test parts get `k + 2` agents each, named `t{i}.{v}`, in copies that already hold the picked code. Then `_pick` runs over all parts.
-6. **Find a check.** If there is still no check (no `--check`, and `cmd_run`'s `detect_check` found none in the project at the start), `detect_check` looks again in the staging copy, and `-x` is removed from what it finds (`report["check"]`). This way the tests the parts just wrote become the check for the repairs.
-7. **Repairs.** Fresh agents named `f{r}.{i}.{v}` (`k + 1` per part) work on the parts the failing output blames. `_pick` runs after each round.
-8. **Racer result.** If the parts did not pass, the run waits for the racers. A racer's passing files are staged only if they also pass in the staging copy (`_take_solo`).
-9. **Write-back.** `_finish(ok)` writes the files the run changed into the project, or keeps them in `~/.locals/runs/`.
+3. **The check before any change.** With a check, it runs once on the untouched project (`report["passed_before"]`). If it passes already (a feature added to a project whose tests pass), a pass cannot tell that the task is done: `Run.check_ends` becomes false, after-write checks only report "still passes" instead of stopping the stage, no racers start, and in stage 2 the new test files come before "as it is" among the options. The agents finish their parts, and the check guards that nothing breaks. Before this, every first write "passed", every agent stopped, and first drafts were written into the project.
+4. **Racers.** Starts the whole-task racers `s0`, `s1`, ... (`_start_solo`). This happens only when there is a check that failed before the run, the plan has more than one part, `--race` is above 0 and `--workers` is not 1.
+5. **Stage 1, code.** The code parts (empty `needs`) get `k` agents each (capped by `room`, see below), named `w{i}.{v}`. Then, with a check, `_pick` stages the best combination. Without a check, each part's first version is staged.
+6. **Stage 2, tests.** The test parts get `k + 2` agents each, named `t{i}.{v}`, in copies that already hold the picked code. Then `_pick` runs over all parts.
+7. **Find a check.** If there is still no check (no `--check`, and `cmd_run`'s `detect_check` found none in the project at the start), `detect_check` looks again in the staging copy, and `-x` is removed from what it finds (`report["check"]`). This way the tests the parts just wrote become the check for the repairs.
+8. **Repairs.** Fresh agents named `f{r}.{i}.{v}` (`k + 1` per part) work on the parts the failing output blames. `_pick` runs after each round.
+9. **Racer result.** If the parts did not pass, the run waits for the racers. A racer's passing files are staged only if they also pass in the staging copy (`_take_solo`).
+10. **Write-back.** `_finish(ok)` writes the files the run changed into the project, or keeps them in `~/.locals/runs/`.
 
 Whatever happens, every agent's copy and the staging copy are removed at the end.
 
@@ -66,6 +69,8 @@ The `run` sub-command (`app.py`) passes its flags to `Run(...)` in `cmd_run`.
 
 - a capitalized stem that is not in the project, such as `Node.js`;
 - a path with a dot in a folder name, such as `github.com/x/y.py`, unless that path exists in the project.
+
+A bare name that is not at the project's top level is the existing file of that name (`_existing`, skipping virtualenvs, `node_modules` and the like): "fix parser.py" means `src/mylib/parser.py`. If several files have the name, no part is made from it, and the model's plan decides (the named-files shortcut is skipped). Before, such a task got a part for a new top-level `parser.py`, and every edit of the real file was refused as not the agent's.
 
 If this gives any parts, the model is never asked for a plan. The comment says this saves 10 to 15 seconds and avoids the 4B planner chaining parts together and dropping files.
 
@@ -137,7 +142,7 @@ Paths go through `_rel` and `_path`:
 
 ### Ending an agent
 
-An agent ends when it calls `finish`, after `max_steps` steps, or when its `stop` event is set. The event is checked between steps, so a request already in flight is not cancelled.
+An agent ends when it calls `finish`, after `max_steps` steps, or when its `stop` event is set. Its request in flight is cancelled then: `_chat` gets the event, closes the connection when it is set, and the server stops decoding a request whose client left; a reply that comes back after the stop is not carried out. (Before, a stopped agent finished its reply, wrote its file and ran the check, and the next stage waited for it: a 3,000-token `write_file` is over a minute at batch speed.)
 
 `Agent.run` also ends an agent on these guards:
 
@@ -165,7 +170,7 @@ After each successful `write_file` or `edit_file`, the check runs in that agent'
 
 The agent gets one of three messages:
 
-- "The project's check passes now. Call finish." The agent is marked verified and `Run.solved` is set, which stops every agent in the stage (but not the racers).
+- "The project's check passes now. Call finish." The agent is marked verified and `Run.solved` is set, which stops every agent in the stage (but not the racers). When the check passed before the run, the agent gets "The project's check still passes." instead, and nothing stops.
 - "...still fails in your part:" followed by the last 1,500 characters of output, when `_blame` points at this part.
 - "...nothing it reports is in your files."
 
@@ -277,7 +282,7 @@ The project is touched once, by `Run._finish`, at the end of a run that complete
   - An existing file keeps its permissions.
   - A path that resolves outside the project is refused.
 - **Check failed, in a run that started with a check** (given or detected by `cmd_run`). Nothing is written. The files the run changed are copied to `~/.locals/runs/<project>-YYYYmmdd-HHMMSS/` (`_keep`, with `keep_dir=app.LOCALS_DIR / "runs"`).
-- **Stopped with Ctrl-C, or crashed.** The work so far goes to the same folder and the project is not changed. `cmd_run` prints "stopped; the project was not changed".
+- **Stopped with Ctrl-C, or crashed.** The work so far goes to the same folder and the project is not changed. `cmd_run` prints "stopped; the project was not changed" and the folder.
 
 `_finish` has no delete path, so the harness never deletes a file from the project. Only part files and named data files reach the staging copy. Scratch files that an agent's commands made in its copy are discarded with the copy.
 
@@ -306,9 +311,11 @@ The locals server decodes requests that arrive together as rows of one batch, an
 
 While the run is going, `cmd_run` keeps one status line up to date. It shows:
 
-- the seconds elapsed;
-- each agent as `name:` followed by the first letter of its state and its step count;
-- the server's active batch rows, from `/stats`.
+- the seconds elapsed, and how many agents are working, done and failed;
+- the working agents as `name:steps`, cut to the terminal's width;
+- the server's active batch rows, from `/stats` (asked at most every 2 s).
+
+The line is redrawn in place (cleared first) and only on a terminal; output sent to a file gets the log lines and the summary.
 
 Agent names follow a pattern: `s{v}` for racers, `w{i}.{v}` for code, `t{i}.{v}` for tests and `f{r}.{i}.{v}` for fixers.
 

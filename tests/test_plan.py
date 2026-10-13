@@ -469,3 +469,21 @@ def test_tests_are_written_after_the_code():
                                       {"title": "cli", "files": ["pkg/cli.py"], "instructions": "", "needs": [0]},
                                       {"title": "tests", "files": ["tests/test_counting.py"], "instructions": "", "needs": []}]})
     assert [p["needs"] for p in plan.tests_after_code(parts)] == [[], [], [0, 1]]  # code at once, even when it uses code
+
+
+def test_a_bare_file_name_is_the_existing_file_in_a_subfolder(tmp_path):
+    """"fix parser.py" for src/mylib/parser.py: the part owned a new top-level parser.py, and every edit of the
+    real file was refused as not the agent's. The existing file of that name is the part's; a name several
+    files have is the plan's call (no part from the name), and virtualenvs do not count."""
+    from locals.plan import cover
+
+    (tmp_path / "src/mylib").mkdir(parents=True)
+    (tmp_path / "src/mylib/parser.py").write_text("x = 1\n")
+    (tmp_path / ".venv/lib").mkdir(parents=True)
+    (tmp_path / ".venv/lib/parser.py").write_text("")
+    for d in ("a", "b"):
+        (tmp_path / d).mkdir()
+        (tmp_path / d / "util.py").write_text("")
+    assert [p["files"] for p in cover([], "fix the bug in parser.py", tmp_path)] == [["src/mylib/parser.py"]]
+    assert [p["files"] for p in cover([], "add a helper to util.py and write report.py", tmp_path)] == [["report.py"]]
+    assert [p["files"] for p in cover([], "write new.py", tmp_path)] == [["new.py"]]

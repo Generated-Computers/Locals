@@ -39,17 +39,29 @@ def gpu_limit_gb() -> float:
         return 0.0
 
 
+def cached_snapshot(model: str, allow_patterns) -> "Path | None":
+    """The folder of a model downloaded already (Hugging Face's cache), or None. Without the progress
+    bar Hugging Face draws even for a lookup in the cache ("Fetching 9 files" on every start)."""
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.utils import are_progress_bars_disabled, disable_progress_bars, enable_progress_bars
+
+    quiet = are_progress_bars_disabled()
+    disable_progress_bars()
+    try:
+        return Path(snapshot_download(model, local_files_only=True, allow_patterns=allow_patterns))
+    except Exception:  # noqa: BLE001  # not downloaded (or not a repository id)
+        return None
+    finally:
+        if not quiet:
+            enable_progress_bars()
+
+
 def weights_gb(model: str, remote: bool = False) -> "float | None":
     """The model's weights in GB: its local files (a folder, or the Hugging Face cache), else, with
     ``remote``, the sizes Hugging Face lists. None if unknown."""
     path = Path(model).expanduser()
     if not path.exists():
-        try:
-            from huggingface_hub import snapshot_download
-
-            path = Path(snapshot_download(model, local_files_only=True, allow_patterns=["*.json", "*.safetensors"]))
-        except Exception:  # noqa: BLE001
-            path = None
+        path = cached_snapshot(model, ["*.json", "*.safetensors"])
     if path is not None:
         files = list(path.glob("*.safetensors"))
         if files:
@@ -96,14 +108,12 @@ def gguf_hint(model: str, remote: bool = True) -> "str | None":
         name = (path.stem if path.is_file() else path.name)
     elif remote and "/" in model and model.count("/") == 1:
         try:
-            from huggingface_hub import HfApi, snapshot_download
+            from huggingface_hub import HfApi
 
-            try:  # downloaded already (MLX weights in the cache): no request to Hugging Face, so it starts offline too
-                cached = Path(snapshot_download(model, local_files_only=True, allow_patterns=["*.json", "*.safetensors"]))
-                if any(cached.glob("*.safetensors")):
-                    return None
-            except Exception:  # noqa: BLE001
-                pass
+            # downloaded already (MLX weights in the cache): no request to Hugging Face, so it starts offline too
+            cached = cached_snapshot(model, ["*.json", "*.safetensors"])
+            if cached is not None and any(cached.glob("*.safetensors")):
+                return None
             names = [s.rfilename for s in HfApi().model_info(model).siblings or []]
         except Exception:  # noqa: BLE001
             return None

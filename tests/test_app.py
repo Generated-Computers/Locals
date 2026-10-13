@@ -181,6 +181,24 @@ def test_code_run_end_to_end_with_stand_ins(tmp_path, monkeypatch, capsys):
         return subprocess.CompletedProcess(cmd, 0, ev + "\n", "")
 
     monkeypatch.setattr(app.subprocess, "run", run)
+
+    class Proc:  # `opencode run`: its events streamed (a tool call shown as it happens), then the answer
+        def __init__(self, cmd, **kw):
+            calls.append(("opencode", cmd[1:], kw.get("stdin")))
+            import io
+
+            tool = {"type": "tool_use", "part": {"type": "tool", "tool": "bash",
+                                                 "state": {"status": "completed", "input": {"command": "python3 primes.py"}}}}
+            self.stdout = io.StringIO(json.dumps(tool) + "\n" + json.dumps(
+                {"type": "text", "part": {"type": "text", "text": "Done: 2 3 5 7"}}) + "\n")
+            self.stderr = io.StringIO("")
+            self.returncode = 0
+
+        def wait(self):
+            return 0
+
+    real_popen = subprocess.Popen
+    monkeypatch.setattr(app.subprocess, "Popen", lambda cmd, **kw: Proc(cmd, **kw) if "--format" in cmd else real_popen(cmd, **kw))
     project = tmp_path / "proj"
     project.mkdir()
     monkeypatch.chdir(tmp_path)
@@ -191,7 +209,11 @@ def test_code_run_end_to_end_with_stand_ins(tmp_path, monkeypatch, capsys):
     assert e.value.code == 0
     out = capsys.readouterr().out
     assert "Done: 2 3 5 7" in out and "gemma-4-e4b-it on the locals engine, agent coder" in out
+    assert "bash: python3 primes.py" in out
     assert calls[0] == ("fetch", args.model) and calls[1] == ("server", args.model) and calls[2][0] == "opencode"
+    # the model on OpenCode's command line (no project setting can swap it), and no stdin to wait on
+    assert calls[2][1][:4] == ["run", "--format", "json", "-m"] and calls[2][1][4] == "locals/locals/gemma-4-e4b-it"
+    assert calls[2][2] == subprocess.DEVNULL
     cfg = json.loads(cfg_path.read_text())
     assert cfg["model"] == "locals/locals/gemma-4-e4b-it" and cfg["default_agent"] == "coder"
     assert json.loads((tmp_path / "locals" / "config.json").read_text())["model"] == args.model
@@ -282,3 +304,38 @@ def test_model_before_a_command_with_its_own_parser(monkeypatch):
     monkeypatch.setattr(app, "_delegate", lambda name: (lambda argv: seen.append((name, argv))) if name == "chat" else None)
     app.main(["--model", "gemma", "chat", "--temp", "0"])
     assert seen == [("chat", ["--model", "gemma", "--temp", "0"])]
+
+
+def test_a_loading_server_is_waited_for_not_started_twice(tmp_path, monkeypatch):
+    """A command stopped with Ctrl-C while the server loaded left it loading; the next command saw nothing
+    listening and started a second server, which loaded the model a second time (on a 16 GB Mac, the
+    double load that once took the machine down). It waits for the loading one instead."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(app, "LOCALS_DIR", tmp_path)
+    up = {"now": False}
+    monkeypatch.setattr(app, "_saved_pid", lambda port: 4242)
+    monkeypatch.setattr(app, "_is_locals_server", lambda pid: True)
+    monkeypatch.setattr(app, "_listener_pid", lambda port: 4242 if up["now"] else None)
+    monkeypatch.setattr(app, "server_alive", lambda port: {"status": "ok", "engines": {"locals": True}} if up["now"] else None)
+    monkeypatch.setattr(app, "get_json", lambda url, timeout=5: {"model": "m/x", "active": []})
+    monkeypatch.setattr(app, "_background_pid", lambda port: 4242)
+
+    def popen(*a, **k):
+        raise AssertionError("a second server was started")
+
+    monkeypatch.setattr(app.subprocess, "Popen", popen)
+
+    def wait(args, running, log_path, start, wait_s):
+        assert running()
+        up["now"] = True
+
+    monkeypatch.setattr(app, "_wait_for_server", wait)
+    args = SimpleNamespace(port=8399, model="m/x", engine=None, engines=None)
+    app._ensure_server(args, 10)
+    assert up["now"]
+    up["now"] = False
+    import pytest
+
+    with pytest.raises(SystemExit, match="starting"):
+        app.cmd_serve(args)

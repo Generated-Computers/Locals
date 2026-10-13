@@ -28,11 +28,13 @@ Serving (OpenAI-compatible, continuous batching for concurrent agents):
 ``locals serve`` runs the server alone; see ``locals --help``.
 """
 
-from .api import CompiledGrammar, GrammarCompiler, Matcher, Vocabulary, load, logits_processor
-from .engine import ConstraintExhausted, Engine, GenResult
-from .runtime import Runtime
-
 __version__ = "0.2.0"
+
+# Every name is imported on first use: the command-line app (locals status, locals stop, the menu bar)
+# imports this package, and MLX and mlx-lm alone took 2.4 of the 2.9 s `locals --version` needed.
+_LAZY = {"CompiledGrammar": "api", "GrammarCompiler": "api", "Matcher": "api", "Vocabulary": "api", "load": "api",
+         "logits_processor": "api", "ConstraintExhausted": "engine", "Engine": "engine", "GenResult": "engine",
+         "Runtime": "runtime", "patch": "lm", "BatchService": "service", "Server": "server"}
 
 __all__ = [
     "__version__",
@@ -53,17 +55,15 @@ __all__ = [
 
 
 def __getattr__(name):
-    # Serving pieces are imported on first use so that ``import locals`` stays light.
-    if name == "patch":
-        from .lm import patch
+    module = _LAZY.get(name)
+    if module is None:
+        raise AttributeError(f"module 'locals' has no attribute {name!r}")
+    import importlib
 
-        return patch
-    if name == "BatchService":
-        from .service import BatchService
+    value = getattr(importlib.import_module(f".{module}", __name__), name)
+    globals()[name] = value
+    return value
 
-        return BatchService
-    if name == "Server":
-        from .server import Server
 
-        return Server
-    raise AttributeError(f"module 'locals' has no attribute {name!r}")
+def __dir__():
+    return sorted(list(globals()) + list(_LAZY))

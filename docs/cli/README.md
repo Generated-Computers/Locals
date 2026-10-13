@@ -9,8 +9,9 @@ This part of the package is the user-facing side. It is the `locals` command, th
 | File | Role |
 |---|---|
 | `locals/app.py` | The `locals` command: argument parsing, every subcommand except the delegated ones, background-server management, tool configuration and launching, `swarm`, `bench`. |
-| `locals/cli.py` | `locals generate`: one generation (optionally under a JSON schema or regex) from the command line, in-process. |
-| `locals/chat.py` | `locals chat` / `locals-chat`: an interactive chat, in-process. |
+| `locals/cli.py` | `locals generate`: one generation (optionally under a JSON schema or regex) from the command line, on the background server (in-process with `--local`). |
+| `locals/chat.py` | `locals chat` / `locals-chat`: an interactive chat, on the background server (in-process with `--local`). |
+| `locals/client.py` | The server side of `locals chat` and `locals generate`: starts or reuses the background server and talks to it. |
 | `locals/agents.py` | `locals agents` / `locals-agents`: many tool-using agents on one in-process `BatchService`, with a built-in task suite. |
 | `locals/menubar.py` | `locals menubar`: a macOS menu-bar app (needs the `menubar` extra). |
 | `install.sh` | The one-line installer (uv, then `uv tool install`). |
@@ -91,8 +92,8 @@ OpenCode references these ids as `<provider>/<engine>/<short>` (`oc_model`), bec
 | `locals solve TASK` | `solve.cmd_solve` | OpenCode agents race in copies of the project. The first whose check passes wins. |
 | `locals swarm` | `cmd_swarm` | Many OpenCode sessions at once on a task list, through one `opencode serve`. |
 | `locals bench` | `cmd_bench` | Concurrent tool-calling requests against both engines through the HTTP API. |
-| `locals generate` | `cli.main` | One generation in-process. |
-| `locals chat` | `chat.main` | Interactive chat in-process. |
+| `locals generate` | `cli.main` | One generation on the background server. |
+| `locals chat` | `chat.main` | Interactive chat on the background server. |
 | `locals agents` | `agents.main` | In-process agent suite (no HTTP server). |
 | `locals tune` | `cmd_tune` | The full one-time kernel autotuning: `Runtime.load(model, tune=mode)`. `--mode full` (default) or `quick`. |
 | `locals menubar` | `menubar.main` | The menu-bar app. |
@@ -135,6 +136,7 @@ The description in `--help` is the module docstring of `app.py`. argparse adds t
    - If `same` and not `stale`, the server is reused. `_SERVER_OPTS` is `engines`, `slots`, `temp`, `top_p`, `top_k`, `max_tokens`, `cache_gb`, `max_calls`, `max_context`. If any of these other than `engines` was given, a note says they only apply on the next start. When a server is reused, `--preload`, `--thinking`, `--walk`, `--typed-tools` and `--ollama` are dropped without a note. If `mlx` was requested but the running server lacks it, the command exits and asks you to stop the server first.
    - Otherwise the command restarts the server only when it is ours and idle. `_background_pid` returns the pid saved in the pid file only if that pid is the one listening (`lsof`), and the server must have no `active` rows. A server that is not ours or is busy is used as-is when `same` (with a note that it runs older code). Otherwise the command exits and names `locals stop` or `--port`. A restart sends `SIGTERM` and waits up to 60 s (120 polls of 0.5 s) for the port to free.
 3. If some other process holds the port (`_listener_pid` finds a process whose command line lacks `locals.server`), the command exits before loading anything.
+   If a server this tool started is still loading (`_starting_pid`: the saved pid is a running `locals.server` that does not listen yet, for example after a command was stopped with Ctrl-C while it waited), the command waits for it and follows its log instead of starting a second copy of the model, then applies the checks above. `locals serve` refuses to start next to it, and `locals status` reports it as starting. Ctrl-C while waiting stops the waiting, not the server.
 4. If `~/.locals/server.log` is larger than 50 MiB (`50 << 20`), it is moved to `server.log.1`.
 5. It `Popen`s `server_cmd(args)`, which runs `python -m locals.server ...` with `sys.executable`. Output is appended to the log, the process gets `start_new_session=True`, and the working directory is the folder that contains the `locals` package. The child inherits the environment of this command. The pid is written to `~/.locals/server-<port>.pid`.
 6. Once a second, until `wait_s`, it prints new log lines that start with `locals:`, `loading ` or `engine `, or that contain `tuning`. The docstring explains the reason: a first load tunes kernels for minutes, so there is no short timeout while the process is alive. If the process exits, the last 15 log lines written since the start are printed and the command exits. As soon as `/health` answers, it prints `server ready in Ns`.
@@ -244,12 +246,13 @@ Every agent, plus `build` and `plan`, gets `steps = AGENT_STEPS = 40`. The comme
 `cmd_code` runs these steps in order:
 
 1. Checks that `DIR` exists.
-2. Runs setup if `_opencode_ready` is false, or if `--engine mlx` is given and the config has no `mlx` provider.
-3. Calls `fetch_model`, `ensure_server` and `remember`.
-4. Writes `--engine` and `--agent` into the OpenCode config, so they persist for later launches.
-5. Runs OpenCode with `OPENCODE_DISABLE_AUTOUPDATE=1` and `PWD=<dir>`. OpenCode reads its project directory from `$PWD`.
+2. Calls `fetch_model` first, so a model that cannot run (a typo, a GGUF, too big) is refused before OpenCode's config names it.
+3. Runs setup if `_opencode_ready` is false, or if `--engine mlx` is given and the config has no `mlx` provider.
+4. Calls `ensure_server`, then `remember` (a model is remembered only once its server started).
+5. Writes `--agent` into the OpenCode config, so it persists for later launches. `--engine` is for this launch only.
+6. Runs OpenCode with `OPENCODE_DISABLE_AUTOUPDATE=1` and `PWD=<dir>` (OpenCode reads its project directory from `$PWD`), and always with `-m <provider>/<engine>/<short>`: a model set in the project's own `opencode.json` or a global `.jsonc` would otherwise win over the one Locals wrote, and could send the project to a cloud model.
 
-Without `--run`, it `execve`s `opencode <dir>` (`--logs` adds `--print-logs`). With `--run TASK`, it runs `opencode run --format json [-c] TASK` (`-c` comes from `--continue`), prints the last text part found by `_opencode_answer` (or the raw output tail), and exits with OpenCode's return code.
+Without `--run`, it `execve`s `opencode <dir> -m ...` (`--logs` adds `--print-logs`). With `--run TASK`, it runs `opencode run --format json -m ... [-c] TASK` (`-c` comes from `--continue`) with stdin closed (`opencode run` reads a piped stdin into the task, and waited forever when Locals ran from a script). Each tool call is printed as one line as it happens (`_opencode_step`, for example `bash: python3 -m pytest -q`); then the last text part found by `_opencode_answer` (or the raw output tail) is printed, and the command exits with OpenCode's return code. Ctrl-C stops OpenCode.
 
 ### `locals swarm` and `OpenCodeServer`
 
@@ -383,7 +386,7 @@ These commands are parsed in `app.py`. Both also accept the server options above
 
 ## `locals generate` (`cli.py`)
 
-This command loads the model in-process with `Runtime.load` and needs no server.
+This command runs on the background server: `client.connect` starts it if it is not running (as `locals code` does) or reuses it, with the model given by `--model`, else the model used last, else this Mac's default. One copy of the model stays in memory, and `--n` sends N requests that decode together in the server's batch, with or without a constraint. The prompt file and the schema are read and checked before anything starts. `--local`, `--dtype`, `--no-fuse` and `--no-forced` load the model in this process with `Runtime.load` instead (stop the server first: two copies of a model do not fit next to each other on a small Mac).
 
 | Option | Default | |
 |---|---|---|
@@ -393,27 +396,28 @@ This command loads the model in-process with `Runtime.load` and needs no server.
 | `--max-tokens` | 512 | |
 | `--temp` | 0.0 | |
 | `--seed` | 0 | |
-| `--n` | 1 | More than 1 means parallel samples sharing the prompt KV (`rt.sample`, temp 0.8 when `--temp` is 0). It cannot be combined with a constraint. |
+| `--n` | 1 | More than 1 means N samples at once (temperature 0.8 when `--temp` is 0), printed one after another. |
 | `--no-forced` | off | Disables forced-span compression. |
 | `--no-fuse` | off | Keeps separate q/k/v and gate/up matmuls. |
 | `--stats` | off | Speed line on stderr. |
-| `--dtype` | `auto` | `auto` means float16 on M1/M2 GPUs. |
+| `--dtype` | `auto` | `auto` means float16 on M1/M2 GPUs. Implies `--local`. |
+| `--local` | off | The model in this process instead of the server. |
 
 ## `locals chat` (`chat.py`)
 
-This command is in-process. Its options are `--system`, `--temp 0.7`, `--top-p 0.9`, `--max-tokens 1024`, `--think`, `--no-stats` and `--dtype auto`. It warms up with an 8-token generation before the first prompt.
+This command runs on the background server (`client.chat`), started if needed, like `locals generate`. Its options are `--model` (default: the model used last), `--system`, `--temp 0.7`, `--max-tokens 1024`, `--think` (the `-thinking` model id; thoughts are printed dimmed), `--no-stats`, and `--local` (or `--dtype`) for the old in-process chat. Replies are streamed; the server's prompt cache keeps the conversation between turns, so a turn reads only what is new. The stats line gives the reply's tokens and speed, the time to the first token, and how much of the context came from the cache.
 
-With a ChatML template (Qwen), `Conversation` keeps the conversation as one token stream whose KV cache persists, so each turn prefills only the new message. Other templates re-render the conversation each turn, and the cache is reused where it still matches. If the re-rendered prefix differs from the stored history, history and cache are dropped.
+In-process (`--local`), `Conversation` keeps a ChatML conversation as one token stream whose KV cache persists, warms up with an 8-token generation, and takes `--top-p`.
 
 | In-chat command | Effect |
 |---|---|
 | `/reset` | Starts a new conversation. |
-| `/json <schema>` | Constrains the next reply only to a schema, given as a file path or inline JSON. The schema is compiled immediately, so errors show before the reply. |
-| `/n <N>` | Generates N alternative replies to the next message in one batch with mlx-lm's `BatchGenerator`. The conversation continues from reply 1. |
+| `/json <schema>` | Constrains the next reply only to a schema, given as a file path or inline JSON. |
+| `/n <N>` | Generates N alternative replies to the next message at once (N requests in the server's batch; in-process, mlx-lm's `BatchGenerator`). The conversation continues from reply 1. |
 | `/stats` | Toggles the speed line. |
 | `/quit` | Exits. |
 
-Ctrl-C stops the current reply and drops that turn.
+Ctrl-C stops the current reply (on the server: the connection closes and the server stops decoding it) and drops that turn.
 
 ## `locals agents` (`agents.py`)
 

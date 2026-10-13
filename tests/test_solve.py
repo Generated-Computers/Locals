@@ -218,3 +218,21 @@ def test_notes_leave_out_the_servers_steering_text():
     notes = solve.failure_notes([a])
     assert "The mean function was replaced by mistake." in notes and "cannot import name" in notes
     assert "already made" not in notes and "I am stuck" not in notes
+
+
+def test_a_check_that_cannot_run_is_named_before_any_agent_starts(tmp_path, monkeypatch):
+    """`locals run --check "python3 -m pytest -q"` on a Mac without pytest ran 17 agents for three minutes and
+    then said only "the check FAILS". A missing runner or program is named before the run starts; programs
+    given as paths and the project's own modules may be created by the task, and are not judged."""
+    import sys
+
+    from locals.solve import check_cannot_run
+
+    py = sys.executable
+    assert "no module named nosuchrunner" not in (check_cannot_run(f"{py} -m pytest -q", tmp_path) or "")
+    monkeypatch.setattr("locals.solve._TOOLS", {"nosuchrunner"})
+    why = check_cannot_run(f"cd . && {py} -m nosuchrunner -q", tmp_path)
+    assert why and "no module named nosuchrunner" in why and "pip install nosuchrunner" in why
+    assert "not installed" in check_cannot_run("no-such-program-xyz --all", tmp_path)
+    for fine in (f"{py} -m wordcount", "./run_tests.sh", f"PYTHONPATH=. {py} -c pass", "true && make test"):
+        assert check_cannot_run(fine, tmp_path) is None, fine

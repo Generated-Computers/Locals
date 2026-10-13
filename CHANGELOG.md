@@ -40,6 +40,19 @@ First public release.
 - **Works with benchmark tools.** `ignore_eos` and
   `stream_options.include_usage` as vLLM and OpenAI handle them, so InferenceX,
   vLLM's and aiperf's clients measure Locals as they measure other servers.
+- **Smoother commands.** `locals chat` and `locals generate` use the background
+  server instead of loading a second copy of the model, so `--n` works with every
+  model; `locals status`, `stop` and `--version` answer in a fraction of a second;
+  `locals code --run` shows each step as it happens; `locals` alone shows what it
+  can do; the installer no longer needs git.
+- **A steadier team of agents.** `locals run` tells you at once when the check
+  command cannot run (for example pytest is not installed), instead of failing
+  after minutes; a check that already passes before the run guards the result
+  instead of ending it after the first file; "fix parser.py" finds
+  `src/.../parser.py`; agents that are stopped stop generating at once.
 - **Fixed:** sixteen long requests arriving at once no longer run the GPU out
-  of memory, and a stream that waits for a long prompt no longer sends a line
-  that strict clients failed to read.
+  of memory; a stream that waits for a long prompt no longer sends a line that
+  strict clients failed to read; a second command no longer starts a second
+  server while the first is still loading the model; OpenCode always runs on the
+  local model, even when a project's own settings name another one; a mistyped
+  model name is no longer saved as the default.

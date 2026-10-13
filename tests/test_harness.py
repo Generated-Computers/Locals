@@ -19,7 +19,7 @@ def _script(monkeypatch, by_agent):
     lock = threading.Lock()
     steps = {}
 
-    def chat(base_url, body, timeout=900):
+    def chat(base_url, body, timeout=900, stop=None):
         key = body["messages"][1]["content"] + str(body.get("temperature"))  # one agent: its prompt and its temperature
         with lock:
             steps[key] = steps.get(key, 0) + 1
@@ -365,3 +365,71 @@ def test_agent_commands_write_only_in_their_copy(tmp_path):
     code, out = run_shell(f"echo b > {outside}", tmp_path, 30)  # the check, the user's own command: not confined
     assert outside.exists()
     outside.unlink()
+
+
+def test_a_check_that_passes_before_the_run_does_not_end_it(tmp_path, monkeypatch):
+    """A feature added to a project whose tests pass: every first write "passed" the check, every agent stopped
+    there, and the first drafts were written into the project. A check that passed before any change guards
+    the result; the agents finish their parts, and no whole-task agent wins by a pass."""
+    root = tmp_path / "p"
+    root.mkdir()
+
+    def agent(body, k):
+        prompt = body["messages"][1]["content"]
+        f, v = ("a.py", "A") if "a.py" in prompt.split("Your part")[-1] else ("b.py", "B")
+        return [_reply("write_file", path=f, content=f"{v} = 0  # a first draft"), _reply("write_file", path=f, content=f"{v} = 1"),
+                _reply("finish", summary="done")][min(k, 3) - 1]
+
+    _script(monkeypatch, agent)
+    logged = []
+    run = harness.Run("Write a.py (A = 1) and b.py (B = 1).", root, "http://x", "m", "python3 -c pass", log=logged.append,
+                      max_steps=10)
+    report = run.go()
+    assert report["passed_before"] and report["passed"]
+    assert (root / "a.py").read_text().strip() == "A = 1" and (root / "b.py").read_text().strip() == "B = 1"
+    assert not report.get("won_by") and not run.solo  # the racers would only have "won" with a first draft
+    assert any("passes before any change" in m for m in logged)
+
+
+def test_a_path_from_a_traceback_is_the_agents_own_file(tmp_path):
+    """Tracebacks in a copy print /private/var/.../w/inventory.py; an agent that passed such a path on was told
+    "no such file". A path inside its own copy is its project-relative file, one outside stays refused, and
+    what the agent reads names the project's files, not the copy's folder."""
+    root = tmp_path / "w"
+    root.mkdir()
+    (root / "inventory.py").write_text("X = 1\n")
+    a = harness.Agent("w0", root, "http://x", "m", ["inventory.py"], "task")
+    assert a._tool("read_file", {"path": str(root / "inventory.py")}) == "X = 1\n"
+    assert a._tool("read_file", {"path": str(root.resolve() / "inventory.py")}) == "X = 1\n"
+    assert a._tool("read_file", {"path": "/etc/hosts"}).startswith("no such file")
+    assert a._tool("write_file", {"path": str(root / "inventory.py"), "content": "X = 2"}).startswith("wrote inventory.py")
+    assert a._clean(f'File "{root.resolve()}/inventory.py", line 1') == 'File "inventory.py", line 1'
+
+
+def test_a_stopped_agents_request_is_closed_not_waited_for():
+    """A stopped agent finished its reply first (a long write_file took over a minute) and the stage waited for
+    it; its connection is closed instead, which the server takes as a cancel."""
+    import pytest
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Slow(BaseHTTPRequestHandler):
+        def do_POST(self):
+            time.sleep(5)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *a):
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        stop = threading.Event()
+        threading.Timer(0.3, stop.set).start()
+        t = time.time()
+        with pytest.raises(Exception):
+            harness._chat(f"http://127.0.0.1:{httpd.server_address[1]}", {"messages": []}, stop=stop)
+        assert time.time() - t < 2
+    finally:
+        httpd.shutdown()
