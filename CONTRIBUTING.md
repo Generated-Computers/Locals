@@ -1,5 +1,10 @@
 # Contributing
 
+How the code is organized is in [locals/README.md](locals/README.md) and the
+[technical documentation](docs/README.md); the tests are described in
+[tests/README.md](tests/README.md), and the benchmarks and how to repeat them in
+[docs/measurements](docs/measurements/README.md).
+
 ## Setup
 
 ```bash
