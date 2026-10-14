@@ -198,14 +198,15 @@ run `locals launch ollama`.
 
 Locals picks a model that fits your Mac's memory, so most people never need to
 change it. To use another one, start Locals with its name, for example
-`locals start --model lfm`. Locals runs one model at a time.
+`locals start --model lfm`. Locals runs one model at a time. The last two
+columns are speeds in tokens per second (tps) with 8 requests at once.
 
-| Model | Start it with | Name in your editor | Download size | mlx-lm, 8 requests | Locals, 8 requests |
+| Model | Start it with | Name in your editor | Size | mlx-lm | Locals |
 |---|---|---|---|---|---|
-| Qwen3.5-4B (the default) | `--model qwen` | `locals/qwen3.5-4b` | 2.8 GB | 87 tokens/s | 271 tokens/s |
-| LFM2.5-2.6B | `--model lfm` | `locals/lfm2.5-2.6b` | 1.6 GB | 144 tokens/s | 404 tokens/s |
-| MiniCPM5-2B | `--model minicpm` | `locals/minicpm5-2b` | 1.4 GB | 160 tokens/s | 478 tokens/s |
-| Gemma 4 E4B | `--model gemma` | `locals/gemma-4-e4b-it` | 4.8 GB | 80 tokens/s | 224 tokens/s |
+| Qwen3.5-4B (the default) | `--model qwen` | `locals/qwen3.5-4b` | 2.8 GB | 87 tps | 271 tps |
+| LFM2.5-2.6B | `--model lfm` | `locals/lfm2.5-2.6b` | 1.6 GB | 144 tps | 404 tps |
+| MiniCPM5-2B | `--model minicpm` | `locals/minicpm5-2b` | 1.4 GB | 160 tps | 478 tps |
+| Gemma 4 E4B | `--model gemma` | `locals/gemma-4-e4b-it` | 4.8 GB | 80 tps | 224 tps |
 
 Each model also has a thinking mode, in which it reasons before it answers: add
 `-thinking` to the name, for example `locals/lfm2.5-2.6b-thinking`. The smaller
