@@ -8,3 +8,16 @@ authors:
 version: 0.2.0
 license: MIT
 repository-code: "https://github.com/Generated-Computers/Locals"
+preferred-citation:
+  type: article
+  title: "Breaking the Space Barrier and its Application to Language Model Inference"
+  authors:
+    - family-names: Asadulaev
+      given-names: Arip
+  journal: "arXiv preprint arXiv:2610.09139"
+  year: 2026
+  url: "https://arxiv.org/abs/2610.09139"
+  identifiers:
+    - type: other
+      value: "arXiv:2610.09139"
+      description: "The arXiv ID of the paper"
