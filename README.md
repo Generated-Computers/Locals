@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/logo.png" alt="Generated Computers" width="480">
+  <img src="docs/assets/logo.png" alt="Generated Computers" width="100%">
 </p>
 
 <h1 align="center">Locals</h1>
@@ -18,9 +18,10 @@
 Locals runs AI models on your own Mac and makes them fast when many requests
 arrive at the same time. That is how today's AI agents work: a coding assistant
 runs several helpers in parallel, and a team of agents can work on one task
-together. Locals answers all of these requests together instead of one after
-another, so the whole team gets its answers about three times faster than with
-the standard way of running models on a Mac.
+together. Locals answers these requests together, and computes such a group of
+requests far more efficiently on your Mac's graphics chip, so the whole team gets
+its answers about three times faster than with the standard way of running
+models on a Mac.
 
 It works with the coding assistants you may already use, such as OpenCode,
 Cline, Aider and OpenHands, and with any app or program that talks to OpenAI or
@@ -45,6 +46,16 @@ Locals is as fast as mlx-lm; the more requests arrive together, the bigger the
 difference. In practice, eight agents working at once finish in about the time
 two would need one after the other, and the answers are the same as mlx-lm's.
 How we measured, and more results, are in [Measurements](docs/measurements/README.md).
+
+**Why.** mlx-lm answers several requests together too. The difference is in the
+arithmetic: for the handful of requests at a time that agents send, mlx-lm's way
+of multiplying by the model's compressed weights gets almost no faster per
+request (87 tokens/s with four requests, 86 with eight), while Locals uses GPU
+code written and tuned for exactly these small groups, and on M1 and M2 chips
+computes in a number format the chip handles natively. For agents, Locals also
+keeps each conversation between turns, so the next turn does not read it again.
+[Why Locals is faster](docs/why-faster/README.md) lists every difference with its
+measured effect.
 
 ## Getting started
 

@@ -7,6 +7,7 @@ and settings involved.
 
 | Page | What it covers |
 |---|---|
+| [Why Locals is faster](why-faster/README.md) | What Locals does differently from mlx-lm, and how much each difference counts, measured one at a time |
 | [The package](../locals/README.md) | A map of the `locals` package: what each module does and how a request travels through them |
 | [Server and APIs](server/README.md) | The HTTP server: endpoints, OpenAI and Ollama compatibility, request options, streaming, reply guards, context limits, security, command-line flags |
 | [Batch engine](engine/README.md) | Continuous batching: the pipelined step loop, admission, prefill, mixed passes, the memory guard, sampling, constrained rows, cancellation and recovery |

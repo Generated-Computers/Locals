@@ -4,10 +4,12 @@
 
 First public release.
 
-- **About three times faster with many requests at once.** Continuous
-  batching, kernels tuned for your GPU and a prompt cache: 271 tokens/s with
-  eight requests at once where mlx-lm gives 87, the same speed for one request,
-  and the same answers. Each agent's next turn starts in under a second.
+- **About three times faster with many requests at once.** GPU kernels written
+  and tuned for the few requests at a time that agents send, float16 on M1 and
+  M2, fused layers, and a prompt cache that keeps each agent's conversation:
+  271 tokens/s with eight requests at once where mlx-lm gives 87, the same speed
+  for one request, and the same answers. What each part contributes is measured
+  in docs/why-faster.
 - **Many agents on one task.** `locals run` puts a team of agents on a task, each
   in its own copy of the project, with your tests as the check; the project is
   changed only when they pass.

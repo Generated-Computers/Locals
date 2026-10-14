@@ -36,6 +36,9 @@ The same test at 8 rows for the other tested models (tokens per second):
 | MiniCPM5-2B | 160 | 478 |
 | Gemma 4 E4B | 80 | 224 |
 
+Which of Locals' differences from mlx-lm produce these numbers, measured by
+switching them off one at a time, is in [Why Locals is faster](../why-faster/README.md).
+
 Dense 4-bit models gain 2.3x to 3.3x at 8 rows. A mixture-of-experts model in
 the mxfp4 format (Mellum) gained nothing (1.0x): the tuned small-batch kernels
 cover 4-bit affine layers in groups of 64 (`_tunable` in `locals/kernels.py`),
