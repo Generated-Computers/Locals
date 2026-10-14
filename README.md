@@ -15,6 +15,8 @@
 
 ## What it is
 
+<img src="docs/assets/emblem.jpg" alt="Generated Computers Co." width="240" align="right">
+
 Locals runs AI models on your own Mac and makes them fast when many requests
 arrive at the same time. That is how today's AI agents work: a coding assistant
 runs several helpers in parallel, and a team of agents can work on one task
@@ -26,6 +28,16 @@ models on a Mac.
 It works with the coding assistants you may already use, such as OpenCode,
 Cline, Aider and OpenHands, and with any app or program that talks to OpenAI or
 Ollama. Everything stays on your computer.
+
+Locals is built on the paper
+[Breaking the Space Barrier and its Application to Language Model Inference](https://arxiv.org/abs/2610.09139)
+(Arip Asadulaev, 2026). The paper goes below the classical memory bound of
+Savitch's theorem for finding paths in the kind of graph that describes a JSON
+format or a tool call, and turns this into an inference engine: text the format
+already decides is written without running the model, the checks run on the
+graphics chip, and a format needs about 3 MB of memory instead of up to 1.5 GB.
+The full results are in the paper, among them sixteen tool-calling agents
+finishing 2.5 times sooner than with mlx-lm and llguidance.
 
 ## How much faster
 
@@ -256,6 +268,19 @@ git clone https://github.com/Generated-Computers/Locals
 cd Locals
 uv sync --extra dev
 uv run pytest tests -q -m "not model"
+```
+
+## Citation
+
+If you use Locals in your research, please cite the paper:
+
+```bibtex
+@article{asadulaev2026breaking,
+  title   = {Breaking the Space Barrier and its Application to Language Model Inference},
+  author  = {Asadulaev, Arip},
+  journal = {arXiv preprint arXiv:2610.09139},
+  year    = {2026}
+}
 ```
 
 ## License

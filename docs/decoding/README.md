@@ -6,6 +6,8 @@ Every grammar the engine decodes under goes through the same front end (to a reg
 
 The decode loop keeps the automaton state on the GPU and masks the logits with one gather. Text that the grammar forces is fed to the model without being sampled.
 
+The theory behind this part, its proofs and its full measurements are in the paper [Breaking the Space Barrier and its Application to Language Model Inference](https://arxiv.org/abs/2610.09139) (Arip Asadulaev, 2026).
+
 ## Module map
 
 | Module | Role |

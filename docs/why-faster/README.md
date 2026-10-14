@@ -4,8 +4,10 @@ Part of the [technical documentation](../README.md) of Locals. This page answers
 one question with measurements: what does Locals do differently from mlx-lm, and
 how much does each difference count when many requests arrive at once?
 
-The short answer: both batch concurrent requests, and both overlap the CPU's work
-with the GPU's. The difference is in how the model is computed for a batch of a
+The short answer: with 8 requests at once, Locals writes 273 tokens per second and
+plain mlx-lm 86, and the whole difference comes from Locals' code. It is not in
+how requests are scheduled: both batch concurrent requests, and both overlap the
+CPU's work with the GPU's. It is in how the model is computed for a batch of a
 few rows. mlx-lm's 4-bit matrix multiplications get no faster per row between 2
 and 8 rows, so 8 requests at once run about as fast as 4. Locals replaces them
 with GPU kernels written and tuned for small batches, computes in float16 on Macs
@@ -30,7 +32,7 @@ runs in its own process.
 |---|---|---|---|---|
 | Plain mlx-lm | 60.5 | 87.0 | 86.2 | 156.8 |
 | Locals | 65.6 | 160.8 | 272.7 | 345.8 |
-| mlx-lm's `BatchGenerator` on Locals' model | 67.0 | 162.1 | 272.9 | 344.6 |
+| Locals' model, scheduled by mlx-lm's `BatchGenerator` instead of Locals' engine | 67.0 | 162.1 | 272.9 | 344.6 |
 | Locals without the small-batch kernels | 67.0 | 118.1 | 119.2 | 213.0 |
 | Locals in bfloat16 instead of float16 | 65.6 | 93.0 | 97.9 | 317.0 |
 | Locals without fused projections | 63.7 | 154.5 | 246.8 | 332.8 |
@@ -38,10 +40,16 @@ runs in its own process.
 | Locals without pipelining | 55.2 | 138.1 | 236.5 | 300.6 |
 | Locals with all of the above off | 53.7 | 78.0 | 79.3 | 146.5 |
 
-How to read it: the third row runs mlx-lm's own batch scheduler on the model as
-Locals loads it, and is as fast as Locals. So for decoding, the speed-up is in the
-model's computation, not in the scheduling. The rows after it remove one piece at
-a time from Locals.
+How to read it: the first two rows are the comparison, plain mlx-lm against
+Locals, 1.8 to 3.2 times faster from 4 requests on. The third row asks where
+that comes from. When Locals loads a model it replaces parts of the model's
+computation (the kernels, the number format, the fused layers below), and then
+runs it in its own batch engine. The third row keeps Locals' model but hands it
+to mlx-lm's batch scheduler instead, and it is just as fast. So the speed-up is
+in Locals' model computation, not in its scheduler; mlx-lm's scheduler with
+mlx-lm's own model is the first row, 86 tokens/s with 8 requests. The rows after
+it remove one piece at a time from Locals; with all of them off, Locals' engine
+is as slow as plain mlx-lm (79 tokens/s with 8 requests).
 
 ## The differences that make decoding faster
 
