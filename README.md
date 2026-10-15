@@ -15,7 +15,7 @@
 
 ## What it is
 
-<img src="docs/assets/emblem.jpg" alt="Generated Computers Co." width="240" align="right">
+<img src="docs/assets/emblem.jpg" alt="Generated Computers Co." width="29%" align="right">
 
 Locals runs AI models on your own Mac and makes them fast when many requests
 arrive at the same time. That is how today's AI agents work: a coding assistant
