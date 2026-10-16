@@ -5,7 +5,7 @@ name: release
 # this workflow itself (trusted publishing), so no password or token is stored
 # anywhere: on pypi.org the project has a trusted publisher for the repository
 # Generated-Computers/Locals, workflow release.yml, environment pypi, and on
-# test.pypi.org the same with environment testpypi. RELEASING.md has the steps.
+# test.pypi.org the same with environment testpypi.
 
 on:
   push:
