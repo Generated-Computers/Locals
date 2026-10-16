@@ -58,16 +58,16 @@ finishing 2.5 times sooner than with mlx-lm and llguidance.
 <div align="center">
 <table>
   <tr>
-    <td align="center" width="96"><a href="https://github.com/anomalyco/opencode"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/opencode.png" width="64" alt="OpenCode"><br>OpenCode</a></td>
-    <td align="center" width="96"><a href="https://github.com/OpenHands/OpenHands"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openhands.png" width="64" alt="OpenHands"><br>OpenHands</a></td>
-    <td align="center" width="96"><a href="https://github.com/cline/cline"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/cline.png" width="64" alt="Cline"><br>Cline</a></td>
-    <td align="center" width="96"><a href="https://github.com/Kilo-Org/kilocode"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/kilo.png" width="64" alt="Kilo Code"><br>Kilo Code</a></td>
+    <td align="center"><a href="https://github.com/anomalyco/opencode"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/opencode.png" width="64" alt="OpenCode"><br>OpenCode</a></td>
+    <td align="center"><a href="https://github.com/OpenHands/OpenHands"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openhands.png" width="64" alt="OpenHands"><br>OpenHands</a></td>
+    <td align="center"><a href="https://github.com/cline/cline"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/cline.png" width="64" alt="Cline"><br>Cline</a></td>
+    <td align="center"><a href="https://github.com/Kilo-Org/kilocode"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/kilo.png" width="64" alt="Kilo Code"><br>Kilo&nbsp;Code</a></td>
   </tr>
   <tr>
-    <td align="center" width="96"><a href="https://github.com/RooCodeInc/Roo-Code"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/roo.png" width="64" alt="Roo Code"><br>Roo Code</a></td>
-    <td align="center" width="96"><a href="https://github.com/openclaw/openclaw"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openclaw.png" width="64" alt="OpenClaw"><br>OpenClaw</a></td>
-    <td align="center" width="96"><a href="https://github.com/NousResearch/hermes-agent"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/hermes.png" width="64" alt="Hermes Agent"><br>Hermes Agent</a></td>
-    <td align="center" width="96"><a href="https://github.com/Aider-AI/aider"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/aider.png" width="64" alt="Aider"><br>Aider</a></td>
+    <td align="center"><a href="https://github.com/RooCodeInc/Roo-Code"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/roo.png" width="64" alt="Roo Code"><br>Roo&nbsp;Code</a></td>
+    <td align="center"><a href="https://github.com/openclaw/openclaw"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openclaw.png" width="64" alt="OpenClaw"><br>OpenClaw</a></td>
+    <td align="center"><a href="https://github.com/NousResearch/hermes-agent"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/hermes.png" width="64" alt="Hermes Agent"><br>Hermes&nbsp;Agent</a></td>
+    <td align="center"><a href="https://github.com/Aider-AI/aider"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/aider.png" width="64" alt="Aider"><br>Aider</a></td>
   </tr>
 </table>
 </div>
