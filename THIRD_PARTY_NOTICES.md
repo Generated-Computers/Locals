@@ -67,6 +67,6 @@ the logos and names remain the property and trademarks of their owners.
 | `cline.png` | Cline | https://github.com/cline/cline, `assets/icons/icon.png` |
 | `kilo.png` | Kilo Code | Kilo Code's square logo (https://github.com/Kilo-Org/kilocode) |
 | `roo.png` | Roo Code | https://github.com/RooCodeInc/Roo-Code, `src/assets/icons/icon.png` |
-| `openclaw.png` | OpenClaw | https://github.com/openclaw/openclaw, `apps/linux/src-tauri/icons/icon.png` |
+| `openclaw.png` | OpenClaw | OpenClaw's logo (https://github.com/openclaw/openclaw), rendered from its SVG |
 | `hermes.png` | Hermes Agent | https://github.com/NousResearch/hermes-agent, `apps/desktop/assets/icon.png` |
 | `aider.png` | Aider | https://github.com/Aider-AI/aider, `aider/website/assets/icons/apple-touch-icon.png` |
