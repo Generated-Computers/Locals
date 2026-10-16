@@ -55,22 +55,17 @@ finishing 2.5 times sooner than with mlx-lm and llguidance.
 
 ## Works with your agents
 
-<div align="center">
-<table>
-  <tr>
-    <td align="center"><a href="https://github.com/anomalyco/opencode"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/opencode.png" width="64" alt="OpenCode"><br>OpenCode</a></td>
-    <td align="center"><a href="https://github.com/OpenHands/OpenHands"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openhands.png" width="64" alt="OpenHands"><br>OpenHands</a></td>
-    <td align="center"><a href="https://github.com/cline/cline"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/cline.png" width="64" alt="Cline"><br>Cline</a></td>
-    <td align="center"><a href="https://github.com/Kilo-Org/kilocode"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/kilo.png" width="64" alt="Kilo Code"><br>Kilo&nbsp;Code</a></td>
-  </tr>
-  <tr>
-    <td align="center"><a href="https://github.com/RooCodeInc/Roo-Code"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/roo.png" width="64" alt="Roo Code"><br>Roo&nbsp;Code</a></td>
-    <td align="center"><a href="https://github.com/openclaw/openclaw"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openclaw.png" width="64" alt="OpenClaw"><br>OpenClaw</a></td>
-    <td align="center"><a href="https://github.com/NousResearch/hermes-agent"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/hermes.png" width="64" alt="Hermes Agent"><br>Hermes&nbsp;Agent</a></td>
-    <td align="center"><a href="https://github.com/Aider-AI/aider"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/aider.png" width="64" alt="Aider"><br>Aider</a></td>
-  </tr>
-</table>
-</div>
+<p align="center">
+  <a href="https://github.com/anomalyco/opencode"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/opencode.png" width="40" height="40" align="middle" alt="">&nbsp;OpenCode</a> &emsp;
+  <a href="https://github.com/OpenHands/OpenHands"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openhands.png" width="40" height="40" align="middle" alt="">&nbsp;OpenHands</a> &emsp;
+  <a href="https://github.com/cline/cline"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/cline.png" width="40" height="40" align="middle" alt="">&nbsp;Cline</a> &emsp;
+  <a href="https://github.com/Kilo-Org/kilocode"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/kilo.png" width="40" height="40" align="middle" alt="">&nbsp;Kilo&nbsp;Code</a>
+  <br><br>
+  <a href="https://github.com/RooCodeInc/Roo-Code"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/roo.png" width="40" height="40" align="middle" alt="">&nbsp;Roo&nbsp;Code</a> &emsp;
+  <a href="https://github.com/openclaw/openclaw"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openclaw.png" width="40" height="40" align="middle" alt="">&nbsp;OpenClaw</a> &emsp;
+  <a href="https://github.com/NousResearch/hermes-agent"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/hermes.png" width="40" height="40" align="middle" alt="">&nbsp;Hermes&nbsp;Agent</a> &emsp;
+  <a href="https://github.com/Aider-AI/aider"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/aider.png" width="40" height="40" align="middle" alt="">&nbsp;Aider</a>
+</p>
 
 Locals works with the coding agents and assistants people already use, on a
 model running on your Mac. Each of these was tested end to end with Qwen3.5-4B
