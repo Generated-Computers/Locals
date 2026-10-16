@@ -229,6 +229,47 @@ If the chunk reaches a checkpoint, the step is evaluated synchronously and `_che
 
 `LOCALS_MIXLOG=1` prints each pass: the number of rows, the prompt tokens in the pass, the position, and the milliseconds since the previous pass.
 
+## One request alone (`_solo`)
+
+With a single row, a pass over a few tokens costs little more than a pass over one: the weights are read once
+either way, and that is what limits one stream (about 66 tokens/s for Qwen3.5-4B on an M2 Pro, near the
+71 the memory bandwidth allows). So the only running request gets steps that feed more than its next token,
+and every token they keep is one a one-token step would have produced:
+
+- **Its forced span at once.** Tokens the grammar decides (tool-call syntax, JSON keys) are fed in one pass
+  instead of one per step, and only the last position is sampled.
+- **A prompt-lookup draft, verified in the same pass.** `_solo_draft` takes what followed the most recent
+  earlier occurrence of the row's last 3 tokens (from an index kept on the request, `lk_index`, updated as
+  tokens are committed, so no scan of a long prompt per step). Under a grammar the draft is first walked
+  through it (`config`, `step_config`, `finished_at`) and cut at the first token it does not allow, and each
+  draft position is masked with the grammar's state there (`_solo_masked`). `_solo_verify` keeps draft tokens
+  while each is the argmax (greedy), or with probability p(d) under the request's own distribution, drawing
+  from p without d on a rejection (sampled: the tokens follow p exactly). Rejected tokens are rewound
+  (`_solo_rewind`: KV layers `trim`, Gated DeltaNet layers the per-token state the fused kernel recorded, so
+  drafts need `_gdn_ok` layers and float32 states). A forced span after an accepted draft token ends the
+  draft there; the span is fed next.
+
+**When.** At a boundary, when one row runs, nothing waits and no prompt is filling (`_solo_ok`: no sliding-
+window caches, so not Gemma; no walk or pushdown constraints). After a chained step, `solo_next` asks for a
+boundary when the only row has a forced span of 3 or more tokens or a draft: entering costs about one step,
+since the pipeline drains. Without a span or a draft, `_solo` returns and the row goes on in pipelined
+steps. It also returns as soon as `source` yields a request, which then joins as usual.
+
+**Drafts that keep failing.** After a draft rejected outright, the row gets no draft for 1 token, doubling to
+32 while drafts keep failing (`solo_miss`, `solo_resume`); one token under a grammar is too often the start
+of a repeated JSON key, so drafts there need 2 tokens or more.
+
+Measured through the server, one request, Qwen3.5-4B, greedy, the same answers with `LOCALS_SOLO=0` and 1:
+
+| Workload | One-token steps | Alone |
+|---|---|---|
+| An edit that repeats a 70-line file | 66 tok/s | 108 tok/s (1.64x) |
+| A `write` tool call that saves that file (the agents' tool-call grammar) | 54 tok/s | 91 tok/s (1.70x) |
+| A short tool call | 37 tok/s | 38 tok/s |
+| A JSON extraction (a list of objects) | 53 tok/s | 52 tok/s |
+
+`LOCALS_SOLO=0` turns it off.
+
 ## Retiring rows
 
 At a boundary, `retire(i, r)` moves a finished row's cache into the prompt cache (if there is one) and calls `on_done(r)`. How the row is taken out depends on whether it is the only row:
@@ -321,6 +362,7 @@ Any other exception escapes `serve`, for example a Metal out-of-memory error. `B
 | `LOCALS_MIX_CHUNK` | 1024 | Rows plus prompt tokens in a mixed pass; 0 turns mixed passes off |
 | `LOCALS_MAX_SNAPSHOTS` | 4 | Shared-prefix snapshots kept |
 | `LOCALS_GROWTH_TRIM` | `1` | `0` turns off the trim every 32 steps |
+| `LOCALS_SOLO` | `1` | `0`: one token per step for a request alone too (no forced spans in one pass, no drafts) |
 | `LOCALS_MEMLOG`, `LOCALS_MIXLOG`, `LOCALS_PREFILL_LOG` | unset (off) | Logging, described above. Any non-empty value turns them on, `0` included, because the code tests `bool(os.environ.get(...))` |
 | `PREFILL_SCORES`, `PREFILL_TOKENS` | `1 << 24`, 2048 | Module constants in `hybrid_batch.py` |
 | `memory_limit` | 0 in the engine | Set by `BatchService` as above |
@@ -339,5 +381,6 @@ Any other exception escapes `serve`, for example a Metal out-of-memory error. `B
 | `mixed_steps` | Mixed passes run |
 | `deferred` | Boundary steps at which the head of the queue was held back for memory |
 | `cache_trims` | Times `_trim_for` evicted prompt-cache entries |
+| `solo_steps`, `drafted` | Steps of a request alone (`_solo`), and the draft tokens they kept |
 
 The service wraps `eng._launch` to publish `active` and `tokens_out` on every step.

@@ -179,6 +179,9 @@ def _append_rows(cache, merged) -> None:
 
 
 _GROWTH_TRIM = os.environ.get("LOCALS_GROWTH_TRIM", "1") != "0"
+# One request running alone: its forced spans fed in one pass, and prompt-lookup drafts verified in the same
+# pass as the next token (HybridBatchEngine._solo). LOCALS_SOLO=0: one token per step, as with many requests.
+_SOLO = os.environ.get("LOCALS_SOLO", "1") != "0"
 
 
 class DiskPromptCache:
@@ -688,6 +691,217 @@ class HybridBatchEngine(BatchEngine):
     def _chainable(self, rows: List[Request]) -> bool:
         return all(not r.controller.may_force() for r in rows)
 
+    # -- one request alone: several tokens per pass ------------------------------------------
+    #
+    # With one row, a pass over several tokens costs little more than a pass over one (the weights are
+    # read once either way), so the only running request gets steps that feed more than its next token:
+    # its forced span at once (tool-call syntax, JSON keys), or a prompt-lookup draft (the continuation
+    # of the most recent earlier occurrence of its last tokens; an agent rewriting a file repeats it)
+    # verified in the same pass. Accepted draft tokens are the ones one-token steps would have sampled;
+    # rejected ones are rewound. Without a span or a draft, the row goes back to the pipelined steps.
+
+    def _solo_ok(self, r, cache) -> bool:
+        if not _SOLO or cache is None or getattr(self, "_walk", None) is not None:
+            return False
+        if any(type(c) not in (BatchKVCache, ArraysCache) for c in cache):
+            return False  # sliding-window layers (Gemma) are not rewound
+        name = type(r.controller).__name__
+        return name not in ("WalkController", "PDAController")
+
+    def _solo_drafts_ok(self, cache) -> bool:
+        """Drafts need the per-token recurrent states the fused Gated DeltaNet kernel records (to rewind)."""
+        ok = getattr(self, "_solo_gdn", None)
+        if ok is None:
+            from . import fuse
+
+            lin = [getattr(l, "linear_attn", None) for l in self.lm.model.layers]
+            lin = [m for m in lin if m is not None]
+            ok = self._solo_gdn = all(getattr(m, "_gdn_ok", False) for m in lin) and fuse.USE_GDN_KERNEL
+        if not ok:
+            return False
+        return all(c.cache[1] is not None and c.cache[1].dtype == mx.float32 and c.left_padding is None
+                   and c.lengths is None for c in cache if isinstance(c, ArraysCache))
+
+    def _solo_draft(self, r, cache) -> List[int]:
+        """A prompt-lookup draft for an unconstrained row: what followed the most recent earlier occurrence of its
+        last 3 tokens (locals/lookup.py's rule, from an index kept on the request instead of a scan of the whole
+        prompt every step); its width follows the recent acceptance."""
+        constrained = isinstance(r.controller, LocalsController)
+        if (hasattr(r.controller, "step_config") and not constrained) or not self._solo_drafts_ok(cache):
+            return []
+        if len(r.out) < getattr(r, "solo_resume", 0):  # recent drafts were rejected: plain pipelined steps for a while
+            return []
+        stream = list(r.prompt) + r.out
+        idx = getattr(r, "lk_index", None)
+        if idx is None:
+            idx, r.lk_index, r.lk_done = {}, {}, 2
+            idx = r.lk_index
+        for i in range(r.lk_done, len(stream) - 1):  # keys ending before the last token: earlier occurrences only
+            idx[(stream[i - 2], stream[i - 1], stream[i])] = i + 1
+        r.lk_done = max(r.lk_done, len(stream) - 1)
+        j = idx.get(tuple(stream[-3:])) if len(stream) >= 3 else None
+        if j is None:
+            return []
+        acc = getattr(r, "solo_acc", None) or []
+        width = 4 if not acc else max(1, min(8, int(round(2 * sum(acc[-8:]) / len(acc[-8:]) + 1))))
+        eos = set(r.controller.eos_ids) or set(self.tokenizer.eos_token_ids)
+        draft = stream[j:j + width]
+        for i, tok in enumerate(draft):
+            if tok in eos:
+                draft = draft[:i]
+                break
+        if constrained and draft:  # only the part the grammar allows (an agent's tool call: its arguments)
+            cfg, kept = r.controller.config(), []
+            for tok in draft:
+                cfg = r.controller.step_config(cfg, tok)
+                if cfg is None:
+                    break
+                kept.append(tok)
+                if r.controller.finished_at(cfg):
+                    break
+            draft = kept if len(kept) >= 2 else []  # one token under a grammar is too often a repeated key's start
+        return draft[: max(0, r.max_tokens - len(r.out) - 1)]
+
+    def _solo_verify(self, logits: mx.array, draft: List[int], temp: float) -> List[int]:
+        """The accepted draft tokens and the token after them. Greedy: draft tokens while each equals the argmax.
+        Sampled: draft token d is kept with probability p(d) under the request's distribution, else the token is
+        drawn from p without d (speculative sampling: the tokens follow p exactly)."""
+        if not temp:
+            preds = mx.argmax(logits, axis=-1).tolist()
+            out = []
+            for j, d in enumerate(draft):
+                if preds[j] != d:
+                    return out + [preds[j]]
+                out.append(d)
+            return out + [preds[len(draft)]]
+        from .engine import _filtered
+
+        lp = _filtered(logits.astype(mx.float32), self.top_p, self.top_k) * (1.0 / temp)
+        p = mx.softmax(lp, axis=-1)
+        k = len(draft)
+        keep = (mx.random.uniform(shape=(k,)) < p[mx.arange(k), mx.array(draft)]).tolist()
+        out = []
+        for j, d in enumerate(draft):
+            if not keep[j]:
+                rest = mx.where(mx.arange(lp.shape[-1]) == d, NEG_INF, lp[j])
+                return out + [int(mx.random.categorical(rest).item())]
+            out.append(d)
+        return out + [int(mx.random.categorical(lp[k]).item())]
+
+    def _solo_masked(self, r, logits: mx.array, g, draft: List[int]) -> mx.array:
+        """Logits at the sampled position and each draft position under the grammar's state there (as _pick
+        masks one-token steps): the state after the fed tokens, then after each draft token."""
+        states = [g]
+        for tok in draft:
+            states.append(self._advance([r], mx.array([tok], dtype=mx.int32), states[-1]))
+        G = mx.concatenate(states)
+        allowed, cover, tlen, offs = self._tab
+        m = allowed[G] & (tlen[None, :] >= cover[G][:, None])
+        left = r.max_tokens - len(r.out)
+        bms = [r.controller.budget_mask(G[i] - offs[id(r.controller.c)], left - i) for i in range(len(states))]
+        if any(b is not None for b in bms):
+            ones = mx.ones((logits.shape[-1],), dtype=mx.bool_)
+            m = m & mx.stack([ones if b is None else b for b in bms])
+        return mx.where(m, logits, NEG_INF)
+
+    def _solo_rewind(self, cache, drop: int) -> None:
+        """Drop the last ``drop`` fed tokens of a batch-of-one cache (recurrent layers: the state the fused
+        kernel recorded after the last kept token)."""
+        for c in cache:
+            if isinstance(c, ArraysCache):
+                ts = getattr(c, "token_states", None)
+                if ts is None:
+                    raise RuntimeError("a recurrent layer recorded no per-token states to rewind to")
+                keep = ts.shape[0] - drop
+                old, qkv = c.token_conv
+                n_keep = old.shape[1]
+                c.cache[1] = ts[keep - 1]
+                c.cache[0] = mx.contiguous(mx.concatenate([old, qkv[:, :keep]], axis=1)[:, -n_keep:])
+            else:
+                c.trim(drop)
+
+    def _solo(self, r, cache, x: int, g, temp: float, arrive, dead: set):
+        """Steps for the only running row while it has a forced span or a draft to feed. Returns (requests that
+        arrived meanwhile, the next token to feed, its constraint state); x None: the row is done."""
+        t_r = temp if getattr(r, "temp", None) is None else r.temp
+        constrained = isinstance(r.controller, LocalsController)
+        while True:
+            got = arrive(False)
+            if got:
+                return got, x, g
+            span = list(r.pend)
+            draft = [] if span else self._solo_draft(r, cache)
+            if not span and not draft:
+                return [], x, g
+            r.pend = []
+            toks = [x] + span + draft
+            for c in cache:
+                if isinstance(c, ArraysCache):
+                    c.want_states = bool(draft)
+                    c.token_states = None
+            try:
+                h = self.lm.model(mx.array([toks], dtype=mx.int32), cache)
+            finally:
+                for c in cache:
+                    if isinstance(c, ArraysCache):
+                        c.want_states = False
+            self.counters["steps"] += 1
+            self.counters["rows"] += 1
+            self.counters["solo_steps"] = self.counters.get("solo_steps", 0) + 1
+            logits = head_logits(self.lm, h[:, len(span):, :])[0]  # the last certain token, then each draft token
+            gs = g
+            if constrained and span:
+                for tok in span:
+                    gs = self._advance([r], mx.array([tok], dtype=mx.int32), gs)
+            r.fed.extend(span)
+            if draft:
+                picked = self._solo_verify(self._solo_masked(r, logits, gs, draft) if constrained else logits, draft, t_r)
+                a = len(picked) - 1
+            else:
+                y = self._pick(logits[-1:], gs if constrained else None, t_r, ([r], [r.max_tokens - len(r.out)]))
+                picked, a = [int(y.item())], 0
+            n0 = len(r.out)
+            kept = a  # draft tokens that stay in the cache
+            nxt = None  # the next token to feed
+            for j, tok in enumerate(picked):
+                r.passes += 1
+                if self._commit_drip(r, tok):
+                    r.text = self.tokenizer.decode(r.out)
+                    dead.add(id(r))
+                    break
+                if j < a and r.pend:  # the grammar forces a span after this draft token: the rest of the draft goes
+                    kept = j + 1
+                    nxt = r.pend.pop(0)
+                    break
+            if draft:
+                if kept < len(draft):
+                    self._solo_rewind(cache, len(draft) - kept)
+                r.fed.extend(draft[:kept])
+                r.solo_acc = (getattr(r, "solo_acc", None) or []) + [kept]
+                self.counters["drafted"] = self.counters.get("drafted", 0) + kept
+                # a draft step costs the pipelining of that step: after a draft rejected outright, none for 1 token,
+                # doubling up to 32 while they keep failing (a JSON list's repeated keys: 0.83x without this)
+                r.solo_miss = getattr(r, "solo_miss", 0) + 1 if kept == 0 else 0
+                if r.solo_miss:
+                    r.solo_resume = len(r.out) + min(32, 1 << (r.solo_miss - 1))
+            self.tokens_out += len(r.out) - n0
+            self._after_commit(r, n0, dead)
+            if id(r) in dead:
+                return [], None, None
+            if nxt is None:
+                nxt = picked[-1]
+                g_after = gs
+                if constrained and draft:  # the state after the kept draft tokens
+                    for tok in draft[:kept]:
+                        g_after = self._advance([r], mx.array([tok], dtype=mx.int32), g_after)
+            else:
+                g_after = gs
+                for tok in draft[:kept]:
+                    g_after = self._advance([r], mx.array([tok], dtype=mx.int32), g_after)
+            x = nxt
+            r.fed.append(x)
+            g = self._advance([r], mx.array([x], dtype=mx.int32), g_after) if constrained else g
+
     # -- drip mode ---------------------------------------------------------------------
     def _commit_drip(self, r, y) -> bool:
         """Commit a sampled token; a forced span goes to the row's queue and is
@@ -1035,6 +1249,7 @@ class HybridBatchEngine(BatchEngine):
                 r.fed.append(r.prompt[-1])
 
         xs: List[int] = []
+        solo_next = False  # the only row has a forced span or a draft: a boundary, then steps of several tokens
         while True:
             queue += arrive(False)
             if not rows and not queue and cur is None and not filling:
@@ -1046,8 +1261,9 @@ class HybridBatchEngine(BatchEngine):
                     break
                 queue += got
             self.active = len(rows)
-            boundary = cur is None or dead or (queue and len(rows) + len(filling) < self.n_slots) or (
+            boundary = cur is None or dead or solo_next or (queue and len(rows) + len(filling) < self.n_slots) or (
                 filling and (filling[0]["pos"] >= filling[0]["end"] or any(getattr(e["r"], "cancel", False) for e in filling)))
+            solo_next = False
             if boundary:
                 ys = cur.tolist() if cur is not None else []
                 # Feeds are decided before committing, as in a chained step: a
@@ -1189,6 +1405,13 @@ class HybridBatchEngine(BatchEngine):
                     continue
                 if g is None:
                     g = mx.array([self._gstate(r) for r in rows], dtype=mx.int32)
+                if len(rows) == 1 and not queue and not filling and self._solo_ok(rows[0], cache):
+                    got, x1, g1 = self._solo(rows[0], cache, xs[0], g, temp, arrive, dead)
+                    if x1 is None:  # done: it is retired at the next boundary
+                        cur = None
+                        continue
+                    queue += got
+                    xs, g = [x1], g1
                 free = not any(isinstance(r.controller, LocalsController) or type(r.controller).__name__ == "WalkController" for r in rows)
                 # A row's next committed sample follows exactly the tokens it has
                 # fed after its prompt, so out has len(fed) - 1 tokens then.
@@ -1233,6 +1456,9 @@ class HybridBatchEngine(BatchEngine):
                     self.tokens_out += len(r.out) - n0
                     self._after_commit(r, n0, dead)
             cur, g = nxt, g2
+            if _SOLO and len(rows) == 1 and not queue and not filling and not dead and self._solo_ok(rows[0], cache):
+                # entering costs about a step (the pipeline drains): a forced span of 3 or more tokens, or a draft
+                solo_next = len(rows[0].pend) >= 3 or bool(self._solo_draft(rows[0], cache))
         mx.synchronize()
         self.active = 0
         return BatchStats(time.perf_counter() - t0, prefill_s, steps, nrows, self.tokens_out)
