@@ -403,7 +403,11 @@ def test_keepalive_is_a_blank_line(monkeypatch):
                                   cancel=lambda: None)
 
             def later():
-                time.sleep(1.2)  # a few 0.25 s polls without tokens
+                # the tokens come once the stream has written its keepalive (at most 10 s): a fixed 1.2 s left
+                # 0.2 s to the four 0.25 s polls the server needs, and on CI's slower Macs they sometimes took longer
+                deadline = real() + 10
+                while srv_mod.KEEPALIVE not in out and real() < deadline:
+                    time.sleep(0.05)
                 on_token([0, 1])
                 job.done = True
 
