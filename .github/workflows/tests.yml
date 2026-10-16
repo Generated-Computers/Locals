@@ -35,16 +35,19 @@ jobs:
       - name: Fast tests
         shell: bash  # with pipefail: the step fails when pytest does
         run: python -m pytest tests -q -m "not model" -rfE 2>&1 | tee pytest.log
-      - name: Failures in the run's summary
-        # the summary shows on the run's page, where the logs need a GitHub sign-in
+      - name: Failures as annotations
+        # annotations show on the run's page to anyone; the logs and the job summary need a GitHub sign-in
         if: failure()
         run: |
-          {
-            echo "### Fast tests failed on Python ${{ matrix.python }}"
-            echo '```'
-            sed -n '/= FAILURES =/,$p' pytest.log | tail -200
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          python - <<'EOF'
+          import re
+          log = open("pytest.log", errors="replace").read()
+          esc = lambda s: s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          for line in re.findall(r"^(?:FAILED|ERROR) .*$", log, re.M)[:8]:
+              print(f"::error title=Fast tests on Python ${{ matrix.python }}::{esc(line)}")
+          failures = log.split("= FAILURES =", 1)[-1] if "= FAILURES =" in log else log
+          print(f"::error title=Last lines of the failures (Python ${{ matrix.python }})::{esc(failures[-6000:])}")
+          EOF
       - name: Build the wheel
         run: |
           python -m build
