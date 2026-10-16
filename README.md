@@ -53,49 +53,6 @@ graphics chip, and a format needs about 3 MB of memory instead of up to 1.5 GB.
 The full results are in the paper, among them sixteen tool-calling agents
 finishing 2.5 times sooner than with mlx-lm and llguidance.
 
-## Works with your agents
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/opencode.png" width="80" height="80" alt="OpenCode" title="OpenCode">
-  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openhands.png" width="80" height="80" alt="OpenHands" title="OpenHands">
-  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/cline.png" width="80" height="80" alt="Cline" title="Cline">
-  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/kilo.png" width="80" height="80" alt="Kilo Code" title="Kilo Code">
-  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/roo.png" width="80" height="80" alt="Roo Code" title="Roo Code">
-  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openclaw.png" width="80" height="80" alt="OpenClaw" title="OpenClaw">
-  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/hermes.png" width="80" height="80" alt="Hermes Agent" title="Hermes Agent">
-  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/aider.png" width="80" height="80" alt="Aider" title="Aider">
-</p>
-
-Locals works with the coding agents and assistants people already use, on a
-model running on your Mac. Each of these was tested end to end with Qwen3.5-4B
-on a 16 GB Mac, on real tasks such as writing a program, running it and
-reporting what it printed. One command starts Locals and connects the tool to it:
-
-| Tool | Run |
-|---|---|
-| [OpenCode](https://github.com/anomalyco/opencode) | `locals code ~/my-project` |
-| [OpenHands](https://github.com/OpenHands/OpenHands) | `locals launch openhands` |
-| [Cline](https://github.com/cline/cline) | `locals launch cline` |
-| [Kilo Code](https://github.com/Kilo-Org/kilocode) | `locals launch kilo` |
-| [Roo Code](https://github.com/RooCodeInc/Roo-Code) | in VS Code, the settings from `locals launch editor` ([how](#use-it-in-apps-and-editors)) |
-| [OpenClaw](https://github.com/openclaw/openclaw) | `locals launch openclaw` |
-| [Hermes Agent](https://github.com/NousResearch/hermes-agent) | `locals launch hermes` |
-| [Aider](https://github.com/Aider-AI/aider) | `locals launch aider` |
-
-`locals launch list` shows every tool it can open. Locals keeps running in the
-background after you close a tool: `locals status` shows what it is doing and
-`locals stop` stops it.
-
-These tools rarely send one request at a time. They run subagents and helpers in
-parallel, and several sessions can work at once; Locals answers all of them
-together in one batch, which is where it is fastest. Most of them also start
-every session with a long system prompt of 3,000 to 16,000 tokens. Locals reads it
-once and keeps it, on disk too, so the next turns and the next sessions start
-without reading it again, even after a restart.
-
-<sub>The logos belong to their projects and are shown only to say that Locals
-works with these tools.</sub>
-
 ## Why Locals
 
 Coding assistants no longer send one request at a time. OpenCode, OpenHands and
@@ -144,6 +101,49 @@ and M2 chips computes in a number format the chip handles natively.
 [Why Locals is faster](https://github.com/Generated-Computers/Locals/blob/main/docs/why-faster/README.md) measures each difference on its
 own, and [Measurements](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md) has every benchmark and how
 to repeat it.
+
+## Works with your agents
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/opencode.png" width="80" height="80" alt="OpenCode" title="OpenCode">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openhands.png" width="80" height="80" alt="OpenHands" title="OpenHands">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/cline.png" width="80" height="80" alt="Cline" title="Cline">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/aider.png" width="80" height="80" alt="Aider" title="Aider">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/roo.png" width="80" height="80" alt="Roo Code" title="Roo Code">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openclaw.png" width="80" height="80" alt="OpenClaw" title="OpenClaw">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/hermes.png" width="80" height="80" alt="Hermes Agent" title="Hermes Agent">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/kilo.png" width="80" height="80" alt="Kilo Code" title="Kilo Code">
+</p>
+
+Locals works with the coding agents and assistants people already use, on a
+model running on your Mac. Each of these was tested end to end with Qwen3.5-4B
+on a 16 GB Mac, on real tasks such as writing a program, running it and
+reporting what it printed. One command starts Locals and connects the tool to it:
+
+| Tool | Run |
+|---|---|
+| [OpenCode](https://github.com/anomalyco/opencode) | `locals code ~/my-project` |
+| [OpenHands](https://github.com/OpenHands/OpenHands) | `locals launch openhands` |
+| [Cline](https://github.com/cline/cline) | `locals launch cline` |
+| [Aider](https://github.com/Aider-AI/aider) | `locals launch aider` |
+| [Roo Code](https://github.com/RooCodeInc/Roo-Code) | in VS Code, the settings from `locals launch editor` ([how](#use-it-in-apps-and-editors)) |
+| [OpenClaw](https://github.com/openclaw/openclaw) | `locals launch openclaw` |
+| [Hermes Agent](https://github.com/NousResearch/hermes-agent) | `locals launch hermes` |
+| [Kilo Code](https://github.com/Kilo-Org/kilocode) | `locals launch kilo` |
+
+`locals launch list` shows every tool it can open. Locals keeps running in the
+background after you close a tool: `locals status` shows what it is doing and
+`locals stop` stops it.
+
+These tools rarely send one request at a time. They run subagents and helpers in
+parallel, and several sessions can work at once; Locals answers all of them
+together in one batch, which is where it is fastest. Most of them also start
+every session with a long system prompt of 3,000 to 16,000 tokens. Locals reads it
+once and keeps it, on disk too, so the next turns and the next sessions start
+without reading it again, even after a restart.
+
+<sub>The logos belong to their projects and are shown only to say that Locals
+works with these tools.</sub>
 
 ## Getting started
 
