@@ -35,7 +35,7 @@ Runtime dependencies are `mlx>=0.32,<0.34`, `mlx-lm>=0.32,<0.33`, `numpy>=1.26`,
 
 1. It refuses anything other than Darwin on `arm64` with macOS 14 or newer.
 2. It uses `uv` from the `PATH` or from `~/.local/bin/uv`. If neither exists, it installs uv with `https://astral.sh/uv/install.sh`.
-3. It runs `uv tool install --force "$SOURCE"`. `SOURCE` is `$LOCALS_SOURCE` when set, else `git+https://github.com/Generated-Computers/Locals`. `LOCALS_SOURCE` is anything `uv tool install` accepts. The script's header shows a package name (`LOCALS_SOURCE=locals`, for PyPI) or a wheel path, and a local folder also works.
+3. It runs `uv tool install --force "$SOURCE"`. `SOURCE` is `$LOCALS_SOURCE` when set, else `locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz`, GitHub's archive of the main branch: unlike `git+https://...` it needs no git, which a Mac without the Command Line Tools lacks. `LOCALS_SOURCE` is anything `uv tool install` accepts. The script's header shows a package name (`LOCALS_SOURCE=locals`, for PyPI) or a wheel path, and a local folder also works.
 4. If uv's bin directory was not on the original `PATH`, it runs `uv tool update-shell` and prints the `export PATH=...` line.
 5. It prints `locals --version` and the next commands to run.
 
@@ -494,7 +494,7 @@ Variables read by the server process must be set in the environment of the comma
 | `OPENCLAW_BIN`, `HERMES_BIN`, `AIDER_BIN`, `CLINE_BIN`, `KILO_BIN`, `OPENHANDS_BIN` | `PATH` lookup | Path of that tool's command. | `app.py:330-331` (`_tool_bin`) |
 | `OPENCLAW_STATE_DIR` | `~/.openclaw` | Where OpenClaw's `openclaw.json` is backed up from. | `app.py:354` |
 | `HERMES_HOME` | `~/.hermes` | Where Hermes's `config.yaml` is backed up from. | `app.py:383` |
-| `LOCALS_SOURCE` | `git+https://github.com/Generated-Computers/Locals` | What `install.sh` installs. | `install.sh:31` |
+| `LOCALS_SOURCE` | `locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz` | What `install.sh` installs. | `install.sh:37` |
 
 ### Set by Locals for the programs it starts
 

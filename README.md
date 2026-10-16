@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.png">
-    <img src="docs/assets/logo.png" alt="Generated Computers" width="80%">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/logo-dark.png">
+    <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/logo.png" alt="Generated Computers" width="80%">
   </picture>
 </p>
 
@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="https://github.com/Generated-Computers/Locals/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
   <a href="#getting-started"><img src="https://img.shields.io/badge/macOS-Apple%20silicon-lightgrey.svg" alt="macOS on Apple silicon"></a>
 </p>
 
@@ -29,7 +29,7 @@ your project. Nothing leaves your computer.
 
 ## What it is
 
-<img src="docs/assets/emblem.png" alt="Generated Computers Co." width="35%" align="right">
+<img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/emblem.png" alt="Generated Computers Co." width="35%" align="right">
 
 Locals runs AI models on your own Mac and makes them fast when many requests
 arrive at the same time. That is how today's AI agents work: a coding assistant
@@ -98,8 +98,8 @@ piece.
 no faster per request for the handful of requests at a time that agents send.
 Locals uses GPU code written and tuned for exactly these small groups, and on M1
 and M2 chips computes in a number format the chip handles natively.
-[Why Locals is faster](docs/why-faster/README.md) measures each difference on its
-own, and [Measurements](docs/measurements/README.md) has every benchmark and how
+[Why Locals is faster](https://github.com/Generated-Computers/Locals/blob/main/docs/why-faster/README.md) measures each difference on its
+own, and [Measurements](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md) has every benchmark and how
 to repeat it.
 
 ## Getting started
@@ -270,7 +270,7 @@ print(reply.choices[0].message.content)
 Send many requests at once, from threads or with an async client, and Locals
 answers them together; that is where it is fastest. Streaming, answers in a
 fixed JSON format, function calls, the Ollama library and plain `curl` all work
-as well; the [examples](examples/README.md) show each of them.
+as well; the [examples](https://github.com/Generated-Computers/Locals/blob/main/examples/README.md) show each of them.
 
 ## Privacy and safety
 
@@ -291,10 +291,10 @@ Questions and problems are welcome as
 
 ## Learn more
 
-[How Locals works](docs/README.md) describes the server, the batching engine,
+[How Locals works](https://github.com/Generated-Computers/Locals/blob/main/docs/README.md) describes the server, the batching engine,
 the prompt cache, the team of agents behind `locals run`, and every setting.
-[Measurements](docs/measurements/README.md) has the benchmarks and how to repeat
-them. [Tests](tests/README.md) and [CONTRIBUTING.md](CONTRIBUTING.md) are for
+[Measurements](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md) has the benchmarks and how to repeat
+them. [Tests](https://github.com/Generated-Computers/Locals/blob/main/tests/README.md) and [CONTRIBUTING.md](https://github.com/Generated-Computers/Locals/blob/main/CONTRIBUTING.md) are for
 working on Locals itself:
 
 ```bash

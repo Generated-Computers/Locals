@@ -43,3 +43,8 @@ discipline for new mechanisms: an exactness test first, a speed number second.
 Plain Python, type hints where they help, docstrings that say what a function
 guarantees. Comments explain *why*, the code says *what*. No new dependencies
 without a reason that fits in one sentence.
+
+## Releases
+
+Releases go to PyPI from GitHub Actions when a version tag is pushed;
+[RELEASING.md](RELEASING.md) has the one-time setup and the steps.

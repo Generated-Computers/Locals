@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:  # the release workflow runs these tests before it builds
 
 jobs:
   fast:
@@ -16,8 +17,8 @@ jobs:
       matrix:
         python: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - name: Install
@@ -32,7 +33,18 @@ jobs:
                             allow_patterns=["*.json", "*.txt", "tokenizer*"])
           EOF
       - name: Fast tests
-        run: python -m pytest tests -q -m "not model"
+        shell: bash  # with pipefail: the step fails when pytest does
+        run: python -m pytest tests -q -m "not model" -rfE 2>&1 | tee pytest.log
+      - name: Failures in the run's summary
+        # the summary shows on the run's page, where the logs need a GitHub sign-in
+        if: failure()
+        run: |
+          {
+            echo "### Fast tests failed on Python ${{ matrix.python }}"
+            echo '```'
+            sed -n '/= FAILURES =/,$p' pytest.log | tail -200
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Build the wheel
         run: |
           python -m build
