@@ -56,25 +56,35 @@ finishing 2.5 times sooner than with mlx-lm and llguidance.
 ## Works with your agents
 
 <p align="center">
-  <a href="https://github.com/anomalyco/opencode"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/opencode.png" width="40" height="40" align="middle" alt="">&nbsp;OpenCode</a> &emsp;
-  <a href="https://github.com/OpenHands/OpenHands"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openhands.png" width="40" height="40" align="middle" alt="">&nbsp;OpenHands</a> &emsp;
-  <a href="https://github.com/cline/cline"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/cline.png" width="40" height="40" align="middle" alt="">&nbsp;Cline</a> &emsp;
-  <a href="https://github.com/Kilo-Org/kilocode"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/kilo.png" width="40" height="40" align="middle" alt="">&nbsp;Kilo&nbsp;Code</a>
-  <br><br>
-  <a href="https://github.com/RooCodeInc/Roo-Code"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/roo.png" width="40" height="40" align="middle" alt="">&nbsp;Roo&nbsp;Code</a> &emsp;
-  <a href="https://github.com/openclaw/openclaw"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openclaw.png" width="40" height="40" align="middle" alt="">&nbsp;OpenClaw</a> &emsp;
-  <a href="https://github.com/NousResearch/hermes-agent"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/hermes.png" width="40" height="40" align="middle" alt="">&nbsp;Hermes&nbsp;Agent</a> &emsp;
-  <a href="https://github.com/Aider-AI/aider"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/aider.png" width="40" height="40" align="middle" alt="">&nbsp;Aider</a>
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/opencode.png" width="56" height="56" alt="OpenCode" title="OpenCode">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openhands.png" width="56" height="56" alt="OpenHands" title="OpenHands">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/cline.png" width="56" height="56" alt="Cline" title="Cline">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/kilo.png" width="56" height="56" alt="Kilo Code" title="Kilo Code">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/roo.png" width="56" height="56" alt="Roo Code" title="Roo Code">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openclaw.png" width="56" height="56" alt="OpenClaw" title="OpenClaw">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/hermes.png" width="56" height="56" alt="Hermes Agent" title="Hermes Agent">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/aider.png" width="56" height="56" alt="Aider" title="Aider">
 </p>
 
 Locals works with the coding agents and assistants people already use, on a
 model running on your Mac. Each of these was tested end to end with Qwen3.5-4B
 on a 16 GB Mac, on real tasks such as writing a program, running it and
-reporting what it printed. One command
-starts Locals and connects the tool to it, for example `locals launch openclaw`
-or `locals launch hermes`. [Use it with your tools](#use-it-with-your-tools)
-gives the command for each; Roo Code is set up in VS Code as
-[Use it in apps and editors](#use-it-in-apps-and-editors) shows.
+reporting what it printed. One command starts Locals and connects the tool to it:
+
+| Tool | Run |
+|---|---|
+| [OpenCode](https://github.com/anomalyco/opencode) | `locals code ~/my-project` |
+| [OpenHands](https://github.com/OpenHands/OpenHands) | `locals launch openhands` |
+| [Cline](https://github.com/cline/cline) | `locals launch cline` |
+| [Kilo Code](https://github.com/Kilo-Org/kilocode) | `locals launch kilo` |
+| [Roo Code](https://github.com/RooCodeInc/Roo-Code) | in VS Code, the settings from `locals launch editor` ([how](#use-it-in-apps-and-editors)) |
+| [OpenClaw](https://github.com/openclaw/openclaw) | `locals launch openclaw` |
+| [Hermes Agent](https://github.com/NousResearch/hermes-agent) | `locals launch hermes` |
+| [Aider](https://github.com/Aider-AI/aider) | `locals launch aider` |
+
+`locals launch list` shows every tool it can open. Locals keeps running in the
+background after you close a tool: `locals status` shows what it is doing and
+`locals stop` stops it.
 
 These tools rarely send one request at a time. They run subagents and helpers in
 parallel, and several sessions can work at once; Locals answers all of them
@@ -158,22 +168,6 @@ starts it in the background and opens the OpenCode assistant in your project.
 From then on it starts in seconds. If you already use the uv package manager,
 you can install with `uv tool install git+https://github.com/Generated-Computers/Locals`
 instead.
-
-## Use it with your tools
-
-For each of these tools, one command starts Locals and connects the tool to it.
-
-| If you use | Run |
-|---|---|
-| OpenCode | `locals code ~/my-project` |
-| OpenHands | `locals launch openhands` |
-| Cline or Kilo Code | `locals launch cline` or `locals launch kilo` |
-| OpenClaw or Hermes Agent | `locals launch openclaw` or `locals launch hermes` |
-| Aider | `locals launch aider` |
-
-To see every supported tool, run `locals launch list`. Locals keeps running in
-the background after you close a tool: `locals status` shows what it is doing
-and `locals stop` stops it.
 
 ## Examples
 
