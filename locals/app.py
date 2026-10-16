@@ -5,7 +5,9 @@
     locals run "TASK" --dir DIR --check "CMD"
                                a team of agents on one task, each in its own copy of the project; the
                                project is changed only when the check passes
-    locals launch TOOL         another coding tool or app on the local model (locals launch list)
+    locals launch TOOL         another coding tool or app on the local model (locals launch alone: the
+                               tools on this Mac and whether they are connected; locals disconnect TOOL)
+    locals models              the tested models: size, memory, whether they fit this Mac, speed
     locals chat                an interactive chat (/json <schema>, /n N, /reset)
     locals generate ...        one answer from the command line (--prompt, --schema | --regex, --n)
     locals start | stop        the server in the background | stop it
@@ -14,7 +16,7 @@
     locals setup [TOOL]        only configure OpenCode (or openclaw, hermes) for the model
 
   More: locals solve (agents race on a task), locals swarm (OpenCode agents on a list of tasks),
-  locals agents, locals bench (our engine against stock mlx-lm), locals tune (full kernel tuning),
+  locals agents, locals bench (the speed test on this Mac), locals tune (full kernel tuning),
   locals menubar. Each has --help.
 
 Models (--model): qwen (Qwen3.5-4B, the default from 16 GB of memory; Qwen3.5-2B below), qwen3.5-2b,
@@ -25,6 +27,7 @@ the last one used is remembered.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -294,6 +297,8 @@ def write_config(cfg: dict, path: Optional[Path] = None) -> None:
                         merged[k][name] = {**old[k][name], **v.get(name, {})}
         else:
             merged[k] = v
+    for name in LEGACY:  # locals's provider under its old name: the server no longer answers to it
+        (merged.get("provider") or {}).pop(name, None)
     _write_atomic(path, json.dumps(merged, indent=2) + "\n")
 
 
@@ -826,6 +831,250 @@ def _offer_install(tool: str, name: str, env: str) -> str:
     return found
 
 
+# --- connections: which tools use locals, and taking locals out of a tool's config --------------
+#
+# OpenCode, OpenClaw and Hermes keep locals in their own config (written by locals setup / launch);
+# Aider, OpenHands, Cline and Kilo Code get locals's settings each time locals launch opens them.
+
+CONFIGURED = ("opencode", "openclaw", "hermes")
+LEGACY = ("stcon",)  # locals's name before 0.2: early setups still have a provider called stcon
+TOOL_NAMES = {"opencode": "OpenCode", "openclaw": "OpenClaw", "hermes": "Hermes Agent", "aider": "Aider",
+              "openhands": "OpenHands", "cline": "Cline", "kilo": "Kilo Code"}
+
+
+def _openclaw_config() -> Path:
+    return Path(os.environ.get("OPENCLAW_STATE_DIR") or HOME / ".openclaw") / "openclaw.json"
+
+
+def _hermes_config() -> Path:
+    return Path(os.environ.get("HERMES_HOME") or HOME / ".hermes") / "config.yaml"
+
+
+def _read_yaml(path: Path) -> Optional[dict]:
+    try:
+        import yaml
+
+        d = yaml.safe_load(path.read_text())
+        return d if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _tool_settings(tool: str) -> Optional[dict]:
+    """What a tool's own config says about locals: {"url": base URL of its locals provider (None if it has
+    none), "model": its default model, "ours": whether that default is a locals model}; {} without a
+    config, None when the config cannot be read."""
+    if tool == "opencode":
+        if not OPENCODE_CONFIG.exists():
+            return {}
+        try:
+            cfg = json.loads(OPENCODE_CONFIG.read_text())
+        except ValueError:
+            return None
+        provs = (cfg.get("provider") or {}) if isinstance(cfg, dict) else {}
+        prov = provs.get("locals")
+        model = str(cfg.get("model") or "") if isinstance(cfg, dict) else ""
+        return {"url": ((prov or {}).get("options") or {}).get("baseURL") if isinstance(prov, dict) else None,
+                "model": model, "ours": model.split("/")[0] in PROVIDERS, "legacy": any(n in provs for n in LEGACY)}
+    if tool == "openclaw":
+        path = _openclaw_config()
+        if not path.exists():
+            return {}
+        try:
+            cfg = json.loads(path.read_text())
+        except ValueError:
+            return None
+        provs = (cfg.get("models") or {}).get("providers") or {}
+        prov = provs.get("locals")
+        model = str((((cfg.get("agents") or {}).get("defaults") or {}).get("model") or {}).get("primary") or "")
+        return {"url": prov.get("baseUrl") if isinstance(prov, dict) else None, "model": model,
+                "ours": model.startswith("locals/"), "legacy": any(n in provs for n in LEGACY)}
+    if tool == "hermes":
+        cfg = _read_yaml(_hermes_config())
+        if cfg is None:
+            return None
+        m = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        model = str(m.get("default") or "")
+        ours = model.startswith("locals/")
+        return {"url": m.get("base_url") if ours else None, "model": model, "ours": ours,
+                "legacy": model.split("/")[0] in LEGACY}
+    return {}
+
+
+def connection(tool: str, port: int):
+    """(state, detail) of a tool's connection to locals: "connected", "needs repair", "not connected",
+    "not installed", or "ready" (a tool that gets locals's settings each time it is launched)."""
+    if tool == "opencode":
+        installed = opencode_bin() is not None
+    else:
+        installed = _installed(tool, tool.upper() + "_BIN") is not None
+    if not installed:
+        how = (f"locals launch {tool} offers to install it" if tool in INSTALLERS else
+               "locals code installs it" if tool == "opencode" else TOOL_SITES.get(tool, ""))
+        return "not installed", how
+    if tool not in CONFIGURED:
+        return "ready", f"gets the settings each time: locals launch {tool}"
+    s = _tool_settings(tool)
+    fix = "locals code" if tool == "opencode" else f"locals launch {tool}"
+    if s is None:
+        return "needs repair", f"its config cannot be read ({_config_path(tool)})"
+    if s.get("legacy") and not s.get("url"):
+        return "needs repair", f"it uses Locals under its old name, stcon: {fix} updates it"
+    if not s.get("url"):
+        return "not connected", f"{fix} connects it"
+    want = base_url(port) + "/v1"
+    if s["url"] != want:
+        return "needs repair", f"it points at {s['url']}, the server is at {want}: {fix} fixes it"
+    if not s["ours"]:
+        return "connected", f"but its default model is {s['model'] or 'not set'}; choose locals/... in it"
+    return "connected", f"default model {s['model']}"
+
+
+def _config_path(tool: str) -> Path:
+    return {"opencode": OPENCODE_CONFIG, "openclaw": _openclaw_config(), "hermes": _hermes_config()}[tool]
+
+
+def print_connections(port: int) -> None:
+    st = server_alive(port)
+    server = (f"running at {base_url(port)}/v1" if st else f"not running (a launch starts it at {base_url(port)}/v1)")
+    print(f"Tools that can use Locals. The server: {server}.\n")
+    for tool in ("opencode", "openclaw", "hermes", "aider", "openhands", "cline", "kilo"):
+        state, detail = connection(tool, port)
+        print(f"  {tool:10s} {TOOL_NAMES[tool]:13s} {state:14s} {detail}")
+    print(f"  {'ollama':10s} {'Ollama apps':13s} {'':14s} locals launch ollama: Locals answers as Ollama")
+    print(f"  {'editor':10s} {'editors':13s} {'':14s} locals launch editor: the settings for VS Code, Zed, JetBrains")
+    print("\nlocals launch <tool> opens one on the local model; locals disconnect <tool> takes Locals out of "
+          "OpenCode's, OpenClaw's or Hermes's config.")
+
+
+def _before_locals(tool: str) -> dict:
+    """The tool's config from before locals first changed it (its backup), parsed; {} without one."""
+    keep = (OPENCODE_CONFIG.with_name(OPENCODE_CONFIG.name + ".before-locals") if tool == "opencode" else
+            LOCALS_DIR / "backups" / f"{tool}-{_config_path(tool).name}.before-locals")
+    if not keep.is_file():
+        return {}
+    if tool == "hermes":
+        return _read_yaml(keep) or {}
+    try:
+        d = json.loads(keep.read_text())
+        return d if isinstance(d, dict) else {}
+    except ValueError:
+        return {}
+
+
+def disconnect_opencode() -> List[str]:
+    """Take locals out of OpenCode's config: its providers, and the default model, agents and settings
+    locals wrote, put back as they were before locals (or removed when OpenCode had none). What changed."""
+    path = OPENCODE_CONFIG
+    if not path.exists():
+        return []
+    try:
+        cfg = json.loads(path.read_text())
+    except ValueError:
+        sys.exit(f"{path} is not plain JSON, so locals does not rewrite it; remove the \"locals\" provider by hand")
+    before, changed = _before_locals("opencode"), []
+    prov, prov_before = cfg.get("provider") or {}, before.get("provider") or {}
+    for pid in (*PROVIDERS, *LEGACY):
+        if pid in prov and pid not in prov_before:
+            del prov[pid]
+            changed.append(f"the {pid} provider")
+    if "provider" in cfg and not prov and "provider" not in before:
+        del cfg["provider"]
+    mine = (*PROVIDERS, *LEGACY)
+    ours = {"model": lambda v: str(v).split("/")[0] in mine, "small_model": lambda v: str(v).split("/")[0] in mine,
+            "default_agent": lambda v: v in AGENTS, "subagent_depth": lambda v: v == 1,
+            "$schema": lambda v: v == "https://opencode.ai/config.json"}
+    for key, is_ours in ours.items():
+        if key in cfg and is_ours(cfg[key]) and cfg[key] != before.get(key):
+            if key in before:
+                cfg[key] = before[key]
+            else:
+                del cfg[key]
+            changed.append(key)
+    agents, agents_before = cfg.get("agent") or {}, before.get("agent") or {}
+    for name in list(agents):
+        if name in AGENTS and name not in agents_before:
+            del agents[name]
+            changed.append(f"the {name} agent")
+        elif name in ("build", "plan") and isinstance(agents[name], dict) and "steps" not in (agents_before.get(name) or {}):
+            if agents[name].pop("steps", None) is not None:
+                changed.append(f"the {name} agent's step limit")
+            if not agents[name] and name not in agents_before:
+                del agents[name]
+    if "agent" in cfg and not agents and "agent" not in before:
+        del cfg["agent"]
+    if changed:
+        _write_atomic(path, json.dumps(cfg, indent=2) + "\n")
+    return changed
+
+
+def disconnect_openclaw() -> List[str]:
+    """Take locals out of OpenClaw's config with its own CLI (openclaw config unset / set)."""
+    s = _tool_settings("openclaw")
+    if not s or not (s.get("url") or s.get("ours") or s.get("legacy")):
+        return []
+    oc = _tool_bin("openclaw", "OPENCLAW_BIN")
+    if oc is None:
+        sys.exit(f"openclaw is not on the PATH; remove models.providers.locals from {_openclaw_config()} by hand")
+    changed = []
+    if s.get("url"):
+        _run_tool([oc, "config", "unset", "models.providers.locals"], "openclaw")
+        changed.append("the locals provider")
+    if s.get("legacy"):
+        for name in LEGACY:
+            _run_tool([oc, "config", "unset", f"models.providers.{name}"], "openclaw")
+            changed.append(f"the {name} provider")
+    if s.get("ours") or s["model"].split("/")[0] in LEGACY:
+        old = str((((_before_locals("openclaw").get("agents") or {}).get("defaults") or {}).get("model") or {}).get("primary") or "")
+        if old and old.split("/")[0] not in ("locals", *LEGACY):
+            _run_tool([oc, "config", "set", "agents.defaults.model.primary", old], "openclaw")
+            changed.append(f"the default model, back to {old}")
+        else:
+            _run_tool([oc, "config", "unset", "agents.defaults.model.primary"], "openclaw")
+            changed.append("the default model (choose one in OpenClaw)")
+    return changed
+
+
+def disconnect_hermes() -> List[str]:
+    """Put back the model settings locals gave Hermes (hermes config set / unset)."""
+    s = _tool_settings("hermes")
+    if not s or not (s.get("ours") or s.get("legacy")):
+        return []
+    hm = _tool_bin("hermes", "HERMES_BIN")
+    if hm is None:
+        sys.exit(f"hermes is not on the PATH; edit the model section of {_hermes_config()} by hand")
+    old = _before_locals("hermes").get("model")
+    old = old if isinstance(old, dict) else {}
+    changed = []
+    for key in hermes_settings("x", DEFAULT_PORT):  # the keys locals sets
+        field = key.split(".", 1)[1]
+        if old.get(field) not in (None, ""):
+            _run_tool([hm, "config", "set", key, str(old[field])], "hermes")
+        else:
+            _run_tool([hm, "config", "unset", key], "hermes")
+        changed.append(key)
+    return changed
+
+
+def _run_tool(cmd: List[str], tool: str) -> None:
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.exit(f"{' '.join(cmd[1:])} failed:\n{(p.stdout + p.stderr)[-1500:]}")
+
+
+def cmd_disconnect(args) -> None:
+    tool = args.tool
+    changed = {"opencode": disconnect_opencode, "openclaw": disconnect_openclaw, "hermes": disconnect_hermes}[tool]()
+    if not changed:
+        print(f"{TOOL_NAMES[tool]} does not use Locals; nothing to change.")
+        return
+    print(f"took Locals out of {TOOL_NAMES[tool]}'s config ({_config_path(tool)}): " + ", ".join(changed) + ".")
+    print(f"Restart {TOOL_NAMES[tool]} if it is open. {'locals code' if tool == 'opencode' else 'locals launch ' + tool} "
+          "connects it again.")
+
+
 def cmd_launch(args) -> None:
     """Start the server (if it is not running) and open a tool on it, pointed at the local model:
     for this launch only, through its environment variables or a config file of locals's (Aider,
@@ -833,13 +1082,7 @@ def cmd_launch(args) -> None:
     copy of it is kept the first time, see _back_up_once)."""
     tool, rest = args.tool, list(args.rest or [])
     if tool == "list":
-        print("locals launch <tool> starts the server (if needed) and opens the tool on the local model:\n")
-        for name, what in LAUNCH_TOOLS.items():
-            if name in ("ollama", "editor", "opencode") or _installed(name, name.upper() + "_BIN"):
-                note = ""
-            else:
-                note = "   (not installed: the launch offers to install it)" if name in INSTALLERS else f"   (not installed: {TOOL_SITES[name]})"
-            print(f"  locals launch {name:10s} {what}{note}")
+        print_connections(args.port)
         return
     if tool == "opencode":
         args.dir = rest[0] if rest and not rest[0].startswith("-") else "."
@@ -1267,7 +1510,63 @@ BENCH_TASKS = [
 ]
 
 
+BENCH_FILE_NAME = "bench.json"
+
+
+def _bench_file() -> Path:
+    return LOCALS_DIR / BENCH_FILE_NAME
+
+
+def load_bench() -> dict:
+    """Speeds locals bench measured on this Mac, by model id."""
+    try:
+        d = json.loads(_bench_file().read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def cmd_bench(args) -> None:
+    """The README's speed test on this Mac: the same model through locals and through stock mlx-lm, with
+    1, 4 and 8 requests at once (--sizes), 256 tokens each; or, with --agents, tool-calling agent
+    requests (the older test). The speeds are saved for locals models."""
+    if args.agents:
+        return _bench_agents(args)
+    from . import bench
+    from .defaults import chip, memory_gb
+
+    with contextlib.redirect_stdout(sys.stderr):
+        fetch_model(args.model)
+        ensure_server(args)
+    sizes = [int(s) for s in str(args.sizes).split(",") if s.strip()]
+    engines = [e.strip() for e in args.bench.split(",") if e.strip()]
+    short, base = model_short(args.model), base_url(args.port) + "/v1"
+    print(f"{short} on {chip() or 'this Mac'} ({memory_gb():.0f} GB), {args.bench_max_tokens} tokens per request; "
+          "speed is the tokens per second all requests write together.", flush=True)
+    res = {}
+    for engine in engines:
+        name = "Locals" if engine == "locals" else "mlx-lm" if engine == "mlx" else engine
+        print(f"\n{name} ({engine}/{short}):", flush=True)
+        try:
+            r = bench.sweep(base, f"{engine}/{short}", sizes, args.bench_max_tokens, {"ignore_eos": True})
+        except Exception as e:  # noqa: BLE001
+            sys.exit(f"locals bench: {engine} failed: {e}")
+        res[engine] = {str(n): round(d["tokens_per_s"], 1) for n, d in r.items()}
+    print()
+    if "locals" in res and "mlx" in res:
+        print(f"  {'requests at once':18s} {'mlx-lm':>10s} {'Locals':>10s}  faster by")
+        for n in sizes:
+            a, b = res["mlx"][str(n)], res["locals"][str(n)]
+            print(f"  {n:<18d} {a:>6.0f} tps {b:>6.0f} tps  {b / a:.1f}x")
+    saved = load_bench()
+    saved[args.model] = {"chip": chip(), "memory_gb": round(memory_gb()), "date": time.strftime("%Y-%m-%d"),
+                         "max_tokens": args.bench_max_tokens, **res}
+    LOCALS_DIR.mkdir(parents=True, exist_ok=True)
+    _write_atomic(_bench_file(), json.dumps(saved, indent=2) + "\n")
+    print(f"\nsaved to {_bench_file()}; locals models shows it.")
+
+
+def _bench_agents(args) -> None:
     import threading
 
     ensure_server(args)
@@ -1312,6 +1611,35 @@ def cmd_bench(args) -> None:
         s = {e: statistics.median(v) for e, v in by.items()}
         print("\nmedian tokens/s: " + "  ".join(f"{e} {v:.0f}" for e, v in s.items())
               + (f"   locals/mlx = {s['locals'] / s['mlx']:.2f}x" if "locals" in s and "mlx" in s else ""))
+
+
+def cmd_models(args) -> None:
+    """The tested models: their size, the memory they need, whether they fit this Mac, and their speed with
+    8 requests at once (measured here by locals bench, else on an M2 Pro)."""
+    from .defaults import (DEFAULT_MODEL, HEADROOM_GB, MEASURED_M2_PRO, MODELS, SHORT, cached_snapshot, chip,
+                           gpu_limit_gb, memory_gb)
+
+    limit, here = gpu_limit_gb(), load_bench()
+    print(f"Models for {chip() or 'this Mac'} with {memory_gb():.0f} GB of memory"
+          + (f" (the GPU can use {limit:.1f} GB)" if limit else "") + ":\n")
+    print(f"  {'name':12s} {'download':>8s} {'needs':>7s}  {'on this Mac':30s} speed with 8 requests at once")
+    for key, mid in MODELS.items():
+        m = MEASURED_M2_PRO[key]
+        local = cached_snapshot(mid, ["*.json", "*.safetensors"])
+        w = sum(f.stat().st_size for f in local.glob("*.safetensors")) / 2**30 if local is not None and any(local.glob("*.safetensors")) else m["weights_gb"]
+        need = w + HEADROOM_GB
+        fit = "fits" if not limit or need <= limit else "too big"
+        notes = [fit] + (["the default"] if mid == DEFAULT_MODEL else []) + (["downloaded"] if local is not None else [])
+        mine = here.get(mid) or {}
+        if "8" in (mine.get("locals") or {}):
+            speed = f"{mine['locals']['8']:.0f} tps, measured here" + (f" (mlx-lm {mine['mlx']['8']:.0f})" if "8" in (mine.get("mlx") or {}) else "")
+        else:
+            speed = f"{m['locals']} tps on an M2 Pro (mlx-lm {m['mlx']})"
+        print(f"  {SHORT[key]:12s} {w:>5.1f} GB {need:>4.1f} GB  {', '.join(notes):30s} {speed}")
+    print("\nStart one with  locals start --model NAME  (or --model with any command). Any MLX model from "
+          "Hugging Face works too, for example --model mlx-community/Qwen3.5-9B-MLX-4bit.")
+    if not any(here.get(mid) for mid in MODELS.values()):
+        print("locals bench measures the speeds on this Mac.")
 
 
 # --- main -------------------------------------------------------------------------------------------
@@ -1539,18 +1867,29 @@ def main(argv=None):
     add_server_opts(p)
     p.set_defaults(fn=cmd_swarm)
 
-    p = sub.add_parser("bench", help="both engines through the API with concurrent requests")
+    p = sub.add_parser("bench", help="the speed test on this Mac: locals against stock mlx-lm with 1, 4 and 8 requests at once")
     add_common(p)
-    p.add_argument("--n", type=int, default=8, help="concurrent requests")
-    p.add_argument("--rounds", type=int, default=2)
-    p.add_argument("--engines", default="locals,mlx")
-    p.add_argument("--max-tokens", dest="bench_max_tokens", type=int, default=300, help="per request (not the server's cap)")
+    p.add_argument("--sizes", default="1,4,8", help="requests at once to measure (default 1,4,8)")
+    p.add_argument("--engines", default="locals,mlx", help="engines to measure (default locals,mlx)")
+    p.add_argument("--max-tokens", dest="bench_max_tokens", type=int, default=256, help="tokens per request (default 256)")
+    p.add_argument("--agents", action="store_true", help="tool-calling agent requests instead (with --n and --rounds)")
+    p.add_argument("--n", type=int, default=8, help="with --agents: concurrent requests")
+    p.add_argument("--rounds", type=int, default=2, help="with --agents: rounds")
     p.add_argument("--preload", default=None)
     p.add_argument("--slots", type=int, default=None)
     p.add_argument("--temp", type=float, default=None)
     p.add_argument("--cache-gb", dest="cache_gb", type=float, default=None)
     p.add_argument("--thinking", action="store_true")
     p.set_defaults(fn=cmd_bench)
+
+    p = sub.add_parser("models", help="the tested models: size, memory, whether they fit this Mac, speed")
+    add_common(p)
+    p.set_defaults(fn=cmd_models)
+
+    p = sub.add_parser("disconnect", help="take Locals out of a tool's config: opencode, openclaw, hermes")
+    p.add_argument("tool", choices=list(CONFIGURED))
+    add_common(p)
+    p.set_defaults(fn=cmd_disconnect)
 
     p = sub.add_parser("start", help="start the server in the background (locals stop stops it)")
     add_server_opts(p)

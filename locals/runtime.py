@@ -106,12 +106,24 @@ def set_compute_dtype(model, dtype: Optional[str] = "auto") -> str:
     saved = [(k, v) for k, v in tree_flatten(model.parameters()) if v.dtype == mx.bfloat16] if ref is not None else []
     model.set_dtype(getattr(mx, dtype), predicate=lambda t: t == mx.bfloat16)
     if ref is not None:
+        from mlx.utils import tree_unflatten
+
         out = model(probe)[0, -1].astype(mx.float32)
         ok = bool(mx.all(mx.isfinite(out))) and int(mx.argmax(out)) == int(mx.argmax(ref)) \
             and float(mx.max(mx.abs(out - ref))) <= 0.05 * float(mx.max(mx.abs(ref))) + 0.5
+        if not ok and bool(mx.all(mx.isfinite(out))):
+            # fp16 and bf16 differ, but bf16 rounds far more coarsely: which is closer to a float32 run? On Gemma 4
+            # E4B fp16 is (largest logit error 0.41 against bf16's 2.55, 6x), and the check above refused it,
+            # leaving the model at 96 instead of about 220 tok/s with 8 requests on an M2
+            model.update(tree_unflatten(saved))
+            model.set_dtype(mx.float32, predicate=lambda t: t == mx.bfloat16)
+            exact = model(probe)[0, -1].astype(mx.float32)
+            mx.eval(exact)
+            model.update(tree_unflatten(saved))
+            model.set_dtype(getattr(mx, dtype), predicate=lambda t: t == mx.bfloat16)
+            err16, err_bf = float(mx.max(mx.abs(out - exact))), float(mx.max(mx.abs(ref - exact)))
+            ok = int(mx.argmax(out)) == int(mx.argmax(exact)) and err16 <= err_bf
         if not ok:  # the model's activations do not fit fp16 (or it computes differently in it): its own arrays back
-            from mlx.utils import tree_unflatten
-
             model.update(tree_unflatten(saved))  # exactly the bf16 arrays it had (a cast back loses small values)
             return "bfloat16"
     return dtype

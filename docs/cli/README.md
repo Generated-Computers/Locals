@@ -82,7 +82,9 @@ OpenCode references these ids as `<provider>/<engine>/<short>` (`oc_model`), bec
 | Command | Handler | What it does |
 |---|---|---|
 | `locals code [DIR]` | `cmd_code` | Sets up OpenCode if needed, downloads the model, starts or reuses the background server, then `exec`s OpenCode on `DIR`. With `--run TASK`, runs one task headless and prints the answer. |
-| `locals launch [TOOL] [ARGS...]` | `cmd_launch` | Starts the server, then opens a tool on it (see the launch-target table below). With no tool, `list`. |
+| `locals launch [TOOL] [ARGS...]` | `cmd_launch` | Starts the server, then opens a tool on it (see the launch-target table below). With no tool, `list`: the tools on this Mac and whether each is connected. |
+| `locals disconnect TOOL` | `cmd_disconnect` | Takes Locals out of OpenCode's, OpenClaw's or Hermes's own config (see "Connections" below). |
+| `locals models` | `cmd_models` | The tested models: download size, memory needed, whether they fit this Mac, speed with 8 requests at once (measured here by `locals bench`, else on an M2 Pro). |
 | `locals setup [opencode\|openclaw\|hermes]` | `cmd_setup` | Writes the tool's config. For `openclaw`/`hermes`, also downloads the model and starts the background server unless `--no-start` is given. |
 | `locals serve` | `cmd_serve` | `os.execv` into `python -m locals.server` in the foreground. The server downloads the model itself. |
 | `locals start` | `cmd_start` | Downloads the model, then starts the server in the background (`ensure_server`). |
@@ -91,7 +93,7 @@ OpenCode references these ids as `<provider>/<engine>/<short>` (`oc_model`), bec
 | `locals run TASK` | `harness.cmd_run` | Locals's own multi-agent harness (plan, parallel versions in copies, check, repair). |
 | `locals solve TASK` | `solve.cmd_solve` | OpenCode agents race in copies of the project. The first whose check passes wins. |
 | `locals swarm` | `cmd_swarm` | Many OpenCode sessions at once on a task list, through one `opencode serve`. |
-| `locals bench` | `cmd_bench` | Concurrent tool-calling requests against both engines through the HTTP API. |
+| `locals bench` | `cmd_bench` | The speed test on this Mac: Locals and stock mlx-lm with 1, 4 and 8 requests at once, through the HTTP API (`--agents`: tool-calling requests). |
 | `locals generate` | `cli.main` | One generation on the background server. |
 | `locals chat` | `chat.main` | Interactive chat on the background server. |
 | `locals agents` | `agents.main` | In-process agent suite (no HTTP server). |
@@ -184,6 +186,7 @@ Local paths are used as-is. Hugging Face repositories are fetched with `snapshot
 | `~/.locals/openclaw-locals.json5` | `setup_openclaw` | The config fragment patched into OpenClaw. |
 | `~/.locals/cline/` | `cmd_launch` | Cline config folder used with `--config`. `~/.cline` is left alone. |
 | `~/.locals/kilo.json` | `cmd_launch` | Kilo Code config, passed by `KILO_CONFIG`. |
+| `~/.locals/bench.json` | `cmd_bench` | The speeds `locals bench` measured, by model id, with the chip and the date. Read by `locals models`. |
 | `~/.locals/solve/<project>-<stamp>/` | `solve.cmd_solve` | Runs of `locals solve`. |
 | `~/.locals/runs/` | `harness.cmd_run` | `keep_dir` of `locals run`. |
 | `~/.config/opencode/opencode.json` | `write_config`, `cmd_code` | OpenCode's config. A one-time copy is kept beside it as `opencode.json.before-locals`. |
@@ -281,7 +284,7 @@ Without `--run`, it `execve`s `opencode <dir> -m ...` (`--logs` adds `--print-lo
 
 | Target | What Locals does |
 |---|---|
-| `list` (default) | Prints the targets and whether each is installed. |
+| `list` (default) | `print_connections`: each tool, its connection state, and what to run (see "Connections" below). |
 | `opencode` | Same as `locals code [DIR]`. `DIR` is the first argument after the name. |
 | `aider` | `exec aider --model openai/locals/<short> --no-show-model-warnings ...` with `OPENAI_API_BASE=<base>/v1`, `OPENAI_API_KEY=locals`. |
 | `cline` | `cline auth --config ~/.locals/cline -p openai -k locals -m locals/<short> -b <base>/v1`, then `exec cline --config ~/.locals/cline ...`. |
@@ -292,6 +295,35 @@ Without `--run`, it `execve`s `opencode <dir> -m ...` (`--logs` adds `--print-lo
 | `editor` | Prints the settings for an OpenAI-compatible provider: base URL, model `locals/<short>`, any API key, and the context window. The context comes from the running server's `/v1/models` (`context_length`), falling back to 65536. It also prints snippets for Continue, Cline/Roo/Kilo Code, Zed and JetBrains AI Assistant. |
 
 For Aider, OpenHands, Cline and Kilo Code, Locals configures the launch only, through environment variables or a config file of its own. OpenCode, OpenClaw and Hermes get Locals written into their own config.
+
+### Connections (`locals launch` with no tool, `locals disconnect`)
+
+`connection(tool, port)` gives each tool one of these states, and `print_connections` lists them with the
+server's address:
+
+| State | When |
+|---|---|
+| `not installed` | The tool's command is not found (`opencode_bin`, `_installed`). The detail says how to install it. |
+| `ready` | Aider, OpenHands, Cline and Kilo Code: Locals gives them its settings each time `locals launch` opens them, so there is nothing to keep connected. |
+| `not connected` | OpenCode, OpenClaw or Hermes without a Locals provider in its config. |
+| `connected` | The config's Locals provider points at this server's `<base>/v1`. The detail names the default model, or says when the tool's default is another model. |
+| `needs repair` | The provider points at another address (another port), the config cannot be read (OpenCode's JSONC, a broken YAML), or the tool still uses Locals under its old name `stcon` (`LEGACY`). The detail names the command that fixes it (`locals code`, `locals launch <tool>`). |
+
+`_tool_settings` reads each config directly: `opencode.json` (`provider.locals.options.baseURL`, `model`),
+`$OPENCLAW_STATE_DIR/openclaw.json` (`models.providers.locals.baseUrl`, `agents.defaults.model.primary`) and
+`$HERMES_HOME/config.yaml` (`model.base_url`, `model.default`). A setup that rewrites OpenCode's config
+(`write_config`) also drops the old `stcon` provider, which the server no longer answers to.
+
+`locals disconnect TOOL` (`cmd_disconnect`) takes Locals out again and leaves the rest of the config alone:
+
+- **OpenCode** (`disconnect_opencode`): removes the `locals`, `mlx` and `stcon` providers and the agents
+  Locals added, and puts `model`, `small_model`, `default_agent`, `subagent_depth`, `$schema` and the build
+  and plan agents' step limit back as they were in `opencode.json.before-locals`, or removes them when
+  OpenCode had none. A config Locals wrote from scratch ends up as `{}`.
+- **OpenClaw** (`disconnect_openclaw`): `openclaw config unset models.providers.locals` (and `stcon`), then
+  sets `agents.defaults.model.primary` back to the backup's value with `openclaw config set`, or unsets it.
+- **Hermes** (`disconnect_hermes`): for each key `hermes_settings` sets, `hermes config set` with the
+  backup's value, or `hermes config unset`.
 
 ### Finding and installing tools
 
@@ -334,17 +366,26 @@ If the tool is not installed, both functions print how to finish by hand and ret
 
 ## `locals bench`
 
-`cmd_bench` forces the server's `--engines` to `locals,mlx` so it can load both. It keeps the parsed `--engines` (default `locals,mlx`) as the list of engines to benchmark. Its options:
+`cmd_bench` measures the README's speed test on this Mac. It downloads the model if needed and starts or
+reuses the background server; `main` sets the server's `--engines` to `locals,mlx` so it can load both.
+For each engine in `--engines` (default `locals,mlx`) it runs `bench.sweep`: one short warm-up request,
+then `--sizes` (default `1,4,8`) requests at once. Each request is one of sixteen short questions
+(`bench.QUESTIONS`), streamed, with `--max-tokens` (default 256) tokens and `ignore_eos`, so every request
+writes the same number of tokens.
 
-| Option | Default |
-|---|---|
-| `--n` (concurrent requests) | 8 |
-| `--rounds` | 2 |
-| `--max-tokens` (per request, stored as `bench_max_tokens`) | 300 |
+`bench.measure` counts each request's tokens (from the usage chunk, else the streamed pieces) and the times
+of its first and last token. The speed is all the tokens over the time from the first token of any request
+to the last token of any, so reading the prompts at the start is left out, and a server that answers
+requests one after another is measured as such (adding up each request's own rate would count it as fast
+as one that runs them together). It works with any OpenAI-compatible server; for Ollama, thinking is
+turned off with `"reasoning_effort": "none"`.
 
-It also accepts `--preload`, `--slots`, `--temp`, `--cache-gb` and `--thinking`.
+It prints a table with both engines and the ratio, and saves the speeds by model id in
+`~/.locals/bench.json` with the chip, the memory and the date. `locals models` shows them.
 
-Each engine first gets one warm-up request. Then each round sends `--n` threads at `/v1/chat/completions`, with model `<engine>/<short>`, three tools (`BENCH_TOOLS`: `read`, `write`, `bash`) and tasks cycled from the eight in `BENCH_TASKS`. It prints output tokens over wall time per round, the median per engine, and the `locals/mlx` ratio. Forced tokens come from the response's `usage.locals.forced_tokens`.
+`--agents` runs the older test instead (`_bench_agents`): `--n` (default 8) tool-calling requests at once,
+`--rounds` (default 2) rounds, three tools (`BENCH_TOOLS`) and tasks cycled from `BENCH_TASKS`; it prints
+output tokens over wall time per round, the median per engine and the `locals/mlx` ratio.
 
 ## `locals run` and `locals solve` options
 

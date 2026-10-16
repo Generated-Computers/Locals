@@ -13,6 +13,30 @@ MODELS = {
 }
 
 
+# Measured on a MacBook Pro with an M2 Pro (16 GB): tokens per second with 8 requests at once, stock
+# mlx-lm and locals, 256 tokens each (locals bench measures them on any Mac), and the weights in GB.
+MEASURED_M2_PRO = {
+    "qwen3.5-4b": {"weights_gb": 2.8, "mlx": 87, "locals": 271},
+    "qwen3.5-2b": {"weights_gb": 1.6, "mlx": 188, "locals": 576},
+    "gemma-4-e4b": {"weights_gb": 4.8, "mlx": 80, "locals": 224},
+    "lfm2.5-2.6b": {"weights_gb": 1.5, "mlx": 144, "locals": 404},
+    "minicpm5-2b": {"weights_gb": 1.3, "mlx": 160, "locals": 478},
+}
+SHORT = {"qwen3.5-4b": "qwen", "qwen3.5-2b": "qwen3.5-2b", "gemma-4-e4b": "gemma", "lfm2.5-2.6b": "lfm",
+         "minicpm5-2b": "minicpm"}
+
+
+def chip() -> str:
+    """The Mac's chip ("Apple M2 Pro"), or "" if it cannot be read."""
+    import subprocess
+
+    try:
+        return subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True,
+                              timeout=5).stdout.strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def memory_gb() -> float:
     """The Mac's memory in GB (0 if it cannot be read)."""
     import subprocess
