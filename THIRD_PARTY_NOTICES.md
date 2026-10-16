@@ -65,7 +65,7 @@ the logos and names remain the property and trademarks of their owners.
 | `opencode.png` | OpenCode | https://github.com/anomalyco/opencode, `packages/desktop/icons/prod/icon.png` |
 | `openhands.png` | OpenHands | https://github.com/OpenHands/OpenHands, `electron/build-resources/icon.png` |
 | `cline.png` | Cline | https://github.com/cline/cline, `assets/icons/icon.png` |
-| `kilo.png` | Kilo Code | https://github.com/Kilo-Org/kilocode, `packages/kilo-docs/public/favicon/android-chrome-512x512.png` |
+| `kilo.png` | Kilo Code | Kilo Code's square logo (https://github.com/Kilo-Org/kilocode) |
 | `roo.png` | Roo Code | https://github.com/RooCodeInc/Roo-Code, `src/assets/icons/icon.png` |
 | `openclaw.png` | OpenClaw | https://github.com/openclaw/openclaw, `apps/linux/src-tauri/icons/icon.png` |
 | `hermes.png` | Hermes Agent | https://github.com/NousResearch/hermes-agent, `apps/desktop/assets/icon.png` |
