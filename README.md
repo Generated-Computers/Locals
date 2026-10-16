@@ -8,13 +8,24 @@
 <h1 align="center">Locals</h1>
 
 <p align="center">
-  Run many AI agents at once on your Mac, about three times faster.
+  <b>Run many AI agents at once on your Mac, about three times faster.</b><br>
+  OpenCode, OpenHands, Cline, Aider and any OpenAI or Ollama app, on one local
+  server built for many agents working at the same time.
 </p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
   <a href="#getting-started"><img src="https://img.shields.io/badge/macOS-Apple%20silicon-lightgrey.svg" alt="macOS on Apple silicon"></a>
 </p>
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/Generated-Computers/Locals/main/install.sh | sh
+locals code ~/my-project
+```
+
+That is all. The first time, Locals downloads a model that suits your Mac
+(about 3 GB), starts it in the background and opens the OpenCode assistant in
+your project. Nothing leaves your computer.
 
 ## What it is
 
@@ -42,35 +53,54 @@ graphics chip, and a format needs about 3 MB of memory instead of up to 1.5 GB.
 The full results are in the paper, among them sixteen tool-calling agents
 finishing 2.5 times sooner than with mlx-lm and llguidance.
 
-## How much faster
+## Why Locals
 
-Measured with the same model (Qwen3.5-4B) on a MacBook Pro with an M2 Pro chip
-and 16 GB of memory. Speed is the number of tokens, roughly word pieces, the
-model writes per second for all requests together.
+Coding assistants no longer send one request at a time. OpenCode, OpenHands and
+Cline run helpers in parallel, and teams of agents split one task between them.
+On a Mac, the standard way of running models, mlx-lm, answers such requests
+together but barely gets faster when there are more of them: it writes 87 tokens
+per second for four requests and the same 87 for eight, so every agent you add
+slows the others down. Locals keeps getting faster as requests are added, so the
+more agents you run, the more it gives you:
 
-| Requests at the same time | mlx-lm | Locals | Faster by |
+| On a MacBook Pro with an M2 Pro and 16 GB | mlx-lm | Locals | |
 |---|---|---|---|
-| 1 | 61 tokens/s | 64 tokens/s | about the same |
-| 2 | 82 tokens/s | 116 tokens/s | 1.4x |
-| 4 | 87 tokens/s | 160 tokens/s | 1.8x |
-| 8 | 87 tokens/s | 271 tokens/s | 3.1x |
-| 16 | 157 tokens/s | 341 tokens/s | 2.2x |
+| 8 requests at once, Qwen3.5-4B | 87 tokens/s | 271 tokens/s | 3.1x |
+| 16 coding agents calling tools, Qwen3.5-2B | 75 s | 29 s | 2.5x |
+| 40 programming problems from LiveCodeBench, 8 at a time | 20 min | 8 min | 2.5x |
+| One request alone | 61 tokens/s | 64 tokens/s | the same |
 
-mlx-lm is the standard way to run models on Apple silicon. With one request
-Locals is as fast as mlx-lm; the more requests arrive together, the bigger the
-difference. In practice, eight agents working at once finish in about the time
-two would need one after the other, and the answers are the same as mlx-lm's.
-How we measured, and more results, are in [Measurements](docs/measurements/README.md).
+With 1, 2, 4, 8 and 16 requests at once, Locals writes 64, 116, 160, 271 and 341
+tokens per second, and mlx-lm 61, 82, 87, 87 and 157. A token is roughly a word
+piece.
 
-**Why.** mlx-lm answers several requests together too. The difference is in the
-arithmetic: for the handful of requests at a time that agents send, mlx-lm's way
-of multiplying by the model's compressed weights gets almost no faster per
-request (87 tokens/s with four requests, 86 with eight), while Locals uses GPU
-code written and tuned for exactly these small groups, and on M1 and M2 chips
-computes in a number format the chip handles natively. For agents, Locals also
-keeps each conversation between turns, so the next turn does not read it again.
-[Why Locals is faster](docs/why-faster/README.md) lists every difference with its
-measured effect.
+- **Many agents in the time of a few.** Eight agents working at once finish in
+  about the time two would need one after the other, and the answers are the
+  same as mlx-lm's.
+- **Each turn picks up where the last one ended.** Locals keeps every
+  conversation between turns, and long system prompts on disk across restarts,
+  so an agent's next turn reads only what it added. With four agents in long
+  conversations, 83% of what they sent came from memory, and a follow-up
+  question about a 138,000-token document started in 2.4 seconds instead of
+  eight minutes of reading it again.
+- **Tool calls that always parse.** Replies are written in the model's own
+  tool-call format under a grammar, so only the tools an agent offers can be
+  called, and a reply cut off by its length limit still closes its call. A small
+  model can also repeat itself or call the same tool forever; Locals notices and
+  stops both.
+- **A team of agents for bigger tasks.** `locals run` splits a task into parts,
+  gives each part to several agents at once, each in its own copy of your
+  project, and lets your tests decide. On four tasks that each span several
+  files, it passed all eight attempts in about three minutes each; one agent
+  alone passed four of eight in about five minutes each.
+
+**How.** mlx-lm's way of multiplying by the model's compressed weights gets almost
+no faster per request for the handful of requests at a time that agents send.
+Locals uses GPU code written and tuned for exactly these small groups, and on M1
+and M2 chips computes in a number format the chip handles natively.
+[Why Locals is faster](docs/why-faster/README.md) measures each difference on its
+own, and [Measurements](docs/measurements/README.md) has every benchmark and how
+to repeat it.
 
 ## Getting started
 
@@ -95,6 +125,22 @@ starts it in the background and opens the OpenCode assistant in your project.
 From then on it starts in seconds. If you already use the uv package manager,
 you can install with `uv tool install git+https://github.com/Generated-Computers/Locals`
 instead.
+
+## Use it with your tools
+
+For each of these tools, one command starts Locals and connects the tool to it.
+
+| If you use | Run |
+|---|---|
+| OpenCode | `locals code ~/my-project` |
+| OpenHands | `locals launch openhands` |
+| Cline or Kilo Code | `locals launch cline` or `locals launch kilo` |
+| OpenClaw or Hermes Agent | `locals launch openclaw` or `locals launch hermes` |
+| Aider | `locals launch aider` |
+
+To see every supported tool, run `locals launch list`. Locals keeps running in
+the background after you close a tool: `locals status` shows what it is doing
+and `locals stop` stops it.
 
 ## Examples
 
@@ -154,22 +200,6 @@ locals generate --prompt "Ana Silva, 29, ana@example.com, application approved, 
 ```json
 {"name":"Ana Silva","age":29,"email":"ana@example.com","status":"approved","tags":["vip","early"]}
 ```
-
-## Use it with your tools
-
-For each of these tools, one command starts Locals and connects the tool to it.
-
-| If you use | Run |
-|---|---|
-| OpenCode | `locals code ~/my-project` |
-| OpenHands | `locals launch openhands` |
-| Cline or Kilo Code | `locals launch cline` or `locals launch kilo` |
-| OpenClaw or Hermes Agent | `locals launch openclaw` or `locals launch hermes` |
-| Aider | `locals launch aider` |
-
-To see every supported tool, run `locals launch list`. Locals keeps running in
-the background after you close a tool: `locals status` shows what it is doing
-and `locals stop` stops it.
 
 ## Use it in apps and editors
 
