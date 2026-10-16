@@ -53,6 +53,44 @@ graphics chip, and a format needs about 3 MB of memory instead of up to 1.5 GB.
 The full results are in the paper, among them sixteen tool-calling agents
 finishing 2.5 times sooner than with mlx-lm and llguidance.
 
+## Works with your agents
+
+<div align="center">
+<table>
+  <tr>
+    <td align="center" width="96"><a href="https://github.com/anomalyco/opencode"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/opencode.png" width="64" alt="OpenCode"><br>OpenCode</a></td>
+    <td align="center" width="96"><a href="https://github.com/OpenHands/OpenHands"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openhands.png" width="64" alt="OpenHands"><br>OpenHands</a></td>
+    <td align="center" width="96"><a href="https://github.com/cline/cline"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/cline.png" width="64" alt="Cline"><br>Cline</a></td>
+    <td align="center" width="96"><a href="https://github.com/Kilo-Org/kilocode"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/kilo.png" width="64" alt="Kilo Code"><br>Kilo Code</a></td>
+  </tr>
+  <tr>
+    <td align="center" width="96"><a href="https://github.com/RooCodeInc/Roo-Code"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/roo.png" width="64" alt="Roo Code"><br>Roo Code</a></td>
+    <td align="center" width="96"><a href="https://github.com/openclaw/openclaw"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openclaw.png" width="64" alt="OpenClaw"><br>OpenClaw</a></td>
+    <td align="center" width="96"><a href="https://github.com/NousResearch/hermes-agent"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/hermes.png" width="64" alt="Hermes Agent"><br>Hermes Agent</a></td>
+    <td align="center" width="96"><a href="https://github.com/Aider-AI/aider"><img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/aider.png" width="64" alt="Aider"><br>Aider</a></td>
+  </tr>
+</table>
+</div>
+
+Locals works with the coding agents and assistants people already use, on a
+model running on your Mac. Each of these was tested end to end with Qwen3.5-4B
+on a 16 GB Mac, on real tasks such as writing a program, running it and
+reporting what it printed. One command
+starts Locals and connects the tool to it, for example `locals launch openclaw`
+or `locals launch hermes`. [Use it with your tools](#use-it-with-your-tools)
+gives the command for each; Roo Code is set up in VS Code as
+[Use it in apps and editors](#use-it-in-apps-and-editors) shows.
+
+These tools rarely send one request at a time. They run subagents and helpers in
+parallel, and several sessions can work at once; Locals answers all of them
+together in one batch, which is where it is fastest. Most of them also start
+every session with a long system prompt of 3,000 to 16,000 tokens. Locals reads it
+once and keeps it, on disk too, so the next turns and the next sessions start
+without reading it again, even after a restart.
+
+<sub>The logos belong to their projects and are shown only to say that Locals
+works with these tools.</sub>
+
 ## Why Locals
 
 Coding assistants no longer send one request at a time. OpenCode, OpenHands and
