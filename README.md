@@ -56,14 +56,14 @@ finishing 2.5 times sooner than with mlx-lm and llguidance.
 ## Works with your agents
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/opencode.png" width="67" height="67" alt="OpenCode" title="OpenCode">
-  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openhands.png" width="67" height="67" alt="OpenHands" title="OpenHands">
-  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/cline.png" width="67" height="67" alt="Cline" title="Cline">
-  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/kilo.png" width="67" height="67" alt="Kilo Code" title="Kilo Code">
-  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/roo.png" width="67" height="67" alt="Roo Code" title="Roo Code">
-  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openclaw.png" width="67" height="67" alt="OpenClaw" title="OpenClaw">
-  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/hermes.png" width="67" height="67" alt="Hermes Agent" title="Hermes Agent">
-  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/aider.png" width="67" height="67" alt="Aider" title="Aider">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/opencode.png" width="80" height="80" alt="OpenCode" title="OpenCode">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openhands.png" width="80" height="80" alt="OpenHands" title="OpenHands">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/cline.png" width="80" height="80" alt="Cline" title="Cline">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/kilo.png" width="80" height="80" alt="Kilo Code" title="Kilo Code">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/roo.png" width="80" height="80" alt="Roo Code" title="Roo Code">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/openclaw.png" width="80" height="80" alt="OpenClaw" title="OpenClaw">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/hermes.png" width="80" height="80" alt="Hermes Agent" title="Hermes Agent">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/agents/aider.png" width="80" height="80" alt="Aider" title="Aider">
 </p>
 
 Locals works with the coding agents and assistants people already use, on a
