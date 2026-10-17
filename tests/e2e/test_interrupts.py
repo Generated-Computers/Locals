@@ -73,7 +73,7 @@ class Stream(threading.Thread):
                         self.tokens += 1
                         self.first = self.first or time.perf_counter() - self.t0
                     self.finish = c.get("finish_reason") or self.finish
-        except (OSError, ValueError, http.client.HTTPException) as e:
+        except Exception as e:  # noqa: BLE001  # (after hang_up, http.client fails in several ways)
             self.error = e
 
     def hang_up(self):

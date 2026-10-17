@@ -152,8 +152,16 @@ class Proxy:
             def do_HEAD(self):
                 proxy._forward(self, "HEAD")
 
-        self._srv = ThreadingHTTPServer((self.host, self.port), Handler)
-        self._srv.daemon_threads = True
+        class Server(ThreadingHTTPServer):
+            daemon_threads = True
+
+            def handle_error(self, request, client_address):  # a client resetting an idle keep-alive connection
+                import sys
+
+                if not isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError, TimeoutError)):
+                    super().handle_error(request, client_address)
+
+        self._srv = Server((self.host, self.port), Handler)
         threading.Thread(target=self._srv.serve_forever, daemon=True, name="e2e-proxy").start()
         return self
 
