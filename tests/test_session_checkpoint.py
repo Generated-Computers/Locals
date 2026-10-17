@@ -90,3 +90,37 @@ def test_the_next_turn_continues_the_previous_request(server, monkeypatch):
     monkeypatch.setattr(srv_mod, "_KEEP_THINK", False)  # the template as it is: the continuation is lost
     a, b = prompts()
     assert not b.startswith(a)
+
+
+def test_a_timestamp_in_the_middle_of_the_system_message_goes_to_its_end(server):
+    """OpenHands writes the date and time (to the microsecond) 36% into its system message: every new session read
+    the rest again. The block is moved to the end, and sessions share everything before it."""
+    head, tail = DATA["system"][:3000], DATA["system"][3000:].split("Here is some useful information")[0]
+
+    def system(stamp):
+        return head + f"\n<CURRENT_DATETIME>\nThe current date and time is: {stamp}\n</CURRENT_DATETIME>\n\n" + tail
+
+    a = server.prepare(_request("/x", system=system("2026-10-17T17:33:08.829311")))
+    b = server.prepare(_request("/x", system=system("2026-10-17T17:33:47.825302")))
+    shared = len(os.path.commonprefix([a["prompt"], b["prompt"]]))
+    assert shared > 0.95 * len(a["prompt"])
+    assert "2026-10-17T17:33:08.829311" in a["text"]  # the model still reads it
+    common = set(_systems(a)) & set(_systems(b))
+    assert common and max(common) > 0.95 * shared
+
+
+def test_the_folder_in_a_tool_description_moves_to_the_system_message(server):
+    """OpenHands names the project's folder in its file editor's description; tools come first in Qwen3.5's
+    template, so two folders parted after 1,555 of 13,795 tokens."""
+    def req(folder):
+        r = _request("/x")
+        r["tools"] = [dict(t) for t in DATA["tools"]]
+        fn = dict(r["tools"][0]["function"])
+        fn["description"] = fn["description"] + f"\n\nYour current working directory is: {folder}\nStart there."
+        r["tools"][0] = {"type": "function", "function": fn}
+        return r
+
+    a, b = server.prepare(req("/Users/me/alpha")), server.prepare(req("/Users/me/beta"))
+    shared = len(os.path.commonprefix([a["prompt"], b["prompt"]]))
+    assert shared > 0.97 * len(a["prompt"]) and "/Users/me/alpha" in a["text"]
+    assert a["text"].index("/Users/me/alpha") > a["text"].index("<tools>")  # now after the tools

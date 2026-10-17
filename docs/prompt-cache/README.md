@@ -55,6 +55,12 @@ In `HybridBatchEngine.serve`:
 | `user` | Start of the last message | Render `msgs[:-1]` with no generation prompt. Used only with more than two messages, or with two when the first is not a system message. | `user` | The history before the last message stays put. This holds even for clients such as OpenClaw that move a context message to the end on every turn. |
 | `reply` | Where this request's reply starts, as the next request will render it | Render `msgs + [assistant "\x01A", user "\x03"]` and the same with `"\x02B"`, and take the point where they differ | `assistant` | See "The reply checkpoint". |
 
+**Per-session text in the middle.** Some agents write what changes from session to session before parts that do
+not: OpenHands puts the date and time, to the microsecond, 36% into its 39,000-character system message, and the
+project's folder into its file editor's description (tools come first in Qwen3.5's template). `_volatile_to_end`
+moves such blocks (`_VOLATILE`, `_TOOL_VOLATILE`) to the end of the system message, where the model still reads
+them. Two OpenHands sessions in different folders then share 13,714 of their 13,795 prompt tokens; they shared 1,555.
+
 **Which candidates are kept.** A candidate is skipped if its text is shorter than 2048 characters ("a short prefix is cheaper to prefill again") or if the prompt text does not start with it. The candidate text is then encoded. Its position is the first index where those ids and the prompt's ids differ, because the last token may merge with what follows; this is computed in one pass. A position is kept only if it is at least 1024 tokens, lies before the prompt's end, and is not already taken.
 
 **How the engine takes them.** Checkpoints between the cached prefix and the prompt's end (`done < cp < len(r.prompt) - 1`) are taken in sorted order:

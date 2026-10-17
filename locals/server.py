@@ -320,6 +320,7 @@ class Server:
             thinking = False  # a model without a thinking mode (Qwen3-Instruct-2507) never closes a think block
         msgs = oai.convert_messages(req.get("messages") or [], raw=self._raw if fmt.replay_raw else None)
         tools = oai.tool_specs(req.get("tools"))
+        _volatile_to_end(msgs, tools)
         if tools:
             _cwd_hint(msgs)
         msgs, tpl_tools = fmt.prepare(msgs, tools)
@@ -560,7 +561,8 @@ class Server:
         return self._ckpt[engine]
 
     _SESSION_MARKERS = ("<env>", "Working directory:", "Current Working Directory", "Current working directory",
-                        "Workspace root folder:", "Today's date:", "Current date:")
+                        "Workspace root folder:", "Today's date:", "Current date:", "<CURRENT_DATETIME>",
+                        "Your current working directory is:")
 
     def _session_start(self, sys_text: str) -> int:
         """Where the part of an agent's system message that differs from session to session starts (the
@@ -1026,6 +1028,38 @@ def _alive_socket(conn) -> bool:
 
 
 _CWD = re.compile(r"Working directory:\s*(\S+)")
+
+
+# Parts of an agent's system message that change with every session, written in its middle: everything after
+# them was read again by every new session (OpenHands: the date and time to the microsecond, 36% into a
+# 39,000-character system message). Moved to the end of the system message, where the model still reads them.
+# The same for a sentence in a tool's description: tools come before the system message in Qwen3.5's template,
+# and OpenHands names the project's folder in its file editor's (two folders parted after 1,555 tokens).
+_VOLATILE = (re.compile(r"<CURRENT_DATETIME>.{0,400}?</CURRENT_DATETIME>\n*", re.S),)
+_TOOL_VOLATILE = re.compile(r"\n*(Your current working directory is: \S+)\n?")
+
+
+def _volatile_to_end(msgs: List[dict], tools=None) -> None:
+    if not msgs or msgs[0].get("role") != "system" or not isinstance(msgs[0].get("content"), str):
+        return
+    text = msgs[0]["content"]
+    moved = []
+    for t in tools or []:
+        fn = t.get("function") if isinstance(t, dict) else None
+        desc = fn.get("description") if isinstance(fn, dict) else None
+        if isinstance(desc, str) and _TOOL_VOLATILE.search(desc):
+            for m in _TOOL_VOLATILE.finditer(desc):
+                if m.group(1) not in moved and m.group(1) not in text:
+                    moved.append(m.group(1))
+            fn["description"] = _TOOL_VOLATILE.sub("\n", desc).strip()
+    for rx in _VOLATILE:
+        for m in list(rx.finditer(text)):
+            if m.end() < len(text.rstrip()):  # (already at the end: nothing to move)
+                moved.append(m.group(0).strip())
+        if moved:
+            text = rx.sub("", text)
+    if moved:
+        msgs[0]["content"] = text.rstrip() + "\n\n" + "\n".join(moved)
 
 
 def _cwd_hint(msgs: List[dict]) -> None:
