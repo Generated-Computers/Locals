@@ -167,10 +167,15 @@ The server also serves a status page at `GET /` (`STATUS_HTML` in `server.py`) t
 
 ### Model download: `fetch_model`
 
-`fetch_model(model)` runs before the background start in `start`, `code`, `launch`, `setup openclaw|hermes`, `run` and `solve`, so there a download shows progress in the terminal instead of in the server log. `swarm` and `bench` call `ensure_server` without it. Their first download happens inside the server, and its progress goes to `server.log`. It refuses two kinds of model before downloading gigabytes:
+`fetch_model(model)` runs before the background start in `start`, `code`, `launch`, `setup openclaw|hermes`, `run`, `solve` and `bench`, so there a download shows progress in the terminal instead of in the server log. `swarm` calls `ensure_server` without it. Its first download happens inside the server, and its progress goes to `server.log`. Ctrl-C during a download ends with a line saying that the next run goes on where it stopped.
+
+`check_model(model)` comes first (`fetch_model` calls it, and `locals setup` calls it alone, before any config names the model). It downloads nothing and refuses:
 
 - GGUF models (`defaults.gguf_hint` names MLX versions instead).
-- Models whose weights plus `HEADROOM_GB = 2.0` exceed the GPU's recommended working set (`defaults.too_big`, skipped with `LOCALS_IGNORE_MEMORY=1`).
+- Models whose weights plus `HEADROOM_GB = 2.0` exceed the GPU's recommended working set (`defaults.too_big`, skipped with `LOCALS_IGNORE_MEMORY=1`). The message suggests a smaller model for this Mac.
+- A name that is neither a folder nor a model on Hugging Face (a typo), with the nearest short name (`did you mean --model gemma?`). Offline, a model not downloaded yet passes, and its download says what is wrong.
+
+When the refused model is the one remembered in `~/.locals/config.json`, the message says so. Hugging Face lookups time out after 10 seconds.
 
 Local paths are used as-is. Hugging Face repositories are fetched with `snapshot_download` and these `allow_patterns`: `*.json`, `model*.safetensors`, `*.py`, `tokenizer.model`, `*.tiktoken`, `tiktoken.model`, `*.txt`, `*.jsonl`, `*.jinja`. A cache-only lookup comes first. Download failures are explained by `server._load_error`.
 
@@ -182,14 +187,14 @@ Local paths are used as-is. Hugging Face repositories are fetched with `snapshot
 | `~/.locals/server-<port>.pid` | `_ensure_server` | Pid of the background server. `server.pid` is the older single-file name, still read. |
 | `~/.locals/server-<port>.lock` | `ensure_server` | `flock` that serializes server starts per port. |
 | `~/.locals/server.log`, `server.log.1` | `_ensure_server` | Output of background servers. One file for all ports. Rotated once past 50 MiB. |
-| `~/.locals/backups/<tool>-<file>.before-locals` | `_back_up_once` | First copy of OpenClaw's `openclaw.json` / Hermes's `config.yaml` before Locals changed it. Never overwritten. The undo command is printed. |
+| `~/.locals/backups/<tool>-<file>.before-locals` | `_back_up_once` | OpenClaw's `openclaw.json` / Hermes's `config.yaml` as it was before Locals changed it (`{}` when the tool had none). Taken once, never of a config that already holds Locals's settings, and removed by `locals disconnect`, so a later connect keeps the config as it is then. The undo command is printed. |
 | `~/.locals/openclaw-locals.json5` | `setup_openclaw` | The config fragment patched into OpenClaw. |
 | `~/.locals/cline/` | `cmd_launch` | Cline config folder used with `--config`. `~/.cline` is left alone. |
 | `~/.locals/kilo.json` | `cmd_launch` | Kilo Code config, passed by `KILO_CONFIG`. |
 | `~/.locals/bench.json` | `cmd_bench` | The speeds `locals bench` measured, by model id, with the chip and the date. Read by `locals models`. |
 | `~/.locals/solve/<project>-<stamp>/` | `solve.cmd_solve` | Runs of `locals solve`. |
 | `~/.locals/runs/` | `harness.cmd_run` | `keep_dir` of `locals run`. |
-| `~/.config/opencode/opencode.json` | `write_config`, `cmd_code` | OpenCode's config. A one-time copy is kept beside it as `opencode.json.before-locals`. |
+| `~/.config/opencode/opencode.json` | `write_config`, `cmd_code` | OpenCode's config. A copy from before Locals is kept beside it as `opencode.json.before-locals`, by the same rules as the other backups. |
 | `~/.opencode/bin/opencode` | `install_opencode` | OpenCode, if Locals installed it. |
 | `~/.local/bin/locals` | `cmd_setup` | Symlink created only for a development checkout when `locals` is not on the `PATH`. |
 | `~/.cache/locals/` | engine and server | Kernel tuning (`tune_v6_<arch>.json`), system-prompt disk cache (`prompts/`), request dumps (`requests/`). See the environment variables below. |
@@ -248,12 +253,13 @@ Every agent, plus `build` and `plan`, gets `steps = AGENT_STEPS = 40`. The comme
 
 `cmd_code` runs these steps in order:
 
-1. Checks that `DIR` exists.
-2. Calls `fetch_model` first, so a model that cannot run (a typo, a GGUF, too big) is refused before OpenCode's config names it.
-3. Runs setup if `_opencode_ready` is false, or if `--engine mlx` is given and the config has no `mlx` provider.
-4. Calls `ensure_server`, then `remember` (a model is remembered only once its server started).
-5. Writes `--agent` into the OpenCode config, so it persists for later launches. `--engine` is for this launch only.
-6. Runs OpenCode with `OPENCODE_DISABLE_AUTOUPDATE=1` and `PWD=<dir>` (OpenCode reads its project directory from `$PWD`), and always with `-m <provider>/<engine>/<short>`: a model set in the project's own `opencode.json` or a global `.jsonc` would otherwise win over the one Locals wrote, and could send the project to a cloud model.
+1. Checks that `DIR` exists, and refuses the home folder, `/` and the folders above the home folder: the agent edits files and runs commands in its folder without asking.
+2. Installs OpenCode if it is missing (`install_opencode` asks first), before the model's download rather than after it.
+3. Calls `fetch_model`, so a model that cannot run (a typo, a GGUF, too big) is refused before OpenCode's config names it.
+4. Runs setup if `_opencode_ready` is false (OpenCode's default model is not `locals/locals/<short>`, or the provider points at another port), or if `--engine mlx` is given and the config has no `mlx` provider. OpenCode's default `model` and `small_model` are always on the Locals engine: `--engine mlx` adds the `mlx` provider and chooses it for that launch only, with `-m`.
+5. Calls `ensure_server`, then `remember` (a model is remembered only once its server started).
+6. Writes `--agent` into the OpenCode config, so it persists for later launches. `--engine` is for this launch only.
+7. Runs OpenCode with `OPENCODE_DISABLE_AUTOUPDATE=1` and `PWD=<dir>` (OpenCode reads its project directory from `$PWD`), and always with `-m <provider>/<engine>/<short>`: a model set in the project's own `opencode.json` or a global `.jsonc` would otherwise win over the one Locals wrote, and could send the project to a cloud model.
 
 Without `--run`, it `execve`s `opencode <dir> -m ...` (`--logs` adds `--print-logs`). With `--run TASK`, it runs `opencode run --format json -m ... [-c] TASK` (`-c` comes from `--continue`) with stdin closed (`opencode run` reads a piped stdin into the task, and waited forever when Locals ran from a script). Each tool call is printed as one line as it happens (`_opencode_step`, for example `bash: python3 -m pytest -q`); then the last text part found by `_opencode_answer` (or the raw output tail) is printed, and the command exits with OpenCode's return code. Ctrl-C stops OpenCode.
 
@@ -310,16 +316,22 @@ server's address:
 | `needs repair` | The provider points at another address (another port), the config cannot be read (OpenCode's JSONC, a broken YAML), or the tool still uses Locals under its old name `stcon` (`LEGACY`). The detail names the command that fixes it (`locals code`, `locals launch <tool>`). |
 
 `_tool_settings` reads each config directly: `opencode.json` (`provider.locals.options.baseURL`, `model`),
-`$OPENCLAW_STATE_DIR/openclaw.json` (`models.providers.locals.baseUrl`, `agents.defaults.model.primary`) and
+`$OPENCLAW_STATE_DIR/openclaw.json` (JSON5, read by `_loads_jsonish`: `models.providers.locals.baseUrl`,
+`agents.defaults.model.primary`) and
 `$HERMES_HOME/config.yaml` (`model.base_url`, `model.default`). A setup that rewrites OpenCode's config
 (`write_config`) also drops the old `stcon` provider, which the server no longer answers to.
 
-`locals disconnect TOOL` (`cmd_disconnect`) takes Locals out again and leaves the rest of the config alone:
+`locals disconnect TOOL` (`cmd_disconnect`) takes Locals out again and leaves the rest of the config alone.
+Values in the backup that are Locals's own (a backup an earlier Locals or stcon took of its own settings) do
+not count as the user's. The backup is removed afterwards. A config Locals cannot read (OpenClaw's or
+Hermes's) is left as it is, with the command that takes Locals out by hand.
 
 - **OpenCode** (`disconnect_opencode`): removes the `locals`, `mlx` and `stcon` providers and the agents
-  Locals added, and puts `model`, `small_model`, `default_agent`, `subagent_depth`, `$schema` and the build
-  and plan agents' step limit back as they were in `opencode.json.before-locals`, or removes them when
-  OpenCode had none. A config Locals wrote from scratch ends up as `{}`.
+  Locals added, and puts `model`, `small_model`, `default_agent`, `subagent_depth`, `$schema`, the user's own
+  agents that have the names of Locals's (`coder`, `reviewer`, ...) and the build and plan agents' step
+  limit back as they were in `opencode.json.before-locals`, or removes them when OpenCode had none. A config
+  Locals wrote from scratch ends up as `{}`. While Locals is connected, a user's own agent of the same name as
+  one of Locals's is kept, not replaced (`_users_agents`).
 - **OpenClaw** (`disconnect_openclaw`): `openclaw config unset models.providers.locals` (and `stcon`), then
   sets `agents.defaults.model.primary` back to the backup's value with `openclaw config set`, or unsets it.
 - **Hermes** (`disconnect_hermes`): for each key `hermes_settings` sets, `hermes config set` with the
@@ -367,8 +379,10 @@ If the tool is not installed, both functions print how to finish by hand and ret
 ## `locals bench`
 
 `cmd_bench` measures the README's speed test on this Mac. It downloads the model if needed and starts or
-reuses the background server; `main` sets the server's `--engines` to `locals,mlx` so it can load both.
-For each engine in `--engines` (default `locals,mlx`) it runs `bench.sweep`: one short warm-up request,
+reuses the background server, with the stock engine only when `--engines` (default `locals,mlx`) measures it,
+and only when two copies of the weights fit next to each other (else it measures Locals alone and says why).
+A server it started with the stock engine is stopped at the end, so no second copy of the weights stays
+loaded. For each engine it runs `bench.sweep`: one short warm-up request,
 then `--sizes` (default `1,4,8`) requests at once. Each request is one of sixteen short questions
 (`bench.QUESTIONS`), streamed, with `--max-tokens` (default 256) tokens and `ignore_eos`, so every request
 writes the same number of tokens.
@@ -381,7 +395,8 @@ as one that runs them together). It works with any OpenAI-compatible server; for
 turned off with `"reasoning_effort": "none"`.
 
 It prints a table with both engines and the ratio, and saves the speeds by model id in
-`~/.locals/bench.json` with the chip, the memory and the date. `locals models` shows them.
+`~/.locals/bench.json` with the chip, the memory and the date (an engine that fails is skipped; what was
+measured is still saved). `locals models` shows them.
 
 `--agents` runs the older test instead (`_bench_agents`): `--n` (default 8) tool-calling requests at once,
 `--rounds` (default 2) rounds, three tools (`BENCH_TOOLS`) and tasks cycled from `BENCH_TASKS`; it prints

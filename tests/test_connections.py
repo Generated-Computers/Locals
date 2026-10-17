@@ -194,6 +194,11 @@ def test_bench_does_not_credit_a_server_that_answers_one_at_a_time(stream_server
 def test_cmd_bench_prints_the_comparison_and_saves_it(monkeypatch, capsys):
     monkeypatch.setattr(app, "fetch_model", lambda model: None)
     monkeypatch.setattr(app, "ensure_server", lambda args: None)
+    monkeypatch.setattr(app, "server_alive", lambda port: None)  # no server before: the bench starts one ...
+    stopped = []
+    monkeypatch.setattr(app, "cmd_stop", lambda args: stopped.append(args.port))  # ... and stops it (never a real one)
+    monkeypatch.setattr(defaults, "weights_gb", lambda model, remote=False: 2.8)
+    monkeypatch.setattr(defaults, "gpu_limit_gb", lambda: 10.7)
     speeds = {"locals": {1: 64.0, 8: 270.0}, "mlx": {1: 61.0, 8: 87.0}}
     monkeypatch.setattr(bench, "sweep", lambda base, model, sizes, max_tokens, extra: {
         n: {"tokens_per_s": speeds[model.split("/")[0]][n]} for n in sizes})
@@ -203,3 +208,124 @@ def test_cmd_bench_prints_the_comparison_and_saves_it(monkeypatch, capsys):
     assert "3.1x" in out and "1.0x" in out
     saved = json.loads((app.LOCALS_DIR / "bench.json").read_text())[QWEN]
     assert saved["locals"] == {"1": 64.0, "8": 270.0} and saved["mlx"]["8"] == 87.0
+    assert stopped == [8321]  # the stock engine's second copy of the weights is not left loaded
+
+
+def test_bench_measures_locals_only_when_two_copies_do_not_fit(monkeypatch, capsys):
+    monkeypatch.setattr(app, "fetch_model", lambda model: None)
+    started = []
+    monkeypatch.setattr(app, "ensure_server", lambda args: started.append(args.engines))
+    monkeypatch.setattr(app, "server_alive", lambda port: {"status": "ok", "engines": {}})  # the everyday server runs
+    monkeypatch.setattr(app, "cmd_stop", lambda args: pytest.fail("the user's own server must not be stopped"))
+    monkeypatch.setattr(defaults, "weights_gb", lambda model, remote=False: 4.8)  # Gemma 4 on a 16 GB Mac
+    monkeypatch.setattr(defaults, "gpu_limit_gb", lambda: 10.7)
+    seen = []
+    monkeypatch.setattr(bench, "sweep", lambda base, model, sizes, max_tokens, extra: seen.append(model) or {
+        n: {"tokens_per_s": 100.0} for n in sizes})
+    app.cmd_bench(argparse.Namespace(agents=False, model=QWEN, port=8321, sizes="1", bench="locals,mlx", bench_max_tokens=8))
+    assert started == ["locals"] and seen == ["locals/qwen3.5-4b"]
+    assert "do not fit" in capsys.readouterr().err
+
+
+GEMMA = "mlx-community/gemma-4-e4b-it-4bit"
+
+
+def test_disconnect_after_two_setups_without_a_config_of_the_users(monkeypatch):
+    """OpenCode had no config; locals wrote one, then rewrote it (another model): the second write must not
+    keep locals's own config as the user's, or the disconnect puts locals back."""
+    monkeypatch.setattr(app, "opencode_bin", lambda: "/x/opencode")
+    app.write_config(app.opencode_config(QWEN, 8321))
+    app.write_config(app.opencode_config(GEMMA, 8321, default_agent="coder"))
+    app.disconnect_opencode()
+    cfg = json.loads(app.OPENCODE_CONFIG.read_text())
+    assert "locals" not in (cfg.get("provider") or {}) and "model" not in cfg
+    assert app.connection("opencode", 8321)[0] == "not connected"
+
+
+def test_the_users_own_agents_of_the_same_names_are_kept(monkeypatch):
+    mine = {"model": "anthropic/claude-x", "agent": {"reviewer": {"prompt": "MY OWN REVIEWER", "mode": "subagent"}}}
+    _opencode(mine)
+    app.write_config(app.opencode_config(QWEN, 8321))
+    assert json.loads(app.OPENCODE_CONFIG.read_text())["agent"]["reviewer"]["prompt"] == "MY OWN REVIEWER"
+    app.write_config(app.opencode_config(GEMMA, 8321))  # again: still the user's
+    assert json.loads(app.OPENCODE_CONFIG.read_text())["agent"]["reviewer"]["prompt"] == "MY OWN REVIEWER"
+    app.disconnect_opencode()
+    assert json.loads(app.OPENCODE_CONFIG.read_text()) == mine
+
+
+def test_the_users_reviewer_overwritten_by_an_older_locals_comes_back(monkeypatch):
+    mine = {"agent": {"reviewer": {"prompt": "MY OWN REVIEWER"}, "build": {"steps": 12}}}
+    _opencode(mine)
+    app._back_up_once(app.OPENCODE_CONFIG, "opencode", ours=False)  # what locals 0.2.0 kept
+    _opencode({"agent": {"reviewer": app.AGENTS["reviewer"], "build": {"steps": app.AGENT_STEPS}},
+               "provider": {"locals": {}}, "model": "locals/locals/qwen3.5-4b"})  # what it wrote
+    app.disconnect_opencode()
+    assert json.loads(app.OPENCODE_CONFIG.read_text()) == mine
+
+
+def test_the_stock_engine_once_does_not_become_opencodes_default(monkeypatch):
+    monkeypatch.setattr(app, "opencode_bin", lambda: "/x/opencode")
+    app.write_config(app.opencode_config(QWEN, 8321, "mlx"))  # locals code --engine mlx
+    cfg = json.loads(app.OPENCODE_CONFIG.read_text())
+    assert cfg["model"] == cfg["small_model"] == "locals/locals/qwen3.5-4b" and "mlx" in cfg["provider"]
+    _opencode({**cfg, "model": "mlx/mlx/qwen3.5-4b", "small_model": "mlx/mlx/qwen3.5-4b"})  # what 0.2.0 wrote
+    assert not app._opencode_ready(QWEN, 8321)  # the next plain locals code rewrites it
+
+
+def test_a_backup_of_stcons_settings_puts_no_stcon_model_back(monkeypatch):
+    _opencode({"provider": {"stcon": {"options": {"baseURL": "http://127.0.0.1:8321/v1"}}, "anthropic": {}},
+               "model": "stcon/stcon/qwen3.5-4b", "small_model": "stcon/stcon/qwen3.5-4b", "theme": "dark"})
+    app._back_up_once(app.OPENCODE_CONFIG, "opencode", ours=False)  # kept by an earlier locals
+    app.write_config(app.opencode_config(QWEN, 8321))
+    app.disconnect_opencode()
+    cfg = json.loads(app.OPENCODE_CONFIG.read_text())
+    assert cfg == {"provider": {"anthropic": {}}, "theme": "dark"}
+
+
+def test_a_reconnect_after_a_disconnect_keeps_the_config_of_then(monkeypatch):
+    _opencode({"model": "openai/gpt-old"})
+    app.write_config(app.opencode_config(QWEN, 8321))
+    app.disconnect_opencode()
+    _opencode({"model": "anthropic/claude-new"})  # the user's choice since
+    app.write_config(app.opencode_config(QWEN, 8321))
+    app.disconnect_opencode()
+    assert json.loads(app.OPENCODE_CONFIG.read_text()) == {"model": "anthropic/claude-new"}
+
+
+def test_hermes_without_a_config_at_first_gets_no_settings_of_locals_back(tmp_path, monkeypatch):
+    yaml = pytest.importorskip("yaml")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ours = {k.split(".", 1)[1]: v for k, v in app.hermes_settings(QWEN, 8321).items()}
+    app._back_up_once(app._hermes_config(), "hermes")  # the first launch: Hermes had no config.yaml
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"model": ours}))  # hermes config set wrote it
+    app._back_up_once(app._hermes_config(), "hermes")  # the second launch
+    monkeypatch.setattr(app, "_tool_bin", lambda name, env: "/opt/hermes")
+    seen = _record_runs(monkeypatch)
+    app.disconnect_hermes()
+    assert all(c[2] == "unset" for c in seen), seen  # nothing of locals's set back
+
+
+def test_openclaw_json5_config_is_read(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path))
+    (tmp_path / "openclaw.json").write_text("""{
+  // OpenClaw writes JSON5
+  models: {providers: {locals: {baseUrl: 'http://127.0.0.1:8321/v1',},},},
+  agents: {defaults: {model: {primary: "locals/locals/qwen3.5-4b"}}},
+}""")
+    monkeypatch.setattr(app, "_installed", lambda name, env: "/opt/openclaw")
+    assert app.connection("openclaw", 8321) == ("connected", "default model locals/locals/qwen3.5-4b")
+
+
+def test_a_foreign_health_endpoint_is_not_a_locals_server(monkeypatch):
+    monkeypatch.setattr(app, "get_json", lambda url, timeout=5.0: {"status": "ok"})  # a dev server's /health
+    assert app.server_alive(8321) is None and not app._answers_as_locals(8321)
+    monkeypatch.setattr(app, "get_json", lambda url, timeout=5.0: {"status": "ok", "engines": {"locals": True}, "build": "x"})
+    assert app.server_alive(8321)
+
+
+def test_locals_code_refuses_the_home_folder(monkeypatch):
+    monkeypatch.setattr(app, "fetch_model", lambda model: pytest.fail("nothing starts"))
+    for d in (str(app.HOME), "/"):
+        with pytest.raises(SystemExit) as e:
+            app.cmd_code(argparse.Namespace(dir=d, model=QWEN, port=8321, engine=None, agent=None, run=None, cont=False, logs=False))
+        assert "project folder" in str(e.value)

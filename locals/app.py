@@ -167,10 +167,13 @@ def get_json(url: str, timeout: float = 5.0):
 
 
 def server_alive(port: int) -> Optional[dict]:
+    """The /health answer of a locals server on the port, or None (nothing there, or another program: a
+    dev server's own /health is not ours, and agents must not be pointed at it)."""
     try:
-        return get_json(base_url(port) + "/health", timeout=2)
+        d = get_json(base_url(port) + "/health", timeout=2)
     except Exception:
         return None
+    return d if isinstance(d, dict) and d.get("status") == "ok" and "engines" in d else None
 
 
 def _write_atomic(path: Path, text: str) -> None:
@@ -194,16 +197,34 @@ def _write_atomic(path: Path, text: str) -> None:
         raise
 
 
-def _back_up_once(path: Path, tool: str) -> Optional[Path]:
-    """A copy of a tool's own config, the first time locals changes it (kept: later runs do not
-    overwrite it); where it is, or None if the tool had no config yet."""
-    if not path.is_file():
+def _backup_path(tool: str, path: Optional[Path] = None) -> Path:
+    """Where the tool's config from before locals is kept (OpenCode's next to its config, as 0.2.0 did)."""
+    if tool == "opencode":
+        path = path or OPENCODE_CONFIG
+        return path.with_name(path.name + ".before-locals")
+    return LOCALS_DIR / "backups" / f"{tool}-{(path or _config_path(tool)).name}.before-locals"
+
+
+def _back_up_once(path: Path, tool: str, ours: Optional[bool] = None) -> Optional[Path]:
+    """The tool's own config, kept the first time locals changes it (later runs do not overwrite it); where
+    it is kept. A config that already holds locals's settings (``ours``; an earlier setup) is not the user's
+    own and is not kept; a tool without a config gets an empty one as its "before", so that
+    `locals disconnect` puts back nothing of locals's."""
+    keep = _backup_path(tool, path)
+    if keep.exists():
+        return keep
+    if ours is None:
+        s = _tool_settings(tool) if path == _config_path(tool) else None
+        ours = bool(s and (s.get("url") or s.get("ours") or s.get("legacy")))
+    if ours:
         return None
-    keep = LOCALS_DIR / "backups" / f"{tool}-{path.name}.before-locals"
-    if not keep.exists():
-        keep.parent.mkdir(parents=True, exist_ok=True)
+    keep.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file():
         shutil.copy2(path, keep)
-        print(f"your {tool} config is saved as {keep}; to undo locals's changes: cp '{keep}' '{path}'")
+        print(f"your {tool} config is saved as {keep}; to undo locals's changes: cp '{keep}' '{path}' "
+              f"(or: locals disconnect {tool})")
+    else:
+        keep.write_text("{}\n")
     return keep
 
 
@@ -238,8 +259,11 @@ def install_opencode(version: str = OPENCODE_VERSION) -> str:
     command = f"curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path --version {version}"
     if not sys.stdin.isatty():
         sys.exit(f"OpenCode is not installed. Install it with:\n  {command}\nthen run the locals command again.")
-    answer = input(f"OpenCode is not installed. Install OpenCode {version} with its official installer (opencode.ai) "
-                   f"into ~/.opencode/bin? [Y/n] ").strip().lower()
+    try:
+        answer = input(f"OpenCode is not installed. Install OpenCode {version} with its official installer (opencode.ai) "
+                       f"into ~/.opencode/bin? [Y/n] ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        sys.exit("\nnot installed")
     if answer not in ("", "y", "yes"):
         sys.exit(f"Install it with:\n  {command}\nthen run the locals command again.")
     print(f"installing opencode {version} from opencode.ai ...")
@@ -266,8 +290,10 @@ def opencode_config(model: str, port: int, default_engine: str = "locals", defau
                                       "temperature": True, "limit": {"context": context, "output": output}}
         prov[pid] = {"npm": "@ai-sdk/openai-compatible", "name": name, "options": {"baseURL": base_url(port) + "/v1", "apiKey": "local"},
                      "models": models}
-    return {"$schema": "https://opencode.ai/config.json", "provider": prov, "model": oc_model(default_engine, short),
-            "small_model": oc_model(default_engine, short), "default_agent": default_agent, "subagent_depth": 1,
+    # OpenCode's default model is always ours: the stock engine (--engine mlx) is chosen for one launch with -m,
+    # and the server loads it only when asked (a default on it failed every launch after the next restart)
+    return {"$schema": "https://opencode.ai/config.json", "provider": prov, "model": oc_model("locals", short),
+            "small_model": oc_model("locals", short), "default_agent": default_agent, "subagent_depth": 1,
             "agent": {**AGENTS, "build": {"steps": AGENT_STEPS}, "plan": {"steps": AGENT_STEPS}}}
 
 
@@ -276,10 +302,6 @@ def write_config(cfg: dict, path: Optional[Path] = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     old = {}
     if path.exists():
-        keep = path.with_name(path.name + ".before-locals")
-        if not keep.exists():  # the user's own config, once: locals makes itself OpenCode's default model
-            shutil.copy(path, keep)
-            print(f"your OpenCode config is kept as {keep}; locals adds its providers and becomes the default model")
         try:
             old = json.loads(path.read_text())
         except ValueError:  # comments or trailing commas (OpenCode reads JSONC): rewritten, they would be lost
@@ -287,19 +309,51 @@ def write_config(cfg: dict, path: Optional[Path] = None) -> None:
                      f"them, or move the file away and run this again (locals then writes a new one).")
         if not isinstance(old, dict):
             sys.exit(f"{path} does not hold a JSON object; move it away and run this again")
+    # the user's own config, once (locals makes itself OpenCode's default model); none to keep when it already
+    # holds locals's settings, or an empty one when OpenCode had no config
+    _back_up_once(path, "opencode", ours=_opencode_has_locals(old))
+    users = _users_agents(old, path)
     merged = dict(old)
     for k, v in cfg.items():
         if k in ("provider", "agent") and isinstance(old.get(k), dict):
             merged[k] = {**old[k], **v}
-            if k == "agent":  # the user's own settings of OpenCode's agents (build, plan) stay
-                for name in ("build", "plan"):
+            if k == "agent":
+                for name in ("build", "plan"):  # the user's own settings of OpenCode's agents stay
                     if isinstance(old[k].get(name), dict):
                         merged[k][name] = {**old[k][name], **v.get(name, {})}
+                for name in users:  # an agent of the user's that has the name of one of locals's: the user's stays
+                    merged[k][name] = old[k][name]
         else:
             merged[k] = v
+    if users:
+        print(f"kept your own OpenCode agent{'s' if len(users) > 1 else ''} {', '.join(users)} (locals has agents of "
+              f"the same name{'s' if len(users) > 1 else ''}; yours {'are' if len(users) > 1 else 'is'} used)")
     for name in LEGACY:  # locals's provider under its old name: the server no longer answers to it
         (merged.get("provider") or {}).pop(name, None)
     _write_atomic(path, json.dumps(merged, indent=2) + "\n")
+
+
+def _opencode_has_locals(cfg: dict) -> bool:
+    """Whether an OpenCode config already holds locals's settings (a provider or the default model)."""
+    if not isinstance(cfg, dict):
+        return False
+    provs = cfg.get("provider") if isinstance(cfg.get("provider"), dict) else {}
+    mine = (*PROVIDERS, *LEGACY)
+    return any(p in provs for p in mine) or str(cfg.get("model") or "").split("/")[0] in mine
+
+
+def _users_agents(old: dict, path: Path) -> List[str]:
+    """The user's own agents with the names of locals's (coder, reviewer, ...): there before locals (in the
+    backup) and not locals's own definition."""
+    agents = old.get("agent") if isinstance(old.get("agent"), dict) else {}
+    keep = _backup_path("opencode", path)
+    try:
+        before = json.loads(keep.read_text()) if keep.is_file() else {}
+    except ValueError:
+        before = {}
+    had = (before.get("agent") or {}) if isinstance(before, dict) else {}
+    return [n for n in AGENTS if isinstance(agents.get(n), dict) and isinstance(had.get(n), dict)
+            and agents[n].get("prompt") != AGENTS[n]["prompt"]]
 
 
 # --- setup: other agent tools (OpenClaw, Hermes Agent) -----------------------------------------
@@ -441,6 +495,7 @@ def setup_opencode(args) -> str:
 
 def cmd_setup(args) -> None:
     target = getattr(args, "target", "opencode")
+    check_model(args.model)  # a model that cannot run (a typo, too big) is refused before any config names it
     if target in ("openclaw", "hermes"):
         if not (setup_openclaw if target == "openclaw" else setup_hermes)(args):
             return
@@ -465,25 +520,59 @@ def cmd_setup(args) -> None:
     print("done. Next:  locals code <project dir>")
 
 
-def fetch_model(model: str) -> None:
-    """Download the model (first run only), with progress, before the server needs it."""
-    from .defaults import gguf_hint, too_big
+_MODEL_FILES = ["*.json", "model*.safetensors", "*.py", "tokenizer.model", "*.tiktoken", "tiktoken.model", "*.txt", "*.jsonl", "*.jinja"]
 
+
+def check_model(model: str) -> None:
+    """Exit with what to do if ``model`` cannot run here: a GGUF model, too big for this Mac, or a name that
+    is neither a folder nor a model on Hugging Face (a typo). Nothing is downloaded; offline, a model not
+    downloaded yet passes (its download says what is wrong)."""
+    from .defaults import cached_snapshot, gguf_hint, too_big
+
+    remembered = _load_saved().get("model") == model
+    hint = (f" ({model} is the model locals remembered from an earlier command; choose one with --model, e.g. "
+            f"--model qwen)") if remembered else ""
     why = gguf_hint(model) or too_big(model, remote=True)  # before a download of gigabytes that cannot run
     if why:
-        sys.exit(f"locals: {why}")
+        sys.exit(f"locals: {why}{hint}")
+    if Path(model).expanduser().exists() or cached_snapshot(model, _MODEL_FILES) is not None:
+        return
+    if model.startswith(("/", "~", ".")):
+        sys.exit(f"locals: no such folder: {model}{hint}")
+    try:
+        from huggingface_hub import HfApi
+        from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
+
+        HfApi().model_info(model, timeout=10)
+    except (RepositoryNotFoundError, GatedRepoError):
+        from .defaults import ALIASES
+
+        import difflib
+
+        near = difflib.get_close_matches(model.split("/")[-1].lower(), list(ALIASES), n=1)
+        sys.exit(f"locals: {model} is not a model on Hugging Face (or it needs a sign-in){hint}"
+                 + (f"; did you mean --model {near[0]}?" if near else "; locals models lists the tested ones"))
+    except Exception:  # noqa: BLE001  # offline or Hugging Face slow: the download tells
+        pass
+
+
+def fetch_model(model: str) -> None:
+    """Download the model (first run only), with progress, before the server needs it."""
+    check_model(model)
     if Path(model).expanduser().exists():
         return
     from huggingface_hub import snapshot_download
 
     from .defaults import cached_snapshot
 
-    patterns = ["*.json", "model*.safetensors", "*.py", "tokenizer.model", "*.tiktoken", "tiktoken.model", "*.txt", "*.jsonl", "*.jinja"]
+    patterns = _MODEL_FILES
     if cached_snapshot(model, patterns) is not None:
         return
     print(f"downloading {model} (first run only) ...", flush=True)
     try:
         snapshot_download(model, allow_patterns=patterns)
+    except KeyboardInterrupt:
+        sys.exit("\nstopped the download; run the command again to go on where it stopped")
     except Exception as e:  # noqa: BLE001
         from .server import _load_error
 
@@ -511,6 +600,10 @@ def remember(**kw) -> None:
         LOCALS_DIR.mkdir(exist_ok=True)
         path = LOCALS_DIR / "config.json"
         cfg = json.loads(path.read_text()) if path.exists() else {}
+        was = cfg.get("port")
+        if kw.get("port") is not None and was not in (None, kw["port"]) and server_alive(int(was)):
+            print(f"note: a locals server still runs on port {was} (the port used before), with its own copy of the "
+                  f"model; locals stop --port {was} stops it", flush=True)
         cfg.update({k: v for k, v in kw.items() if v is not None})
         path.write_text(json.dumps(cfg, indent=1))
     except (OSError, ValueError):
@@ -752,7 +845,7 @@ def _opencode_ready(model: str, port: int = DEFAULT_PORT) -> bool:
     except ValueError:
         return False
     prov = (cfg.get("provider") or {}).get("locals") or {}
-    return (str(cfg.get("model", "")).endswith("/" + model_short(model)) and isinstance(prov, dict)
+    return (str(cfg.get("model", "")) == oc_model("locals", model_short(model)) and isinstance(prov, dict)
             and (prov.get("options") or {}).get("baseURL") == base_url(port) + "/v1")
 
 
@@ -764,10 +857,7 @@ def _has_provider(name: str) -> bool:
 
 
 def _answers_as_locals(port: int) -> bool:
-    try:
-        return get_json(base_url(port) + "/health", timeout=2).get("status") == "ok"
-    except Exception:  # noqa: BLE001
-        return False
+    return server_alive(port) is not None
 
 
 LAUNCH_TOOLS = {
@@ -882,9 +972,8 @@ def _tool_settings(tool: str) -> Optional[dict]:
         path = _openclaw_config()
         if not path.exists():
             return {}
-        try:
-            cfg = json.loads(path.read_text())
-        except ValueError:
+        cfg = _loads_jsonish(path.read_text())  # OpenClaw's config is JSON5
+        if not isinstance(cfg, dict):
             return None
         provs = (cfg.get("models") or {}).get("providers") or {}
         prov = provs.get("locals")
@@ -950,18 +1039,72 @@ def print_connections(port: int) -> None:
 
 
 def _before_locals(tool: str) -> dict:
-    """The tool's config from before locals first changed it (its backup), parsed; {} without one."""
-    keep = (OPENCODE_CONFIG.with_name(OPENCODE_CONFIG.name + ".before-locals") if tool == "opencode" else
-            LOCALS_DIR / "backups" / f"{tool}-{_config_path(tool).name}.before-locals")
+    """The tool's config from before locals first changed it (its backup), parsed; {} without one. A backup
+    taken of locals's own settings (an earlier locals, or stcon) does not count: their values are not the user's."""
+    keep = _backup_path(tool)
     if not keep.is_file():
         return {}
     if tool == "hermes":
-        return _read_yaml(keep) or {}
-    try:
-        d = json.loads(keep.read_text())
-        return d if isinstance(d, dict) else {}
-    except ValueError:
+        d = _read_yaml(keep) or {}
+        m = d.get("model") if isinstance(d.get("model"), dict) else {}
+        if str(m.get("default") or "").split("/")[0] in ("locals", *LEGACY) or "127.0.0.1" in str(m.get("base_url") or ""):
+            d = {k: v for k, v in d.items() if k != "model"}
+        return d
+    d = _loads_jsonish(keep.read_text())
+    if not isinstance(d, dict):
         return {}
+    if tool == "opencode":
+        mine = (*PROVIDERS, *LEGACY)
+        if isinstance(d.get("provider"), dict):
+            d["provider"] = {k: v for k, v in d["provider"].items() if k not in mine}
+        for key in ("model", "small_model"):
+            if str(d.get(key) or "").split("/")[0] in mine:
+                d.pop(key)
+        if isinstance(d.get("agent"), dict):  # locals's own agents written by an earlier locals
+            d["agent"] = {k: v for k, v in d["agent"].items() if not (k in AGENTS and isinstance(v, dict)
+                                                                     and v.get("description") == AGENTS[k]["description"])}
+    return d
+
+
+def _loads_jsonish(text: str):
+    """JSON, or JSON5 / JSONC as OpenClaw and OpenCode allow it (comments, trailing commas, unquoted keys,
+    single quotes); None if it still does not parse."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    import re
+
+    out, i, n = [], 0, len(text)
+    while i < n:  # comments out, strings kept as they are (single-quoted ones in double quotes)
+        ch = text[i]
+        if ch in "\"'":
+            j, buf = i + 1, []
+            while j < n and text[j] != ch:
+                if text[j] == "\\" and j + 1 < n:
+                    buf.append(text[j:j + 2])
+                    j += 2
+                    continue
+                buf.append('\\"' if text[j] == '"' and ch == "'" else text[j])
+                j += 1
+            out.append('"' + "".join(buf) + '"')
+            i = j + 1
+        elif text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                i += 1
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+        else:
+            out.append(ch)
+            i += 1
+    s = "".join(out)
+    s = re.sub(r",(\s*[}\]])", r"\1", s)  # trailing commas
+    s = re.sub(r'([{,]\s*)([A-Za-z_$][\w$]*)(\s*:)', r'\1"\2"\3', s)  # unquoted keys
+    try:
+        return json.loads(s)
+    except ValueError:
+        return None
 
 
 def disconnect_opencode() -> List[str]:
@@ -998,8 +1141,16 @@ def disconnect_opencode() -> List[str]:
         if name in AGENTS and name not in agents_before:
             del agents[name]
             changed.append(f"the {name} agent")
-        elif name in ("build", "plan") and isinstance(agents[name], dict) and "steps" not in (agents_before.get(name) or {}):
-            if agents[name].pop("steps", None) is not None:
+        elif name in AGENTS and agents[name] != agents_before[name]:  # the user's own agent of that name, back
+            agents[name] = agents_before[name]
+            changed.append(f"your {name} agent, back as it was")
+        elif name in ("build", "plan") and isinstance(agents[name], dict):
+            was = agents_before.get(name) if isinstance(agents_before.get(name), dict) else {}
+            if "steps" in was:
+                if agents[name].get("steps") != was["steps"]:
+                    agents[name]["steps"] = was["steps"]
+                    changed.append(f"the {name} agent's step limit, back to {was['steps']}")
+            elif agents[name].pop("steps", None) is not None:
                 changed.append(f"the {name} agent's step limit")
             if not agents[name] and name not in agents_before:
                 del agents[name]
@@ -1007,6 +1158,7 @@ def disconnect_opencode() -> List[str]:
         del cfg["agent"]
     if changed:
         _write_atomic(path, json.dumps(cfg, indent=2) + "\n")
+    _backup_path("opencode").unlink(missing_ok=True)  # a later connect keeps the config as it is then
     return changed
 
 
@@ -1034,6 +1186,7 @@ def disconnect_openclaw() -> List[str]:
         else:
             _run_tool([oc, "config", "unset", "agents.defaults.model.primary"], "openclaw")
             changed.append("the default model (choose one in OpenClaw)")
+    _backup_path("openclaw").unlink(missing_ok=True)  # a later connect keeps the config as it is then
     return changed
 
 
@@ -1055,6 +1208,7 @@ def disconnect_hermes() -> List[str]:
         else:
             _run_tool([hm, "config", "unset", key], "hermes")
         changed.append(key)
+    _backup_path("hermes").unlink(missing_ok=True)  # a later connect keeps the config as it is then
     return changed
 
 
@@ -1066,6 +1220,10 @@ def _run_tool(cmd: List[str], tool: str) -> None:
 
 def cmd_disconnect(args) -> None:
     tool = args.tool
+    if tool in ("openclaw", "hermes") and _tool_settings(tool) is None:
+        how = ("openclaw config unset models.providers.locals" if tool == "openclaw" else
+               "hermes config set model.provider ... (the provider you used before)")
+        sys.exit(f"locals cannot read {_config_path(tool)}, so it changed nothing; take Locals out with: {how}")
     changed = {"opencode": disconnect_opencode, "openclaw": disconnect_openclaw, "hermes": disconnect_hermes}[tool]()
     if not changed:
         print(f"{TOOL_NAMES[tool]} does not use Locals; nothing to change.")
@@ -1081,6 +1239,9 @@ def cmd_launch(args) -> None:
     OpenHands, Cline, Kilo Code); OpenCode, OpenClaw and Hermes get locals in their own config (a
     copy of it is kept the first time, see _back_up_once)."""
     tool, rest = args.tool, list(args.rest or [])
+    # the tool's project folder is this one: OpenCode and Kilo read it from $PWD, which a shell keeps right but a
+    # script that started locals in another folder does not (Kilo then edited the files of the folder in $PWD)
+    os.environ["PWD"] = os.getcwd()
     if tool == "list":
         print_connections(args.port)
         return
@@ -1185,6 +1346,14 @@ def cmd_code(args) -> None:
     d = Path(args.dir).expanduser().resolve()
     if not d.is_dir():
         sys.exit(f"no such directory: {d}")
+    if d in (HOME.resolve(), Path("/")) or d in HOME.resolve().parents:
+        # the agent edits files and runs commands in its folder without asking: a new terminal opens in the home
+        # folder, and `locals code` there would hand it every file the user has
+        sys.exit(f"locals code works on a project folder, and {d} is your {'home folder' if d == HOME.resolve() else 'disk'}: "
+                 f"the agent edits files and runs commands there. Run it on a project:  locals code ~/my-project  "
+                 f"(mkdir it first for a new one)")
+    if opencode_bin() is None:  # asked before the model's gigabytes download, not after
+        install_opencode(OPENCODE_VERSION)
     fetch_model(args.model)  # checked (and downloaded) before OpenCode's settings name it
     if not _opencode_ready(args.model, args.port) or (args.engine == "mlx" and not _has_provider("mlx")):
         print(f"setting up OpenCode for {args.model} ...", flush=True)
@@ -1208,12 +1377,56 @@ def cmd_code(args) -> None:
         print(f"opencode in {d}: running the task ({shown}) ...", flush=True)
         sys.exit(_opencode_run([oc, "run", "--format", "json", "-m", ref, *(["-c"] if args.cont else []), args.run], env))
     print(f"opencode in {d}  ({shown}; /models switches the engine, Tab the agent)")
+    _space_opencode_starts()
     os.execve(oc, [oc, str(d), "-m", ref] + (["--print-logs"] if args.logs else []), env)
+
+
+OPENCODE_START_GAP = 2.0  # seconds between OpenCode starts (see _space_opencode_starts)
+
+
+def _space_opencode_starts(gap: float = OPENCODE_START_GAP) -> None:
+    """Wait until ``gap`` seconds have passed since the last OpenCode a locals command started. OpenCode switches
+    its database to WAL before it sets its busy timeout, so two that start in the same second (two terminals,
+    a script starting several agents) fail with "database is locked"; once started they wait for each other."""
+    import fcntl
+
+    LOCALS_DIR.mkdir(parents=True, exist_ok=True)
+    path = LOCALS_DIR / "opencode-start"
+    with open(path, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.seek(0)
+        try:
+            last = float(f.read().strip() or 0)
+        except ValueError:
+            last = 0.0
+        wait = last + gap - time.time()
+        if 0 < wait <= gap:
+            time.sleep(wait)
+        f.seek(0)
+        f.truncate()
+        f.write(str(time.time()))
 
 
 def _opencode_run(cmd: List[str], env: dict) -> int:
     """`opencode run` with a line per action as it happens, then the agent's answer; its exit code. Its stdin
     is closed: `opencode run` reads a piped stdin into the task and waited forever when locals ran from a script."""
+    for attempt in range(3):
+        _space_opencode_starts()
+        t0 = time.time()
+        rc, out, err = _opencode_run_once(cmd, env)
+        if rc == 130:  # Ctrl-C
+            return rc
+        locked = "database is locked" in (out + err)
+        if not (locked and time.time() - t0 < 30 and rc not in (0, 130)):
+            break
+        print("  (OpenCode's database was locked by another OpenCode starting; trying again)", flush=True)
+    answer = _opencode_answer(out)
+    print("\n" + (answer or (out[-2000:] + err[-2000:])))
+    return rc
+
+
+def _opencode_run_once(cmd: List[str], env: dict):
+    """One `opencode run`: (exit code, stdout, stderr), a line per tool call printed as it happens."""
     import threading
 
     p = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -1231,11 +1444,9 @@ def _opencode_run(cmd: List[str], env: dict) -> int:
     except KeyboardInterrupt:
         p.terminate()
         print("\nstopped")
-        return 130
+        return 130, "".join(out), ""
     t.join(timeout=5)
-    answer = _opencode_answer("".join(out))
-    print("\n" + (answer or ("".join(out)[-2000:] + "".join(err)[-2000:])))
-    return p.returncode
+    return p.returncode, "".join(out), "".join(err)
 
 
 def _opencode_step(line: str) -> str:
@@ -1295,6 +1506,7 @@ class OpenCodeServer:
         self.port = _free_port()
         self.base = f"http://127.0.0.1:{self.port}"
         env = dict(os.environ, OPENCODE_DISABLE_AUTOUPDATE="1", PWD=str(cwd))  # OpenCode reads its directory from $PWD
+        _space_opencode_starts()
         self.proc = subprocess.Popen([oc, "serve", "--port", str(self.port)], stdout=open(log_path, "wb"), stderr=subprocess.STDOUT,
                                      env=env, cwd=str(cwd))
         t0 = time.time()
@@ -1533,13 +1745,29 @@ def cmd_bench(args) -> None:
     if args.agents:
         return _bench_agents(args)
     from . import bench
-    from .defaults import chip, memory_gb
+    from .defaults import HEADROOM_GB, chip, gpu_limit_gb, memory_gb, weights_gb
 
+    engines = [e.strip() for e in args.bench.split(",") if e.strip()]
+    w, limit = weights_gb(args.model), gpu_limit_gb()
+    if "mlx" in engines and w and limit and 2 * w + HEADROOM_GB > limit and not os.environ.get("LOCALS_IGNORE_MEMORY"):
+        print(f"note: two copies of {model_short(args.model)} ({2 * w:.1f} GB) do not fit next to each other in this Mac's "
+              f"{limit:.1f} GB of GPU memory; measuring Locals only", file=sys.stderr)
+        engines = [e for e in engines if e != "mlx"]
+    args.engines = ",".join(dict.fromkeys(["locals", *engines]))
+    started = server_alive(args.port) is None
     with contextlib.redirect_stdout(sys.stderr):
         fetch_model(args.model)
         ensure_server(args)
+    try:
+        _bench_run(args, bench, engines, chip, memory_gb)
+    finally:
+        if started and "mlx" in engines:  # the stock engine's copy of the weights is not left loaded
+            with contextlib.redirect_stdout(sys.stderr):
+                cmd_stop(args)
+
+
+def _bench_run(args, bench, engines, chip, memory_gb) -> None:
     sizes = [int(s) for s in str(args.sizes).split(",") if s.strip()]
-    engines = [e.strip() for e in args.bench.split(",") if e.strip()]
     short, base = model_short(args.model), base_url(args.port) + "/v1"
     print(f"{short} on {chip() or 'this Mac'} ({memory_gb():.0f} GB), {args.bench_max_tokens} tokens per request; "
           "speed is the tokens per second all requests write together.", flush=True)
@@ -1549,9 +1777,12 @@ def cmd_bench(args) -> None:
         print(f"\n{name} ({engine}/{short}):", flush=True)
         try:
             r = bench.sweep(base, f"{engine}/{short}", sizes, args.bench_max_tokens, {"ignore_eos": True})
-        except Exception as e:  # noqa: BLE001
-            sys.exit(f"locals bench: {engine} failed: {e}")
+        except Exception as e:  # noqa: BLE001  # what was measured before is still saved
+            print(f"locals bench: {engine} failed: {e}", file=sys.stderr)
+            continue
         res[engine] = {str(n): round(d["tokens_per_s"], 1) for n, d in r.items()}
+    if not res:
+        sys.exit("locals bench: nothing was measured")
     print()
     if "locals" in res and "mlx" in res:
         print(f"  {'requests at once':18s} {'mlx-lm':>10s} {'Locals':>10s}  faster by")
@@ -1903,7 +2134,7 @@ def main(argv=None):
 
     args = ap.parse_args(argv)
     if args.cmd == "bench":
-        args.bench, args.engines = args.engines, "locals,mlx"  # the server must be able to load both
+        args.bench = args.engines  # the engines measured; the server's (args.engines) are set by cmd_bench
     args.fn(args)
 
 

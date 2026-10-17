@@ -145,6 +145,7 @@ def test_agent_setup_without_the_agent_installed(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(app, "fetch_model", boom)
     monkeypatch.setattr(app, "ensure_server", boom)
+    monkeypatch.setattr(app, "check_model", lambda model: None)  # (checks the name on Hugging Face; downloads nothing)
     for target in ("openclaw", "hermes"):
         app.cmd_setup(argparse.Namespace(target=target, model="mlx-community/gemma-4-e4b-it-4bit", port=8321, context=None,
                                          output=4096, no_start=False))

@@ -95,7 +95,7 @@ def weights_gb(model: str, remote: bool = False) -> "float | None":
     try:
         from huggingface_hub import HfApi
 
-        info = HfApi().model_info(model, files_metadata=True)
+        info = HfApi().model_info(model, files_metadata=True, timeout=10)
         n = sum(s.size or 0 for s in info.siblings or [] if s.rfilename.endswith(".safetensors") and "/" not in s.rfilename)
         return n / 2**30 if n else None
     except Exception:  # noqa: BLE001
@@ -113,8 +113,13 @@ def too_big(model: str, remote: bool = False) -> "str | None":
     if not w or not limit or w + HEADROOM_GB <= limit:
         return None
     return (f"{model} has {w:.1f} GB of weights; this Mac's GPU can use {limit:.1f} GB ({memory_gb():.0f} GB of memory), "
-            f"and the model needs about {HEADROOM_GB:.0f} GB more to run. Choose a smaller model (--model qwen), or set "
+            f"and the model needs about {HEADROOM_GB:.0f} GB more to run. Choose a smaller model (--model {_smaller(model)}), or set "
             f"LOCALS_IGNORE_MEMORY=1 to try anyway (macOS may swap, or stop the server).")
+
+
+def _smaller(model: str) -> str:
+    """A model to suggest instead of one too big for this Mac: this Mac's default, or the smallest Qwen3.5."""
+    return "qwen3.5-2b" if model in (DEFAULT_MODEL, MODELS.get("qwen3.5-4b")) else short_name(DEFAULT_MODEL)
 
 
 def gguf_hint(model: str, remote: bool = True) -> "str | None":
@@ -138,7 +143,7 @@ def gguf_hint(model: str, remote: bool = True) -> "str | None":
             cached = cached_snapshot(model, ["*.json", "*.safetensors"])
             if cached is not None and any(cached.glob("*.safetensors")):
                 return None
-            names = [s.rfilename for s in HfApi().model_info(model).siblings or []]
+            names = [s.rfilename for s in HfApi().model_info(model, timeout=10).siblings or []]
         except Exception:  # noqa: BLE001
             return None
         if not any(n.endswith(".gguf") for n in names) or any(n.endswith(".safetensors") for n in names):
