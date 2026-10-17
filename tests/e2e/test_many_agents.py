@@ -5,7 +5,7 @@ finish, every request be served without a fault, and the batch must beat running
 import time
 
 import pytest
-from agents import find_tool, popen_task, run_task
+from agents import escaped, find_tool, popen_task, run_task
 from conftest import kill_tree, summarize
 from tasks import TASKS
 
@@ -32,6 +32,8 @@ def _run_at_once(stack, report, plan, scenario, timeout=1500):
         jobs.append((p, d, before, name, tool, TASKS[task]))
     rows = _wait_all(stack, jobs, timeout)
     wall = time.time() - t0
+    out_of_bounds = escaped()
+    assert not out_of_bounds, f"an agent changed files outside its project (put back): {out_of_bounds}"
     records = stack.proxy.since(mark)
     problems = stack.problems(off)
     for r in rows:

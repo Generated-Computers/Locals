@@ -10,8 +10,20 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from conftest import LOCALS, Stack, kill_tree, summarize
-from tasks import Task, tree_digest
+from conftest import LOCALS, REPO, Stack, kill_tree, summarize
+from tasks import PROJECTS, Task, tree_digest
+
+_PRISTINE = tree_digest(PROJECTS)
+
+
+def escaped() -> List[str]:
+    """Sample-project files in this repository an agent changed (it worked outside its copy); put back."""
+    now = tree_digest(PROJECTS)
+    bad = sorted(k for k in set(now) | set(_PRISTINE) if now.get(k) != _PRISTINE.get(k))
+    if bad:
+        subprocess.run(["git", "checkout", "--", str(PROJECTS)], cwd=REPO, capture_output=True)
+        subprocess.run(["git", "clean", "-fdq", "--", str(PROJECTS)], cwd=REPO, capture_output=True)
+    return bad
 
 # the tool's command (looked up on the PATH, or in <NAME>_BIN) and how locals starts it on a task
 COMMANDS = {"opencode": "opencode", "openclaw": "openclaw", "hermes": "hermes", "kilo": "kilo", "cline": "cline",
@@ -60,8 +72,7 @@ def run_task(stack: Stack, tool: str, task: Task, timeout: float = 900, env: Opt
     d = task.copy_to(root or stack.runs)
     before = tree_digest(d)
     cmd, cwd = argv(tool, task.prompt, d, stack.port)
-    if tool == "opencode":
-        env["PWD"] = str(d)
+    env["PWD"] = str(cwd)  # OpenCode and Kilo take their project folder from $PWD (a shell sets it; a script must)
     name = label or f"{tool}-{task.name}"
     out_path, err_path = stack.runs / f"{name}.out", stack.runs / f"{name}.err"
     mark, off = stack.proxy.mark(name), stack.log_offset()
@@ -84,6 +95,9 @@ def run_task(stack: Stack, tool: str, task: Task, timeout: float = 900, env: Opt
     row = {"scenario": "agent", "tool": tool, "task": task.name, "rc": rc, "wall": wall, "ok": ok, "why": why, "dir": str(d),
            "server_problems": stack.problems(off), **summarize(records)}
     row["faults"] = row["faults"] + [f"server: {ln[:300]}" for ln in row["server_problems"]]
+    out_of_bounds = escaped()
+    if out_of_bounds:
+        row["faults"].append(f"{tool} changed files outside its project (put back): {out_of_bounds}")
     return row
 
 
@@ -94,8 +108,7 @@ def popen_task(stack: Stack, tool: str, task: Task, env: Optional[dict] = None, 
     d = task.copy_to(stack.runs)
     before = tree_digest(d)
     cmd, cwd = argv(tool, task.prompt, d, stack.port)
-    if tool == "opencode":
-        env["PWD"] = str(d)
+    env["PWD"] = str(cwd)
     name = name or f"{tool}-{task.name}"
     stack.proxy.projects[str(d)] = name
     out, err = open(stack.runs / f"{name}.out", "w"), open(stack.runs / f"{name}.err", "w")

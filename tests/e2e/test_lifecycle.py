@@ -87,3 +87,57 @@ def test_bad_requests_get_400(stack, bad):
     with pytest.raises(urllib.error.HTTPError) as e:
         urllib.request.urlopen(req, timeout=30)
     assert e.value.code == 400
+
+
+OFFLINE = {"HTTPS_PROXY": "http://127.0.0.1:9", "HTTP_PROXY": "http://127.0.0.1:9", "https_proxy": "http://127.0.0.1:9",
+           "http_proxy": "http://127.0.0.1:9", "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}
+
+
+def test_offline_start_and_agent_turn(stack, report):
+    """No network (a plane, a captive Wi-Fi): every connection out goes to a closed port. A downloaded model
+    must start and serve, and OpenCode must finish a turn."""
+    from agents import run_task
+    from tasks import TASKS
+
+    stack.stop()
+    env = {**stack.env, **OFFLINE}
+    t0 = time.time()
+    p = stack.locals("start", "--port", stack.server_port, env=env, timeout=600)
+    took = time.time() - t0
+    assert p.returncode == 0, p.stdout[-1500:] + p.stderr[-1500:]
+    stack.proxy.start()
+    try:
+        row = run_task(stack, "opencode", TASKS["fix_bug"], env=env, timeout=600, label="offline-opencode-fix_bug")
+        report.add({**row, "scenario": "offline"})
+        report.note(f"offline: locals start {took:.0f} s; OpenCode's task {'done' if row['ok'] else 'not done'} in {row['wall']:.0f} s")
+        assert took < 120, f"locals start took {took:.0f} s offline"
+        assert row["rc"] == 0 and row["n_requests"] > 0, row
+    finally:
+        stack.stop()
+        stack.start()  # online again, for the tests after this one
+
+
+def test_switching_models_keeps_one_in_memory(stack, report):
+    """`locals start --model gemma` while the server runs Qwen: the server is switched (one model in memory),
+    and the new model answers."""
+    import os
+
+    other = os.environ.get("LOCALS_E2E_SWITCH", "gemma")
+    if not other:
+        pytest.skip("LOCALS_E2E_SWITCH is empty")
+    before = get_json(f"http://127.0.0.1:{stack.server_port}/stats")["model"]
+    t0 = time.time()
+    p = stack.locals("start", "--model", other, "--port", stack.server_port, timeout=1800)
+    took = time.time() - t0
+    assert p.returncode == 0, p.stdout[-1500:] + p.stderr[-1500:]
+    import subprocess
+
+    servers = subprocess.run(["pgrep", "-f", f"locals.server --port {stack.server_port}"], capture_output=True,
+                             text=True).stdout.split()  # (this suite's servers only, not the user's own)
+    now = get_json(f"http://127.0.0.1:{stack.server_port}/stats")["model"]
+    report.note(f"switch {before} -> {now}: {took:.0f} s; locals servers running after: {len(servers)}")
+    assert now != before, (before, now)
+    assert len(servers) == 1, f"{len(servers)} locals servers run after a switch: {servers}"
+    r = _send(stack, {"model": get_json(f"http://127.0.0.1:{stack.port}/v1/models")["data"][0]["id"], "stream": True,
+                      "max_tokens": 10, "messages": [{"role": "user", "content": "Say hi."}]})
+    assert r["first"] is not None

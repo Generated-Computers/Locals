@@ -94,6 +94,7 @@ def user_env(home: Path, path: Optional[List[str]] = None) -> dict:
     """The environment of a user whose home is ``home``: none of this shell's LOCALS_ (or API key) settings."""
     skip = ("LOCALS_", "STCON_", "OPENAI_", "ANTHROPIC_", "PYTEST_", "OPENCODE_", "HERMES_", "OPENCLAW_", "VIRTUAL_ENV")
     env = {k: v for k, v in os.environ.items() if not k.startswith(skip)}
+    env.pop("PWD", None)  # each run sets its own (tools read their project folder from it)
     env.update(HOME=str(home), HF_HUB_CACHE=hf_hub(), OPENCODE_DISABLE_AUTOUPDATE="1", NO_COLOR="1", TERM="dumb",
                PATH=":".join([*(EXTRA_PATH if path is None else path), "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin",
                               "/bin", "/usr/sbin", "/sbin"]))

@@ -77,8 +77,10 @@ def test_errors_are_clean(client, model):
     with pytest.raises(openai.BadRequestError) as e:
         client.chat.completions.create(model=model, max_tokens=10, messages=[{"role": "user", "content": "word " * 400_000}])
     assert "context" in str(e.value).lower() or "token" in str(e.value).lower()
-    with pytest.raises(openai.APIStatusError):
-        client.chat.completions.create(model="no-such-model-at-all", max_tokens=5, messages=[{"role": "user", "content": "hi"}])
+    # a model name the server does not know is served by its model (agents' configs carry all sorts of names);
+    # the reply says which model answered
+    r = client.chat.completions.create(model="no-such-model-at-all", max_tokens=5, messages=[{"role": "user", "content": "hi"}])
+    assert r.choices and r.model
     # the server still answers
     assert client.chat.completions.create(model=model, max_tokens=5, messages=[{"role": "user", "content": "hi"}]).choices
 

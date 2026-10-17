@@ -7,6 +7,8 @@ Almost every test imports MLX, so the suite runs on Apple silicon only. Tests ar
 - **The fast suite** needs no model weights. At most it needs a tokenizer or a chat template from the local Hugging Face cache. It covers grammars, tokenizers, the server protocol, sampling and the agent tools.
 - **The model suite** (tests marked `model`) loads real weights. It checks that every fast path decodes the same tokens as the plain path it replaces.
 
+A third suite, `tests/e2e` (marked `e2e`), runs the `locals` command, the server and real agent tools as a user does. It is skipped unless `LOCALS_E2E=1` is set; see [tests/e2e/README.md](e2e/README.md).
+
 ## Running the tests
 
 Install the package in editable mode with the `dev` extra, which adds `pytest>=8` and `build>=1.2`:

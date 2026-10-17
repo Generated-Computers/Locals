@@ -96,9 +96,15 @@ def test_streams_cut_off_free_their_places(stack, report):
     assert _wait(lambda: all(s.tokens > 5 for s in streams), 120), "the streams did not start"
     for s in streams[:3]:
         s.hang_up()
-    freed = _wait(lambda: _rows(stack) <= 3, 10)
-    report.note(f"three of six streams cut off: their places freed in {freed if freed is None else round(freed, 2)} s")
-    assert freed is not None, f"{_rows(stack)} rows still decoding 10 s after three of six streams hung up"
+    time.sleep(1.0)
+    # the engine's output against what the three streams still open read: equal once the cut-off replies stopped
+    # (a row count alone misled: the old code kept decoding the abandoned replies while the count looked right)
+    a0, r0 = _out_tokens(stack), sum(s.tokens for s in streams[3:])
+    time.sleep(3.0)
+    decoded, read = _out_tokens(stack) - a0, sum(s.tokens for s in streams[3:]) - r0
+    report.note(f"three of six streams cut off: in the 3 s after, the engine wrote {decoded} tokens, the open streams read {read}")
+    assert read > 0, "the streams still open got nothing"
+    assert decoded <= 1.25 * read + 16, f"the engine wrote {decoded} tokens while the open streams read {read}: the cut-off replies go on"
     for s in streams[3:]:
         s.join(timeout=300)
         assert s.finish == "length" and s.error is None, (s.finish, s.error)

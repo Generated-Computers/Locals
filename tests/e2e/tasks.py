@@ -75,7 +75,10 @@ def _feature(d: Path, out: str, before: dict) -> Tuple[bool, str]:
 
 
 def _rename(d: Path, out: str, before: dict) -> Tuple[bool, str]:
-    left = [str(p.relative_to(d)) for p in d.rglob("*.py") if "find_by_tag" in p.read_text()]
+    import re
+
+    # the method's name as a word: its definition and calls (a test named test_find_by_tag may keep its name)
+    left = [str(p.relative_to(d)) for p in d.rglob("*.py") if re.search(r"\bfind_by_tag\b", p.read_text())]
     if left:
         return False, f"find_by_tag still in {left}"
     if "def with_tag" not in (d / "inventory" / "store.py").read_text():
