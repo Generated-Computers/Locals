@@ -984,7 +984,9 @@ class HybridBatchEngine(BatchEngine):
         """The next step: a plain decode step, or, while a prompt is being prefilled (``filling``), a
         mixed pass with its next chunk (locals/mixed.py). ``self._fill_eval``: what the caller evaluates
         with the step (the filling cache)."""
-        e = next((e for e in filling if e["pos"] < e["end"]), None)
+        # the prompt with the fewest tokens left first: a 3k-token request that arrived during a 31k-token one waited
+        # for all of it (a minute) in arrival order; the long one loses the short one's few seconds
+        e = min((e for e in filling if e["pos"] < e["end"]), key=lambda e: e["end"] - e["pos"], default=None)
         if e is None:
             self._fill_eval = []
             return self._launch1(cache, x, g, temp, budget)
@@ -1279,7 +1281,7 @@ class HybridBatchEngine(BatchEngine):
                 queue += got
             self.active = len(rows)
             boundary = cur is None or dead or solo_next or (queue and len(rows) + len(filling) < self.n_slots) or (
-                filling and (filling[0]["pos"] >= filling[0]["end"] or any(getattr(e["r"], "cancel", False) for e in filling)))
+                filling and any(e["pos"] >= e["end"] or getattr(e["r"], "cancel", False) for e in filling))
             solo_next = False
             if boundary:
                 ys = cur.tolist() if cur is not None else []
@@ -1339,11 +1341,10 @@ class HybridBatchEngine(BatchEngine):
                     del ready
                 # a for-loop variable outlives its loop: it would hold a cancelled or joined request's cache
                 e = gone = None
-                if filling and filling[0]["pos"] >= filling[0]["end"]:  # prefilled in mixed passes: join the batch
+                if any(e["pos"] >= e["end"] for e in filling):  # prefilled in mixed passes: join the batch
                     tp = time.perf_counter()
-                    ready = []
-                    while filling and filling[0]["pos"] >= filling[0]["end"]:
-                        ready.append(filling.pop(0))
+                    ready = [e for e in filling if e["pos"] >= e["end"]]
+                    filling[:] = [e for e in filling if e["pos"] < e["end"]]
                     attach([e["r"] for e in ready], self._prefill_batch(
                         [e["r"].prompt[:-1] for e in ready], [], starts=[(e["cache"], []) for e in ready]), tp, count=False)
                     del ready

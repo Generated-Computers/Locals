@@ -69,7 +69,7 @@ A boundary step runs when any of the following holds:
 - `cur is None`: nothing is in flight (start-up, or the batch has emptied).
 - `dead` is non-empty: a row finished (end-of-sequence token, constraint finished, `max_tokens`) or was cancelled at its last commit.
 - A request is queued and `len(rows) + len(filling) < n_slots`.
-- The first prompt in `filling` is fully prefilled and can join.
+- A prompt in `filling` is fully prefilled and can join.
 - Any request in `filling` was cancelled.
 
 The batch's rows change only at boundaries. The per-boundary flag `free` (no constrained rows) therefore stays valid through the chained steps that follow.
@@ -85,7 +85,7 @@ A request deferred for memory leaves the queue condition true. While it waits, e
 5. Feeds are appended to `fed`, and `g` advances by them.
 6. Cancelled queued requests and cancelled `filling` entries are dropped (see "Cancellation").
 7. If `filling` is non-empty but no rows remain, the remaining prompts are prefilled at once and joined.
-8. Fully prefilled `filling` entries at the head of the list join the batch.
+8. Fully prefilled `filling` entries join the batch. Each mixed pass reads a chunk of the entry with the fewest tokens left (`_launch`), so a short prompt that arrives while a long one is read does not wait for all of it: a 3k-token request waited 41 s behind a 31k-token one in arrival order, 7 s now, and the long one finished as before (46 s, 44 s).
 9. Admission runs.
 10. If there are still no rows, `cur = None` and the loop continues. At the top of the next iteration, if `arrive(False)` brought nothing and `filling` is empty, the combined tables are reset and `source(True)` blocks.
 11. Otherwise the next step is launched from host-known tokens, `mx.array(xs)`.

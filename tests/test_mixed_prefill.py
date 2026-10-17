@@ -80,3 +80,27 @@ def test_checkpoint_reached_in_mixed_passes(service):
     assert steps >= 4
     kinds = service._lru.stats_by_type()
     assert kinds.get("user", {}).get("n_sequences", 0) >= 1
+
+
+def test_a_short_prompt_is_read_before_a_long_one(service):
+    """Prompts read beside a decoding row go shortest first: a short one that arrives during a long one does not
+    wait for all of it (a 3k-token request waited 41 s behind a 31k-token one)."""
+    import time
+
+    from locals import mixed
+
+    eng = service._eng
+    eng._mix_ok = mixed.supported(eng.lm.model)
+    eng.mix_chunk = 128
+    service._lru.trim_to(n_bytes=0)
+    tok = service.tokenizer
+    started = threading.Event()
+    a = service.submit(_prompt(tok, "warehouse", 30), max_tokens=400, on_token=lambda t: started.set())
+    assert started.wait(120)
+    long, short = service.submit(_prompt(tok, "kitchen", 400), max_tokens=4), None
+    time.sleep(0.5)
+    short = service.submit(_prompt(tok, "garden", 20), max_tokens=4)
+    short.wait(600)
+    long.wait(600)
+    a.wait(600)
+    assert short.t_done < long.t_done, (short.t_done - long.t_done)
