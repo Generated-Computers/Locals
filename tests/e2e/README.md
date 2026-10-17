@@ -14,11 +14,11 @@ Each module starts its own server through `locals start`, in a HOME of its own, 
 
 | File | What a user does |
 |---|---|
-| `test_tools.py` | Each agent tool on real tasks, one at a time: OpenCode (`locals code --run`), Hermes, OpenClaw, Kilo Code, Cline, OpenHands and Aider (`locals launch TOOL`). The tasks are fixing a bug so the tests pass, renaming a method across files, adding a command with its test, and a question about a bigger code base. |
+| `test_tools.py` | Each agent tool on real tasks, one at a time: OpenCode (`locals code --run`), Hermes, OpenClaw, Kilo Code, Cline, OpenHands, Aider and Claude Code (`locals launch TOOL`; Claude Code through Anthropic's Messages API, its settings in the test's HOME). The tasks are fixing a bug so the tests pass, renaming a method across files, adding a command with its test, and a question about a bigger code base. |
 | `test_many_agents.py` | Several agents at once: two OpenCode terminals beside two other tools, then six OpenCode terminals in one HOME, measured against one alone. |
 | `test_session.py` | A working session: five follow-up turns in one OpenCode session (`--continue`). Each follow-up's first request must come mostly from the prompt cache. |
 | `test_interrupts.py` | Esc or Ctrl-C: streams cut off mid-reply, a hang-up while a 20k-token prompt is read, and Ctrl-C on a writing agent. The engine must stop those replies, and the next request must not wait for them. |
-| `test_clients.py` | The OpenAI Python SDK (streams, tool calls, JSON schemas, errors, eight async streams) and Ollama's HTTP API. |
+| `test_clients.py` | The OpenAI Python SDK (streams, tool calls, JSON schemas, errors, eight async streams), Ollama's HTTP API, and the Anthropic SDK (a tool-use round trip, streamed, from the prompt cache). |
 | `test_lifecycle.py` | `locals status`, a restart (OpenCode's first request then comes from the prompt cache on disk), a port held by another program, malformed requests, a start with no network, and switching models with one model in memory. |
 | `test_first_run.py` | A new user: an empty HOME, `install.sh` with a wheel built from this checkout, then the first `locals code PROJECT --run TASK` in a pseudo-terminal, answering yes when locals offers to install OpenCode. |
 
@@ -36,5 +36,6 @@ An agent that changes files outside its copy of the project fails the run, and t
 | `LOCALS_E2E_DIR` | a new temporary folder | where runs, logs and the report go |
 | `LOCALS_E2E_PORT` | `8341` | the proxy's port; the server listens on the next one, and the new-user test on 8343 |
 | `LOCALS_E2E_SERVER_ENV` | | extra server settings, e.g. `LOCALS_SOLO=0,LOCALS_MIX_CHUNK=512` |
+| `LOCALS_E2E_SERVER_ARGS` | | extra options for `locals start`, e.g. `--temp 1.0 --top-p 0.95 --top-k 64` |
 | `LOCALS_E2E_SWITCH` | `gemma` | the model the switching test switches to (empty: skipped) |
 | `LOCALS_E2E_<TOOL>_BIN` | | a tool's command, if it is not on the PATH |

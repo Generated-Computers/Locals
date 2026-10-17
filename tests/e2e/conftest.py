@@ -14,6 +14,7 @@ except the Hugging Face model cache (models are not downloaded twice) and, read 
     LOCALS_E2E_DIR     where runs, logs and the report go (default: a new temporary folder)
     LOCALS_E2E_PORT    the proxy's port (default 8341; the server listens on the next one)
     LOCALS_E2E_SERVER_ENV  extra settings for the server, e.g. "LOCALS_SOLO=0,LOCALS_MIX_CHUNK=512"
+    LOCALS_E2E_SERVER_ARGS extra options for `locals start`, e.g. "--temp 1.0 --top-p 0.95 --top-k 64"
 """
 
 from __future__ import annotations
@@ -134,7 +135,8 @@ class Stack:
         _port_free_or_die(self.port)
         _port_free_or_die(self.server_port)
         t = time.time()
-        p = self.locals("start", "--model", MODEL, "--port", self.server_port, timeout=3600)
+        extra = os.environ.get("LOCALS_E2E_SERVER_ARGS", "").split()  # e.g. "--temp 1.0 --top-p 0.95"
+        p = self.locals("start", "--model", MODEL, "--port", self.server_port, *extra, timeout=3600)
         (self.runs / "start.out").write_text(p.stdout + p.stderr)
         if p.returncode != 0:
             raise RuntimeError(f"locals start failed:\n{p.stdout[-2000:]}\n{p.stderr[-2000:]}")

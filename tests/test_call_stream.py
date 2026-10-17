@@ -122,3 +122,33 @@ def test_a_streamed_reply_sends_its_call_in_pieces(monkeypatch):
         assert finish == ["tool_calls"]
     finally:
         httpd.shutdown()
+
+
+def test_the_anthropic_sdk_gets_the_call_in_pieces():
+    """The same through the Messages API (Claude Code): many input_json_delta events, the SDK's input is the call."""
+    anthropic = pytest.importorskip("anthropic")
+    import test_messages_api as m
+
+    from huggingface_hub import snapshot_download
+
+    try:
+        path = snapshot_download(m.MODEL, local_files_only=True, allow_patterns=["*.json", "*.jinja", "tokenizer*"])
+    except Exception:  # noqa: BLE001
+        pytest.skip("tokenizer not cached")
+    from mlx_lm.utils import load_tokenizer
+
+    httpd, svc = m._serve(load_tokenizer(path), "Writing it.\n\n" + _call("write", filePath="notes.md", content=CONTENT * 4))
+    try:
+        client = anthropic.Anthropic(base_url=f"http://127.0.0.1:{httpd.server_address[1]}", api_key="x", max_retries=0)
+        tools = [{"name": t["function"]["name"], "description": t["function"]["description"],
+                  "input_schema": t["function"]["parameters"]} for t in TOOLS]
+        with client.messages.stream(model="claude-anything", max_tokens=2000, tools=tools,
+                                    messages=[{"role": "user", "content": "Write notes.md."}]) as stream:
+            pieces = [ev.partial_json for ev in stream if ev.type == "input_json"]
+            final = stream.get_final_message()
+        use = [b for b in final.content if b.type == "tool_use"]
+        assert len(use) == 1 and use[0].name == "write"
+        assert use[0].input == {"filePath": "notes.md", "content": CONTENT * 4}
+        assert len(pieces) > 20 and final.stop_reason == "tool_use"
+    finally:
+        httpd.shutdown()
