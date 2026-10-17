@@ -24,9 +24,10 @@ MEASURED_M2_PRO = {
 }
 SHORT = {"qwen3.5-4b": "qwen", "qwen3.5-2b": "qwen3.5-2b", "gemma-4-e4b": "gemma", "lfm2.5-2.6b": "lfm",
          "minicpm5-2b": "minicpm"}
-# Agent tasks done in the end-to-end suite (tests/e2e: real agent tools on real coding tasks, an M2 Pro):
-# Gemma 4 E4B repeats itself on the longer ones (the server's loop guard cuts it) and gives up early.
-AGENT_TASKS = {"qwen3.5-4b": (16, 16), "gemma-4-e4b": (2, 8)}
+# Agent tasks done in the end-to-end suite (tests/e2e: real agent tools on real coding tasks, an M2 Pro), the same
+# eight for both (OpenCode's four, Hermes's and OpenClaw's two; Qwen3.5-4B also did all 18 with eight tools):
+# Gemma 4 E4B repeats itself on the longer ones (the server's loop guard cuts it) and gives up early (2 to 3 of 8).
+AGENT_TASKS = {"qwen3.5-4b": (8, 8), "gemma-4-e4b": (3, 8)}
 
 
 def agent_note(model: str) -> str:
