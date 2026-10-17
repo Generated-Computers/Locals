@@ -44,6 +44,23 @@ the mxfp4 format (Mellum) gained nothing (1.0x): the tuned small-batch kernels
 cover 4-bit affine layers in groups of 64 (`_tunable` in `locals/kernels.py`),
 and mxfp4 layers stay on MLX's own kernels.
 
+## On an M2 Max with 96 GB
+
+The same test through the HTTP server on an Apple M2 Max (38-core GPU, 96 GB),
+14 and 15 October 2026: 8 requests at once, 256 tokens each with the end-of-text
+token ignored, the median of two rounds (tokens per second):
+
+| Model | mlx-lm | Locals | Ratio |
+|---|---|---|---|
+| Qwen3.5-4B | 152 | 403 | 2.7x |
+| Qwen3.5-9B | 72 | 220 | 3.0x |
+| Qwen3.8-27B | 25 | 78 | 3.1x |
+
+Bigger models gain more. mlx-lm itself is faster on this Mac than on the M2 Pro
+(152 tokens per second for the 4B at 8 requests, against 87), so the 4B's ratio
+is lower than its 3.1x there. Every batch size from 1 to 16, `locals bench`'s
+numbers, memory and the script: [M2 Max measurements](m2-max.md).
+
 ## Serving benchmark with the InferenceX client
 
 To check the numbers through the HTTP server with a client we did not write, we

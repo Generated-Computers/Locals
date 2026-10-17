@@ -72,7 +72,10 @@ more agents you run, the more it gives you:
 
 With 1, 2, 4, 8 and 16 requests at once, Locals writes 64, 116, 160, 271 and 341
 tokens per second, and mlx-lm 61, 82, 87, 87 and 157. A token is roughly a word
-piece.
+piece. On an M2 Max with 96 GB, eight requests at once get 403 tokens per second
+from Locals and 152 from mlx-lm, and bigger models gain more: 3.0x for
+Qwen3.5-9B and 3.1x for a 27B model
+([measurements](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/m2-max.md)).
 
 - **Many agents in the time of a few.** Eight agents working at once finish in
   about the time two would need one after the other, and the answers are the
