@@ -517,9 +517,10 @@ class HybridBatchEngine(BatchEngine):
             print(f"[mem] room for {need / 1e9:.2f} GB: active {mx.get_active_memory() / 1e9:.2f} GB, prompt cache "
                   f"{lru.nbytes / 1e9:.2f} GB in {len(lru)}, limit {self.memory_limit / 1e9:.2f}", flush=True)
 
-    def _prefill_batch(self, prompts: List[List[int]], others: List[List[int]], chunk: int = 1024, starts=None):
+    def _prefill_batch(self, prompts: List[List[int]], others: List[List[int]], chunk: int = 1024, starts=None, stop=None):
         """Prefill several prompts in one right-padded batch; returns a batch
-        cache. ``starts[i]``, if given, is a (cache, remaining tokens) pair."""
+        cache. ``starts[i]``, if given, is a (cache, remaining tokens) pair.
+        ``stop()``, asked between chunks: true gives up the prefill (returns None)."""
         caches, rests = [], []
         for i, p in enumerate(prompts):
             if starts is not None and starts[i] is not None:
@@ -533,7 +534,9 @@ class HybridBatchEngine(BatchEngine):
             # Rows whose whole prompt is a shared snapshot (the second of two requests with one prompt)
             # have nothing to prefill: padding them to the others' length cost most of an admission
             # (8 of 10 rows, 236 tokens each). Prefill the rows that need it, then merge all.
-            sub = self._prefill_batch([prompts[i] for i in busy], others, chunk, starts=[(caches[i], rests[i]) for i in busy])
+            sub = self._prefill_batch([prompts[i] for i in busy], others, chunk, starts=[(caches[i], rests[i]) for i in busy], stop=stop)
+            if sub is None:
+                return None
             done_rows = {i: [c.extract(j) for c in sub] for j, i in enumerate(busy)}
             cache = _merge([done_rows.get(i, caches[i]) for i in range(len(caches))])
             for c in cache:
@@ -578,15 +581,18 @@ class HybridBatchEngine(BatchEngine):
             if i == 0 and n < L:
                 _reserve(cache, base + L)
             i += n
+            if stop is not None and i < L and stop():
+                return None
         if ragged:
             for c in cache:
                 c.finalize()
             mx.eval([c.state for c in cache])
         return cache
 
-    def _run(self, cache, toks: List[int], chunk: int = 2048) -> None:
+    def _run(self, cache, toks: List[int], chunk: int = 2048, stop=None) -> bool:
         """Prefill ``toks`` into ``cache``. The body only, without the output
-        layer: its logits (chunk x 248k) are not needed and cost ~1 GB at 2048."""
+        layer: its logits (chunk x 248k) are not needed and cost ~1 GB at 2048.
+        False if ``stop()`` (asked between chunks) gave it up."""
         done, i = _cached(cache), 0
         while i < len(toks):
             n = prefill_chunk(done + i, 1, chunk)
@@ -595,6 +601,9 @@ class HybridBatchEngine(BatchEngine):
             if i == 0 and n < len(toks):
                 _reserve(cache, done + len(toks))
             i += n
+            if stop is not None and i < len(toks) and stop():
+                return False
+        return True
 
     # -- decoding ------------------------------------------------------------------------
     def _forward(self, cache, feeds: List[List[int]]) -> mx.array:
@@ -710,17 +719,20 @@ class HybridBatchEngine(BatchEngine):
 
     def _solo_drafts_ok(self, cache) -> bool:
         """Drafts need the per-token recurrent states the fused Gated DeltaNet kernel records (to rewind)."""
-        ok = getattr(self, "_solo_gdn", None)
-        if ok is None:
-            from . import fuse
+        from . import fuse
 
+        n = getattr(self, "_solo_gdn", None)
+        if n is None:  # the fused GDN layers, or 0 when any layer cannot record its states
             lin = [getattr(l, "linear_attn", None) for l in self.lm.model.layers]
             lin = [m for m in lin if m is not None]
-            ok = self._solo_gdn = all(getattr(m, "_gdn_ok", False) for m in lin) and fuse.USE_GDN_KERNEL
-        if not ok:
+            n = self._solo_gdn = len(lin) if lin and all(getattr(m, "_gdn_ok", False) for m in lin) else 0
+        rec = [c for c in cache if isinstance(c, ArraysCache)]
+        # every recurrent cache must be a fused GDN layer's: LFM2's convolutions (one state) and Mamba layers
+        # record nothing to rewind to (they crashed every request in flight on the first rejected draft)
+        if not n or len(rec) != n or not fuse.USE_GDN_KERNEL:
             return False
-        return all(c.cache[1] is not None and c.cache[1].dtype == mx.float32 and c.left_padding is None
-                   and c.lengths is None for c in cache if isinstance(c, ArraysCache))
+        return all(len(c.cache) >= 2 and c.cache[1] is not None and c.cache[1].dtype == mx.float32 and c.left_padding is None
+                   and c.lengths is None for c in rec)
 
     def _solo_draft(self, r, cache) -> List[int]:
         """A prompt-lookup draft for an unconstrained row: what followed the most recent earlier occurrence of its
@@ -868,6 +880,7 @@ class HybridBatchEngine(BatchEngine):
                 if self._commit_drip(r, tok):
                     r.text = self.tokenizer.decode(r.out)
                     dead.add(id(r))
+                    kept = min(kept, j)  # the draft tokens after the last one committed stay out of the cache
                     break
                 if j < a and r.pend:  # the grammar forces a span after this draft token: the rest of the draft goes
                     kept = j + 1
@@ -876,6 +889,9 @@ class HybridBatchEngine(BatchEngine):
             if draft:
                 if kept < len(draft):
                     self._solo_rewind(cache, len(draft) - kept)
+                for c in cache:  # the per-token states (48 MB a token on Qwen3.5-4B) are not kept past the pass
+                    if isinstance(c, ArraysCache):
+                        c.token_states = c.token_conv = None
                 r.fed.extend(draft[:kept])
                 r.solo_acc = (getattr(r, "solo_acc", None) or []) + [kept]
                 self.counters["drafted"] = self.counters.get("drafted", 0) + kept
@@ -1256,6 +1272,7 @@ class HybridBatchEngine(BatchEngine):
                 # idle: the combined tables (which only grow) start again from the next requests' constraints
                 self._tab = self._otab = self._walk = self._wtab = self._wrows = None
                 self._fill_eval = []
+                self.active = 0
                 got = arrive(True)
                 if not got:
                     break
@@ -1372,7 +1389,12 @@ class HybridBatchEngine(BatchEngine):
                             filling.append({"r": r, "cache": c0 if c0 is not None else make_prompt_cache(self.model),
                                             "pos": end - len(rest), "end": end, "reserved": 0, "cps": sorted(cps.items())})
                         new, found = [], []
+                    # every client of these prompts gone (Esc in the agent while it waits for a long prompt): the
+                    # prefill stops between chunks instead of reading the prompts to their end for nobody
+                    left_all = lambda: all(getattr(q, "cancel", False) for q in new)  # noqa: E731
                     for r, (c0, rest) in zip(new, found):
+                        if left_all():
+                            break
                         done = r.cached_tokens
                         for cp, kind in sorted(getattr(r, "checkpoints", None) or []):
                             if kind == "reply" and lru is not None and c0 is not None and cp == done:
@@ -1382,7 +1404,8 @@ class HybridBatchEngine(BatchEngine):
                                 continue
                             # prefill to the checkpoint, keep a copy, go on from there
                             c0 = c0 if c0 is not None else make_prompt_cache(self.model)
-                            self._run(c0, list(r.prompt[done:cp]))
+                            if not self._run(c0, list(r.prompt[done:cp]), stop=left_all):
+                                break
                             if kind == "reply":
                                 self._keep_reply(r, cp, c0)
                             elif self._room_for_copy(lru, len(r.prompt)):
@@ -1393,10 +1416,19 @@ class HybridBatchEngine(BatchEngine):
                                 print(f"[checkpoint] {kind} at {cp} (disk {'on' if self.disk is not None else 'off'})", flush=True)
                             done, rest = cp, list(r.prompt[cp:-1])
                         starts.append((c0, rest) if c0 is not None else None)
-                    if new:
-                        merged = self._prefill_batch([r.prompt[:-1] for r in new], [q.prompt[:-1] for q in queue], starts=starts)
+                    merged = None
+                    if new and not left_all():
+                        merged = self._prefill_batch([r.prompt[:-1] for r in new], [q.prompt[:-1] for q in queue], starts=starts,
+                                                     stop=left_all)
+                    if merged is not None:
                         attach(new, merged, tp, count=True)
-                        del merged
+                    elif new:
+                        for q in new:
+                            q.finish = "cancelled"
+                            if on_done is not None:
+                                on_done(q)
+                        self.counters["prefills_given_up"] = self.counters.get("prefills_given_up", 0) + 1
+                    del merged
                     # the per-request prefill caches: merged copies now live in the batch (a name left bound here
                     # would hold its request's whole KV next to the batch's copy for as long as it decodes)
                     starts = found = c0 = rest = None
@@ -1440,7 +1472,8 @@ class HybridBatchEngine(BatchEngine):
             nrows += len(rows)
             self.counters["steps"] += 1
             self.counters["rows"] += len(rows)
-            if lru is not None and self.memory_limit and self.counters["steps"] % 32 == 0 and _GROWTH_TRIM:
+            if lru is not None and self.memory_limit and self.counters["steps"] >= getattr(self, "_next_trim", 0) and _GROWTH_TRIM:
+                self._next_trim = self.counters["steps"] + 32  # (a multiple of 32 can be passed by in a lone row's passes)
                 # the rows' KV grows every step, past what their admission counted: room for the next 32
                 # steps comes out of the prompt cache now, before Metal runs out (which fails every row)
                 self._trim_for(lru, len(rows) * 32 * self._kv_bytes_per_token())

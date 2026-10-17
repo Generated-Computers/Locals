@@ -16,7 +16,7 @@ import time
 import uuid
 from typing import Callable, Dict, List, Optional
 
-IMAGE_NOTE = "[an image was attached here; this model reads text only]"
+from .oai import IMAGE_NOTE  # noqa: E402,F401  # one wording for both APIs
 
 
 def _uid(prefix: str) -> str:

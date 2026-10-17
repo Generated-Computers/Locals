@@ -140,6 +140,7 @@ class Server:
                  max_calls: int = 6, walk: bool = False, typed_tools: bool = False, log=None, top_p: float = 0.0, top_k: int = 0,
                  max_context: Optional[int] = None):
         self.model_id = model_id(model)  # a short name (qwen, gemma) or any model id
+        self._recent_systems: List[str] = []  # the system messages of recent sessions (see _session_start)
         # Prompt + reply tokens per request; longer prompts get a context_length_exceeded error (past
         # what fits, a Metal out-of-memory error would end every request in flight). None: what fits
         # this Mac's GPU memory next to the model (service.context_fit: 140k tokens for Qwen3.5-4B on
@@ -468,7 +469,7 @@ class Server:
                 elif write is not None and time.perf_counter() - last_emit > 15:
                     write(KEEPALIVE)
                     last_emit = time.perf_counter()
-                if write is None and p.get("alive") is not None and time.perf_counter() - last_probe > 1:
+                if p.get("alive") is not None and time.perf_counter() - last_probe > 1:
                     last_probe = time.perf_counter()  # while tokens come too: a client that left frees its row
                     if not p["alive"]():
                         job.cancel()
@@ -558,6 +559,30 @@ class Server:
             self._ckpt[engine] = model is None or any(type(c) is not KVCache for c in make_prompt_cache(model))
         return self._ckpt[engine]
 
+    _SESSION_MARKERS = ("<env>", "Working directory:", "Current Working Directory", "Current working directory",
+                        "Workspace root folder:", "Today's date:", "Current date:")
+
+    def _session_start(self, sys_text: str) -> int:
+        """Where the part of an agent's system message that differs from session to session starts (the
+        beginning of its line): at a marker agents write there (the working directory, the date), else where it
+        first differs from the system message of a recent session (other agents); -1 if not found."""
+        hits = [i for i in (sys_text.find(m) for m in self._SESSION_MARKERS) if i >= 0]
+        if hits:
+            i = min(hits)
+        else:
+            i = -1
+            for other in self._recent_systems:
+                if other == sys_text:
+                    continue
+                n = len(os.path.commonprefix([other, sys_text]))
+                if n < len(sys_text):
+                    i = max(i, n)
+            if sys_text not in self._recent_systems:
+                self._recent_systems = (self._recent_systems + [sys_text])[-16:]
+        if i < 0:
+            return -1
+        return sys_text.rfind("\n", 0, i) + 1 if i > 0 else 0
+
     def _checkpoints(self, tok, msgs: List[dict], tools, think_kw: dict, text: str, prompt: List[int]) -> List[tuple]:
         """Where to snapshot the prompt's cache on the way (a recurrent GDN
         cache cannot be cut back afterwards, so only stored prefixes are reused):
@@ -586,7 +611,20 @@ class Server:
                 a = _render(tok, msgs[:1] + [{"role": "user", "content": "\x01A"}], tools, add_generation_prompt=False, **think_kw)
                 b = _render(tok, msgs[:1] + [{"role": "user", "content": "\x02B"}], tools, add_generation_prompt=False, **think_kw)
                 n = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
-                cands.append((a[:n], "system"))
+                end = a[:n]
+                # * the start of the session's own part of the system message: agents end it with the project's
+                #   folder and the date (OpenCode's <env>), so the end above is reached only by sessions in the
+                #   same folder on the same day; everything before is the same in every project (7,157 of
+                #   OpenCode's 7,222 tokens), and a new project's first request read it all again (7 s)
+                sys_text = msgs[0].get("content").strip() if isinstance(msgs[0].get("content"), str) else ""
+                at = text.find(sys_text) if sys_text else -1  # (templates may trim it)
+                j = self._session_start(sys_text) if at >= 0 else -1
+                if j > 0:
+                    cands.append((text[:at + j], "system"))
+                    if len(end) - (at + j) > 4096:  # far from the end (a long folder-specific part): keep both
+                        cands.append((end, "system"))
+                else:
+                    cands.append((end, "system"))
             except Exception:  # noqa: BLE001
                 pass
         if len(msgs) > 2 or (len(msgs) == 2 and msgs[0]["role"] != "system"):
@@ -702,7 +740,10 @@ class Server:
             if len(blocks) != len(set(blocks)):
                 return "duplicate_call"
         if in_call:
-            looping = _looping(toks, reps=8, min_span=128, short_span=256)
+            # a file written through a call repeats lines on purpose (a grid, a table, test data): 16 repeats over
+            # 256 tokens or more (8 over 128 cut an 8 x 8 board out of a write call, and the call was dropped)
+            looping = _looping(toks, reps=16, min_span=256, short_span=256)
+            return "loop_in_call" if looping else None
         else:
             looping = _looping(toks) if tools else _looping(toks, reps=12, min_span=96, short_span=256)
             looping = looping or (tools and _line_looping(text))
@@ -733,10 +774,10 @@ class Server:
 
         key = uuid.uuid4().hex[:8]
         self._active[key] = {"engine": p["engine"], "prompt_tokens": len(p["prompt"]), "tokens": 0, "started": time.time()}
-        prev = self._previous_calls(req) if p["tools"] else {}
         prefix = ""
         job = None
         try:
+            prev = self._previous_calls(req) if p["tools"] else {}
             for attempt in range(2):
                 if prefix:  # inside the think block the prompt opened (Qwen3.5 thinking), it is reasoning
                     chunk({"reasoning_content": prefix} if _in_think(p) else {"content": prefix})
@@ -798,7 +839,10 @@ class Server:
                 chunk({"tool_calls": [{"index": i, "id": c["id"], "type": "function",
                                        "function": {"name": c["function"]["name"], "arguments": c["function"]["arguments"]}}]})
             usage = self._account(p, job, len(job.tokens), len(calls), t0, stopped)
-            finish = "tool_calls" if calls else ("length" if job.finish in ("length", "exhausted") else "stop")
+            # a reply cut by the loop guard inside a call (the call is dropped), or inside a JSON answer, is cut short:
+            # "length" says so (with "stop" an agent took the reply without its call as the end of its task)
+            cut = stopped == "loop_in_call" or (stopped == "loop" and not p["tools"] and (p["schema"] or p["regex"]))
+            finish = "tool_calls" if calls else ("length" if job.finish in ("length", "exhausted") or cut else "stop")
             chunk({}, finish=finish, usage=None if p.get("include_usage") else usage)
             if write is not None:
                 if p.get("include_usage"):
@@ -820,25 +864,10 @@ class Server:
         finally:
             self._active.pop(key, None)
 
-    def _decode(self, p: dict, prefix: str, chunk, write, key: str):
-        """Generate one reply after ``prefix`` (assistant text already
-        written), streaming deltas through ``chunk``; returns (job, reply
-        text including the prefix, why it was stopped early or None)."""
-        tok = p["svc"].tokenizer
-        prompt = list(p["prompt"])
-        if prefix:
-            prompt += list(tok._tokenizer.encode(prefix, add_special_tokens=False))
-        q: "queue.Queue[List[int]]" = queue.Queue()
-        job = p["svc"].submit(prompt, schema=p["schema"], max_tokens=p["max_tokens"], regex=p["regex"], on_token=q.put,
-                              temp=p.get("temp"), ignore_eos=p.get("ignore_eos", False),
-                              checkpoints=p.get("checkpoints"))
-        job.prefix_tokens = len(prompt) - len(p["prompt"])
-        toks: List[int] = []
-        rs = oai.ReplyStream(p["thinking"] and (not prefix or _in_think(p)), p.get("fmt"))
+    def _decode_loop(self, p, job, q, toks, tok, rs, chunk, write, key, stops, hold, last_emit, last_probe):
+        """_decode's streaming loop: tokens to deltas, the guards, keepalives and the hang-up probe, until the
+        job is done; returns why the reply was stopped early (or None)."""
         stopped = None
-        stops = [] if p["tools"] else (p.get("stop") or [])  # stop sequences apply to plain replies
-        hold = max((len(s) for s in stops), default=1) - 1
-        last_emit = last_probe = time.perf_counter()
         while True:
             got = False
             try:
@@ -874,13 +903,44 @@ class Server:
                 # it is complete, so nothing else is written meanwhile); a client that left fails the write
                 write(KEEPALIVE)
                 last_emit = now
-            if (write is None or p.get("probe_stream")) and p.get("alive") is not None and now - last_probe > 1:
+            if p.get("alive") is not None and now - last_probe > 1:
+                # a client that left, found within a second (a write fails only once the socket is known to be
+                # closed: a stream waiting for a long prompt or a held-back tool call writes nothing for 15 s)
                 last_probe = now
-                if not p["alive"]():  # a non-streaming client that went away: its slot is freed
+                if not p["alive"]():
                     job.cancel()
                     raise ConnectionResetError("the client went away")
             if job.done and q.empty():
                 break
+        return stopped
+
+    def _decode(self, p: dict, prefix: str, chunk, write, key: str):
+        """Generate one reply after ``prefix`` (assistant text already
+        written), streaming deltas through ``chunk``; returns (job, reply
+        text including the prefix, why it was stopped early or None)."""
+        tok = p["svc"].tokenizer
+        prompt = list(p["prompt"])
+        if prefix:
+            prompt += list(tok._tokenizer.encode(prefix, add_special_tokens=False))
+        q: "queue.Queue[List[int]]" = queue.Queue()
+        job = p["svc"].submit(prompt, schema=p["schema"], max_tokens=p["max_tokens"], regex=p["regex"], on_token=q.put,
+                              temp=p.get("temp"), ignore_eos=p.get("ignore_eos", False),
+                              checkpoints=p.get("checkpoints"))
+        job.prefix_tokens = len(prompt) - len(p["prompt"])
+        toks: List[int] = []
+        rs = oai.ReplyStream(p["thinking"] and (not prefix or _in_think(p)), p.get("fmt"))
+        stopped = None
+        stops = [] if p["tools"] else (p.get("stop") or [])  # stop sequences apply to plain replies
+        hold = max((len(s) for s in stops), default=1) - 1
+        last_emit = last_probe = time.perf_counter()
+        try:
+            stopped = self._decode_loop(p, job, q, toks, tok, rs, chunk, write, key, stops, hold, last_emit, last_probe)
+        except BaseException:
+            # the client hung up (a write failed, or the probe found the socket closed) or this thread failed:
+            # the reply is unread, so its row stops now instead of decoding to its end (up to max_tokens)
+            if not job.done:
+                job.cancel()
+            raise
         if job.finish.startswith("invalid:"):
             raise BadRequest(job.finish[len("invalid:"):].strip())
         if job.finish.startswith("error") and not toks and not p.get("_retried"):
@@ -947,6 +1007,24 @@ class Server:
         self._run(req, write, p)
 
 
+def _alive_socket(conn) -> bool:
+    """Whether the client on ``conn`` is still connected (a closed socket reads as end of file). poll, not
+    select: select refuses file descriptors above 1023 (many agents at once, many open files)."""
+    import select
+    import socket
+
+    try:
+        pl = select.poll()
+        pl.register(conn, select.POLLIN | select.POLLHUP | select.POLLERR)
+        if not pl.poll(0):
+            return True
+        return conn.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) != b""
+    except BlockingIOError:  # readable a moment ago, nothing to read now: still there
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 _CWD = re.compile(r"Working directory:\s*(\S+)")
 
 
@@ -1010,15 +1088,7 @@ def make_handler(server: Server, ollama_root: bool = False):
             return True
 
         def _alive(self) -> bool:
-            """Whether the client is still connected (a closed socket reads as end of file)."""
-            import select
-            import socket
-
-            try:
-                ready, _, _ = select.select([self.connection], [], [], 0)
-                return not ready or self.connection.recv(1, socket.MSG_PEEK) != b""
-            except OSError:
-                return False
+            return _alive_socket(self.connection)
 
         def _json(self, obj, status=200):
             body = json.dumps(obj, ensure_ascii=False).encode()
@@ -1098,7 +1168,15 @@ def make_handler(server: Server, ollama_root: bool = False):
                 return fail(f"{type(e).__name__}: {e}", 400)
             if not text_req["stream"]:
                 p["alive"] = self._alive
-                resp = server.text_completion(text_req, p)
+                try:
+                    resp = server.text_completion(text_req, p)
+                except BadRequest as e:
+                    return fail(str(e), 400)
+                except Exception as e:  # noqa: BLE001  # an engine error: an answer, not a dropped connection
+                    import traceback
+
+                    traceback.print_exc()
+                    return fail(f"{type(e).__name__}: {e}", 500)
                 return None if resp is None else self._json(apis.text_to_ollama(resp, shown, t0))
 
             def write(b: bytes):
@@ -1112,6 +1190,7 @@ def make_handler(server: Server, ollama_root: bool = False):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
+            p["alive"] = self._alive
             try:
                 server.text_completion(text_req, p, out.feed)
                 out.close()
@@ -1119,6 +1198,17 @@ def make_handler(server: Server, ollama_root: bool = False):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except Exception as e:  # noqa: BLE001  # mid-stream: an error line and a clean end
+                import traceback
+
+                traceback.print_exc()
+                server.errors += 1
+                try:
+                    write((json.dumps({"error": f"{type(e).__name__}: {e}"}) + "\n").encode())
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except Exception:  # noqa: BLE001  # the client is gone
+                    pass
 
         def _other_api(self, path: str, req: dict):
             """The Ollama API, through the Chat Completions path."""
@@ -1185,7 +1275,7 @@ def make_handler(server: Server, ollama_root: bool = False):
                 self.wfile.flush()
 
             out = apis.OllamaStream(write, shown, t0, generate=path == "/api/generate")
-            p["alive"], p["probe_stream"] = self._alive, True  # its NDJSON has no keepalive: a client that left is probed
+            p["alive"] = self._alive  # a client that left is found by the probe, within a second
             self.send_response(200)
             self._cors()
             self.send_header("Content-Type", "application/x-ndjson")
@@ -1262,6 +1352,7 @@ def make_handler(server: Server, ollama_root: bool = False):
                     if resp is None:  # the client went away
                         return
                     return self._json(resp)
+                p["alive"] = self._alive  # a client that hangs up (Esc in the agent) stops its reply within a second
                 self.send_response(200)
                 self._cors()
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")

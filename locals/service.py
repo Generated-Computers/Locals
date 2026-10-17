@@ -187,9 +187,11 @@ class BatchService:
         return int(free // kv) // 1024 * 1024 if kv and free > 0 else None
 
     def stats(self) -> dict:
-        out = {"engine": self.engine, "active": self.active, "tokens_out": self.tokens_out,
-               "prompt_tokens": self.prompt_tokens, "cached_tokens": self.cached_tokens}
         eng = getattr(self, "_eng", None)
+        # the engine's own counters, read now (the copies made at each pipelined step stand still while one
+        # request runs alone, several tokens a pass)
+        out = {"engine": self.engine, "active": getattr(eng, "active", self.active), "tokens_out": getattr(eng, "tokens_out", self.tokens_out),
+               "prompt_tokens": self.prompt_tokens, "cached_tokens": self.cached_tokens}
         out.update(getattr(eng, "counters", {}) if eng is not None else {})
         lru = getattr(self, "_lru", None)
         if lru is not None:

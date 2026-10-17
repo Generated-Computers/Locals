@@ -39,6 +39,10 @@ THINK_CLOSE = "</think>"
 
 # --- messages ------------------------------------------------------------------------------
 
+
+IMAGE_NOTE = "[an image was attached here; this model reads text only]"
+FILE_NOTE = "[a file was attached here; this model reads only the text of the conversation]"
+
 def text_of(content) -> str:
     """The text of an OpenAI message content (a string or a list of parts)."""
     if content is None:
@@ -52,9 +56,9 @@ def text_of(content) -> str:
         elif part.get("type") == "text":
             out.append(part.get("text") or "")
         elif part.get("type") in ("image_url", "image", "input_image"):
-            out.append("[image omitted]")
+            out.append(IMAGE_NOTE)  # the model can say it cannot see it (a bare "[image omitted]" it took for text)
         elif part.get("type") in ("file", "input_file"):
-            out.append("[file omitted]")
+            out.append(FILE_NOTE)
     return "\n".join(out)  # parts are separate pieces of text (vLLM joins them the same way)
 
 

@@ -107,7 +107,7 @@ def test_convert_messages():
             {"role": "tool", "tool_call_id": "c1", "content": "text"}]
     out = oai.convert_messages(msgs)
     assert out[0] == {"role": "system", "content": "A\n\nB"}
-    assert out[1]["content"] == "hi\n[image omitted]"
+    assert out[1]["content"] == "hi\n" + oai.IMAGE_NOTE
     assert out[2]["tool_calls"][0]["function"]["arguments"] == {"path": "a"}
     assert out[3]["role"] == "tool"
     assert oai.engine_of("mlx/qwen3.5-2b") == "mlx" and oai.engine_of("locals/qwen3.5-2b-thinking") == "locals"
@@ -172,7 +172,10 @@ def test_loop_guard_spares_call_arguments():
     assert srv._guard(head + line * 3, "I will do it. I will do it. I will do it.", fmt) == "loop"
     in_call = '<tool_call>\n{"name": "write", "arguments": {"content": "a\\na\\n'
     assert srv._guard(head + line * 6, in_call, fmt) is None
-    assert srv._guard(head + line * 13, in_call, fmt) == "loop"
+    row = list(range(600, 620))  # "[0, 0, 0, 0, 0, 0, 0, 0],\n": an 8 x 8 board written out is not a loop
+    assert srv._guard(head + row * 8, in_call, fmt) is None
+    assert srv._guard(head + line * 13, in_call, fmt) is None
+    assert srv._guard(head + line * 26, in_call, fmt) == "loop_in_call"  # a call that goes on forever is
 
 
 def test_error_mid_stream_is_an_event_not_a_second_response():

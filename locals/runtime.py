@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
@@ -129,6 +130,76 @@ def set_compute_dtype(model, dtype: Optional[str] = "auto") -> str:
     return dtype
 
 
+# --- MLX attention kernels that cannot run on this GPU -----------------------------------------
+#
+# MLX 0.32.4's vector attention kernel (a few query tokens over a long cache) asks for 1024 threads per
+# threadgroup, and for 8 queries of head size 256 in float16 an M2 Pro's GPU allows 896: every pass over
+# 8 tokens (a lone request's draft pass, the last 8 tokens of a prompt read after a cached prefix) failed,
+# and with it every request in flight ("Maximum threads per threadgroup is 896 but requested 1024 for
+# kernel sdpa_vector_2pass_1_float16_t_256_256_..."). The kernel is built when the graph is evaluated, so
+# its error cannot be caught at the call: the model's shapes are tried once at load, and queries of a
+# length that fails here are split in two (each half sees the same keys: the same result).
+
+_SDPA = mx.fast.scaled_dot_product_attention
+_SPLIT: set = set()  # (head size, dtype, query length) the kernel cannot run here
+_PROBED: set = set()
+
+
+def _sdpa_split(q, k, v, *, scale, mask=None, **kw):
+    L = q.shape[-2]
+    if (q.shape[-1], q.dtype, L) not in _SPLIT:
+        return _SDPA(q, k, v, scale=scale, mask=mask, **kw)
+    if isinstance(mask, str):  # "causal": the last L of the keys; written out, it splits by rows
+        n = k.shape[-2]
+        mask = mx.arange(n)[None, :] <= (mx.arange(L) + n - L)[:, None]
+    h = L // 2
+
+    def rows(a, b):
+        m = mask[..., a:b, :] if isinstance(mask, mx.array) and mask.ndim >= 2 and mask.shape[-2] == L else mask
+        return _sdpa_split(q[..., a:b, :], k, v, scale=scale, mask=m, **kw)
+
+    return mx.concatenate([rows(0, h), rows(h, L)], axis=-2)
+
+
+def guard_attention(model, dtype) -> List[int]:
+    """Try MLX's attention for this model's head sizes with 2 to 8 query tokens (no mask, a boolean mask and
+    "causal", over short and long caches); the lengths that fail are split from now on. Returns them."""
+    dims, heads, kv_heads = set(), 16, 4
+    for args in (getattr(model, "args", None), getattr(getattr(model, "args", None), "text_config", None)):
+        get = (lambda k: args.get(k)) if isinstance(args, dict) else (lambda k: getattr(args, k, None))
+        for name in ("head_dim", "global_head_dim", "local_head_dim"):
+            if isinstance(get(name), int) and get(name) > 0:
+                dims.add(get(name))
+        if isinstance(get("num_attention_heads"), int):
+            heads = get("num_attention_heads")
+        if isinstance(get("num_key_value_heads"), int):
+            kv_heads = get("num_key_value_heads")
+    if not dims:
+        dims = {128, 256}
+    dtype = getattr(mx, dtype) if isinstance(dtype, str) else dtype
+    bad = []
+    for d in sorted(dims):
+        if (d, dtype) in _PROBED:
+            continue
+        _PROBED.add((d, dtype))
+        for L in range(2, 9):
+            # the model's own head counts and cache lengths short and long: the kernel's block count, and with it
+            # the threads it asks for, depends on them
+            for n in (1100, 3000, 20000):
+                q = mx.zeros((1, heads, L, d), dtype=dtype)
+                kv = mx.zeros((1, kv_heads, n, d), dtype=dtype)
+                try:
+                    mx.eval(_SDPA(q, kv, kv, scale=1.0, mask=None), _SDPA(q, kv, kv, scale=1.0, mask="causal"),
+                            _SDPA(q, kv, kv, scale=1.0, mask=mx.ones((L, n), dtype=mx.bool_)))
+                except Exception:  # noqa: BLE001  # (RuntimeError from Metal)
+                    _SPLIT.add((d, dtype, L))
+                    bad.append(L)
+                    break
+    if _SPLIT and mx.fast.scaled_dot_product_attention is _SDPA:
+        mx.fast.scaled_dot_product_attention = _sdpa_split
+    return bad
+
+
 class Runtime:
     """A loaded model with our decode loop.
 
@@ -147,6 +218,10 @@ class Runtime:
         self.model = model
         self.tokenizer = tokenizer
         self.dtype = set_compute_dtype(model, dtype)
+        split = guard_attention(model, self.dtype)
+        if split:
+            (log or (lambda m: print(m, file=sys.stderr, flush=True)))(f"locals: MLX {mx.__version__}'s attention kernel cannot run {sorted(set(split))} query tokens at once on "
+                f"this GPU; those passes are split in two")
         if fuse:
             fuse_model(model)
         enable_small_m(small_m_kernel, model)
