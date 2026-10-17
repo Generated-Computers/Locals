@@ -308,7 +308,8 @@ def qwen_calls(text: str) -> List[Tuple[str, Dict[str, str], int]]:
                 j = -1
                 break
             v = text[pm.end():k]
-            args[pm.group(1).strip()] = v[:-1] if v.endswith("\n") else v
+            args.setdefault(pm.group(1).strip(), v[:-1] if v.endswith("\n") else v)  # a repeated parameter: the first
+            # (what CallStream sent as it was written)
             j = k + len("</parameter>")
         cm = _FN_CLOSE.match(text, j) if j >= 0 else None
         if cm is None:  # cut, or not a call the grammar writes: skip this opener
@@ -318,6 +319,151 @@ def qwen_calls(text: str) -> List[Tuple[str, Dict[str, str], int]]:
             continue
         out.append((name, args, cm.end()))
         pos = cm.end()
+
+
+def _partial_qwen_calls(text: str) -> List[Tuple[str, List[Tuple[str, str, bool]], bool]]:
+    """The calls in a calls part being written, as qwen_calls reads them once complete: (name, [(parameter,
+    value so far, complete)], complete). Stops at the first call not yet written to its "</function>"."""
+    out, pos = [], 0
+    while True:
+        m = _FN_OPEN.search(text, pos)
+        if not m:
+            return out
+        name, j, params = m.group(1).strip(), m.end(), []
+        while True:
+            pm = _P_OPEN.match(text, j)
+            if not pm:
+                break
+            k = text.find("</parameter>", pm.end())
+            if k < 0:
+                params.append((pm.group(1).strip(), text[pm.end():], False))
+                out.append((name, params, False))
+                return out
+            v = text[pm.end():k]
+            params.append((pm.group(1).strip(), v[:-1] if v.endswith("\n") else v, True))
+            j = k + len("</parameter>")
+        cm = _FN_CLOSE.match(text, j)
+        if cm is None:
+            out.append((name, params, False))  # its next parameter or its close is being written
+            return out
+        out.append((name, params, True))
+        pos = cm.end()
+
+
+def _held_back(value: str) -> str:
+    """A value being written, less an end that may still turn out to be its close ("\n</parameter>")."""
+    for close in ("\n</parameter>", "</parameter>"):
+        for n in range(len(close), 0, -1):
+            if value.endswith(close[:n]):
+                return value[:-n]
+    return value
+
+
+class CallStream:
+    """Tool calls in Qwen3.5's XML format sent while the model writes them, as OpenAI's tool-call deltas: the
+    first with the call's id and name, then its arguments in pieces of the JSON the finished reply's parse
+    gives (a string value as it is written, another type once complete), so the pieces add up to the call's
+    final arguments. A long write call showed nothing for up to 27 s until it was complete. A call that may
+    still turn out to repeat one the guards drop or steer away from (the previous turn's, one before it in this
+    reply) waits until it differs, and later calls wait with it; calls past ``max_calls`` and to tools not
+    offered are not sent."""
+
+    def __init__(self, tools: Optional[List[dict]], prev=(), max_calls: int = 6):
+        self.schemas: Dict[str, dict] = {}
+        for t in tool_specs(tools):
+            self.schemas[t["function"]["name"]] = (t["function"].get("parameters") or {}).get("properties") or {}
+        self.prev = [(name, json.loads(args)) for name, args in prev]  # (name, arguments) of the previous turn's calls
+        self.max_calls = max_calls
+        self.ids: List[str] = []
+        self.sent: List[str] = []
+        self.broken = False
+
+    def _could_be(self, name: str, params, other: Tuple[str, dict]) -> bool:
+        """Whether a call being written may still turn out equal to ``other`` (a finished call)."""
+        if name != other[0] or not isinstance(other[1], dict):
+            return False
+        props = self.schemas.get(name, {})
+        for pname, value, complete in params:
+            if pname not in other[1]:
+                return False
+            want = other[1][pname]
+            if complete:
+                if coerce(value, props.get(pname)) != want:
+                    return False
+            elif isinstance(want, str) and not want.startswith(_held_back(value)):
+                return False
+        return True
+
+    def _text(self, name: str, params, complete: bool) -> str:
+        """The arguments' JSON as far as it is decided."""
+        props, parts, seen = self.schemas.get(name, {}), [], set()
+        for pname, value, done in params:
+            if pname in seen:  # (qwen_calls keeps a repeated parameter's first value)
+                if not done:
+                    break
+                continue
+            seen.add(pname)
+            schema = props.get(pname)
+            key = json.dumps(pname, ensure_ascii=False) + ": "
+            text_kind = not schema or not _types(schema) or "string" in _types(schema)
+            if text_kind:
+                body = value if done else _held_back(value)
+                parts.append(key + '"' + json.dumps(body, ensure_ascii=False)[1:-1] + ('"' if done else ""))
+            else:
+                parts.append(key + (json.dumps(coerce(value, schema), ensure_ascii=False) if done else ""))
+            if not done:
+                break
+        return "{" + ", ".join(parts) + ("}" if complete else "")
+
+    def feed(self, part: str) -> List[dict]:
+        """``part``: the reply from its first call's opener on. The deltas to send now."""
+        out: List[dict] = []
+        if self.broken:
+            return out
+        k, finished = 0, []  # k: the call's index among the reply's calls (offered tools only)
+        for name, params, complete in _partial_qwen_calls(part):
+            if self.schemas and name not in self.schemas:
+                if complete:
+                    continue  # not a call (parse_reply leaves it out)
+                break
+            if k >= self.max_calls:
+                break
+            if k >= len(self.ids) and any(self._could_be(name, params, o) for o in self.prev + finished):
+                break  # may be a repeat: it waits, and the calls after it too
+            text = self._text(name, params, complete)
+            if k >= len(self.ids):
+                self.ids.append(_call_id())
+                self.sent.append("")
+                out.append({"index": k, "id": self.ids[k], "type": "function", "function": {"name": name, "arguments": ""}})
+            if not text.startswith(self.sent[k]):  # (cannot happen by construction; if it does, stop sending)
+                self.broken = True
+                return out
+            if len(text) > len(self.sent[k]):
+                out.append({"index": k, "function": {"arguments": text[len(self.sent[k]):]}})
+                self.sent[k] = text
+            if not complete:
+                break
+            finished.append((name, json.loads(text)))
+            k += 1
+        return out
+
+    def finish(self, calls: List[dict]) -> List[dict]:
+        """The deltas that complete the reply's final calls (their ids become the ones sent): the rest of a
+        call sent in part, a call not sent at all whole."""
+        out = []
+        for i, c in enumerate(calls):
+            args = c["function"]["arguments"]
+            if i < len(self.ids):  # sent in part: its rest (a part that is not the final call's beginning cannot be undone)
+                c["id"] = self.ids[i]
+                if args.startswith(self.sent[i]) and len(args) > len(self.sent[i]):
+                    out.append({"index": i, "function": {"arguments": args[len(self.sent[i]):]}})
+            else:
+                out.append({"index": i, "id": c["id"], "type": "function",
+                            "function": {"name": c["function"]["name"], "arguments": args}})
+        return out
+
+    def streamed(self) -> int:
+        return len(self.ids)
 
 
 def _call_id() -> str:

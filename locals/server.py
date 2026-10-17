@@ -788,6 +788,8 @@ class Server:
         job = None
         try:
             prev = self._previous_calls(req) if p["tools"] else {}
+            p["prev_calls"] = list(prev)
+            p["tool_choice"] = req.get("tool_choice")
             for attempt in range(2):
                 if prefix:  # inside the think block the prompt opened (Qwen3.5 thinking), it is reasoning
                     chunk({"reasoning_content": prefix} if _in_think(p) else {"content": prefix})
@@ -815,6 +817,12 @@ class Server:
                     rest = job.stream.unsent(content[len(prefix):] if content.startswith(prefix) else content)
                     if rest:
                         chunk({"content": rest})
+                cs = getattr(job, "call_stream", None)
+                if calls and self._repeats(calls, prev) and cs is not None and cs.streamed():
+                    # calls already sent (none of them a repeat: a call that might be one waits) cannot be steered
+                    # away from: the reply keeps them, up to the first repeat
+                    n = next(i for i, c in enumerate(calls) if self._repeats([c], prev))
+                    text, calls = p["fmt"].cut_after(text, n), calls[:n]
                 if calls and self._repeats(calls, prev):
                     # steering writes text before the calls, which formats whose calls
                     # are the whole reply (Llama's JSON, Mistral 7B's) cannot hold
@@ -844,10 +852,13 @@ class Server:
                 break
             # the reply as the client got it (cut after max_calls, without a duplicate call): the replay of a
             # tool-call turn is this text, and only an uncut reply is a token stream to continue on
+            cs = getattr(job, "call_stream", None)
+            ends = cs.finish(calls) if cs is not None else [  # (the ids of calls sent while written become the calls')
+                {"index": i, "id": c["id"], "type": "function",
+                 "function": {"name": c["function"]["name"], "arguments": c["function"]["arguments"]}} for i, c in enumerate(calls)]
             self._remember(p["engine"], p, job, calls, prefix, raw=text, exact=stopped is None)
-            for i, c in enumerate(calls):
-                chunk({"tool_calls": [{"index": i, "id": c["id"], "type": "function",
-                                       "function": {"name": c["function"]["name"], "arguments": c["function"]["arguments"]}}]})
+            for d in ends:
+                chunk({"tool_calls": [d]})
             usage = self._account(p, job, len(job.tokens), len(calls), t0, stopped)
             # a reply cut by the loop guard inside a call (the call is dropped), or inside a JSON answer, is cut short:
             # "length" says so (with "stop" an agent took the reply without its call as the end of its task)
@@ -907,6 +918,11 @@ class Server:
                     for kind, delta in rs.feed(text):
                         chunk({"reasoning_content": delta} if kind == "reasoning" else {"content": delta})
                         last_emit = time.perf_counter()
+                    cs = getattr(job, "call_stream", None)
+                    if cs is not None and rs.mode == "tool" and stopped is None:
+                        for d in cs.feed(text[rs.sent:]):
+                            chunk({"tool_calls": [d]})
+                            last_emit = time.perf_counter()
             now = time.perf_counter()
             if write is not None and now - last_emit > 15:
                 # keeps the connection open through a long prefill, and through a tool call (sent when
@@ -939,6 +955,11 @@ class Server:
         job.prefix_tokens = len(prompt) - len(p["prompt"])
         toks: List[int] = []
         rs = oai.ReplyStream(p["thinking"] and (not prefix or _in_think(p)), p.get("fmt"))
+        fmt = p.get("fmt")
+        # a streamed reply's calls go out while they are written (Qwen3.5's format; others when they are complete)
+        job.call_stream = (oai.CallStream(p["tools"], p.get("prev_calls") or (), self.max_calls)
+                           if write is not None and p["tools"] and (fmt is None or fmt.name == "qwen_xml")
+                           and p.get("tool_choice") != "none" else None)
         stopped = None
         stops = [] if p["tools"] else (p.get("stop") or [])  # stop sequences apply to plain replies
         hold = max((len(s) for s in stops), default=1) - 1

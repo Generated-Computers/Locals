@@ -305,7 +305,8 @@ def test_steered_reply_in_thinking_mode_streams_reasoning(monkeypatch):
     reasoning = "".join(d.get("reasoning_content") or "" for d in deltas)
     assert "</think>" not in content and "already made" not in content and "So I read" not in content
     assert "already made" in reasoning and "So I read a.py instead." in reasoning
-    calls = [d["tool_calls"][0]["function"] for d in deltas if d.get("tool_calls")]
+    calls = [d["tool_calls"][0]["function"] for d in deltas  # (a call's first delta has its name; the rest, arguments)
+             if d.get("tool_calls") and "name" in d["tool_calls"][0]["function"]]
     assert [c["name"] for c in calls] == ["read"]
 
 
@@ -325,7 +326,8 @@ def test_steered_gemma_reply_cannot_open_a_thought_block(monkeypatch):
     content = "".join(d.get("content") or "" for d in deltas)
     assert "already made" in content and "I will read it." in content
     assert "<channel|>" not in content and "<|channel>" not in content
-    calls = [d["tool_calls"][0]["function"] for d in deltas if d.get("tool_calls")]
+    calls = [d["tool_calls"][0]["function"] for d in deltas  # (a call's first delta has its name; the rest, arguments)
+             if d.get("tool_calls") and "name" in d["tool_calls"][0]["function"]]
     assert [c["name"] for c in calls] == ["read"]
     rx = compile_dfa(fmt.free_text(), 100_000)
     assert rx.matches(b"plain words") and not rx.matches(b"thinking\n<channel|>\nmore")
