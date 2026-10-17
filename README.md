@@ -76,6 +76,10 @@ piece. On an M2 Max with 96 GB, eight requests at once get 403 tokens per second
 from Locals and 152 from mlx-lm, and bigger models gain more: 3.0x for
 Qwen3.5-9B and 3.1x for a 27B model
 ([measurements](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/m2-max.md)).
+Against Ollama and Magnitude on the M2 Pro, with eight requests at once Locals
+writes 111 tokens per second for Qwen3.5-4B where Ollama writes 34 and Magnitude
+42, and the first token comes after 1.6 seconds instead of 42 and 16
+([comparison](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md#against-ollama-and-magnitude)).
 
 - **Many agents in the time of a few.** Eight agents working at once finish in
   about the time two would need one after the other, and the answers are the

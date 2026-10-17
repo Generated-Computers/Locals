@@ -73,4 +73,6 @@ First public release.
   with "database is locked"; an agent that repeats its last call is led to a
   different call (to another tool if it insists), instead of a plan in words or
   a question that ended its task; Aider no
-  longer writes a new file named after a sentence of the model's reply.
+  longer writes a new file named after a sentence of the model's reply;
+  several Gemma 4 requests at once with prompts longer than 512 tokens no
+  longer get empty or wrong replies.

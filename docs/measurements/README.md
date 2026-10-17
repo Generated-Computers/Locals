@@ -112,6 +112,97 @@ run had too few long-prompt arrivals for a 12 s gap to reach the p99.9 of its
 token gaps. At 8 requests the delay is spread over all streams: the median time
 per token rose (98 ms to 122 ms) while its p99 fell (178 ms to 148 ms).
 
+## Against Ollama and Magnitude
+
+The same InferenceX client against three servers on the same M2 Pro, one at a
+time on the GPU: Locals, Ollama 0.40.5 and Magnitude 0.2.9, each with its own
+4-bit build of the model:
+
+| | Qwen3.5-4B | Gemma 4 E4B |
+|---|---|---|
+| Locals | `mlx-community/Qwen3.5-4B-MLX-4bit` | `mlx-community/gemma-4-e4b-it-4bit` |
+| Ollama | `qwen3.5:4b` (its MLX build, NVFP4 weights) | `gemma4:e4b-it-qat` (GGUF, Q4_0) |
+| Magnitude | `qwen3.5-4b:gguf:q4` | `gemma-4-e4b-it-qat:gguf:q4` |
+
+Chat completions (backend `openai-chat`), the client's `random` prompts (seed
+0, lengths 80% to 100% of the target), temperature 0, thinking off
+(`reasoning_effort: none`), 3 x N requests per point (2 x N with 8,000-token
+prompts) after 2 x N warmup requests. Replies end where the model ends them:
+Ollama does not support `ignore_eos` and Magnitude refuses it, so Locals ran
+without it too. Each engine runs a different build of the model, so reply
+lengths still differ; the time to the first token and the time per output token
+do not depend on them, and output tokens per second are given with the average
+reply length. The client ran unchanged except for what the other two servers
+needed: `max_tokens` sent beside `max_completion_tokens` (Ollama reads only
+`max_tokens`), `ignore_eos` and `max_completion_tokens` left out for Magnitude
+(it refuses fields it does not know), and SSE comment lines skipped (Magnitude's
+keepalive comments stopped the client). Ollama and Magnitude were measured on
+16 and 17 October 2026, Locals on 18 October (commit `26f2482`).
+
+### Qwen3.5-4B, 1,000 tokens in
+
+| Requests at once | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| First token, Locals | 1.4 s | 1.5 s | 1.4 s | 1.6 s |
+| First token, Ollama | 2.1 s | 9.4 s | 18.9 s | 41.8 s |
+| First token, Magnitude | 1.4 s | 2.7 s | 3.3 s | 16.1 s |
+| Time per token, Locals | 16 ms | 19 ms | 36 ms | 58 ms |
+| Time per token, Ollama | 21 ms | 21 ms | 21 ms | 22 ms |
+| Time per token, Magnitude | 24 ms | 35 ms | 79 ms | 109 ms |
+| Tokens/s (reply length), Locals | 47 (259) | 79 (387) | 86 (362) | 111 (330) |
+| Tokens/s (reply length), Ollama | 33 (171) | 36 (288) | 33 (220) | 34 (236) |
+| Tokens/s (reply length), Magnitude | 37 (353) | 50 (666) | 45 (497) | 42 (405) |
+
+Ollama answers one request at a time with this model: each reply is written at
+full speed (21 ms a token) while the others wait, so the first token comes later
+the more requests there are. Locals' numbers are lower than the fixed-length ones
+above (111 against 177 tokens per second at 8 requests) because replies end at
+different times, so the batch is not always full, and a new prompt is read each
+time one ends.
+
+### Qwen3.5-4B, 8,000 tokens in
+
+| Requests at once | 1 | 4 |
+|---|---|---|
+| First token, Locals | 10.9 s | 17.6 s |
+| First token, Ollama | 16.4 s | 72.5 s |
+| First token, Magnitude | 11.5 s | 124.5 s |
+| Time per token, Locals | 18 ms | 77 ms |
+| Time per token, Ollama | 23 ms | 23 ms |
+| Time per token, Magnitude | 26 ms | 120 ms |
+| Tokens/s (reply length), Locals | 18 (282) | 30 (470) |
+| Tokens/s (reply length), Ollama | 14 (270) | 15 (317) |
+| Tokens/s (reply length), Magnitude | 24 (399) | 3.5 (143) |
+
+With 4 requests at once, 4 of Magnitude's 8 replies came back empty; Locals and
+Ollama answered all of them. For one request, Magnitude's higher tokens per
+second come from its longer replies (399 tokens against 282): its first token
+and its time per token are both slower than Locals'.
+
+### Gemma 4 E4B, 1,000 tokens in
+
+| Requests at once | 1 | 4 | 8 |
+|---|---|---|---|
+| First token, Locals | 0.9 s | 0.9 s | 1.1 s |
+| First token, Ollama | 1.6 s | 2.2 s | 2.0 s |
+| First token, Magnitude | 0.8 s | 3.8 s | 12.7 s |
+| Time per token, Locals | 20 ms | 39 ms | 57 ms |
+| Time per token, Ollama | 21 ms | 80 ms | 98 ms |
+| Time per token, Magnitude | 18 ms | 53 ms | 101 ms |
+| Tokens/s (reply length), Locals | 41 (187) | 81 (225) | 105 (208) |
+| Tokens/s (reply length), Ollama | 35 (169) | 38 (171) | 58 (246) |
+| Tokens/s (reply length), Magnitude | 50 (220) | 55 (183) | 45 (165) |
+
+For one Gemma request alone Magnitude is a little faster than Locals (18 ms a
+token against 20). With 4 or 8 requests Locals writes 1.5 to 2.3 times as many
+tokens per second as either, and its first token stays near one second.
+
+This comparison found a bug in Locals: before commit `26f2482`, Gemma 4's replies
+to prompts longer than its 512-token sliding window, read several at a time,
+could begin with the end of turn (with 4 or 8 requests at once, 6 of 36 replies
+came back empty; none when each prompt was sent alone). The numbers above are
+after the fix.
+
 ## Where the time goes
 
 **Decode steps.** One decode step at about 1,000 tokens of context took 25.7 ms
