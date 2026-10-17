@@ -123,6 +123,7 @@ reporting what it printed. One command starts Locals and connects the tool to it
 | [Aider](https://github.com/Aider-AI/aider) | `locals launch aider` |
 | [Roo Code](https://github.com/RooCodeInc/Roo-Code) | in VS Code, the settings from `locals launch editor` ([how](#use-it-in-apps-and-editors)) |
 | [OpenClaw](https://github.com/openclaw/openclaw) | `locals launch openclaw` |
+| [Claude Code](https://github.com/anthropics/claude-code) | `locals launch claude` (through Anthropic's Messages API, which Locals also answers) |
 
 `locals launch list` shows every tool it can open. Locals keeps running in the
 background after you close a tool: `locals status` shows what it is doing and

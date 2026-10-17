@@ -124,3 +124,21 @@ def test_the_folder_in_a_tool_description_moves_to_the_system_message(server):
     shared = len(os.path.commonprefix([a["prompt"], b["prompt"]]))
     assert shared > 0.97 * len(a["prompt"]) and "/Users/me/alpha" in a["text"]
     assert a["text"].index("/Users/me/alpha") > a["text"].index("<tools>")  # now after the tools
+
+
+def test_thinking_on_the_reply_checkpoint_is_where_the_next_request_continues(server):
+    """Claude Code (thinking on) adds a user text after every tool result, so each earlier reply loses its thoughts
+    in the next request: the reply checkpoint must be at the reply's start, inside the prompt. A stand-in reply
+    without thoughts kept its empty think block (_stable_template) and the checkpoint fell past the prompt's end."""
+    call = {"id": "call_1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "todo.py"})}}
+    first = [{"role": "system", "content": DATA["system"]}, {"role": "user", "content": "Read todo.py."},
+             {"role": "assistant", "content": "Reading.", "reasoning_content": "I should read it.", "tool_calls": [call]},
+             {"role": "tool", "tool_call_id": "call_1", "content": "def add(x): ..."},
+             {"role": "user", "content": "<total_tokens>9000 tokens left</total_tokens>"}]
+    second = first + [{"role": "assistant", "content": "It defines add.", "reasoning_content": "Done."},
+                      {"role": "user", "content": "Thanks."}]
+    req = lambda msgs: {"model": "locals/qwen3.5-4b-thinking", "messages": msgs, "tools": DATA["tools"]}  # noqa: E731
+    a, b = server.prepare(req(first)), server.prepare(req(second))
+    replies = [n for n, kind in a["checkpoints"] if kind == "reply"]
+    shared = len(os.path.commonprefix([a["prompt"], b["prompt"]]))
+    assert replies and replies[0] <= shared and replies[0] > shared - 8, (a["checkpoints"], shared, len(a["prompt"]))

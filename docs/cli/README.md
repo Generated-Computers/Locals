@@ -296,6 +296,7 @@ Without `--run`, it `execve`s `opencode <dir> -m ...` (`--logs` adds `--print-lo
 | `cline` | `cline auth --config ~/.locals/cline -p openai -k locals -m locals/<short> -b <base>/v1`, then `exec cline --config ~/.locals/cline ...`. |
 | `kilo` | Writes `~/.locals/kilo.json` (provider `locals`, model `locals/locals/<short>`, context `agent_context(model)`, output 4096), then `exec`s Kilo with `KILO_CONFIG` pointing to it. |
 | `openhands` | `exec openhands --override-with-envs ...` with `LLM_MODEL=openai/locals/<short>`, `LLM_BASE_URL=<base>/v1`, `LLM_API_KEY=locals`, `OPENHANDS_SUPPRESS_BANNER=1`. |
+| `claude` | `exec claude ...` with, for that launch only, `ANTHROPIC_BASE_URL=<base>` (the server's Messages API), `ANTHROPIC_AUTH_TOKEN=locals`, `ANTHROPIC_MODEL` and the default Haiku, Sonnet and Opus models set to `locals/<short>`, `CLAUDE_CODE_MAX_CONTEXT_TOKENS` set to the server's context (Claude Code assumes 200k tokens for a model it does not know, and would compact too late), `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and `API_TIMEOUT_MS=3600000` (a long first prompt is read for minutes). An `ANTHROPIC_API_KEY` in the environment is left out. Claude Code's own settings are not touched. |
 | `openclaw`, `hermes` | Runs `setup_openclaw` / `setup_hermes` (below), then `exec`s the tool. |
 | `ollama` | Makes the server also answer on port 11434. It exits if that port is held by something that is not Locals (Ollama itself, for example). It restarts an idle running server that lacks the Ollama port, and refuses while that server has active requests. It then prints the address and the model name `<short>:latest`. |
 | `editor` | Prints the settings for an OpenAI-compatible provider: base URL, model `locals/<short>`, any API key, and the context window. The context comes from the running server's `/v1/models` (`context_length`), falling back to 65536. It also prints snippets for Continue, Cline/Roo/Kilo Code, Zed and JetBrains AI Assistant. |
@@ -347,6 +348,7 @@ Hermes's) is left as it is, with the command that takes Locals out by hand.
 | `aider` | `uv tool install aider-chat` |
 | `cline` | `npm install -g cline` |
 | `kilo` | `npm install -g @kilocode/cli` |
+| `claude` | `npm install -g @anthropic-ai/claude-code` |
 
 Without a TTY, or without uv or npm, it prints what to run and exits.
 

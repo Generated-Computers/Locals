@@ -895,6 +895,7 @@ LAUNCH_TOOLS = {
     "openclaw": "OpenClaw",
     "hermes": "Hermes Agent",
     "aider": "Aider",
+    "claude": "Claude Code, through Anthropic's Messages API (for this launch only)",
     "ollama": "apps with an Ollama setting: locals answers as Ollama",
     "editor": "VS Code (Roo Code, Cline, Kilo Code, Continue), Zed, JetBrains: the settings to enter",
 }
@@ -906,6 +907,7 @@ INSTALLERS = {  # (package manager, its arguments) for tools a launch can instal
     "aider": ("uv", ["tool", "install", "aider-chat"]),
     "cline": ("npm", ["install", "-g", "cline"]),
     "kilo": ("npm", ["install", "-g", "@kilocode/cli"]),
+    "claude": ("npm", ["install", "-g", "@anthropic-ai/claude-code"]),
 }
 
 
@@ -956,7 +958,7 @@ def _offer_install(tool: str, name: str, env: str) -> str:
 CONFIGURED = ("opencode", "openclaw", "hermes")
 LEGACY = ("stcon",)  # locals's name before 0.2: early setups still have a provider called stcon
 TOOL_NAMES = {"opencode": "OpenCode", "openclaw": "OpenClaw", "hermes": "Hermes Agent", "aider": "Aider",
-              "openhands": "OpenHands", "cline": "Cline", "kilo": "Kilo Code"}
+              "openhands": "OpenHands", "cline": "Cline", "kilo": "Kilo Code", "claude": "Claude Code"}
 
 
 def _openclaw_config() -> Path:
@@ -1056,7 +1058,7 @@ def print_connections(port: int) -> None:
     st = server_alive(port)
     server = (f"running at {base_url(port)}/v1" if st else f"not running (a launch starts it at {base_url(port)}/v1)")
     print(f"Tools that can use Locals. The server: {server}.\n")
-    for tool in ("opencode", "openclaw", "hermes", "aider", "openhands", "cline", "kilo"):
+    for tool in ("opencode", "openclaw", "hermes", "aider", "openhands", "cline", "kilo", "claude"):
         state, detail = connection(tool, port)
         print(f"  {tool:10s} {TOOL_NAMES[tool]:13s} {state:14s} {detail}")
     print(f"  {'ollama':10s} {'Ollama apps':13s} {'':14s} locals launch ollama: Locals answers as Ollama")
@@ -1263,7 +1265,7 @@ def cmd_disconnect(args) -> None:
 def cmd_launch(args) -> None:
     """Start the server (if it is not running) and open a tool on it, pointed at the local model:
     for this launch only, through its environment variables or a config file of locals's (Aider,
-    OpenHands, Cline, Kilo Code); OpenCode, OpenClaw and Hermes get locals in their own config (a
+    OpenHands, Cline, Kilo Code, Claude Code); OpenCode, OpenClaw and Hermes get locals in their own config (a
     copy of it is kept the first time, see _back_up_once)."""
     tool, rest = args.tool, list(args.rest or [])
     # the tool's project folder is this one: OpenCode and Kilo read it from $PWD, which a shell keeps right but a
@@ -1327,6 +1329,19 @@ def cmd_launch(args) -> None:
                                                                  "limit": {"context": agent_context(args.model), "output": 4096}}}}},
             "model": f"locals/locals/{short}"}, indent=2) + "\n")
         os.execve(exe, [exe, *rest], dict(os.environ, KILO_CONFIG=str(cfg)))
+    if tool == "claude":
+        try:  # the server's context: Claude Code assumes 200k tokens for a model it does not know, and compacts too late
+            ctx = int(get_json(base + "/v1/models", timeout=5)["data"][0]["context_length"])
+        except Exception:  # noqa: BLE001
+            ctx = AGENT_CONTEXT
+        ref = f"locals/{short}"
+        env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}  # a key for
+        # Anthropic's own API stays out of a session that talks to this Mac
+        env.update(ANTHROPIC_BASE_URL=base, ANTHROPIC_AUTH_TOKEN="locals", ANTHROPIC_MODEL=ref, ANTHROPIC_SMALL_FAST_MODEL=ref,
+                   ANTHROPIC_DEFAULT_HAIKU_MODEL=ref, ANTHROPIC_DEFAULT_SONNET_MODEL=ref, ANTHROPIC_DEFAULT_OPUS_MODEL=ref,
+                   CLAUDE_CODE_MAX_CONTEXT_TOKENS=str(ctx), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
+                   API_TIMEOUT_MS="3600000")  # a long prompt is read for minutes before the first token
+        os.execve(exe, [exe, *rest], env)
     if tool == "openhands":
         env = dict(os.environ, LLM_MODEL=f"openai/locals/{short}", LLM_BASE_URL=f"{base}/v1", LLM_API_KEY="locals",
                    OPENHANDS_SUPPRESS_BANNER="1")

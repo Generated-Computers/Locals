@@ -52,7 +52,11 @@ def _now() -> int:
 
 class ContextTooLong(ValueError):
     """A prompt longer than the server's context; answered as OpenAI's
-    ``context_length_exceeded`` so agents compact their history and retry."""
+    ``context_length_exceeded`` (or Anthropic's "prompt is too long") so agents compact their history and retry."""
+
+    def __init__(self, msg: str, n: int = 0, limit: int = 0):
+        super().__init__(msg)
+        self.n, self.limit = n, limit
 
 
 class BadRequest(ValueError):
@@ -342,14 +346,14 @@ class Server:
         limit = self.context_for(engine)
         if len(prompt) >= limit:
             raise ContextTooLong(f"This model's maximum context length is {limit} tokens. However, your messages "
-                                 f"resulted in {len(prompt)} tokens. Please reduce the length of the messages.")
+                                 f"resulted in {len(prompt)} tokens. Please reduce the length of the messages.", len(prompt), limit)
         asked = req.get("max_completion_tokens") or req.get("max_tokens")
         max_tokens = int(asked) if asked is not None and int(asked) > 0 else self.max_tokens  # -1: "no limit"
         room = limit - len(prompt)
         if room < min(max_tokens, 256):  # a reply of a few tokens, cut: the client is told to make room instead
             raise ContextTooLong(f"This model's maximum context length is {limit} tokens. However, your messages "
                                  f"resulted in {len(prompt)} tokens, which leaves {room} for the reply. Please reduce the "
-                                 f"length of the messages.")
+                                 f"length of the messages.", len(prompt) + min(max_tokens, 256), limit)
         max_tokens = max(1, min(max_tokens, self.max_tokens, room))
         schema = oai.response_schema(req)
         regex = None
@@ -411,7 +415,7 @@ class Server:
         limit = self.context_for(engine)
         if len(ids) >= limit:
             raise ContextTooLong(f"This model's maximum context length is {limit} tokens. However, your prompt "
-                                 f"resulted in {len(ids)} tokens. Please reduce the length of the prompt.")
+                                 f"resulted in {len(ids)} tokens. Please reduce the length of the prompt.", len(ids), limit)
         asked = req.get("max_tokens")
         max_tokens = int(asked) if asked is not None and int(asked) > 0 else 256
         max_tokens = max(1, min(max_tokens, self.max_tokens, limit - len(ids)))
@@ -643,8 +647,12 @@ class Server:
             if os.environ.get("LOCALS_REPLY_CHECKPOINT", "1") == "0":
                 raise LookupError("off")
             follow = [{"role": "user", "content": "\x03"}]
-            a = _render(tok, msgs + [{"role": "assistant", "content": "\x01A"}] + follow, tools, add_generation_prompt=False, **think_kw)
-            b = _render(tok, msgs + [{"role": "assistant", "content": "\x02B"}] + follow, tools, add_generation_prompt=False, **think_kw)
+            # thinking on, the reply has thoughts, which the template drops from an earlier turn: the stand-in reply
+            # has some too (one without them keeps its empty think block, _stable_template, and the position fell
+            # past the prompt's end: Claude Code, thinking on, read every earlier step of the conversation again)
+            thought = {"reasoning_content": "\x04R"} if think_kw.get("enable_thinking") else {}
+            a = _render(tok, msgs + [{"role": "assistant", "content": "\x01A", **thought}] + follow, tools, add_generation_prompt=False, **think_kw)
+            b = _render(tok, msgs + [{"role": "assistant", "content": "\x02B", **thought}] + follow, tools, add_generation_prompt=False, **think_kw)
             n = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
             cands.append((a[:n], "reply"))
         except Exception:  # noqa: BLE001
@@ -1167,7 +1175,10 @@ def make_handler(server: Server, ollama_root: bool = False):
                 return
             path = urlparse(self.path).path.rstrip("/") or "/"
             if path in ("/v1/models", "/models"):
-                return self._json({"object": "list", "data": server.models()})
+                # OpenAI's list, with the fields of Anthropic's (type, display_name, created_at, has_more) beside them
+                data = [dict(m, type="model", display_name=m.get("id"), created_at=apis._now_iso()) for m in server.models()]
+                return self._json({"object": "list", "data": data, "has_more": False,
+                                   "first_id": data[0]["id"] if data else None, "last_id": data[-1]["id"] if data else None})
             if path == "/" and ollama_root:  # what Ollama answers, and some apps check
                 return self._text("Ollama is running")
             if path == "/api/version":
@@ -1239,6 +1250,81 @@ def make_handler(server: Server, ollama_root: bool = False):
                 server.errors += 1
                 try:
                     write((json.dumps({"error": f"{type(e).__name__}: {e}"}) + "\n").encode())
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except Exception:  # noqa: BLE001  # the client is gone
+                    pass
+
+        def _messages_api(self, path: str, req: dict):
+            """Anthropic's Messages API (Claude Code, the Anthropic SDKs), through the Chat Completions path."""
+            def fail(msg: str, status: int, kind: str = "invalid_request_error"):
+                server.errors += 1
+                server.log(f"{status} POST {path}: {msg[:200]}")
+                return self._json(apis.anthropic_error(msg, kind), status)
+
+            if os.environ.get("LOCALS_DEBUG"):
+                _dump_request(req, "anthropic")
+            name = req.get("model") or ""
+            if not isinstance(req.get("messages"), list) or not req["messages"]:
+                return fail("messages: at least one message is required", 400)
+            try:
+                chat = apis.anthropic_to_chat(req, server.chat_model(name))
+                p = server.prepare(chat)
+            except ContextTooLong as e:  # Anthropic's wording: Claude Code compacts the conversation on it
+                server.log(f"rejected: {e}")
+                return fail(f"prompt is too long: {e.n} tokens > {e.limit} maximum", 400)
+            except (ValueError, TypeError, KeyError, AttributeError) as e:
+                return fail(f"{type(e).__name__}: {e}", 400)
+            except Exception as e:  # noqa: BLE001
+                import traceback
+
+                traceback.print_exc()
+                return fail(f"{type(e).__name__}: {e}", 500, "api_error")
+            if path.endswith("/count_tokens"):
+                return self._json({"input_tokens": len(p["prompt"])})
+            server.requests += 1
+            shown = name or p["model"]
+            p["alive"] = self._alive
+            if not chat["stream"]:
+                try:
+                    resp = server.complete(chat, p)
+                except BadRequest as e:
+                    return fail(str(e), 400)
+                except Exception as e:  # noqa: BLE001
+                    import traceback
+
+                    traceback.print_exc()
+                    return fail(f"{type(e).__name__}: {e}", 500, "api_error")
+                return None if resp is None else self._json(apis.chat_to_anthropic(resp, shown))
+
+            def write(b: bytes):
+                self.wfile.write(f"{len(b):x}\r\n".encode() + b + b"\r\n")
+                self.wfile.flush()
+
+            out = apis.AnthropicStream(write, shown, len(p["prompt"]))
+            self.send_response(200)
+            self._cors()
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                out.start()  # at once: the client knows the request is in, before a long prompt is read
+                server.stream(chat, out.feed, p)
+                out.close()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:  # noqa: BLE001  # mid-stream: an error event and a clean end
+                import traceback
+
+                bad = isinstance(e, BadRequest)
+                if not bad:
+                    traceback.print_exc()
+                server.errors += 1
+                try:
+                    out.error(str(e) if bad else f"{type(e).__name__}: {e}", "invalid_request_error" if bad else "api_error")
                     self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
                 except Exception:  # noqa: BLE001  # the client is gone
@@ -1347,8 +1433,23 @@ def make_handler(server: Server, ollama_root: bool = False):
             if n < 0 or n > MAX_BODY:
                 self.close_connection = True
                 return self._error(f"the request body must be 0 to {MAX_BODY} bytes", 413)
+            body = self.rfile.read(n)
+            enc = (self.headers.get("Content-Encoding") or "").strip().lower()
+            if enc in ("gzip", "deflate"):  # Claude Code can compress its request bodies (CLAUDE_CODE_GZIP_REQUEST_BODIES)
+                import zlib
+
+                try:
+                    d = zlib.decompressobj(wbits=47)  # gzip or zlib, found from the header
+                    body = d.decompress(body, MAX_BODY)
+                except zlib.error:
+                    return self._error(f"the body is not valid {enc}")
+                if d.unconsumed_tail:
+                    self.close_connection = True
+                    return self._error(f"the request body must be at most {MAX_BODY} bytes", 413)
+            elif enc not in ("", "identity"):
+                return self._error(f"Content-Encoding {enc} is not supported (gzip, deflate)", 415)
             try:
-                req = json.loads(self.rfile.read(n) or b"{}")
+                req = json.loads(body or b"{}")
             except (ValueError, RecursionError):
                 return self._error("invalid JSON body")
             if not isinstance(req, dict):
@@ -1356,6 +1457,8 @@ def make_handler(server: Server, ollama_root: bool = False):
             text_api = path in ("/v1/completions", "/completions")
             if path in OTHER_POSTS:
                 return self._other_api(path, req)
+            if path in apis.ANTHROPIC_POSTS:
+                return self._messages_api(path, req)
             if path not in ("/v1/chat/completions", "/chat/completions") and not text_api:
                 return self._error("not found", 404)
             if not text_api and (not isinstance(req.get("messages"), list) or not req["messages"]):

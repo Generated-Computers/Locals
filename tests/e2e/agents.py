@@ -27,7 +27,7 @@ def escaped() -> List[str]:
 
 # the tool's command (looked up on the PATH, or in <NAME>_BIN) and how locals starts it on a task
 COMMANDS = {"opencode": "opencode", "openclaw": "openclaw", "hermes": "hermes", "kilo": "kilo", "cline": "cline",
-            "openhands": "openhands", "aider": "aider"}
+            "openhands": "openhands", "aider": "aider", "claude": "claude"}
 
 
 def find_tool(tool: str, env: dict) -> Optional[str]:
@@ -57,6 +57,8 @@ def argv(tool: str, task: str, d: Path, port: int) -> Tuple[List[str], Path]:
         return [*launch, "cline", "--yolo", "-c", str(d), task], d
     if tool == "openhands":
         return [*launch, "openhands", "--headless", "--json", "--always-approve", "-t", task], d
+    if tool == "claude":
+        return [*launch, "claude", "-p", task, "--dangerously-skip-permissions", "--output-format", "text"], d
     if tool == "aider":
         files = [str(p.relative_to(d)) for p in sorted(d.rglob("*.py")) if "__pycache__" not in p.parts]
         return [*launch, "aider", "--message", task, "--yes-always", "--no-auto-commits", "--no-check-update",
@@ -73,6 +75,8 @@ def run_task(stack: Stack, tool: str, task: Task, timeout: float = 900, env: Opt
     before = tree_digest(d)
     cmd, cwd = argv(tool, task.prompt, d, stack.port)
     env["PWD"] = str(cwd)  # OpenCode and Kilo take their project folder from $PWD (a shell sets it; a script must)
+    if tool == "claude":  # its settings, history and sign-in kept in the test's HOME, apart from the user's own
+        env["CLAUDE_CONFIG_DIR"] = str(Path(env["HOME"]) / ".claude")
     name = label or f"{tool}-{task.name}"
     out_path, err_path = stack.runs / f"{name}.out", stack.runs / f"{name}.err"
     mark, off = stack.proxy.mark(name), stack.log_offset()
@@ -109,6 +113,8 @@ def popen_task(stack: Stack, tool: str, task: Task, env: Optional[dict] = None, 
     before = tree_digest(d)
     cmd, cwd = argv(tool, task.prompt, d, stack.port)
     env["PWD"] = str(cwd)
+    if tool == "claude":
+        env["CLAUDE_CONFIG_DIR"] = str(Path(env["HOME"]) / ".claude")
     name = name or f"{tool}-{task.name}"
     stack.proxy.projects[str(d)] = name
     out, err = open(stack.runs / f"{name}.out", "w"), open(stack.runs / f"{name}.err", "w")

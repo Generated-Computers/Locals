@@ -72,6 +72,9 @@ class _Scan:
             return
         if not isinstance(ev, dict):
             return
+        if ev.get("type") in ("message_start", "content_block_start", "content_block_delta", "content_block_stop",
+                              "message_delta", "message_stop", "ping", "error"):
+            return self._anthropic(ev, now)
         if ev.get("error"):
             self.rec.setdefault("errors", []).append(json.dumps(ev["error"])[:300])
         if ev.get("usage"):
@@ -94,6 +97,34 @@ class _Scan:
             if "prompt_eval_count" in ev:
                 self.rec["usage"] = {"prompt_tokens": ev.get("prompt_eval_count"), "completion_tokens": ev.get("eval_count")}
         if token:
+            t = now - self.t0
+            self.rec["token_events"] = self.rec.get("token_events", 0) + 1
+            if self.last_token is None:
+                self.rec["first_token"] = t
+            else:
+                self.rec["max_gap"] = max(self.rec.get("max_gap", 0.0), t - self.last_token)
+            self.last_token = t
+
+
+    def _anthropic(self, ev: dict, now: float) -> None:
+        """Anthropic's Messages API events (Claude Code): its usage in OpenAI's terms, for summarize()."""
+        kind = ev["type"]
+        if kind == "error":
+            self.rec.setdefault("errors", []).append(json.dumps(ev.get("error"))[:300])
+        elif kind == "ping":
+            self.rec["keepalives"] = self.rec.get("keepalives", 0) + 1
+        elif kind == "message_delta":
+            u = ev.get("usage") or {}
+            cached = u.get("cache_read_input_tokens") or 0
+            self.rec["usage"] = {"prompt_tokens": (u.get("input_tokens") or 0) + cached, "completion_tokens": u.get("output_tokens"),
+                                 "prompt_tokens_details": {"cached_tokens": cached}}
+            self.rec["finish"] = (ev.get("delta") or {}).get("stop_reason")
+        elif kind == "message_stop":
+            self.rec["done"] = True
+        elif kind in ("content_block_delta", "content_block_start") and (kind == "content_block_delta" or
+                                                                         (ev.get("content_block") or {}).get("type") == "tool_use"):
+            if (ev.get("content_block") or {}).get("type") == "tool_use" or (ev.get("delta") or {}).get("type") == "input_json_delta":
+                self.rec["tool_call_chunks"] = self.rec.get("tool_call_chunks", 0) + 1
             t = now - self.t0
             self.rec["token_events"] = self.rec.get("token_events", 0) + 1
             if self.last_token is None:
@@ -248,6 +279,11 @@ class Proxy:
         if whole and rec["chat"]:  # a reply in one piece (not streamed)
             try:
                 d = json.loads(b"".join(whole))
+                if isinstance(d, dict) and d.get("type") == "message":  # Anthropic's Messages API
+                    u = d.get("usage") or {}
+                    cached = u.get("cache_read_input_tokens") or 0
+                    d = {"usage": {"prompt_tokens": (u.get("input_tokens") or 0) + cached, "completion_tokens": u.get("output_tokens"),
+                                   "prompt_tokens_details": {"cached_tokens": cached}}, "choices": [{"finish_reason": d.get("stop_reason")}]}
                 if isinstance(d, dict):
                     rec["usage"] = d.get("usage") or rec.get("usage")
                     if d.get("error"):

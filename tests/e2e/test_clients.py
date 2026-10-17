@@ -3,7 +3,6 @@ streams, tools, JSON schemas, errors) and Ollama's HTTP API as Ollama clients ca
 
 import asyncio
 import json
-import urllib.error
 import urllib.request
 
 import pytest
@@ -124,10 +123,21 @@ def test_ollama_api(stack):
     assert show and show[0].get("model_info") is not None or show[0].get("details") is not None
 
 
-def test_anthropic_messages_api(stack, report):
-    """Claude Code and other Anthropic-API tools send /v1/messages; until it is served, this records it."""
-    try:
-        _post(stack, "/v1/messages", {"model": "x", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]})
-    except urllib.error.HTTPError as e:
-        report.note(f"/v1/messages (Anthropic API, Claude Code): HTTP {e.code}")
-        pytest.xfail(f"the Anthropic Messages API is not served (HTTP {e.code})")
+def test_anthropic_messages_api(stack):
+    """Claude Code and the Anthropic SDKs: /v1/messages, streamed and not, a tool-use round trip, token counts."""
+    anthropic = pytest.importorskip("anthropic")
+    client = anthropic.Anthropic(base_url=f"http://127.0.0.1:{stack.port}", api_key="locals", max_retries=0, timeout=300)
+    tool = {"name": "get_weather", "description": "The weather in a city.",
+            "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}
+    ask = [{"role": "user", "content": "What is the weather in Paris? Use the tool."}]
+    msg = client.messages.create(model="claude-sonnet-anything", max_tokens=200, tools=[tool], messages=ask)
+    use = next(b for b in msg.content if b.type == "tool_use")
+    assert msg.stop_reason == "tool_use" and use.name == "get_weather" and use.input["city"]
+    turn = ask + [{"role": "assistant", "content": [b.model_dump(exclude_none=True) for b in msg.content]},
+                  {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use.id, "content": "sunny, 21 C"}]}]
+    with client.messages.stream(model="claude-sonnet-anything", max_tokens=150, tools=[tool], messages=turn) as stream:
+        text = "".join(stream.text_stream)
+        final = stream.get_final_message()
+    assert "sun" in text.lower() and final.stop_reason == "end_turn"
+    assert final.usage.cache_read_input_tokens > 0  # the conversation so far came from the prompt cache
+    assert client.messages.count_tokens(model="x", messages=ask).input_tokens > 5

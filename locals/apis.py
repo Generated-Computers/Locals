@@ -1,12 +1,13 @@
-"""The Ollama API, on the same engine.
+"""The Ollama API and Anthropic's Messages API, on the same engine.
 
 The server's own API is OpenAI Chat Completions. Many local tools default to Ollama
 (Open WebUI, Continue, Cline, Roo, Kilo Code, Zed, ...), so the server also answers
 Ollama's ``/api/chat``, ``/api/generate``, ``/api/tags``, ``/api/show``, ``/api/ps``
-and ``/api/version``: a request becomes a Chat Completions request, the reply is
-translated back, and a stream goes through a translator that reads the server's own
-server-sent events and writes Ollama's newline-delimited JSON. Every client gets the
-same batch, prompt cache, tool-call grammar and loop guards.
+and ``/api/version``; Claude Code and the Anthropic SDKs speak the Messages API
+(``/v1/messages``, ``/v1/messages/count_tokens``). A request becomes a Chat Completions
+request, the reply is translated back, and a stream goes through a translator that
+reads the server's own server-sent events and writes the other API's events. Every
+client gets the same batch, prompt cache, tool-call grammar and loop guards.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import time
 import uuid
 from typing import Callable, Dict, List, Optional
 
-from .oai import IMAGE_NOTE  # noqa: E402,F401  # one wording for both APIs
+from .oai import FILE_NOTE, IMAGE_NOTE  # noqa: E402,F401  # one wording for every API
 
 
 def _uid(prefix: str) -> str:
@@ -221,3 +222,237 @@ def _param_size(short: str) -> str:
 
     m = re.search(r"(\d+(?:\.\d+)?)\s*[bB]", short)
     return f"{m.group(1)}B" if m else ""
+
+
+# --- Anthropic's Messages API -------------------------------------------------------------------
+
+ANTHROPIC_POSTS = ("/v1/messages", "/v1/messages/count_tokens")
+
+
+def _blocks(content) -> List[dict]:
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    return [b for b in content or [] if isinstance(b, dict)]
+
+
+def _block_text(content) -> str:
+    """The text of a tool result's content (a string, or text and image blocks)."""
+    if isinstance(content, str):
+        return content
+    out = []
+    for b in _blocks(content):
+        if b.get("type") == "text":
+            out.append(b.get("text") or "")
+        elif b.get("type") == "image":
+            out.append(IMAGE_NOTE)
+        elif b.get("type") == "document":
+            out.append(_document_text(b))
+    return "\n".join(out)
+
+
+def _document_text(b: dict) -> str:
+    src = b.get("source") if isinstance(b.get("source"), dict) else {}
+    if src.get("type") == "text" and isinstance(src.get("data"), str):
+        return src["data"]
+    if src.get("type") == "content":
+        return _block_text(src.get("content"))
+    return FILE_NOTE
+
+
+def anthropic_to_chat(req: dict, model: str) -> dict:
+    """A Messages API request as a Chat Completions request for ``model``: the system blocks as one system
+    message, tool_use blocks as the assistant's tool_calls, tool_result blocks as tool messages (in their
+    order, before the user's text), Anthropic's own server tools (web search, code execution) left out."""
+    msgs: List[dict] = []
+    system = req.get("system")
+    text = system if isinstance(system, str) else "\n\n".join(
+        b.get("text") or "" for b in _blocks(system) if b.get("type") == "text")
+    if text.strip():
+        msgs.append({"role": "system", "content": text})
+    for m in req.get("messages") or []:
+        if not isinstance(m, dict):
+            raise ValueError("messages: every message must be an object")
+        role, blocks = m.get("role"), _blocks(m.get("content"))
+        if role == "assistant":
+            texts, thoughts, calls = [], [], []
+            for b in blocks:
+                kind = b.get("type")
+                if kind == "text":
+                    texts.append(b.get("text") or "")
+                elif kind == "thinking":
+                    thoughts.append(b.get("thinking") or "")
+                elif kind in ("tool_use", "server_tool_use"):
+                    calls.append({"id": b.get("id") or _uid("toolu_"), "type": "function",
+                                  "function": {"name": b.get("name") or "", "arguments": _args_text(b.get("input") or {})}})
+            out = {"role": "assistant", "content": "".join(texts)}
+            if thoughts:
+                out["reasoning_content"] = "\n".join(thoughts)
+            if calls:
+                out["tool_calls"] = calls
+            msgs.append(out)
+        elif role in ("user", "system"):  # a mid-conversation system message: an instruction in the user's turn
+            parts: List[str] = []
+            for b in blocks:
+                kind = b.get("type")
+                if kind == "tool_result":
+                    if parts:  # (results answer the previous turn's calls: they come first)
+                        msgs.append({"role": "user", "content": "\n".join(parts)})
+                        parts = []
+                    content = _block_text(b.get("content"))
+                    msgs.append({"role": "tool", "tool_call_id": b.get("tool_use_id") or "",
+                                 "content": ("Error: " + content) if b.get("is_error") else content})
+                elif kind == "text":
+                    parts.append(b.get("text") or "")
+                elif kind == "image":
+                    parts.append(IMAGE_NOTE)
+                elif kind == "document":
+                    parts.append(_document_text(b))
+            if parts:
+                msgs.append({"role": "user", "content": "\n".join(parts)})
+        else:
+            raise ValueError(f"messages: unknown role {role!r}")
+    chat = {"model": model, "messages": msgs, "stream": bool(req.get("stream")), "stream_options": {"include_usage": True}}
+    tools = []
+    for t in req.get("tools") or []:
+        if not isinstance(t, dict) or not t.get("name") or (t.get("type") not in (None, "custom") and "input_schema" not in t):
+            continue  # an Anthropic server tool (web_search_..., code_execution_...): run by Anthropic, not here
+        tools.append({"type": "function", "function": {"name": t["name"], "description": t.get("description") or "",
+                                                       "parameters": t.get("input_schema") or {"type": "object", "properties": {}}}})
+    if tools:
+        chat["tools"] = tools
+    tc = req.get("tool_choice") if isinstance(req.get("tool_choice"), dict) else {}
+    if tc.get("type") == "any":
+        chat["tool_choice"] = "required"
+    elif tc.get("type") == "tool" and tc.get("name"):
+        chat["tool_choice"] = {"type": "function", "function": {"name": tc["name"]}}
+    elif tc.get("type") == "none":
+        chat["tool_choice"] = "none"
+    if tc.get("disable_parallel_tool_use"):
+        chat["parallel_tool_calls"] = False
+    for k in ("max_tokens", "temperature", "top_p", "top_k"):
+        if req.get(k) is not None:
+            chat[k] = req[k]
+    if req.get("stop_sequences"):
+        chat["stop"] = list(req["stop_sequences"])
+    thinking = req.get("thinking") if isinstance(req.get("thinking"), dict) else {}
+    if thinking.get("type") in ("enabled", "adaptive"):
+        chat["chat_template_kwargs"] = {"enable_thinking": True}
+    elif thinking.get("type") == "disabled":
+        chat["chat_template_kwargs"] = {"enable_thinking": False}
+    return chat
+
+
+_STOP_REASONS = {"tool_calls": "tool_use", "length": "max_tokens", "stop": "end_turn"}
+
+
+def _anthropic_usage(usage: dict) -> dict:
+    usage = usage or {}
+    prompt = int(usage.get("prompt_tokens") or 0)
+    cached = int(((usage.get("prompt_tokens_details") or {}).get("cached_tokens")) or 0)
+    return {"input_tokens": max(0, prompt - cached), "output_tokens": int(usage.get("completion_tokens") or 0),
+            "cache_read_input_tokens": cached, "cache_creation_input_tokens": 0}
+
+
+def chat_to_anthropic(resp: dict, model: str) -> dict:
+    """A Chat Completions reply as a Messages API message."""
+    ch = (resp.get("choices") or [{}])[0]
+    msg = ch.get("message") or {}
+    content: List[dict] = []
+    if msg.get("reasoning_content"):
+        content.append({"type": "thinking", "thinking": msg["reasoning_content"], "signature": ""})
+    if msg.get("content"):
+        content.append({"type": "text", "text": msg["content"]})
+    for c in msg.get("tool_calls") or []:
+        fn = c.get("function") or {}
+        content.append({"type": "tool_use", "id": c.get("id") or _uid("toolu_"), "name": fn.get("name") or "",
+                        "input": _args_obj(fn.get("arguments"))})
+    return {"id": _uid("msg_"), "type": "message", "role": "assistant", "model": model, "content": content,
+            "stop_reason": _STOP_REASONS.get(ch.get("finish_reason"), "end_turn"), "stop_sequence": None,
+            "usage": _anthropic_usage(resp.get("usage") or {})}
+
+
+def anthropic_error(message: str, kind: str = "invalid_request_error") -> dict:
+    return {"type": "error", "error": {"type": kind, "message": message}}
+
+
+class AnthropicStream:
+    """The server's Chat Completions stream as the Messages API's events: message_start at once, then a content
+    block per kind (thinking, text, each tool call) with its deltas, ping for the server's keepalives, and
+    message_delta (stop reason, usage) and message_stop at the end."""
+
+    def __init__(self, write: Callable[[bytes], None], model: str, input_tokens: int):
+        self.write, self.model, self.input_tokens = write, model, input_tokens
+        self.buf, self.index, self.open, self.usage, self.finish = bytearray(), -1, None, {}, None
+        self.failed = False
+
+    def _event(self, name: str, d: dict) -> None:
+        self.write(f"event: {name}\ndata: {json.dumps(d, ensure_ascii=False)}\n\n".encode())
+
+    def start(self) -> None:
+        self._event("message_start", {"type": "message_start", "message": {
+            "id": _uid("msg_"), "type": "message", "role": "assistant", "model": self.model, "content": [],
+            "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": self.input_tokens, "output_tokens": 0, "cache_read_input_tokens": 0,
+                      "cache_creation_input_tokens": 0}}})
+
+    def _begin(self, kind, block: dict) -> None:
+        self._end()
+        self.index += 1
+        self.open = kind
+        self._event("content_block_start", {"type": "content_block_start", "index": self.index, "content_block": block})
+
+    def _end(self) -> None:
+        if self.open is None:
+            return
+        if self.open == "thinking":
+            self._delta({"type": "signature_delta", "signature": ""})
+        self._event("content_block_stop", {"type": "content_block_stop", "index": self.index})
+        self.open = None
+
+    def _delta(self, delta: dict) -> None:
+        self._event("content_block_delta", {"type": "content_block_delta", "index": self.index, "delta": delta})
+
+    def feed(self, data: bytes) -> None:
+        if not data.strip():  # the server's keepalive (a long prompt being read, a call being written)
+            self._event("ping", {"type": "ping"})
+            return
+        for ev in _openai_events(self.buf, data):
+            if ev.get("error"):
+                self.error(str((ev["error"] or {}).get("message") or ev["error"]))
+                continue
+            if ev.get("usage"):
+                self.usage = ev["usage"]
+            for ch in ev.get("choices") or []:
+                d = ch.get("delta") or {}
+                if d.get("reasoning_content"):
+                    if self.open != "thinking":
+                        self._begin("thinking", {"type": "thinking", "thinking": "", "signature": ""})
+                    self._delta({"type": "thinking_delta", "thinking": d["reasoning_content"]})
+                if d.get("content"):
+                    if self.open != "text":
+                        self._begin("text", {"type": "text", "text": ""})
+                    self._delta({"type": "text_delta", "text": d["content"]})
+                for tc in d.get("tool_calls") or []:
+                    fn = tc.get("function") or {}
+                    key = ("tool", tc.get("index", 0))
+                    if self.open != key:
+                        self._begin(key, {"type": "tool_use", "id": tc.get("id") or _uid("toolu_"), "name": fn.get("name") or "",
+                                          "input": {}})
+                    if fn.get("arguments"):
+                        self._delta({"type": "input_json_delta", "partial_json": _args_text(fn["arguments"])})
+                if ch.get("finish_reason"):
+                    self.finish = ch["finish_reason"]
+
+    def error(self, message: str, kind: str = "api_error") -> None:
+        self._end()
+        self.failed = True
+        self._event("error", anthropic_error(message, kind))
+
+    def close(self) -> None:
+        if self.failed:
+            return
+        self._end()
+        u = _anthropic_usage(self.usage)
+        self._event("message_delta", {"type": "message_delta", "delta": {
+            "stop_reason": _STOP_REASONS.get(self.finish, "end_turn"), "stop_sequence": None}, "usage": u})
+        self._event("message_stop", {"type": "message_stop"})

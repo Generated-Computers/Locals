@@ -7,7 +7,7 @@ import pytest
 from agents import find_tool, run_task
 from tasks import TASKS
 
-TOOLS = ["opencode", "hermes", "openclaw", "kilo", "cline", "openhands", "aider"]
+TOOLS = ["opencode", "hermes", "openclaw", "kilo", "cline", "openhands", "aider", "claude"]
 RESULTS = []
 
 

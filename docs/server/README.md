@@ -347,6 +347,39 @@ The answer is OpenAI's error, so agents compact their history and retry:
 
 Otherwise `max_tokens = max(1, min(asked or --max-tokens, --max-tokens, room))`. A text completion fails only when the prompt alone reaches the limit.
 
+## Anthropic's Messages API
+
+Claude Code and the Anthropic SDKs speak Anthropic's Messages API, so the server answers `POST /v1/messages` and
+`POST /v1/messages/count_tokens` as well (`locals launch claude` points Claude Code at it). `apis.anthropic_to_chat`
+turns a request into a Chat Completions request, which goes through the same `prepare`, batch, prompt cache, grammar,
+guards and hang-up handling:
+
+| Messages API | Chat Completions |
+|---|---|
+| `system` (a string or text blocks) | one system message (blocks joined by a blank line) |
+| `text`, `image`, `document` blocks | text; an image as `oai.IMAGE_NOTE`; a text document as its text, another as `oai.FILE_NOTE` |
+| assistant `thinking`, `text`, `tool_use` blocks | `reasoning_content`, `content`, `tool_calls` (ids kept, so raw replay finds the reply) |
+| user `tool_result` blocks | `tool` messages, in order, before the user's text; `is_error` as "Error: " before the result |
+| `tools` (`name`, `description`, `input_schema`) | functions; Anthropic's own server tools (web search, code execution) are left out |
+| `tool_choice` `auto` / `any` / `tool` / `none`, `disable_parallel_tool_use` | `auto` / `required` / that function / `none`, `parallel_tool_calls: false` |
+| `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences` | the same |
+| `thinking` `enabled` or `adaptive` / `disabled` | thinking on / off (`chat_template_kwargs.enable_thinking`) |
+
+Any model name is served by the server's model (`chat_model`), and the reply carries the name asked for.
+`apis.AnthropicStream` reads the server's SSE output and writes the Messages API's events: `message_start` at once,
+a content block per kind (`thinking` with `thinking_delta` and an empty `signature_delta`, `text` with `text_delta`,
+each tool call as `tool_use` with `input_json_delta`), `ping` for the server's keepalives, `message_delta` (stop
+reason `end_turn`, `tool_use` or `max_tokens`; usage with `cache_read_input_tokens` from the prompt cache) and
+`message_stop`. Errors have Anthropic's shape (`{"type": "error", "error": {"type": ..., "message": ...}}`); a
+prompt longer than the context is "prompt is too long: N tokens > M maximum", the words Claude Code compacts on.
+`count_tokens` answers the prompt's length without generating. `GET /v1/models` carries Anthropic's fields
+(`type`, `display_name`, `created_at`, `has_more`) beside OpenAI's. A request body may be gzip- or
+deflate-compressed (`Content-Encoding`), as Claude Code can send it.
+
+Claude Code asks for thinking and adds a user text (a `<total_tokens>` note) after every tool result, so in the
+next request each earlier reply is written without its thoughts: the reply checkpoint, at the reply's start, is
+where every request continues (16,363 of 16,934 tokens from the cache in a measured session).
+
 ## The Ollama API
 
 Many local tools default to Ollama, so the server answers Ollama's API too:
