@@ -62,4 +62,5 @@ locals = ["presets/*.json"]
 testpaths = ["tests"]
 markers = [
   "model: needs model weights cached locally (slow; `pytest -m 'not model'` for the fast suite)",
+  "e2e: the end-to-end suite in tests/e2e (real agent tools on a real server; opt-in with LOCALS_E2E=1)",
 ]
