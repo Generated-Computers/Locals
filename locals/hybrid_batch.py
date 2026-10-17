@@ -20,7 +20,7 @@ from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 import mlx.core as mx
-from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache, make_prompt_cache
+from mlx_lm.models.cache import ArraysCache, BatchKVCache, BatchRotatingKVCache, KVCache, make_prompt_cache
 
 from .engine import LocalsController, sample_logits, sample_rows
 from .kernels import head_logits, packed_rows, text_model
@@ -29,6 +29,22 @@ from .packed import NEG_INF, BatchEngine, BatchStats, Request, _common
 
 def _merge(caches):
     return [caches[0][i].merge([c[i] for c in caches]) for i in range(len(caches[0]))]
+
+
+def _prepare_ragged(cache, lens: List[int]) -> None:
+    """Rows right-padded to the longest: every layer told each row's own length, as mlx-lm's batch generator does.
+    A sliding-window layer (Gemma's) needs the lengths too, or the padding evicts a shorter row's last real
+    tokens from its window and the row continues from the padding: past the 512-token window, Gemma 4 E4B's
+    replies to prompts read together began with the end of turn (11 of 24 empty, none alone)."""
+    L = max(lens)
+    pads = [L - n for n in lens]
+    for c in cache:
+        if isinstance(c, BatchKVCache):
+            c.prepare(right_padding=pads)
+        elif isinstance(c, BatchRotatingKVCache):
+            c.prepare(lengths=lens, right_padding=pads)
+        elif isinstance(c, ArraysCache):
+            c.prepare(lengths=lens)
 
 
 _MEMLOG = bool(os.environ.get("LOCALS_MEMLOG"))  # print GPU memory around each admission
@@ -564,11 +580,7 @@ class HybridBatchEngine(BatchEngine):
         x = mx.array([r + [0] * (L - len(r)) for r in rests])
         ragged = min(lens) < L
         if ragged:
-            for c in cache:
-                if isinstance(c, BatchKVCache):
-                    c.prepare(right_padding=[L - n for n in lens])
-                elif isinstance(c, ArraysCache):
-                    c.prepare(lengths=lens)
+            _prepare_ragged(cache, lens)
         done = max(len(p) - len(r) for p, r in zip(prompts, rests))  # longest reused prefix
         if os.environ.get("LOCALS_PREFILL_LOG"):
             print(f"[prefill] {len(prompts)} rows, prompts {[len(p) for p in prompts]}, to prefill {lens}", flush=True)
@@ -613,11 +625,7 @@ class HybridBatchEngine(BatchEngine):
         # Padding bookkeeping only when feeds are ragged: with lengths set, the
         # recurrent layers take the masked path (and skip the fused kernel).
         if min(lens) < L:
-            for c in cache:
-                if isinstance(c, BatchKVCache):
-                    c.prepare(right_padding=[L - n for n in lens])
-                elif isinstance(c, ArraysCache):
-                    c.prepare(lengths=lens)
+            _prepare_ragged(cache, lens)
         with packed_rows(len(feeds), L, lens):
             h = self.lm.model(x, cache)  # (B, L, D), normed
         for c in cache:

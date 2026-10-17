@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import numpy as np
-from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache, make_prompt_cache
+from mlx_lm.models.cache import ArraysCache, KVCache, make_prompt_cache
 
 from .kernels import packed_rows, text_model
 from .regex import DEAD
@@ -98,11 +98,9 @@ class RegionScorer:
             if isinstance(c, ArraysCache):
                 c.left_padding = None
         if min(lens) < L:
-            for c in cache:
-                if isinstance(c, BatchKVCache):
-                    c.prepare(right_padding=[L - n for n in lens])
-                elif isinstance(c, ArraysCache):
-                    c.prepare(lengths=lens)
+            from .hybrid_batch import _prepare_ragged  # (sliding-window layers need the lengths too)
+
+            _prepare_ragged(cache, lens)
         x = mx.array([f + [0] * (L - len(f)) for f in feeds])
         with packed_rows(K, L, lens):
             h = self.lm.model(x, cache)  # (K, L, D)
