@@ -814,7 +814,8 @@ class Server:
                         text = p["fmt"].cut_after(text, len(uniq))  # what is remembered and replayed: the calls sent
                     calls = uniq
                 if content:  # held back as a possible call (a code block, a "{"), and text after all: send it now
-                    rest = job.stream.unsent(content[len(prefix):] if content.startswith(prefix) else content)
+                    # (the steering text was sent; content is stripped, so a call right after it leaves less of it)
+                    rest = job.stream.unsent(content[len(prefix):] if content.startswith(prefix.rstrip()) else content)
                     if rest:
                         chunk({"content": rest})
                 cs = getattr(job, "call_stream", None)
@@ -828,13 +829,19 @@ class Server:
                     # are the whole reply (Llama's JSON, Mistral 7B's) cannot hold
                     if attempt == 0 and p["fmt"].name not in ("llama3_json", "mistral", "mistral_legacy"):
                         # The model wants to repeat the previous turn's call. Decode
-                        # the turn again with its text started for it (the same grammar,
-                        # less a thought block that would open the reply).
+                        # the turn again with its text started for it (a grammar that
+                        # calls at once, without a thought block that would open the reply).
                         self.log(f"[{p['engine']}] reply repeats the previous call; steering")
                         prefix = self._steer_text(calls, prev)
                         # the steered reply should be a different call, not an essay
                         # (Gemma 4 wrote 4,096 tokens of prose after the steering text)
                         p = dict(p, max_tokens=min(p["max_tokens"], STEERED_MAX_TOKENS))
+                        if p["regex"] and p.get("tool_choice") in (None, "auto"):
+                            # a call right after the steering text: given room for text, Qwen3.5 wrote a plan and
+                            # no call (Kilo took that as the end of its task), Gemma 4 prose to the token limit
+                            p["regex"] = oai.reply_regex(p["tools"], "required", p["thinking"], typed=self.typed_tools,
+                                                         fmt=p["fmt"], preamble=False,
+                                                         parallel=req.get("parallel_tool_calls") is not False)
                         lead = p["fmt"].thought_regex() if hasattr(p["fmt"], "thought_regex") else ""
                         if p["regex"] and lead and p["regex"].startswith(lead):
                             # the reply has begun with text: no thought block opens it now
@@ -1019,7 +1026,7 @@ class Server:
             if key in prev:
                 res = " ".join(prev[key].split())[:160]
                 return (f"The {c['function']['name']} call above was already made and returned: {res!r}. "
-                        "Repeating it would give the same result, so I will do something different now: ")
+                        "Repeating it would give the same result, so I will do something different now:\n\n")
         return ""
 
     @staticmethod

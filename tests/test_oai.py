@@ -318,19 +318,41 @@ def test_steered_gemma_reply_cannot_open_a_thought_block(monkeypatch):
 
     fmt = formats.FORMATS["gemma4"]
     replies = ['<|channel>thought\nagain\n<channel|><|tool_call>call:bash{command:<|"|>ls<|"|>}<tool_call|>',
-               'I will read it.<|tool_call>call:read{filePath:<|"|>a.py<|"|>}<tool_call|>']
+               '<|tool_call>call:read{filePath:<|"|>a.py<|"|>}<tool_call|>']
     srv, svc, p, req = _scripted_server(monkeypatch, fmt, replies, thinking=True)
     deltas = _events(srv, req, p)
     lead = fmt.thought_regex()
-    assert svc.regexes[0].startswith(lead) and svc.regexes[1] == svc.regexes[0][len(lead):]
+    required = fmt.reply_regex(["bash", "read"], "required", preamble=False)
+    assert svc.regexes[0].startswith(lead) and svc.regexes[1] == required[len(lead):]
     content = "".join(d.get("content") or "" for d in deltas)
-    assert "already made" in content and "I will read it." in content
+    assert "already made" in content
     assert "<channel|>" not in content and "<|channel>" not in content
     calls = [d["tool_calls"][0]["function"] for d in deltas  # (a call's first delta has its name; the rest, arguments)
              if d.get("tool_calls") and "name" in d["tool_calls"][0]["function"]]
     assert [c["name"] for c in calls] == ["read"]
     rx = compile_dfa(fmt.free_text(), 100_000)
     assert rx.matches(b"plain words") and not rx.matches(b"thinking\n<channel|>\nmore")
+
+
+def test_a_steered_reply_makes_a_call(monkeypatch):
+    """After the steering text the reply is a call at once (tool_choice auto): given room for text, Qwen3.5 wrote
+    a plan and no call, and Kilo took that as the end of its task."""
+    from locals import formats
+
+    fmt = formats.FORMATS["qwen_xml"]
+    call = "<tool_call>\n<function={}>\n<parameter={}>\n{}\n</parameter>\n</function>\n</tool_call>"
+    replies = ["Again.\n\n" + call.format("bash", "command", "ls"), call.format("read", "filePath", "a.py")]
+    srv, svc, p, req = _scripted_server(monkeypatch, fmt, replies, thinking=False)
+    deltas = _events(srv, req, p)
+    assert svc.regexes[1] == oai.reply_regex(p["tools"], "required", False, fmt=fmt, preamble=False)
+    rx = compile_dfa(svc.regexes[1], 100_000)
+    assert rx.matches(call.format("read", "filePath", "a.py").encode())
+    assert not rx.matches(b"1. Run the tests. 2. Fix the bug.")
+    content = "".join(d.get("content") or "" for d in deltas)
+    assert content.endswith("so I will do something different now:\n\n") and content.count("already made") == 1
+    names = [d["tool_calls"][0]["function"]["name"] for d in deltas
+             if d.get("tool_calls") and "name" in d["tool_calls"][0]["function"]]
+    assert names == ["read"]
 
 
 def test_ignore_eos_and_usage_chunk_on_text_completions():
