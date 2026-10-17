@@ -51,9 +51,16 @@ class Task:
         return d
 
 
+def _new_files(d: Path, before: dict) -> list:
+    """Files the task did not ask for (Aider once wrote a file named after a sentence of the model's reply)."""
+    return sorted(set(tree_digest(d)) - set(before))
+
+
 def _fix_bug(d: Path, out: str, before: dict) -> Tuple[bool, str]:
     if tree_digest(d).get("test_textstats.py") != before.get("test_textstats.py"):
         return False, "the agent changed the tests"
+    if _new_files(d, before):
+        return False, f"new files: {_new_files(d, before)}"
     return _unittest(d)
 
 
@@ -83,6 +90,8 @@ def _rename(d: Path, out: str, before: dict) -> Tuple[bool, str]:
         return False, f"find_by_tag still in {left}"
     if "def with_tag" not in (d / "inventory" / "store.py").read_text():
         return False, "no Store.with_tag"
+    if _new_files(d, before):
+        return False, f"new files: {_new_files(d, before)}"
     ok, why = _unittest(d)
     run = subprocess.run(["python3", "main.py"], cwd=d, capture_output=True, text=True, timeout=60)
     if run.returncode != 0:

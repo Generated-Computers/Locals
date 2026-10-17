@@ -359,3 +359,31 @@ def test_a_weak_agent_model_gets_a_note():
     gemma, qwen = defaults.MODELS["gemma-4-e4b"], defaults.MODELS["qwen3.5-4b"]
     assert "--model qwen" in defaults.agent_note(gemma) and defaults.agent_note(qwen) == ""
     assert defaults.agent_note("someone/unknown-model") == ""
+
+
+def test_launch_aider_uses_search_replace_edits(monkeypatch):
+    """locals launch aider: diff edits (in the whole-file format a sentence before quoted code became a file
+    name), and the user's own --edit-format, given after, still wins."""
+    import argparse
+
+    import pytest
+
+    from locals import app
+
+    seen = {}
+    monkeypatch.setattr(app, "_installed", lambda name, env: "/opt/aider")
+    monkeypatch.setattr(app, "fetch_model", lambda model: None)
+    monkeypatch.setattr(app, "ensure_server", lambda args: None)
+
+    def execve(exe, argv, env):  # (the real one never returns)
+        seen.update(argv=argv, env=env)
+        raise SystemExit(0)
+
+    monkeypatch.setattr(app.os, "execve", execve)
+    with pytest.raises(SystemExit):
+        app.cmd_launch(argparse.Namespace(tool="aider", rest=["--edit-format", "whole", "a.py"], port=8321,
+                                          model="mlx-community/Qwen3.5-4B-MLX-4bit", ollama_port=None))
+    argv = seen["argv"]
+    assert argv[:5] == ["/opt/aider", "--model", "openai/locals/qwen3.5-4b", "--no-show-model-warnings", "--edit-format"]
+    assert argv[5] == "diff" and argv[6:] == ["--edit-format", "whole", "a.py"]
+    assert seen["env"]["OPENAI_API_BASE"] == "http://127.0.0.1:8321/v1"

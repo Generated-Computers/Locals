@@ -61,8 +61,9 @@ def argv(tool: str, task: str, d: Path, port: int) -> Tuple[List[str], Path]:
         return [*launch, "claude", "-p", task, "--dangerously-skip-permissions", "--output-format", "text"], d
     if tool == "aider":
         files = [str(p.relative_to(d)) for p in sorted(d.rglob("*.py")) if "__pycache__" not in p.parts]
+        # (one task, headless: Aider declines the shell commands it suggests then, and stops before any edit)
         return [*launch, "aider", "--message", task, "--yes-always", "--no-auto-commits", "--no-check-update",
-                "--no-analytics", *files], d
+                "--no-analytics", "--no-suggest-shell-commands", *files], d
     raise ValueError(tool)
 
 

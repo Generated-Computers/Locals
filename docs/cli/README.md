@@ -292,7 +292,7 @@ Without `--run`, it `execve`s `opencode <dir> -m ...` (`--logs` adds `--print-lo
 |---|---|
 | `list` (default) | `print_connections`: each tool, its connection state, and what to run (see "Connections" below). |
 | `opencode` | Same as `locals code [DIR]`. `DIR` is the first argument after the name. |
-| `aider` | `exec aider --model openai/locals/<short> --no-show-model-warnings ...` with `OPENAI_API_BASE=<base>/v1`, `OPENAI_API_KEY=locals`. |
+| `aider` | `exec aider --model openai/locals/<short> --no-show-model-warnings --edit-format diff ...` with `OPENAI_API_BASE=<base>/v1`, `OPENAI_API_KEY=locals`. Search/replace edits: in the whole-file format Aider picks for a model it does not know, code the model quotes after a sentence became a file named after the sentence. A user's own `--edit-format` comes later and wins. |
 | `cline` | `cline auth --config ~/.locals/cline -p openai -k locals -m locals/<short> -b <base>/v1`, then `exec cline --config ~/.locals/cline ...`. |
 | `kilo` | Writes `~/.locals/kilo.json` (provider `locals`, model `locals/locals/<short>`, context `agent_context(model)`, output 4096), then `exec`s Kilo with `KILO_CONFIG` pointing to it. |
 | `openhands` | `exec openhands --override-with-envs ...` with `LLM_MODEL=openai/locals/<short>`, `LLM_BASE_URL=<base>/v1`, `LLM_API_KEY=locals`, `OPENHANDS_SUPPRESS_BANNER=1`. |

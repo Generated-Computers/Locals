@@ -1316,7 +1316,11 @@ def cmd_launch(args) -> None:
     base, short = base_url(args.port), model_short(args.model)
     if tool == "aider":
         env = dict(os.environ, OPENAI_API_BASE=f"{base}/v1", OPENAI_API_KEY="locals")
-        os.execve(exe, [exe, "--model", f"openai/locals/{short}", "--no-show-model-warnings", *rest], env)
+        # search/replace edits: in the whole-file format (Aider's choice for a model it does not know) code quoted
+        # after a sentence became a new file named after the sentence (5 of 7 bug fixes with Qwen3.5-4B, none of 7
+        # with diff); the user's own --edit-format comes later and wins
+        os.execve(exe, [exe, "--model", f"openai/locals/{short}", "--no-show-model-warnings", "--edit-format", "diff",
+                        *rest], env)
     if tool == "cline":
         cfg = LOCALS_DIR / "cline"  # a config folder of locals's: the user's own ~/.cline is left alone
         subprocess.run([exe, "auth", "--config", str(cfg), "-p", "openai", "-k", "locals", "-m", f"locals/{short}",
