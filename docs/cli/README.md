@@ -84,7 +84,7 @@ OpenCode references these ids as `<provider>/<engine>/<short>` (`oc_model`), bec
 | `locals code [DIR]` | `cmd_code` | Sets up OpenCode if needed, downloads the model, starts or reuses the background server, then `exec`s OpenCode on `DIR`. With `--run TASK`, runs one task headless and prints the answer. |
 | `locals launch [TOOL] [ARGS...]` | `cmd_launch` | Starts the server, then opens a tool on it (see the launch-target table below). With no tool, `list`: the tools on this Mac and whether each is connected. |
 | `locals disconnect TOOL` | `cmd_disconnect` | Takes Locals out of OpenCode's, OpenClaw's or Hermes's own config (see "Connections" below). |
-| `locals models` | `cmd_models` | The tested models: download size, memory needed, whether they fit this Mac, speed with 8 requests at once (measured here by `locals bench`, else on an M2 Pro). |
+| `locals models` | `cmd_models` | The tested models: download size, memory needed, whether they fit this Mac, speed with 8 requests at once (measured here by `locals bench`, else on an M2 Pro), and which to use for coding agents (`defaults.AGENT_TASKS`: the tasks each finished in the end-to-end suite). `locals code` and `locals launch` print a note for a model that finished fewer than half (`defaults.agent_note`: Gemma 4 E4B). |
 | `locals setup [opencode\|openclaw\|hermes]` | `cmd_setup` | Writes the tool's config. For `openclaw`/`hermes`, also downloads the model and starts the background server unless `--no-start` is given. |
 | `locals serve` | `cmd_serve` | `os.execv` into `python -m locals.server` in the foreground. The server downloads the model itself. |
 | `locals start` | `cmd_start` | Downloads the model, then starts the server in the background (`ensure_server`). |

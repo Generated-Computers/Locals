@@ -14,10 +14,16 @@ First public release.
   in its own copy of the project, with your tests as the check; the project is
   changed only when they pass.
 - **One command for coding agents.** `locals code` opens OpenCode on a local
-  model; `locals launch` does the same for OpenHands, Cline, Kilo Code,
-  OpenClaw, Hermes Agent, Aider, editor extensions and apps that work with Ollama.
-- **An OpenAI- and Ollama-compatible server** on MLX, running in the background
-  (`locals start`, `locals status`, `locals stop`) or in the menu bar.
+  model; `locals launch` does the same for Claude Code, OpenHands, Cline, Kilo
+  Code, OpenClaw, Hermes Agent, Aider, editor extensions and apps that work with
+  Ollama. `locals models` says which model to use for agents.
+- **An OpenAI-, Anthropic- and Ollama-compatible server** on MLX, running in the
+  background (`locals start`, `locals status`, `locals stop`) or in the menu bar.
+  Anthropic's Messages API (`/v1/messages`) is what Claude Code and the Anthropic
+  SDK speak; each step of a Claude Code session comes from the prompt cache.
+- **Files appear as the agent writes them.** Tool calls stream while the model
+  writes them, so an agent writing a file shows it line by line, instead of
+  nothing for 10 to 30 seconds and then the whole file at once (Qwen3.5).
 - **Tool calls and JSON that always parse**, in each model's own format: Qwen,
   Gemma 4, Llama, Mistral, LFM2.5, MiniCPM5 and Hermes-style models.
 - **Models for every Mac.** A default that fits your memory, short names for
@@ -39,6 +45,8 @@ First public release.
   prompt arrives, the requests already answering keep streaming: their next
   tokens are computed in the same passes over the model as the new prompt,
   instead of waiting for all of it (12 seconds for 8,000 tokens on a 4B model).
+  Short prompts are read before long ones: a new agent's first token comes in
+  7 seconds instead of 41 while another agent's 30,000-token prompt is read.
 - **Works with benchmark tools.** `ignore_eos` and
   `stream_options.include_usage` as vLLM and OpenAI handle them, so InferenceX,
   vLLM's and aiperf's clients measure Locals as they measure other servers.
@@ -57,4 +65,9 @@ First public release.
   strict clients failed to read; a second command no longer starts a second
   server while the first is still loading the model; OpenCode always runs on the
   local model, even when a project's own settings name another one; a mistyped
-  model name is no longer saved as the default.
+  model name is no longer saved as the default; a follow-up message in an agent
+  session no longer reads the previous turn again (Qwen3.5 and Gemma 4); pressing
+  Esc or Ctrl-C in an agent stops its reply on the server too; with MLX 0.32.4, a
+  new user's first task on an M2 no longer fails with "Maximum threads per
+  threadgroup"; two OpenCode agents started in the same second no longer fail
+  with "database is locked".

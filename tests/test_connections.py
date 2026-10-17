@@ -353,3 +353,9 @@ def test_a_launch_that_finds_the_tool_set_up_runs_none_of_its_commands(tmp_path,
     app.setup_hermes(args)
     app.setup_openclaw(args)
     assert any(c[:3] == ["/opt/hermes", "config", "set"] for c in seen) and any(c[1:3] == ["config", "patch"] for c in seen)
+
+
+def test_a_weak_agent_model_gets_a_note():
+    gemma, qwen = defaults.MODELS["gemma-4-e4b"], defaults.MODELS["qwen3.5-4b"]
+    assert "--model qwen" in defaults.agent_note(gemma) and defaults.agent_note(qwen) == ""
+    assert defaults.agent_note("someone/unknown-model") == ""

@@ -24,6 +24,20 @@ MEASURED_M2_PRO = {
 }
 SHORT = {"qwen3.5-4b": "qwen", "qwen3.5-2b": "qwen3.5-2b", "gemma-4-e4b": "gemma", "lfm2.5-2.6b": "lfm",
          "minicpm5-2b": "minicpm"}
+# Agent tasks done in the end-to-end suite (tests/e2e: real agent tools on real coding tasks, an M2 Pro):
+# Gemma 4 E4B repeats itself on the longer ones (the server's loop guard cuts it) and gives up early.
+AGENT_TASKS = {"qwen3.5-4b": (16, 16), "gemma-4-e4b": (2, 8)}
+
+
+def agent_note(model: str) -> str:
+    """A line for a model that does poorly as a coding agent (in AGENT_TASKS), else ""."""
+    key = next((k for k, v in MODELS.items() if v == model), None)
+    done, of = AGENT_TASKS.get(key, (None, None))
+    if done is None or done * 2 >= of:
+        return ""
+    q = AGENT_TASKS["qwen3.5-4b"]
+    return (f"note: {SHORT[key]} finished {done} of {of} coding-agent tasks in our tests, qwen {q[0]} of {q[1]}; "
+            f"for agents use --model qwen")
 
 
 def chip() -> str:

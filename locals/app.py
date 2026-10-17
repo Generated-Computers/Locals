@@ -1296,6 +1296,10 @@ def cmd_launch(args) -> None:
             print("restarting the locals server to answer on Ollama's port as well ...", flush=True)
             cmd_stop(args)
     exe = None
+    from .defaults import agent_note
+
+    if tool not in ("ollama", "editor") and agent_note(args.model):
+        print(agent_note(args.model), file=sys.stderr, flush=True)
     if tool in INSTALLERS:  # the tool first (installed if the user agrees), then the server
         env_name = tool.upper() + "_BIN"
         exe = _installed(tool, env_name) or _offer_install(tool, tool, env_name)
@@ -1394,6 +1398,10 @@ def cmd_code(args) -> None:
         sys.exit(f"locals code works on a project folder, and {d} is your {'home folder' if d == HOME.resolve() else 'disk'}: "
                  f"the agent edits files and runs commands there. Run it on a project:  locals code ~/my-project  "
                  f"(mkdir it first for a new one)")
+    from .defaults import agent_note
+
+    if agent_note(args.model):
+        print(agent_note(args.model), flush=True)
     if opencode_bin() is None:  # asked before the model's gigabytes download, not after
         install_opencode(OPENCODE_VERSION)
     fetch_model(args.model)  # checked (and downloaded) before OpenCode's settings name it
@@ -1909,7 +1917,12 @@ def cmd_models(args) -> None:
         else:
             speed = f"{m['locals']} tps on an M2 Pro (mlx-lm {m['mlx']})"
         print(f"  {SHORT[key]:12s} {w:>5.1f} GB {need:>4.1f} GB  {', '.join(notes):30s} {speed}")
-    print("\nStart one with  locals start --model NAME  (or --model with any command). Any MLX model from "
+    from .defaults import AGENT_TASKS
+
+    q, g = AGENT_TASKS["qwen3.5-4b"], AGENT_TASKS["gemma-4-e4b"]
+    print(f"\nFor coding agents use qwen: in our end-to-end tests (agent tools on real coding tasks, an M2 Pro) "
+          f"Qwen3.5-4B finished {q[0]} of {q[1]} tasks and Gemma 4 E4B {g[0]} of {g[1]}.")
+    print("Start one with  locals start --model NAME  (or --model with any command). Any MLX model from "
           "Hugging Face works too, for example --model mlx-community/Qwen3.5-9B-MLX-4bit.")
     if not any(here.get(mid) for mid in MODELS.values()):
         print("locals bench measures the speeds on this Mac.")
