@@ -790,9 +790,12 @@ class Server:
             prev = self._previous_calls(req) if p["tools"] else {}
             p["prev_calls"] = list(prev)
             p["tool_choice"] = req.get("tool_choice")
-            for attempt in range(2):
-                if prefix:  # inside the think block the prompt opened (Qwen3.5 thinking), it is reasoning
+            banned: set = set()  # tools a steered reply may not call: its call to them repeated the previous turn's
+            shown = False  # the steering text has gone to the client
+            for attempt in range(4):
+                if prefix and not shown:  # inside the think block the prompt opened (Qwen3.5 thinking), it is reasoning
                     chunk({"reasoning_content": prefix} if _in_think(p) else {"content": prefix})
+                    shown = True
                 job, text, stopped = self._decode(p, prefix, chunk, write, key)
                 if stopped == "max_calls":
                     text = p["fmt"].cut_after(text, self.max_calls)
@@ -827,7 +830,9 @@ class Server:
                 if calls and self._repeats(calls, prev):
                     # steering writes text before the calls, which formats whose calls
                     # are the whole reply (Llama's JSON, Mistral 7B's) cannot hold
-                    if attempt == 0 and p["fmt"].name not in ("llama3_json", "mistral", "mistral_legacy"):
+                    steerable = p["fmt"].name not in ("llama3_json", "mistral", "mistral_legacy")
+                    named = isinstance(req.get("tool_choice"), dict)
+                    if attempt == 0 and steerable:
                         # The model wants to repeat the previous turn's call. Decode
                         # the turn again with its text started for it (a grammar that
                         # calls at once, without a thought block that would open the reply).
@@ -836,21 +841,20 @@ class Server:
                         # the steered reply should be a different call, not an essay
                         # (Gemma 4 wrote 4,096 tokens of prose after the steering text)
                         p = dict(p, max_tokens=min(p["max_tokens"], STEERED_MAX_TOKENS))
-                        if p["regex"] and p.get("tool_choice") in (None, "auto"):
-                            # a call right after the steering text: given room for text, Qwen3.5 wrote a plan and
-                            # no call (Kilo took that as the end of its task), Gemma 4 prose to the token limit
-                            p["regex"] = oai.reply_regex(p["tools"], "required", p["thinking"], typed=self.typed_tools,
-                                                         fmt=p["fmt"], preamble=False,
-                                                         parallel=req.get("parallel_tool_calls") is not False)
-                        lead = p["fmt"].thought_regex() if hasattr(p["fmt"], "thought_regex") else ""
-                        if p["regex"] and lead and p["regex"].startswith(lead):
-                            # the reply has begun with text: no thought block opens it now
-                            # (Gemma 4 went on as if thinking, and wrote <channel|> into its text)
-                            p["regex"] = p["regex"][len(lead):]
+                        p["regex"] = self._steered_regex(p, req, banned)
                         continue
-                    # Still repeating: end the turn with a message instead of looping (unless a call is required:
-                    # then the repeated call it is, as asked)
-                    if req.get("tool_choice") == "required" or isinstance(req.get("tool_choice"), dict):
+                    if steerable and p["regex"] and not named and attempt < 3:
+                        # The steered call repeats as well. Ending the turn with a question for the user ended a
+                        # headless agent's task (Gemma 4 E4B's, in OpenCode): once more, without the tools whose
+                        # call repeats, for this reply only (the next turn offers them all again)
+                        banned |= {c["function"]["name"] for c in calls if self._repeats([c], prev)}
+                        if any(t["function"]["name"] not in banned for t in oai.tool_specs(p["tools"])):
+                            self.log(f"[{p['engine']}] steered reply repeats the call too; steering to another tool")
+                            p["regex"] = self._steered_regex(p, req, banned)
+                            continue
+                    # Still repeating, and no other tool to call: end the turn with a message instead of looping
+                    # (unless a call is required: then the repeated call it is, as asked)
+                    if req.get("tool_choice") == "required" or named:
                         break
                     self.log(f"[{p['engine']}] reply repeats the previous call again; stopping the turn")
                     stop = self._stop_text(calls, prev)
@@ -1028,6 +1032,22 @@ class Server:
                 return (f"The {c['function']['name']} call above was already made and returned: {res!r}. "
                         "Repeating it would give the same result, so I will do something different now:\n\n")
         return ""
+
+    def _steered_regex(self, p: dict, req: dict, banned=frozenset()) -> Optional[str]:
+        """The grammar of a reply decoded again because it repeated the previous turn's call: a call right after the
+        steering text (given room for text, Qwen3.5 wrote a plan and no call, and Kilo took that as the end of its
+        task; Gemma 4 wrote prose to the token limit), to none of the tools in ``banned``, and without the thought
+        block that may open a reply (Gemma 4 went on as if thinking, and wrote <channel|> into its text). A named
+        tool_choice keeps its own grammar (no other call can be made)."""
+        rx = p["regex"]
+        if rx and not isinstance(req.get("tool_choice"), dict):
+            tools = [t for t in oai.tool_specs(p["tools"]) if t["function"]["name"] not in banned]
+            rx = oai.reply_regex(tools, "required", p["thinking"], typed=self.typed_tools, fmt=p["fmt"], preamble=False,
+                                 parallel=req.get("parallel_tool_calls") is not False)
+        lead = p["fmt"].thought_regex() if hasattr(p["fmt"], "thought_regex") else ""
+        if rx and lead and rx.startswith(lead):
+            rx = rx[len(lead):]
+        return rx
 
     @staticmethod
     def _stop_text(calls: List[dict], prev: dict) -> str:

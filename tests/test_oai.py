@@ -7,6 +7,8 @@ import json
 import re
 import random
 
+import pytest
+
 from locals import oai
 from locals.regex import compile_dfa
 
@@ -353,6 +355,52 @@ def test_a_steered_reply_makes_a_call(monkeypatch):
     names = [d["tool_calls"][0]["function"]["name"] for d in deltas
              if d.get("tool_calls") and "name" in d["tool_calls"][0]["function"]]
     assert names == ["read"]
+
+
+def _qwen_call(name, key, value):
+    return f"<tool_call>\n<function={name}>\n<parameter={key}>\n{value}\n</parameter>\n</function>\n</tool_call>"
+
+
+def _gemma_call(name, key, value):
+    return f'<|tool_call>call:{name}{{{key}:<|"|>{value}<|"|>}}<tool_call|>'
+
+
+@pytest.mark.parametrize("fmt_name", ["qwen_xml", "gemma4"])
+def test_a_steered_call_that_repeats_too_goes_to_another_tool(monkeypatch, fmt_name):
+    """The steered reply repeats the call as well (Gemma 4 E4B did): the turn used to end with a question for the
+    user, and a headless agent stopped there. It is decoded once more without the tool it repeated a call to."""
+    from locals import formats
+
+    fmt = formats.FORMATS[fmt_name]
+    call = _qwen_call if fmt_name == "qwen_xml" else _gemma_call
+    replies = [call("bash", "command", "ls"), call("bash", "command", "ls"), call("read", "filePath", "a.py")]
+    srv, svc, p, req = _scripted_server(monkeypatch, fmt, replies, thinking=False)
+    deltas = _events(srv, req, p)
+    others = [t for t in p["tools"] if t["function"]["name"] == "read"]
+    lead = fmt.thought_regex() if hasattr(fmt, "thought_regex") else ""
+    rx = oai.reply_regex(others, "required", False, fmt=fmt, preamble=False)
+    assert len(svc.regexes) == 3 and svc.regexes[2] == (rx[len(lead):] if lead and rx.startswith(lead) else rx)
+    dfa = compile_dfa(svc.regexes[2], 100_000)
+    assert dfa.matches(call("read", "filePath", "b.py").encode()) and not dfa.matches(call("bash", "command", "ls").encode())
+    content = "".join(d.get("content") or "" for d in deltas)
+    assert content.count("already made") == 1 and "I am stuck" not in content
+    names = [d["tool_calls"][0]["function"]["name"] for d in deltas
+             if d.get("tool_calls") and "name" in d["tool_calls"][0]["function"]]
+    assert names == ["read"]
+
+
+def test_a_call_that_repeats_with_no_other_tool_ends_the_turn(monkeypatch):
+    """One tool, and the steered call repeats it: no other call can be made, so the turn ends with a message."""
+    from locals import formats
+
+    fmt = formats.FORMATS["qwen_xml"]
+    srv, svc, p, req = _scripted_server(monkeypatch, fmt, [_qwen_call("bash", "command", "ls")] * 2, thinking=False)
+    p["tools"] = [t for t in p["tools"] if t["function"]["name"] == "bash"]
+    p["regex"] = oai.reply_regex(p["tools"], "auto", False, fmt=fmt, preamble=False)
+    deltas = _events(srv, req, p)
+    content = "".join(d.get("content") or "" for d in deltas)
+    assert len(svc.regexes) == 2 and "I am stuck" in content
+    assert not any(d.get("tool_calls") for d in deltas)
 
 
 def test_ignore_eos_and_usage_chunk_on_text_completions():
