@@ -617,13 +617,24 @@ def remember(**kw) -> None:
         path = LOCALS_DIR / "config.json"
         cfg = json.loads(path.read_text()) if path.exists() else {}
         was = cfg.get("port")
-        if kw.get("port") is not None and was not in (None, kw["port"]) and server_alive(int(was)):
+        if kw.get("port") is not None and was not in (None, kw["port"]) and server_alive(int(was)) \
+                and not _same_server(int(was), kw["port"]):
             print(f"note: a locals server still runs on port {was} (the port used before), with its own copy of the "
                   f"model; locals stop --port {was} stops it", flush=True)
         cfg.update({k: v for k, v in kw.items() if v is not None})
         path.write_text(json.dumps(cfg, indent=1))
     except (OSError, ValueError):
         pass
+
+
+def _same_server(a: int, b: int) -> bool:
+    """Whether ports a and b answer from one server (a port forward, a tunnel, a proxy): the same model, started
+    at the same time."""
+    try:
+        sa, sb = get_json(base_url(a) + "/stats", timeout=3), get_json(base_url(b) + "/stats", timeout=3)
+    except Exception:  # noqa: BLE001
+        return False
+    return sa.get("model") == sb.get("model") and abs((sa.get("uptime_s") or 0) - (sb.get("uptime_s") or 0)) < 3
 
 
 def cmd_serve(args) -> None:
