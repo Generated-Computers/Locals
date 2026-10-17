@@ -203,6 +203,32 @@ could begin with the end of turn (with 4 or 8 requests at once, 6 of 36 replies
 came back empty; none when each prompt was sent alone). The numbers above are
 after the fix.
 
+## Against mlx-lm's own server
+
+The same requests to mlx-lm's server (`python -m mlx_lm server`, mlx-lm 0.32.2,
+`--chat-template-args '{"enable_thinking": false}'`, its defaults otherwise) and
+to Locals (`python -m locals.server --temp 0`, commit `26f2482`), one server at a
+time, Qwen3.5-4B, temperature 0, streamed, 18 October 2026:
+
+| Request | mlx-lm | Locals |
+|---|---|---|
+| One request: rewrite a 100-line Python file with one rename (689 tokens back) | 43 tokens/s, 16.1 s | 128 tokens/s, 6.9 s |
+| OpenCode's first request (its system prompt and tools, 7,283 tokens), cold | first token 16.3 s | 11.9 s |
+| The same right after a restart | 16.3 s (as cold: nothing is kept) | 1.7 s (7,152 tokens from the disk cache) |
+| A question about a 16,751-token document, then a follow-up | 39.7 s, then 0.34 s | 26.5 s, then 0.26 s |
+| The same with 48,531 tokens | 136 s, then out of GPU memory | 101 s, then 0.56 s |
+| The same with 58,344 tokens | 172 to 176 s, then out of GPU memory (twice) | 155 s, then 0.93 s |
+
+The rewrite is faster for one request alone because the reply repeats the file,
+and Locals checks drafts taken from the prompt in the same pass as the next token
+(see [Batch engine](../engine/README.md)). The restart row is the disk cache of
+system prompts: mlx-lm keeps prompts in memory only. Both servers answer a
+follow-up from their prompt cache; past about 48,000 tokens on 16 GB, mlx-lm's
+generation thread stopped with Metal's "Insufficient Memory" on the follow-up
+(three of three tries) and the request failed, while Locals' memory guard kept
+the conversation and answered. The edit row is the second of three rounds (the
+rounds differed by less than 1%); the others ran once.
+
 ## Where the time goes
 
 **Decode steps.** One decode step at about 1,000 tokens of context took 25.7 ms

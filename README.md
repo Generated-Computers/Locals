@@ -61,25 +61,33 @@ On a Mac, the standard way of running models, mlx-lm, answers such requests
 together but barely gets faster when there are more of them: it writes 87 tokens
 per second for four requests and the same 87 for eight, so every agent you add
 slows the others down. Locals keeps getting faster as requests are added, so the
-more agents you run, the more it gives you:
+more agents you run, the more it gives you. It is also faster for a single agent
+at work, after a restart, and in long conversations:
 
-| On a MacBook Pro with an M2 Pro and 16 GB | mlx-lm | Locals | |
+| On a MacBook Pro with an M2 Pro and 16 GB, Qwen3.5-4B | Without Locals | With Locals | |
 |---|---|---|---|
-| 8 requests at once, Qwen3.5-4B | 87 tokens/s | 271 tokens/s | 3.1x |
-| 16 coding agents calling tools, Qwen3.5-2B | 75 s | 29 s | 2.5x |
-| 40 programming problems from LiveCodeBench, 8 at a time | 20 min | 8 min | 2.5x |
-| One request alone | 61 tokens/s | 64 tokens/s | the same |
+| 8 requests at once | 87 tokens/s (mlx-lm) | 271 tokens/s | 3.1x |
+| 8 agents asking at once: time to the first word | 42 s (Ollama) | 1.6 s | 26x sooner |
+| One agent rewriting a 100-line file | 43 tokens/s (mlx-lm) | 128 tokens/s | 3.0x |
+| An agent's first request after a restart | 16 s (mlx-lm) | 1.7 s | 9.6x sooner |
+| A follow-up question about a 48,000-token document | out of memory (mlx-lm) | 0.6 s | |
+| 16 coding agents calling tools (Qwen3.5-2B) | 75 s (mlx-lm) | 29 s | 2.5x |
+| 40 programming problems from LiveCodeBench, 8 at a time | 20 min (mlx-lm) | 8 min | 2.5x |
 
 With 1, 2, 4, 8 and 16 requests at once, Locals writes 64, 116, 160, 271 and 341
-tokens per second, and mlx-lm 61, 82, 87, 87 and 157. A token is roughly a word
-piece. On an M2 Max with 96 GB, eight requests at once get 403 tokens per second
-from Locals and 152 from mlx-lm, and bigger models gain more: 3.0x for
-Qwen3.5-9B and 3.1x for a 27B model
-([measurements](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/m2-max.md)).
-Against Ollama and Magnitude on the M2 Pro, with eight requests at once Locals
-writes 111 tokens per second for Qwen3.5-4B where Ollama writes 34 and Magnitude
-42, and the first token comes after 1.6 seconds instead of 42 and 16
-([comparison](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md#against-ollama-and-magnitude)).
+tokens per second, and mlx-lm 61, 82, 87, 87 and 157; a plain answer alone, with
+nothing to reuse, comes at about the same speed. A token is roughly a word piece.
+Ollama answers this model one request at a time, so the eighth waits for the other
+seven; Magnitude's first word came after 16 s. A file rewrite is faster even alone
+because the reply repeats the file, and Locals checks pieces of it taken from the
+prompt in the same pass as the next word. After a restart, Locals reads the
+agent's long system prompt from disk instead of again. On an M2 Max with 96 GB,
+eight requests at once get 403 tokens per second from Locals and 152 from mlx-lm,
+and bigger models gain more: 3.0x for Qwen3.5-9B and 3.1x for a 27B model. How
+each number was measured:
+[Ollama and Magnitude](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md#against-ollama-and-magnitude),
+[mlx-lm's own server](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md#against-mlx-lms-own-server),
+[the M2 Max](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/m2-max.md).
 
 - **Many agents in the time of a few.** Eight agents working at once finish in
   about the time two would need one after the other, and the answers are the
