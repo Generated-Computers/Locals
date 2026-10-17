@@ -30,7 +30,13 @@ The first is all the fast suite needs (its tokenizer); the second is for the mod
 python -m pytest tests -q -m "not model"   # fast: grammars, tokenizer, server protocol, sampling (about 2 min)
 python -m pytest tests -q                  # everything, with the models (~6 minutes once the models are cached)
 LOCALS_TEST_MODEL=mlx-community/Qwen3.5-4B-MLX-4bit python -m pytest tests -q -m model
+LOCALS_E2E=1 python -m pytest tests/e2e -v    # real agent tools on a real server (about 30 min; tests/e2e/README.md)
 ```
+
+Run the model tests in a fresh environment too (`python3 -m venv`, then `pip install -e ".[dev]"`): it gets
+the newest MLX and mlx-lm the version ranges allow, as a new user's install does. A working environment
+created weeks earlier keeps older ones: MLX 0.32.4's attention kernel failed every 8-token pass on an M2
+for three days before a fresh install showed it.
 
 Every mechanism is tested against the plain path it replaces: forced spans
 against token-by-token decoding, the GPU walk against the token table, the
