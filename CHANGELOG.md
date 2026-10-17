@@ -70,4 +70,6 @@ First public release.
   Esc or Ctrl-C in an agent stops its reply on the server too; with MLX 0.32.4, a
   new user's first task on an M2 no longer fails with "Maximum threads per
   threadgroup"; two OpenCode agents started in the same second no longer fail
-  with "database is locked".
+  with "database is locked"; an agent that repeats its last call is led to a
+  different call, instead of a plan in words that ended its task; Aider no
+  longer writes a new file named after a sentence of the model's reply.
