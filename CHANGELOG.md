@@ -71,5 +71,6 @@ First public release.
   new user's first task on an M2 no longer fails with "Maximum threads per
   threadgroup"; two OpenCode agents started in the same second no longer fail
   with "database is locked"; an agent that repeats its last call is led to a
-  different call, instead of a plan in words that ended its task; Aider no
+  different call (to another tool if it insists), instead of a plan in words or
+  a question that ended its task; Aider no
   longer writes a new file named after a sentence of the model's reply.
