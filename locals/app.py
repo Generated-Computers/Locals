@@ -409,6 +409,14 @@ def setup_openclaw(args) -> bool:
               f"--replace-path models.providers.locals.models)")
         return False
     state = Path(os.environ.get("OPENCLAW_STATE_DIR") or HOME / ".openclaw")
+    cur = _loads_jsonish((state / "openclaw.json").read_text()) if (state / "openclaw.json").is_file() else None
+    want = patch["models"]["providers"]["locals"]
+    provs = ((cur.get("models") or {}).get("providers") or {}) if isinstance(cur, dict) else {}
+    if isinstance(cur, dict) and (provs.get("locals") or {}) == want and not any(n in provs for n in LEGACY) \
+            and (((cur.get("agents") or {}).get("defaults") or {}).get("model") or {}).get("primary") == \
+            patch["agents"]["defaults"]["model"]["primary"]:
+        print(f"OpenClaw uses {patch['agents']['defaults']['model']['primary']} at {base_url(args.port)}/v1 already.")
+        return True  # set up like this already: `openclaw config patch` takes seconds (minutes on its first start)
     _back_up_once(state / "openclaw.json", "openclaw")
     print(f"writing the locals provider into OpenClaw's config ({oc} config patch; its first start can take a few minutes) ...",
           flush=True)
@@ -418,6 +426,9 @@ def setup_openclaw(args) -> bool:
                        capture_output=True, text=True)
     if p.returncode != 0:
         sys.exit(f"openclaw config patch failed:\n{p.stdout[-1500:]}{p.stderr[-1500:]}\nthe fragment is in {path}")
+    for name in LEGACY:  # locals's provider under its old name (stcon): the server no longer answers to it
+        if name in provs:
+            subprocess.run([oc, "config", "unset", f"models.providers.{name}"], capture_output=True, text=True)
     print(f"OpenClaw now uses {patch['agents']['defaults']['model']['primary']} at {base_url(args.port)}/v1 "
           f"(context {patch['models']['providers']['locals']['models'][0]['contextWindow']}).")
     return True
@@ -437,6 +448,11 @@ def setup_hermes(args) -> bool:
         for k, v in kv.items():
             print(f"  hermes config set {k} {v}")
         return False
+    cur = _read_yaml(_hermes_config()) or {}
+    have = cur.get("model") if isinstance(cur.get("model"), dict) else {}
+    if all(str(have.get(k.split(".", 1)[1])) == v for k, v in kv.items()):
+        print(f"Hermes Agent uses {kv['model.default']} at {kv['model.base_url']} already.")
+        return True  # set up like this already: each `hermes config set` takes 3-4 s
     keep = _back_up_once(Path(os.environ.get("HERMES_HOME") or HOME / ".hermes") / "config.yaml", "hermes")
     for k, v in kv.items():
         p = subprocess.run([hm, "config", "set", k, v], capture_output=True, text=True)

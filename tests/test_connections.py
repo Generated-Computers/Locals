@@ -329,3 +329,27 @@ def test_locals_code_refuses_the_home_folder(monkeypatch):
         with pytest.raises(SystemExit) as e:
             app.cmd_code(argparse.Namespace(dir=d, model=QWEN, port=8321, engine=None, agent=None, run=None, cont=False, logs=False))
         assert "project folder" in str(e.value)
+
+
+def test_a_launch_that_finds_the_tool_set_up_runs_none_of_its_commands(tmp_path, monkeypatch):
+    """locals launch hermes / openclaw ran five `hermes config set` (17 s) or `openclaw config patch` (4 s) on
+    every launch: none when the config already holds these settings."""
+    yaml = pytest.importorskip("yaml")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path / "openclaw"))
+    (tmp_path / "hermes").mkdir()
+    (tmp_path / "openclaw").mkdir()
+    monkeypatch.setattr(app, "_tool_bin", lambda name, env: f"/opt/{name}")
+    args = argparse.Namespace(model=QWEN, port=8321, context=None, output=None)
+    monkeypatch.setattr(app, "agent_context", lambda model: 65536)
+    ours = {k.split(".", 1)[1]: v for k, v in app.hermes_settings(QWEN, 8321).items()}
+    (tmp_path / "hermes" / "config.yaml").write_text(yaml.safe_dump({"model": {**ours, "context_length": 65536}}))
+    patch = app.openclaw_patch(QWEN, 8321)
+    (tmp_path / "openclaw" / "openclaw.json").write_text(json.dumps({**patch, "gateway": {"mode": "local"}}))
+    seen = _record_runs(monkeypatch)
+    assert app.setup_hermes(args) and app.setup_openclaw(args)
+    assert seen == []
+    args.port = 8399  # another port: written again
+    app.setup_hermes(args)
+    app.setup_openclaw(args)
+    assert any(c[:3] == ["/opt/hermes", "config", "set"] for c in seen) and any(c[1:3] == ["config", "patch"] for c in seen)
