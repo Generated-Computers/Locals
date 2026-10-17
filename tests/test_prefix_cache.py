@@ -47,9 +47,11 @@ def test_follow_up_from_cache_equals_fresh(service):
     from locals.service import BatchService
 
     tok = service.tokenizer
-    first = _prompt(tok, [("Which shelf is on line 12?", None)])
-    a = service.submit(first, max_tokens=24).wait()
-    assert a.finish == "stop"
+    # a short answer that ends (its end-of-turn token is part of the stream continued): MLX 0.32.4 made the
+    # 2B model add a breakdown after "shelf 5", past 24 tokens, to the open question "Which shelf is on line 12?"
+    first = _prompt(tok, [("Which shelf is on line 12? Answer with the shelf number only.", None)])
+    a = service.submit(first, max_tokens=48).wait()
+    assert a.finish == "stop", a.text
     turn = "<|im_end|>\n<|im_start|>user\nAnd on line 40? Answer briefly.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     follow = list(first) + list(a.tokens) + list(tok.encode(turn, add_special_tokens=False))
     b = service.submit(follow, max_tokens=24).wait()

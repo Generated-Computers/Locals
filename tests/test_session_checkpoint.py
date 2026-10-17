@@ -63,3 +63,30 @@ def test_a_system_prompt_without_markers_is_split_where_sessions_differ(server):
     shared = len(os.path.commonprefix([p2["prompt"], p3["prompt"]]))
     assert set(_systems(p2)) & set(_systems(p3)), (_systems(p1), _systems(p2), _systems(p3))
     assert max(set(_systems(p2)) & set(_systems(p3))) > 0.95 * shared
+
+
+def test_the_next_turn_continues_the_previous_request(server, monkeypatch):
+    """A new user message must not change how the previous turn is written: Qwen3.5's template dropped the empty
+    think block of every earlier reply, so the next turn's first request stopped being a continuation of the
+    last one at the turn's first reply, and its tool calls and results were read again."""
+    from locals import server as srv_mod
+
+    call = {"id": "call_1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "todo.py"})}}
+    turn = [{"role": "system", "content": "You are a coding agent."}, {"role": "user", "content": "Read todo.py."},
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "def add(x): ..."}]
+    reply = "It defines add."
+    nxt = turn + [{"role": "assistant", "content": reply}, {"role": "user", "content": "Now add a test."}]
+    tools = [{"type": "function", "function": {"name": "read", "description": "Read a file.", "parameters": {
+        "type": "object", "properties": {"filePath": {"type": "string"}}, "required": ["filePath"]}}}]
+
+    def prompts():
+        a = server.prepare({"model": "locals/qwen3.5-4b", "messages": turn, "tools": tools})["text"]
+        b = server.prepare({"model": "locals/qwen3.5-4b", "messages": nxt, "tools": tools})["text"]
+        return a, b
+
+    a, b = prompts()
+    assert b.startswith(a + reply), (a[-200:], b[len(a) - 200:len(a) + 100])
+    monkeypatch.setattr(srv_mod, "_KEEP_THINK", False)  # the template as it is: the continuation is lost
+    a, b = prompts()
+    assert not b.startswith(a)

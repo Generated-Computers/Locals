@@ -51,7 +51,7 @@ In `HybridBatchEngine.serve`:
 
 | Kind | Position | How it is rendered | Entry type | Why |
 |---|---|---|---|---|
-| `system` | End of the system message (tools included) plus the user-turn header | Used only when there are at least two messages and the first is a system message. Render `[system, user "\x01A"]` and `[system, user "\x02B"]` and take the point where they differ. A template may refuse a conversation with no user message (Qwen3.5 does). | `system`, also saved to disk | Every session of an agent starts with it. |
+| `system` | The start of the line where the session's own part of the system message begins (`_session_start`), else the end of the system message (tools included) plus the user-turn header | Used only when there are at least two messages and the first is a system message. The end: render `[system, user "\x01A"]` and `[system, user "\x02B"]` and take the point where they differ (a template may refuse a conversation with no user message; Qwen3.5 does). The session's part: the first of the markers agents write there (`<env>`, `Working directory:`, `Today's date:` and the like, `_SESSION_MARKERS`), else where the system message first differs from a recent session's (the last 16 kept). When that point is within 4096 characters of the end, the end is not taken as well. | `system`, also saved to disk | Every session of an agent starts with it. Agents end it with the project's folder and the date: OpenCode's 7,222-token prompt has its folder at token 7,157, so the end is reached only by sessions in the same folder on the same day, and a new project's first request read the whole prompt again (about 7 s on an M2 Pro). |
 | `user` | Start of the last message | Render `msgs[:-1]` with no generation prompt. Used only with more than two messages, or with two when the first is not a system message. | `user` | The history before the last message stays put. This holds even for clients such as OpenClaw that move a context message to the end on every turn. |
 | `reply` | Where this request's reply starts, as the next request will render it | Render `msgs + [assistant "\x01A", user "\x03"]` and the same with `"\x02B"`, and take the point where they differ | `assistant` | See "The reply checkpoint". |
 
@@ -69,6 +69,8 @@ When a prompt is prefilled in mixed passes next to decoding rows (`mix_chunk`, `
 ## The reply checkpoint
 
 **The problem.** A chat template writes an earlier assistant turn differently from the open turn that produced it; Qwen3.5 drops the empty think block. So request k's prompt plus its reply is not a prefix of request k+1. With a cache that cannot be cut back, the next turn fell back to the `user` checkpoint and read the last question and the whole reply again on every turn. The comment's example: a follow-up question on a 60k-token document took 137 s.
+
+**Qwen3.5 with thinking off.** Its template writes the think block of an assistant turn only while the turn is the current one, and drops it from every earlier reply once the user writes again. So at each new user message, the conversation stopped being a prefix of what was cached at the previous turn's first reply: all of that turn's tool calls and results were read again (in an OpenCode session, 1,100 tokens after the first turn, 1,950 after the second, growing with the session). `_render` therefore renders with a variant of such a template (`_stable_template`: the condition `loop.index0 > ns.last_query_index` also holds for a reply without reasoning), so the empty block stays where the reply was generated after it. Replies with reasoning are written as the template writes them. The next turn's first request is then a continuation of the last one: 5,646 of its 5,673 tokens came from the cache, where 4,534 did before. `LOCALS_KEEP_THINK=0` turns the variant off.
 
 **The position.** The `reply` candidate ends where the two renderings differ: where the reply's content starts in the next request's rendering. The open prompt continues past that point (for example, with the empty think block), which is why the position falls inside the prompt. A template that writes both turns the same way gives a position at the prompt's end. The `n < len(prompt)` rule drops it, and the finished row is then a prefix of the next request as it stands.
 
@@ -182,6 +184,7 @@ According to the code's comments, `copy.deepcopy` of a cache does not duplicate 
 | `--cache-gb` | Sized from free GPU memory | Prompt cache cap in GiB. |
 | `--max-context` | What fits, at least 65,536, and at most the model's own context length | Prompt plus reply tokens per request. |
 | `LOCALS_REPLY_CHECKPOINT` | `1` | `0`: no reply checkpoints. |
+| `LOCALS_KEEP_THINK` | `1` | `0`: Qwen3.5's template as it is, earlier replies without their empty think block (see "The reply checkpoint"). |
 | `LOCALS_DISK_CACHE`, `LOCALS_DISK_CACHE_DIR`, `LOCALS_DISK_CACHE_GB` | `1`, `~/.cache/locals/prompts`, `4` | See "Disk cache of system prompts". |
 | `LOCALS_GROWTH_TRIM` | `1` | `0`: no trimming every 32 steps for decode growth. |
 | `LOCALS_MAX_SNAPSHOTS` | `4` | Number of shared-prefix snapshots kept. |

@@ -1518,9 +1518,35 @@ def _line_looping(text: str, window: int = 30, distinct: int = 6, min_len: int =
     return len(lines) >= window and len(set(lines[-window:])) <= distinct
 
 
+# Qwen3.5's template writes an assistant turn's think block only while the turn is the current one: once the
+# user writes again, every earlier reply loses it, empty or not. With thinking off, each reply was generated
+# after "<think>\n\n</think>\n\n", so at every new user message the conversation stopped being a prefix of what
+# was cached at its first reply, and the whole previous turn (its tool calls and results) was read again: in
+# an OpenCode session, 1-4k tokens and several seconds per new message, growing with the session. The empty
+# block is kept on replies without reasoning (as they were generated); replies with reasoning are left as the
+# template writes them (it drops old thoughts on purpose). LOCALS_KEEP_THINK=0: the template as it is.
+_THINK_TURN = "{%- if loop.index0 > ns.last_query_index %}"
+_KEEP_THINK = os.environ.get("LOCALS_KEEP_THINK", "1") != "0"
+_STABLE: Dict[int, Optional[str]] = {}
+
+
+def _stable_template(tok) -> Optional[str]:
+    hf = getattr(tok, "_tokenizer", tok)
+    key = id(hf)
+    if key not in _STABLE:
+        src = getattr(hf, "chat_template", None)
+        _STABLE[key] = (src.replace(_THINK_TURN, "{%- if loop.index0 > ns.last_query_index or (locals_keep_empty_think "
+                                                  "is defined and locals_keep_empty_think and not reasoning_content) %}")
+                        if isinstance(src, str) and src.count(_THINK_TURN) == 1 else None)
+    return _STABLE[key]
+
+
 def _render(tok, msgs: List[dict], tools, add_generation_prompt: bool, **kw) -> str:
     """The chat template's text; a template's own error (role order, a field it
     insists on) is the request's problem, so it surfaces as a 400."""
+    tpl = _stable_template(tok) if _KEEP_THINK and "chat_template" not in kw else None
+    if tpl is not None:
+        kw = dict(kw, chat_template=tpl, locals_keep_empty_think=True)
     try:
         return tok.apply_chat_template(msgs, tools=tools or None, add_generation_prompt=add_generation_prompt, tokenize=False, **kw)
     except Exception as e:  # jinja2's TemplateError and the template's own raise_exception
