@@ -142,3 +142,32 @@ def test_thinking_on_the_reply_checkpoint_is_where_the_next_request_continues(se
     replies = [n for n, kind in a["checkpoints"] if kind == "reply"]
     shared = len(os.path.commonprefix([a["prompt"], b["prompt"]]))
     assert replies and replies[0] <= shared and replies[0] > shared - 8, (a["checkpoints"], shared, len(a["prompt"]))
+
+
+def test_gemma_keeps_the_thoughts_of_earlier_turns():
+    """Gemma 4 writes thoughts with thinking off, and its template keeps them only for a call-making reply of the
+    current turn: at the next user message the previous turn was read again from its first reply."""
+    from huggingface_hub import snapshot_download
+
+    gemma = "mlx-community/gemma-4-e4b-it-4bit"
+    try:
+        path = snapshot_download(gemma, local_files_only=True, allow_patterns=["*.json", "*.jinja", "tokenizer*"])
+    except Exception:  # noqa: BLE001
+        pytest.skip("Gemma 4's tokenizer not cached")
+    from mlx_lm.utils import load_tokenizer
+
+    from locals.server import Server
+
+    srv = Server(gemma, engines=("locals",), preload=(), log=lambda s: None)
+    srv._svc["locals"] = _Svc(load_tokenizer(path))
+    call = {"id": "c1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "todo.py"})}}
+    turn = [{"role": "system", "content": "You are a coding agent."}, {"role": "user", "content": "Read todo.py."},
+            {"role": "assistant", "content": "", "reasoning_content": "I should read the file first.", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "c1", "content": "def add(x): ..."}]
+    nxt = turn + [{"role": "assistant", "content": "It defines add."}, {"role": "user", "content": "Now add a test."}]
+    tools = [{"type": "function", "function": {"name": "read", "description": "Read a file.", "parameters": {
+        "type": "object", "properties": {"filePath": {"type": "string"}}, "required": ["filePath"]}}}]
+    a = srv.prepare({"model": "locals/gemma-4-e4b-it", "messages": turn, "tools": tools})
+    b = srv.prepare({"model": "locals/gemma-4-e4b-it", "messages": nxt, "tools": tools})
+    assert b["text"].startswith(a["text"]), (a["text"][-300:], b["text"][len(a["text"]) - 300:len(a["text"]) + 100])
+    assert "I should read the file first." in b["text"]

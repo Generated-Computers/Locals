@@ -1683,7 +1683,12 @@ def _line_looping(text: str, window: int = 30, distinct: int = 6, min_len: int =
 # an OpenCode session, 1-4k tokens and several seconds per new message, growing with the session. The empty
 # block is kept on replies without reasoning (as they were generated); replies with reasoning are left as the
 # template writes them (it drops old thoughts on purpose). LOCALS_KEEP_THINK=0: the template as it is.
+# Gemma 4's template does the same with its thought channel, which it writes only for a call-making reply of the
+# current turn: Gemma writes real thoughts with thinking off (it opens the channel itself), and at each new user
+# message the previous turn read again from its first reply (in a measured OpenCode session, from 3,584 of 17,297
+# tokens). Its variant keeps the thoughts a reply carries (raw replay gives them back as they were written).
 _THINK_TURN = "{%- if loop.index0 > ns.last_query_index %}"
+_THOUGHT_TURN = "{%- if thinking_text and loop.index0 > ns_turn.last_user_idx and message.get('tool_calls') -%}"
 _KEEP_THINK = os.environ.get("LOCALS_KEEP_THINK", "1") != "0"
 _STABLE: Dict[int, Optional[str]] = {}
 
@@ -1693,9 +1698,15 @@ def _stable_template(tok) -> Optional[str]:
     key = id(hf)
     if key not in _STABLE:
         src = getattr(hf, "chat_template", None)
-        _STABLE[key] = (src.replace(_THINK_TURN, "{%- if loop.index0 > ns.last_query_index or (locals_keep_empty_think "
-                                                  "is defined and locals_keep_empty_think and not reasoning_content) %}")
-                        if isinstance(src, str) and src.count(_THINK_TURN) == 1 else None)
+        out = None
+        if isinstance(src, str) and src.count(_THINK_TURN) == 1:
+            out = src.replace(_THINK_TURN, "{%- if loop.index0 > ns.last_query_index or (locals_keep_empty_think "
+                                           "is defined and locals_keep_empty_think and not reasoning_content) %}")
+        elif isinstance(src, str) and src.count(_THOUGHT_TURN) == 1:
+            out = src.replace(_THOUGHT_TURN, "{%- if thinking_text and ((loop.index0 > ns_turn.last_user_idx and "
+                                             "message.get('tool_calls')) or (locals_keep_empty_think is defined and "
+                                             "locals_keep_empty_think)) -%}")
+        _STABLE[key] = out
     return _STABLE[key]
 
 
