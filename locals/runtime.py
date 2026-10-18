@@ -215,6 +215,12 @@ class Runtime:
 
     def __init__(self, model, tokenizer, fuse: bool = True, small_m_kernel: bool = True, prompt_cache_bytes: int = 2 << 30,
                  dtype: Optional[str] = "auto", tune: Optional[str] = None, log=None):
+        # Switches for measuring what each part gives on a new GPU (docs/runtime): LOCALS_DTYPE (auto, float16,
+        # bfloat16), LOCALS_FUSE=0 (no fused projections), LOCALS_KERNELS=0 (MLX's matmul kernels for few rows)
+        if dtype == "auto" and os.environ.get("LOCALS_DTYPE"):
+            dtype = os.environ["LOCALS_DTYPE"]
+        fuse = fuse and os.environ.get("LOCALS_FUSE", "1") != "0"
+        small_m_kernel = small_m_kernel and os.environ.get("LOCALS_KERNELS", "1") != "0"
         self.model = model
         self.tokenizer = tokenizer
         self.dtype = set_compute_dtype(model, dtype)

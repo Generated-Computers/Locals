@@ -375,6 +375,7 @@ def _tune_shape(x2, mod, M, K, N, dt, key, tune):
     mlx_t = times[("mlx",)]
     for fam in {c[0] for c in ok}:
         tune[f"{key}|{fam}"] = min((c for c in ok if c[0] == fam), key=lambda c: times[c])
+    tune.setdefault("__times__", {})[key] = {fam: round(min(times[c] for c in ok if c[0] == fam), 1) for fam in {c[0] for c in ok}}
     challenger = min((c for c in ok if c[0] != "mlx"), key=lambda c: times[c], default=None)
     choice = challenger if challenger is not None and times[challenger] < 0.9 * mlx_t else ("mlx",)
     best = (times[choice], choice)
@@ -453,23 +454,75 @@ def _maybe_packed(self, x, call):
     return call(self, x)
 
 
-PREFILL_M = 128  # from this many rows, dequantize to fp16 and use the dense GEMM
+PREFILL_M = 128  # from this many rows, dequantize and use the dense GEMM where that is faster on this GPU
+PREFILL_TUNE_M = 1024  # the rows that choice is timed at: one prefill chunk
 
 
 DENSE_MAX = 1 << 27  # weights (N x K) dequantized at most: an lm_head of 248k x 2560 would be a 1.3 GB temporary
+_DENSE: dict = {}  # (N, K, dtype) -> True: dequantize + dense GEMM; False: MLX's quantized GEMM
 
 
 def _dense_ok(x, mod) -> bool:
     if not _tunable(mod) or mod["weight"].shape[0] * mod["weight"].shape[1] * 8 > DENSE_MAX:
         return False
-    return x.dtype in (mx.float16, mx.bfloat16) and x.size // x.shape[-1] >= PREFILL_M
+    return x.dtype in (mx.float16, mx.bfloat16) and x.size // x.shape[-1] >= PREFILL_M and _dense_prefill(mod, x.dtype)
+
+
+def _prefill_key(N: int, K: int, dt: str) -> str:
+    return f"{N}x{K}xP" + ("" if dt == "float16" else f"x{dt}")
+
+
+def _dense_prefill(mod, dtype) -> bool:
+    """Whether a prompt is read through this layer as dequantize + dense GEMM rather than MLX's quantized
+    GEMM: timed on this GPU once per shape (cached with the other choices). On an M2 Pro with MLX 0.32 the
+    dense GEMM is 3-11% faster at 1024 rows (it was 1.5x with older MLX); MLX's quantized GEMM uses the M5's
+    neural accelerators. ``LOCALS_DENSE_PREFILL``: 1 always dense, 0 never."""
+    w = mod["weight"]
+    N, K, dt = w.shape[0], w.shape[1] * 8, str(dtype).split(".")[-1]
+    hit = _DENSE.get((N, K, dt))
+    if hit is not None:
+        return hit
+    force = _os.environ.get("LOCALS_DENSE_PREFILL")
+    if force in ("0", "1"):
+        _DENSE[(N, K, dt)] = force == "1"
+        return _DENSE[(N, K, dt)]
+    key = _prefill_key(N, K, dt)
+    tune = _load_tune()
+    if key in tune:
+        _DENSE[(N, K, dt)] = tune[key][0] == "dense"
+        return _DENSE[(N, K, dt)]
+    if _DEFER and not _TUNING:
+        return True  # not timed yet: as before (the server times it while idle)
+    with _TUNE_LOCK:
+        if (N, K, dt) not in _DENSE:
+            _tune_prefill(mod, N, K, dtype, key, tune)
+        return _DENSE[(N, K, dt)]
+
+
+def _tune_prefill(mod, N, K, dtype, key, tune) -> None:
+    x = mx.random.normal((PREFILL_TUNE_M, K), key=mx.random.key(K + 7)).astype(dtype)
+    sc, bi = mod["scales"].astype(dtype), mod["biases"].astype(dtype)
+
+    def quant():
+        return mx.quantized_matmul(x, mod["weight"], mod["scales"], mod["biases"], transpose=True, group_size=64, bits=4)
+
+    def dense():
+        return x @ mx.dequantize(mod["weight"], sc, bi, group_size=64, bits=4).T
+
+    tq = td = float("inf")
+    for _ in range(3):  # interleaved rounds, the best of each
+        tq, td = min(tq, _time_us(quant, reps=4)), min(td, _time_us(dense, reps=4))
+    dense_wins = td < 0.95 * tq  # (the dense path also needs the dequantized weights as a temporary)
+    tune[key] = ("dense",) if dense_wins else ("mlx",)
+    tune.setdefault("__times__", {})[key] = {"mlx": round(tq, 1), "dense": round(td, 1)}
+    _DENSE[(N, K, str(dtype).split(".")[-1])] = dense_wins
+    _save_tune()
 
 
 def _dense_matmul(x, mod):
-    """Large-M 4-bit matmul as dequantize + GEMM in the activations' own type: MLX's dense GEMM runs
-    about 1.5x the throughput of its quantized GEMM on M2-class GPUs, and the dequantized weights
-    cost little traffic next to M x K x N FLOPs. (A bf16 model is not computed in fp16: values past
-    65504 would become inf.)"""
+    """Large-M 4-bit matmul as dequantize + GEMM in the activations' own type, where it is faster than MLX's
+    quantized GEMM on this GPU (_dense_prefill): the dequantized weights cost little traffic next to
+    M x K x N FLOPs. (A bf16 model is not computed in fp16: values past 65504 would become inf.)"""
     w = mx.dequantize(mod["weight"], mod["scales"].astype(x.dtype), mod["biases"].astype(x.dtype), group_size=64, bits=4)
     return x @ w.T
 
@@ -771,10 +824,15 @@ def pretune(model, max_m: int = MAX_M, log=None) -> int:
             name = str(dt).split(".")[-1]
             for M in range(MIN_M, max_m + 1):
                 work.append((mod, M, K, dt, f"{N}x{K}x{M}" + ("" if name == "float16" else f"x{name}") not in tune))
+            if N * K <= DENSE_MAX:  # how prompts are read through it (_dense_prefill)
+                work.append((mod, PREFILL_TUNE_M, K, dt, _prefill_key(N, K, name) not in tune))
     total, done = sum(w[-1] for w in work), 0
     t0 = last = _time.perf_counter()
     for mod, M, K, dt, pending in work:
-        _choose(mx.zeros((M, K), dt), mod)
+        if M >= PREFILL_M:
+            _dense_prefill(mod, dt)
+        else:
+            _choose(mx.zeros((M, K), dt), mod)
         done += pending
         now = _time.perf_counter()
         if log and pending and done < total and done * 10 // total > (done - 1) * 10 // total and now - last >= 20:
@@ -798,6 +856,8 @@ def pending_work(model, max_m: int = 16) -> list:
             for M in range(MIN_M, max_m + 1):
                 if f"{N}x{K}x{M}" + ("" if name == "float16" else f"x{name}") not in tune:
                     work.append((mod, M))
+            if N * K <= DENSE_MAX and _prefill_key(N, K, name) not in tune:
+                work.append((mod, PREFILL_TUNE_M))  # how prompts are read through it, after the batch sizes
     return sorted(work, key=lambda w: w[1])
 
 
@@ -806,6 +866,8 @@ def tune_one(mod, M: int) -> tuple:
     global _TUNING
     _TUNING = True
     try:
+        if M >= PREFILL_M:
+            return ("dense",) if _dense_prefill(mod, mod["scales"].dtype) else ("mlx",)
         K = mod["weight"].shape[1] * 8
         return _choose(mx.zeros((M, K), mod["scales"].dtype), mod)
     finally:
@@ -829,6 +891,56 @@ def tune_pending(model, max_m: int = MAX_M) -> int:
                 key = f"{N}x{K}x{M}" + ("" if dt == "float16" else f"x{dt}")
                 missing += key not in tune
     return missing
+
+
+def tune_report(model) -> str:
+    """What tuning measured for ``model`` on this GPU (locals tune --report): per batch size, the time of
+    one decode step's 4-bit matmuls with MLX's kernels against the chosen ones (each layer shape counted
+    as often as the model has it), the fastest of Locals' own, and per shape how prompts are read. Shapes
+    taken from a shipped preset have no timings."""
+    from collections import Counter
+
+    tune = _load_tune()
+    times = tune.get("__times__", {})
+    shapes = Counter()
+    for _, mod in model.named_modules():
+        if _tunable(mod):
+            w = mod["weight"]
+            if (w.shape[1] * 8) % 64 == 0:
+                shapes[(w.shape[0], w.shape[1] * 8, str(mod["scales"].dtype).split(".")[-1])] += 1
+    dts = sorted({dt for _, _, dt in shapes})
+    out = [f"GPU {mx.device_info()['architecture']}, MLX {mx.__version__}, {', '.join(dts)}, "
+           f"{sum(shapes.values())} quantized layers in {len(shapes)} shapes; cache {_TUNE_PATH}",
+           "", "rows  MLX's kernels  chosen  speed-up  fastest of Locals' own  chosen kernels (layers)"]
+    for M in (1, 2, 3, 4, 6, 8, 12, 16, 24, 32):
+        t_mlx = t_ch = t_own = 0.0
+        fams, timed = Counter(), 0
+        for (N, K, dt), n in shapes.items():
+            key = f"{N}x{K}x{M}" + ("" if dt == "float16" else f"x{dt}")
+            t, c = times.get(key), tune.get(key)
+            if not t or "mlx" not in t or c is None:
+                continue
+            timed += n
+            own = min((v for f, v in t.items() if f != "mlx"), default=t["mlx"])
+            t_mlx, t_ch, t_own = t_mlx + n * t["mlx"], t_ch + n * t.get(c[0], t["mlx"]), t_own + n * own
+            fams[c[0]] += n
+        if not timed:
+            out.append(f"{M:4d}  (not timed here)")
+            continue
+        note = "" if timed == sum(shapes.values()) else f", {timed} of {sum(shapes.values())} layers timed"
+        out.append(f"{M:4d}  {t_mlx / 1e3:9.2f} ms  {t_ch / 1e3:6.2f} ms  {t_mlx / t_ch:6.2f}x  {t_own / 1e3:9.2f} ms "
+                   f"({t_mlx / t_own:.2f}x)    " + ", ".join(f"{f} {k}" for f, k in fams.most_common()) + note)
+    out += ["", f"reading prompts ({PREFILL_TUNE_M} rows): MLX's quantized GEMM against dequantize + dense GEMM"]
+    for (N, K, dt), n in sorted(shapes.items()):
+        key = _prefill_key(N, K, dt)
+        t, c = times.get(key), tune.get(key)
+        if N * K > DENSE_MAX:
+            continue
+        if not t:
+            out.append(f"  {N}x{K} ({n} layers): not timed here")
+            continue
+        out.append(f"  {N}x{K} ({n} layers): MLX {t['mlx'] / 1e3:.2f} ms, dense {t['dense'] / 1e3:.2f} ms -> {c[0]}")
+    return "\n".join(out)
 
 
 def tune_model(model, mode: str = "auto", log=None) -> dict:

@@ -317,8 +317,9 @@ class BatchService:
         self._eng = eng
         limit = int(mx.device_info()["max_recommended_working_set_size"])
         # MLX keeps up to 1 GB of freed buffers (set_cache_limit); 1.5 GB more covers what the
-        # admission estimate misses (5 concurrent agents peaked 1.1 GB above it on a 16 GB Mac)
-        eng.memory_limit = limit - (5 << 29)
+        # admission estimate misses (5 concurrent agents peaked 1.1 GB above it on a 16 GB Mac).
+        # LOCALS_MEMORY_MARGIN_GB sets the whole margin.
+        eng.memory_limit = limit - int(float(os.environ.get("LOCALS_MEMORY_MARGIN_GB", "2.5")) * (1 << 30))
         if self.cache_bytes is None:  # what is left after the weights and 5 GB for running rows and prefill,
             free = limit - mx.get_active_memory() - (5 << 30)  # and at least one conversation as long as fits
             # (its follow-up question then continues from it: 1.5 s instead of 137 s at 60k tokens). The memory

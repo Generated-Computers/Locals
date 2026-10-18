@@ -4,7 +4,7 @@ Part of the [technical documentation](../README.md) of Locals. File and function
 
 The server is made of four files:
 
-- `server.py` is an OpenAI-compatible HTTP server built on the standard library's `ThreadingHTTPServer`. It runs one thread per connection and uses no web framework.
+- `server.py` is an OpenAI-compatible HTTP server built on the standard library's `ThreadingHTTPServer`. It runs one thread per connection and uses no web framework. It accepts up to 128 waiting connections (`_HTTPServer.request_queue_size`): with the standard library's 5, macOS 27 reset connections when 8 or 16 requests arrived at once.
 - `apis.py` translates Ollama's API to Chat Completions and back.
 - `oai.py` converts OpenAI messages into what the model's chat template expects. It also builds the tool-call grammar and parses replies back into OpenAI form.
 - `service.py` holds `BatchService`, the client API to one engine. A single worker thread owns the model and runs continuous batching. Every HTTP request becomes one row of a shared batch, so concurrent agents decode together.

@@ -50,6 +50,10 @@ First public release.
 - **Works with benchmark tools.** `ignore_eos` and
   `stream_options.include_usage` as vLLM and OpenAI handle them, so InferenceX,
   vLLM's and aiperf's clients measure Locals as they measure other servers.
+- **Measures itself on a new Mac.** How prompts are read (MLX's 4-bit kernel or
+  a dense one) is timed on each GPU instead of fixed for M2-class chips, and
+  `locals tune --report` shows where Locals gains on this Mac: MLX's matrix
+  kernels against the chosen ones for each number of requests at once.
 - **Smoother commands.** `locals chat` and `locals generate` use the background
   server instead of loading a second copy of the model, so `--n` works with every
   model; `locals status`, `stop` and `--version` answer in a fraction of a second;
@@ -75,4 +79,5 @@ First public release.
   a question that ended its task; Aider no
   longer writes a new file named after a sentence of the model's reply;
   several Gemma 4 requests at once with prompts longer than 512 tokens no
-  longer get empty or wrong replies.
+  longer get empty or wrong replies; eight or more requests at once no longer
+  get "Connection reset by peer" on macOS 27.

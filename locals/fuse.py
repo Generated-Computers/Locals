@@ -9,6 +9,7 @@ small k/v projections.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -104,7 +105,7 @@ def _fuse_mlp(mlp) -> None:
     mlp.__class__ = type("Fused" + type(mlp).__name__, (FusedMLP, type(mlp)), {})
 
 
-USE_GDN_KERNEL = True  # one fused Metal kernel per decode step (see gdn_kernel.py)
+USE_GDN_KERNEL = os.environ.get("LOCALS_GDN_KERNEL", "1") != "0"  # one fused Metal kernel per decode step (see gdn_kernel.py)
 _GDN_MAX_S = 4  # longer passes (drafts) take the kernel too when per-token states are wanted; see below
 
 

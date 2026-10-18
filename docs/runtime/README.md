@@ -147,7 +147,7 @@ A tied embedding head goes through `QuantizedEmbedding.as_linear` -> `_embed_swi
 
 **Which layers qualify.** `_tunable(mod)` requires a quantized linear or embedding with 4 bits, group size 64, affine mode, biases, and K divisible by 64. Other group sizes, and mxfp4 and similar formats, stay on MLX's kernels: tuning them crashed the load (`kernels.py:387-392`). The weight layout is MLX's affine 4-bit: `w` is `(N, K/8)` uint32 with the low nibble first, and `scales`/`biases` are `(N, K/64)` (`kernels.py:12-13`). `_eligible(x, mod)` also requires `MIN_M` (1) <= M <= `MAX_M` (32), where M is the number of rows after flattening all leading dimensions, and fp16 or bf16 activations (`kernels.py:395-402`).
 
-**Dense prefill path.** At `PREFILL_M = 128` rows or more, a qualifying layer is computed as dequantize + dense GEMM in the activations' own dtype (`kernels.py:456`, `kernels.py:462-474`). MLX's dense GEMM runs at about 1.5x the throughput of its quantized GEMM on M2-class GPUs. Next to the M x K x N FLOPs, the dequantized weights add little memory traffic. A bf16 model is not computed in fp16 on this path, because values above 65504 would become inf. Layers with more than `DENSE_MAX = 1 << 27` weights are excluded: a 248k x 2560 lm_head would need a 1.3 GB temporary (`kernels.py:459`).
+**Dense prefill path.** At `PREFILL_M = 128` rows or more, a qualifying layer can be computed as dequantize + dense GEMM in the activations' own dtype instead of MLX's quantized GEMM (`_dense_ok`, `_dense_matmul`). Which one is timed on the GPU once per layer shape at `PREFILL_TUNE_M = 1024` rows and cached with the other choices (`_dense_prefill`, `_tune_prefill`; keys `NxKxP`): dense must be 5% faster, since it also needs the dequantized weights as a temporary. On an M2 Pro with MLX 0.32 it is 6-11% faster for the large shapes and level for the small ones (it was 1.5x with older MLX); MLX's quantized GEMM uses the neural accelerators of M5 GPUs (`quantized_nax.h` in MLX's kernels). The server times untimed shapes while idle and reads prompts densely until then; `locals tune` times them at once. `LOCALS_DENSE_PREFILL=1` always reads densely, `0` never. A bf16 model is not computed in fp16 on this path, because values above 65504 would become inf. Layers with more than `DENSE_MAX = 1 << 27` weights are excluded: a 248k x 2560 lm_head would need a 1.3 GB temporary.
 
 **Row packing.** Inside `with packed_rows(B, L, lengths):` (a thread-local context), a linear layer applied to right-padded `(B, L, D)` activations gathers only the valid rows. It runs the matmul on those rows and scatters the result back into zeros, so padding costs no matmul work (`kernels.py:425-453`). Packing applies even when small-row routing is disabled (`_linear_call_plain`). Ragged batched passes use it. `hybrid_batch.py:609` is `HybridBatchEngine._forward`, the batch decode step, whose rows feed different numbers of tokens (called at `hybrid_batch.py:1298` and `:1355`). `regions.py:107` is `RegionScorer.logprobs`, which scores candidate paths in one right-padded pass.
 
@@ -244,7 +244,7 @@ When `tune_model` returns with `_DEFER` set, the service builds `kernels.pending
   3. A user cache that does not parse is renamed to `.bad`, not silently replaced.
   4. If there is no readable user cache (none, or one just renamed to `.bad`) and the preset is non-empty, the preset is written out as the user cache. Later writes also save the merged preset + user dictionary.
 - **Writes** (`_save_tune`) replace the whole file atomically, via a temporary file and `os.replace`. Writes and tuning both take `_TUNE_LOCK`, an `RLock`, because the server runs two engines (`kernels.py:161`, `kernels.py:201-219`).
-- **Format:** a JSON object. Shape keys (`"2560x10240x4"`, `"…x4xbfloat16"`) map to choice lists such as `["frag", 2, 2, 1]`. `"…|family"` keys hold per-family winners. `"__model_tuned_pipe__…"` keys hold lists of finished row counts. Keys that start with `__` are kept as they are, and all others are read as tuples (`kernels.py:164-166`).
+- **Format:** a JSON object. Shape keys (`"2560x10240x4"`, `"…x4xbfloat16"`) map to choice lists such as `["frag", 2, 2, 1]`. `"…xP"` keys hold the prompt-reading choice (`["dense"]` or `["mlx"]`). `"__times__"` holds what tuning measured, per shape key and family in microseconds, which `locals tune --report` (`tune_report`) sums per batch size. `"…|family"` keys hold per-family winners. `"__model_tuned_pipe__…"` keys hold lists of finished row counts. Keys that start with `__` are kept as they are, and all others are read as tuples (`kernels.py:164-166`).
 - **Presets:** `locals/presets/tune_v6_applegpu_g14s.json` is the one preset shipped. It is packaged through `[tool.setuptools.package-data]` (`pyproject.toml:58-59`). Setting `LOCALS_NO_PRESET=1` hides presets, so a start behaves as on a GPU without one (`kernels.py:145-156`).
 
 To re-tune from scratch, delete the cache file (or point `LOCALS_TUNE_CACHE` at a new path) and set `LOCALS_NO_PRESET=1`.
@@ -302,12 +302,17 @@ To re-tune from scratch, delete the cache file (or point `LOCALS_TUNE_CACHE` at 
 | `LOCALS_MAX_COMPILED` | `16` | Most compiled constraints kept (`runtime.py:162`) |
 | `LOCALS_COMPILED_GB` | `1.5` | GB of constraint tables kept (`runtime.py:245`) |
 | `LOCALS_IGNORE_MEMORY` | unset | Skip the `too_big` memory check (`defaults.py:74`) |
+| `LOCALS_DTYPE` | `auto` | The compute dtype `Runtime` uses when `dtype="auto"`: `float16` or `bfloat16` forces one (to measure a new GPU; `auto` picks float16 only on GPUs without native bfloat16) |
+| `LOCALS_FUSE` | `1` | `0`: no fused projections |
+| `LOCALS_KERNELS` | `1` | `0`: MLX's matmul kernels for few rows (no tuned kernels) |
+| `LOCALS_GDN_KERNEL` | `1` | `0`: mlx-lm's Gated DeltaNet decode instead of `gdn_kernel.py` (`fuse.USE_GDN_KERNEL`) |
+| `LOCALS_DENSE_PREFILL` | timed | `1`: prompts always through dequantize + dense GEMM; `0`: through MLX's quantized GEMM |
 
 ## Code switches
 
 | Constant | Value | Where |
 |---|---|---|
-| `USE_GDN_KERNEL` | `True` | `fuse.py:107` |
+| `USE_GDN_KERNEL` | `True` unless `LOCALS_GDN_KERNEL=0` | `fuse.py:108` |
 | `_GDN_MAX_S` | `4`; the 16-token limit with `want_states` is a literal in the condition at `fuse.py:126`. `gdn_kernel.MAX_S = 16` (`gdn_kernel.py:182`) is defined but never referenced | `fuse.py:108`, `fuse.py:126` |
 | `USE_ADD_RMS` | `False` | `fuse.py:229` |
 | `USE_RAGGED` | `False` | `packed.py:70` |

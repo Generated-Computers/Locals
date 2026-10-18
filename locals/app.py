@@ -1940,13 +1940,19 @@ def cmd_tune(argv: List[str]) -> None:
     ap.add_argument("--model", default=DEFAULT_MODEL, type=model_id, help=MODEL_HELP)
     ap.add_argument("--mode", choices=["full", "quick"], default="full", help="full: every batch size up to 32 plus whole-step "
                     "timing (10-20 minutes, best throughput); quick: shapes for batch sizes up to 16 (a few minutes)")
+    ap.add_argument("--report", action="store_true", help="then print what was measured: MLX's matrix kernels against the "
+                    "chosen ones per batch size, and how prompts are read (for a new GPU: tells where Locals gains)")
     a = ap.parse_args(argv)
     from .runtime import Runtime
 
     t0 = time.time()
     print(f"loading {a.model} and tuning ({a.mode}) ...", flush=True)
-    Runtime.load(a.model, tune=a.mode)
-    print(f"done in {time.time() - t0:.0f}s; results cached under ~/.cache/locals")
+    rt = Runtime.load(a.model, tune=a.mode)
+    from . import kernels
+
+    print(f"done in {time.time() - t0:.0f}s; results cached in {kernels._TUNE_PATH}")
+    if a.report:
+        print(kernels.tune_report(rt.model))
 
 
 def _solve(args) -> None:

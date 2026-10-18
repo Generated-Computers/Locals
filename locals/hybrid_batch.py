@@ -47,6 +47,10 @@ def _prepare_ragged(cache, lens: List[int]) -> None:
             c.prepare(lengths=lens)
 
 
+# The prefill transient an admission keeps room for (activations and attention scores of a prompt being read).
+# LOCALS_PREFILL_RESERVE_GB sets it: a model that nearly fills the GPU limit (a 27B on 24 GB) admits no second
+# request next to a running one with 1.5 GB, though a short prompt needs less.
+PREFILL_RESERVE = int(float(os.environ.get("LOCALS_PREFILL_RESERVE_GB", "1.5")) * (1 << 30))
 _MEMLOG = bool(os.environ.get("LOCALS_MEMLOG"))  # print GPU memory around each admission
 _MIXLOG = bool(os.environ.get("LOCALS_MIXLOG"))  # print each mixed pass (locals/mixed.py)
 
@@ -483,7 +487,7 @@ class HybridBatchEngine(BatchEngine):
         a prompt-cache entry)."""
         if not self.memory_limit:
             return True
-        need = positions * self._kv_bytes_per_token() + (1536 << 20)
+        need = positions * self._kv_bytes_per_token() + PREFILL_RESERVE
         self._trim_for(lru, need)
         return mx.get_active_memory() + need <= self.memory_limit
 
@@ -493,7 +497,7 @@ class HybridBatchEngine(BatchEngine):
         if not self.memory_limit:
             return True
         copies = _copies(r)
-        need = (len(r.prompt) * (1 + copies) + held) * self._kv_bytes_per_token() + (1536 << 20) + _replies(r) * self._reply_bytes
+        need = (len(r.prompt) * (1 + copies) + held) * self._kv_bytes_per_token() + PREFILL_RESERVE + _replies(r) * self._reply_bytes
         return need <= self.memory_limit - (mx.get_active_memory() - (lru.nbytes if lru is not None else 0))
 
     def _make_room(self, lru, tokens: int, copies: int, held: int) -> None:
@@ -506,7 +510,7 @@ class HybridBatchEngine(BatchEngine):
         PREFILL_SCORES)."""
         if not self.memory_limit or lru is None:
             return
-        self._trim_for(lru, (tokens * (1 + copies) + held) * self._kv_bytes_per_token() + (1536 << 20))
+        self._trim_for(lru, (tokens * (1 + copies) + held) * self._kv_bytes_per_token() + PREFILL_RESERVE)
 
     def _trim_for(self, lru, need: int) -> None:
         """Drop prompt-cache entries (least valuable first) until ``need`` more

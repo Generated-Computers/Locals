@@ -1752,6 +1752,10 @@ def _render(tok, msgs: List[dict], tools, add_generation_prompt: bool, **kw) -> 
 
 
 class _HTTPServer(ThreadingHTTPServer):
+    # Connections waiting to be accepted: socketserver's default of 5 reset connections past it on macOS 27
+    # (an M5 Pro: 1-8 of every batch of 8 or 16 requests at once failed with "Connection reset by peer")
+    request_queue_size = 128
+
     def __init__(self, addr, handler):
         import socket
 
