@@ -1,8 +1,6 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/logo-dark.png">
-    <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/logo.png" alt="Generated Computers" width="80%">
-  </picture>
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/8404f6b4b32b8070facd0290d157e3ed97777623/docs/assets/logo.png#gh-light-mode-only" alt="Generated Computers" width="80%">
+  <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/8404f6b4b32b8070facd0290d157e3ed97777623/docs/assets/logo-dark.png#gh-dark-mode-only" alt="Generated Computers" width="80%">
 </p>
 
 <h1 align="center">Locals</h1>
@@ -29,7 +27,7 @@ your project. Nothing leaves your computer.
 
 ## What it is
 
-<img src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/emblem.png" alt="Generated Computers Co." width="35%" align="right">
+<img src="https://raw.githubusercontent.com/Generated-Computers/Locals/8404f6b4b32b8070facd0290d157e3ed97777623/docs/assets/emblem.png" alt="Generated Computers Co." width="35%" align="right">
 
 Locals runs AI models on your own Mac and makes them fast when many requests
 arrive at the same time. That is how today's AI agents work: a coding assistant
