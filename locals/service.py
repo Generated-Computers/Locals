@@ -316,10 +316,13 @@ class BatchService:
         eng.top_p, eng.top_k = self.top_p, self.top_k
         self._eng = eng
         limit = int(mx.device_info()["max_recommended_working_set_size"])
-        # MLX keeps up to 1 GB of freed buffers (set_cache_limit); 1.5 GB more covers what the
-        # admission estimate misses (5 concurrent agents peaked 1.1 GB above it on a 16 GB Mac).
-        # LOCALS_MEMORY_MARGIN_GB sets the whole margin.
-        eng.memory_limit = limit - int(float(os.environ.get("LOCALS_MEMORY_MARGIN_GB", "2.5")) * (1 << 30))
+        # MLX keeps up to 1 GB of freed buffers (set_cache_limit), and 0.5 GB covers what the admission
+        # estimate misses. It was 1.5 GB (2.5 in all) while the estimate left out each request's own state
+        # and kept 1.5 GB for reading a prompt that takes 2.1 GB; with them counted, 2.5 made room by emptying
+        # the prompt cache (four agents at once: 71-88% of their prompts from it, first token 5.1 s, against
+        # 87-95% and 1.2 s with 1.5). With 1.5 on a 16 GB Mac, 16 x 2k, 8 x 8k and 4 x 30k-token prompts at
+        # once all finished, at most 9.06 GB of 11.45 in use. LOCALS_MEMORY_MARGIN_GB sets the whole margin.
+        eng.memory_limit = limit - int(float(os.environ.get("LOCALS_MEMORY_MARGIN_GB", "1.5")) * (1 << 30))
         if self.cache_bytes is None:  # what is left after the weights and 5 GB for running rows and prefill,
             free = limit - mx.get_active_memory() - (5 << 30)  # and at least one conversation as long as fits
             # (its follow-up question then continues from it: 1.5 s instead of 137 s at 60k tokens). The memory

@@ -47,10 +47,27 @@ def _prepare_ragged(cache, lens: List[int]) -> None:
             c.prepare(lengths=lens)
 
 
-# The prefill transient an admission keeps room for (activations and attention scores of a prompt being read).
-# LOCALS_PREFILL_RESERVE_GB sets it: a model that nearly fills the GPU limit (a 27B on 24 GB) admits no second
-# request next to a running one with 1.5 GB, though a short prompt needs less.
-PREFILL_RESERVE = int(float(os.environ.get("LOCALS_PREFILL_RESERVE_GB", "1.5")) * (1 << 30))
+# What an admission keeps room for besides KV: each new request's fixed state (Qwen3.5's recurrent layers: 52 MB
+# a request for the 4B, 154 MB for a 27B, which the check did not count: 16 requests at once on a 27B on 24 GB ran
+# Metal out of memory) and reading its prompt. Reading needs memory that is no straight line in the tokens
+# (Qwen3.5-4B: 0.14 GB for 16 tokens, 1.1 GB for 128 to 256, 2.1 GB for 2048), so the engine records what each
+# read needed (_note_read) and keeps room for the most a read of as many tokens or more needed; PREFILL_RESERVE
+# (1.5 GB) until it has seen one. LOCALS_PREFILL_RESERVE_GB keeps a fixed size instead.
+_RESERVE_ENV = os.environ.get("LOCALS_PREFILL_RESERVE_GB")
+PREFILL_RESERVE = int(float(_RESERVE_ENV or "1.5") * (1 << 30))
+_PEAK = [0]  # the highest GPU memory seen before the engine reset MLX's peak counter (peak_memory())
+
+
+def peak_memory() -> int:
+    """The process's peak GPU memory, across the engine's resets of MLX's counter."""
+    return max(_PEAK[0], mx.get_peak_memory())
+
+
+def _reset_peak() -> None:
+    _PEAK[0] = max(_PEAK[0], mx.get_peak_memory())
+    mx.reset_peak_memory()
+
+
 _MEMLOG = bool(os.environ.get("LOCALS_MEMLOG"))  # print GPU memory around each admission
 _MIXLOG = bool(os.environ.get("LOCALS_MIXLOG"))  # print each mixed pass (locals/mixed.py)
 
@@ -380,6 +397,8 @@ class HybridBatchEngine(BatchEngine):
         self.memory_limit = 0
         self._kv_tok = None
         self._kv_layers = 1
+        self._row_bytes = None  # fixed state bytes per request (_row_state)
+        self._reads: Dict[int, int] = {}  # tokens per prefill pass (power of 2) -> most bytes one needed
         self.disk = None  # a DiskPromptCache: system-prompt snapshots kept across restarts
 
     # -- prefill with prefix snapshots -------------------------------------------------
@@ -465,6 +484,62 @@ class HybridBatchEngine(BatchEngine):
             self._kv_tok = self._kv_layers * per * 2
         return self._kv_tok
 
+    def _row_state(self) -> int:
+        """Bytes of the state each request holds whatever its length: every cache layer that is not a growing KV
+        cache (recurrent and convolution state; a sliding window at its full size), measured once on a one-row
+        cache after one token."""
+        if self._row_bytes is None:
+            self._row_bytes = 0
+            try:
+                cache = make_prompt_cache(self.model)
+                self.lm.model(mx.array([[100]]), cache)
+                mx.eval([c.state for c in cache])
+                fixed = 0
+                for c in cache:
+                    if isinstance(c, KVCache):
+                        continue
+                    seen, arrs = set(), []
+                    for group in (getattr(c, "state", ()), getattr(c, "cache", ())):
+                        for a in (group if isinstance(group, (list, tuple)) else [group]):
+                            if isinstance(a, mx.array) and id(a) not in seen:
+                                seen.add(id(a))
+                                arrs.append(a)
+                    n = sum(a.nbytes for a in arrs)
+                    size, k = getattr(c, "max_size", None), getattr(c, "keys", None)
+                    if size and isinstance(k, mx.array) and k.ndim == 4 and k.shape[2]:
+                        n = n * size // k.shape[2]  # a sliding window, at its full size
+                    fixed += n
+                self._row_bytes = fixed
+                if _MEMLOG:
+                    print(f"[mem] fixed state per request {fixed / 1e6:.1f} MB", flush=True)
+            except Exception:  # noqa: BLE001  # a model the probe cannot run: no fixed state counted, as before
+                pass
+        return self._row_bytes
+
+    def _note_read(self, tokens: int, need: int) -> None:
+        """A prefill pass of ``tokens`` tokens (all rows) needed ``need`` bytes above what was in use before it."""
+        b = 16
+        while b < tokens:
+            b *= 2
+        self._reads[b] = max(self._reads.get(b, 0), need)
+
+    def _read_bytes(self, tokens: int) -> int:
+        """Room for reading ``tokens`` prompt tokens: the most a recorded read of as many tokens or more needed,
+        with a sixth more; PREFILL_RESERVE where none was recorded (or LOCALS_PREFILL_RESERVE_GB is set)."""
+        if _RESERVE_ENV:
+            return PREFILL_RESERVE
+        t = min(max(tokens, 1), PREFILL_TOKENS)
+        seen = [v for b, v in self._reads.items() if b >= t]
+        return max(seen) * 7 // 6 if seen else PREFILL_RESERVE
+
+    def _admit_bytes(self, rows: int, tokens: int) -> int:
+        """Memory ``rows`` new requests need besides their KV: each one's fixed state, held 2.2 times over while the
+        batch decodes (Qwen3.5-4B: 14 requests admitted together added 1.68 GB, 120 MB each, against 52 MB of
+        state: the step being computed and the one queued behind it each hold their own), and a first block of KV
+        (256 positions); and reading ``tokens`` of their prompts."""
+        per_row = int(2.2 * self._row_state()) + 256 * self._kv_bytes_per_token()
+        return rows * per_row + self._read_bytes(tokens)
+
     def _merge_tokens(self, rows, new_lens: List[int]) -> int:
         """KV positions that merging new rows (prompt lengths ``new_lens``) into
         the running batch holds at its peak, beyond their own prefill: every row
@@ -487,20 +562,22 @@ class HybridBatchEngine(BatchEngine):
         a prompt-cache entry)."""
         if not self.memory_limit:
             return True
-        need = positions * self._kv_bytes_per_token() + PREFILL_RESERVE
+        need = positions * self._kv_bytes_per_token() + self._admit_bytes(0, PREFILL_TOKENS)
         self._trim_for(lru, need)
         return mx.get_active_memory() + need <= self.memory_limit
 
-    def _fits(self, lru, r, held: int) -> bool:
-        """Whether admitting ``r`` (its whole prompt uncached, at worst) can fit
-        under ``memory_limit`` once the prompt cache is emptied."""
+    def _fits(self, lru, r, held: int, rows: int = 1, tokens: int = 0) -> bool:
+        """Whether admitting ``r`` (its whole prompt uncached, at worst) can fit under ``memory_limit`` once the
+        prompt cache is emptied, with ``rows`` new requests in all (``r`` and those admitted with it) whose
+        prompts, ``tokens`` of them, are read together."""
         if not self.memory_limit:
             return True
         copies = _copies(r)
-        need = (len(r.prompt) * (1 + copies) + held) * self._kv_bytes_per_token() + PREFILL_RESERVE + _replies(r) * self._reply_bytes
+        need = ((len(r.prompt) * (1 + copies) + held) * self._kv_bytes_per_token()
+                + self._admit_bytes(rows, tokens or len(r.prompt)) + _replies(r) * self._reply_bytes)
         return need <= self.memory_limit - (mx.get_active_memory() - (lru.nbytes if lru is not None else 0))
 
-    def _make_room(self, lru, tokens: int, copies: int, held: int) -> None:
+    def _make_room(self, lru, tokens: int, copies: int, held: int, rows: int = 1) -> None:
         """Drop least-valuable prompt-cache entries until an admission fits under
         ``memory_limit``: a Metal out-of-memory error fails every request in
         flight, a cache miss only costs a prefill. The admission needs KV for
@@ -510,7 +587,7 @@ class HybridBatchEngine(BatchEngine):
         PREFILL_SCORES)."""
         if not self.memory_limit or lru is None:
             return
-        self._trim_for(lru, (tokens * (1 + copies) + held) * self._kv_bytes_per_token() + PREFILL_RESERVE)
+        self._trim_for(lru, (tokens * (1 + copies) + held) * self._kv_bytes_per_token() + self._admit_bytes(rows, tokens))
 
     def _trim_for(self, lru, need: int) -> None:
         """Drop prompt-cache entries (least valuable first) until ``need`` more
@@ -592,8 +669,11 @@ class HybridBatchEngine(BatchEngine):
         i = 0
         while i < L:
             n = prefill_chunk(done + i, len(prompts), chunk)
+            a0 = mx.get_active_memory()
+            _reset_peak()
             self.lm.model(x[:, i : i + n], cache)
             mx.eval([c.state for c in cache])
+            self._note_read(len(prompts) * n, mx.get_peak_memory() - a0)
             if i == 0 and n < L:
                 _reserve(cache, base + L)
             i += n
@@ -612,8 +692,11 @@ class HybridBatchEngine(BatchEngine):
         done, i = _cached(cache), 0
         while i < len(toks):
             n = prefill_chunk(done + i, 1, chunk)
+            a0 = mx.get_active_memory()
+            _reset_peak()
             self.lm.model(mx.array([toks[i : i + n]]), cache)
             mx.eval([c.state for c in cache])
+            self._note_read(n, mx.get_peak_memory() - a0)
             if i == 0 and n < len(toks):
                 _reserve(cache, done + len(toks))
             i += n
@@ -1268,7 +1351,7 @@ class HybridBatchEngine(BatchEngine):
                 print(f"[mem] admitted {[len(r.prompt) for r in new]} (cached {[r.cached_tokens for r in new]}): active "
                       f"{mx.get_active_memory() / 1e9:.2f} GB, peak {mx.get_peak_memory() / 1e9:.2f} GB, "
                       f"prompt cache {lru.nbytes / 1e9 if lru is not None else 0:.2f} GB", flush=True)
-                mx.reset_peak_memory()
+                _reset_peak()
             if count:  # (mixed passes count their chunks as they go)
                 self.counters["prefill_tokens"] += sum(len(r.prompt) - 1 - getattr(r, "cached_tokens", 0) for r in new)
             gn = mx.array([self._gstate(r) for r in new], dtype=mx.int32)
@@ -1364,7 +1447,8 @@ class HybridBatchEngine(BatchEngine):
                 while queue and len(rows) + len(filling) + len(new) < self.n_slots:
                     # a request that would not fit next to the running rows waits for one to finish
                     held0 = self._merge_tokens(rows, [len(e["r"].prompt) for e in filling] + [len(q.prompt) for q in new + [queue[0]]])
-                    if (rows or new or filling) and not self._fits(lru, queue[0], held0 + sum(len(q.prompt) for q in new)):
+                    if (rows or new or filling) and not self._fits(lru, queue[0], held0 + sum(len(q.prompt) for q in new),
+                                                                   rows=len(new) + 1, tokens=sum(len(q.prompt) for q in new + [queue[0]])):
                         self.counters["deferred"] = self.counters.get("deferred", 0) + 1
                         break
                     new.append(queue.pop(0))
@@ -1373,7 +1457,7 @@ class HybridBatchEngine(BatchEngine):
                     if _MEMLOG:
                         print(f"[mem] before admission: active {mx.get_active_memory() / 1e9:.2f} GB, peak since last "
                               f"{mx.get_peak_memory() / 1e9:.2f} GB, rows {len(rows)}", flush=True)
-                        mx.reset_peak_memory()
+                        _reset_peak()
                     starts = []
                     found = []
                     for r in new:  # every cached prefix first: making room for one must not drop the next one's
@@ -1386,7 +1470,8 @@ class HybridBatchEngine(BatchEngine):
                     self._make_room(lru, sum(len(r.prompt) + len(rest) * _copies(r)
                                              + _replies(r) * self._reply_bytes // max(1, self._kv_bytes_per_token())
                                              for r, (_, rest) in zip(new, found)), 0,
-                                    self._merge_tokens(rows, [len(e["r"].prompt) for e in filling] + [len(r.prompt) for r in new]))
+                                    self._merge_tokens(rows, [len(e["r"].prompt) for e in filling] + [len(r.prompt) for r in new]),
+                                    rows=len(new))
                     if self._mix_ok and rows and sum(len(rest) for _, rest in found) > self.mix_chunk:
                         # the running rows decode on while these prompts are prefilled, a chunk in each step. Prompts
                         # that fit one pass are prefilled together at once instead: the rows would get a single token

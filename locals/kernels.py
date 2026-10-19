@@ -403,10 +403,47 @@ def _eligible(x: mx.array, mod) -> bool:
     return MIN_M <= M <= MAX_M and x.dtype in (mx.float16, mx.bfloat16)
 
 
+_PAD: dict = {}  # (N, K, M, dtype) -> the rows M rows of this shape are computed at (_pad_rows)
+
+
+def _pad_rows(N: int, K: int, M: int, dt: str) -> int:
+    """The rows to compute M rows of this layer shape at: up to 2M rows where the tuned timings say the chosen
+    kernel there is at least 7% faster. On an M5 Pro a Qwen3.5-4B decode step took 32.5 ms at 12 rows and 29.8 ms
+    at 16 (9B: 64.9 and 55.5): there MLX switches to another kernel between them. On an M2 Pro no larger size is
+    more than 3% faster, so nothing is padded. Needs the timings tuning keeps; ``LOCALS_PAD_ROWS=0`` never pads."""
+    hit = _PAD.get((N, K, M, dt))
+    if hit is not None:
+        return hit
+    best = M
+    if _os.environ.get("LOCALS_PAD_ROWS", "1") != "0":
+        tune = _load_tune()
+        times = tune.get("__times__", {})
+
+        def t(m):
+            k = f"{N}x{K}x{m}" + ("" if dt == "float16" else f"x{dt}")
+            c, tt = tune.get(k), times.get(k)
+            return tt.get(c[0], tt.get("mlx")) if c is not None and tt else None
+
+        tm = t(M)
+        if tm:
+            for m2 in range(M + 1, min(MAX_M, 2 * M) + 1):
+                t2 = t(m2)
+                if t2 and t2 < 0.93 * tm and (best == M or t2 < t(best)):
+                    best = m2
+    _PAD[(N, K, M, dt)] = best
+    return best
+
+
 def _small_matmul(x, mod):
     shape = x.shape
     x2 = x.reshape(-1, shape[-1])
-    y = _run(_choose(x2, mod), x2, mod)
+    M, K = x2.shape
+    P = _pad_rows(mod["weight"].shape[0], K, M, str(x2.dtype).split(".")[-1])
+    if P > M:  # more rows run faster on this GPU: compute them, keep these
+        xp = mx.concatenate([x2, mx.zeros((P - M, K), x2.dtype)])
+        y = _run(_choose(xp, mod), xp, mod)[:M]
+    else:
+        y = _run(_choose(x2, mod), x2, mod)
     return y.reshape(*shape[:-1], y.shape[-1])
 
 
@@ -928,6 +965,10 @@ def tune_report(model) -> str:
             out.append(f"{M:4d}  (not timed here)")
             continue
         note = "" if timed == sum(shapes.values()) else f", {timed} of {sum(shapes.values())} layers timed"
+        pads = Counter(_pad_rows(N, K, M, dt) for (N, K, dt), n in shapes.items() for _ in range(n))
+        pads.pop(M, None)
+        if pads:
+            note += "; computed at " + ", ".join(f"{m} rows ({k} layers)" for m, k in sorted(pads.items()))
         out.append(f"{M:4d}  {t_mlx / 1e3:9.2f} ms  {t_ch / 1e3:6.2f} ms  {t_mlx / t_ch:6.2f}x  {t_own / 1e3:9.2f} ms "
                    f"({t_mlx / t_own:.2f}x)    " + ", ".join(f"{f} {k}" for f, k in fams.most_common()) + note)
     out += ["", f"reading prompts ({PREFILL_TUNE_M} rows): MLX's quantized GEMM against dequantize + dense GEMM"]

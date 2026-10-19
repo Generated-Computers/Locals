@@ -172,7 +172,7 @@ According to the code's comments, `copy.deepcopy` of a cache does not duplicate 
 |---|---|---|
 | GPU limit | `mx.device_info()["max_recommended_working_set_size"]` | Depends on the Mac. |
 | MLX pool of freed buffers | `mx.set_cache_limit(1 << 30)` | 1 GiB. By default MLX keeps up to the whole memory limit. |
-| `memory_limit` | `limit - (5 << 29)` | The limit minus 2.5 GiB: 1 GiB for the pool, and 1.5 GiB for what the admission estimate misses (five concurrent agents peaked 1.1 GB above it on a 16 GB Mac). |
+| `memory_limit` | `limit - 1.5 GiB` | The limit minus 1.5 GiB (`LOCALS_MEMORY_MARGIN_GB`): 1 GiB for the pool, and 0.5 GiB for what the admission estimate misses, now that it counts each request's fixed state and what reading a prompt takes (see [Batch engine](../engine/README.md)). |
 | `weights_bytes` | `mx.get_active_memory()` right after `Runtime.load` | |
 | KV bytes per token | `_kv_bytes_per_token()` | (number of `KVCache` layers) × (2 × KV heads × `head_dim`, raised to the widest `k_proj` + `v_proj` output) × 2 bytes. The widest-projection rule exists because Gemma 4's full-attention layers have 512-wide heads where the config says 256. Recurrent state has a fixed size and is not counted. Qwen3.5-4B: 32 KB per token. |
 | `context_fit()` | `(memory_limit - weights_bytes - (3 << 29)) // kv`, rounded down to a multiple of 1024 | The 1.5 GiB is a prefill's activations. Qwen3.5-4B on a 16 GB Mac: 145,408 tokens. |

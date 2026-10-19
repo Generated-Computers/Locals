@@ -282,7 +282,9 @@ class Server:
 
         import mlx.core as mx
 
-        mem = {"gpu_active_mb": mx.get_active_memory() / 1e6, "gpu_peak_mb": mx.get_peak_memory() / 1e6,
+        from .hybrid_batch import peak_memory
+
+        mem = {"gpu_active_mb": mx.get_active_memory() / 1e6, "gpu_peak_mb": peak_memory() / 1e6,
                "gpu_cache_mb": mx.get_cache_memory() / 1e6, "rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6}
         out = {"model": self.model_id, "uptime_s": time.time() - self.t_start, "requests": self.requests, "errors": self.errors,
                "active": list(self._active.values()), "memory": mem, "engines": {}}

@@ -80,4 +80,7 @@ First public release.
   longer writes a new file named after a sentence of the model's reply;
   several Gemma 4 requests at once with prompts longer than 512 tokens no
   longer get empty or wrong replies; eight or more requests at once no longer
-  get "Connection reset by peer" on macOS 27.
+  get "Connection reset by peer" on macOS 27; a model that nearly fills the
+  Mac's memory (a 27B on 24 GB) runs several requests at once instead of one at
+  a time, without running out of memory with sixteen: each request's own state
+  is counted, and the room kept for reading a prompt is what reading one took.

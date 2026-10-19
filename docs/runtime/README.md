@@ -245,7 +245,7 @@ When `tune_model` returns with `_DEFER` set, the service builds `kernels.pending
   4. If there is no readable user cache (none, or one just renamed to `.bad`) and the preset is non-empty, the preset is written out as the user cache. Later writes also save the merged preset + user dictionary.
 - **Writes** (`_save_tune`) replace the whole file atomically, via a temporary file and `os.replace`. Writes and tuning both take `_TUNE_LOCK`, an `RLock`, because the server runs two engines (`kernels.py:161`, `kernels.py:201-219`).
 - **Format:** a JSON object. Shape keys (`"2560x10240x4"`, `"…x4xbfloat16"`) map to choice lists such as `["frag", 2, 2, 1]`. `"…xP"` keys hold the prompt-reading choice (`["dense"]` or `["mlx"]`). `"__times__"` holds what tuning measured, per shape key and family in microseconds, which `locals tune --report` (`tune_report`) sums per batch size. `"…|family"` keys hold per-family winners. `"__model_tuned_pipe__…"` keys hold lists of finished row counts. Keys that start with `__` are kept as they are, and all others are read as tuples (`kernels.py:164-166`).
-- **Presets:** `locals/presets/tune_v6_applegpu_g14s.json` is the one preset shipped. It is packaged through `[tool.setuptools.package-data]` (`pyproject.toml:58-59`). Setting `LOCALS_NO_PRESET=1` hides presets, so a start behaves as on a GPU without one (`kernels.py:145-156`).
+- **Presets:** `locals/presets/tune_v6_applegpu_g14s.json` (M2 Pro and M2 Max) and `tune_v6_applegpu_g17s.json` (M5 Pro: so far only how prompts are read, measured on one for Qwen3.5-4B and 9B) are shipped. It is packaged through `[tool.setuptools.package-data]` (`pyproject.toml:58-59`). Setting `LOCALS_NO_PRESET=1` hides presets, so a start behaves as on a GPU without one (`kernels.py:145-156`).
 
 To re-tune from scratch, delete the cache file (or point `LOCALS_TUNE_CACHE` at a new path) and set `LOCALS_NO_PRESET=1`.
 
@@ -307,6 +307,7 @@ To re-tune from scratch, delete the cache file (or point `LOCALS_TUNE_CACHE` at 
 | `LOCALS_KERNELS` | `1` | `0`: MLX's matmul kernels for few rows (no tuned kernels) |
 | `LOCALS_GDN_KERNEL` | `1` | `0`: mlx-lm's Gated DeltaNet decode instead of `gdn_kernel.py` (`fuse.USE_GDN_KERNEL`) |
 | `LOCALS_DENSE_PREFILL` | timed | `1`: prompts always through dequantize + dense GEMM; `0`: through MLX's quantized GEMM |
+| `LOCALS_PAD_ROWS` | `1` | `0`: never compute a small batch at more rows (`_pad_rows`: where the tuned timings show a larger size, up to twice the rows, at least 7% faster, as on an M5 Pro at 9 to 15 rows) |
 
 ## Code switches
 
