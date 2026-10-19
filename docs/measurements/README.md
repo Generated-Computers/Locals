@@ -203,6 +203,91 @@ could begin with the end of turn (with 4 or 8 requests at once, 6 of 36 replies
 came back empty; none when each prompt was sent alone). The numbers above are
 after the fix.
 
+## Against llama.cpp
+
+The same client and prompts against llama.cpp's own server (`llama-server` from
+the official macOS build `b11724`) on the same M2 Pro, running the GGUF files
+Ollama downloaded above (`qwen3.5:4b-q4_K_M`, Q4_K_M, and `gemma4:e4b-it-qat`,
+Q4_0), with `-ngl 99 -fa on -np 8 -c 32768` (`-c 81920` for 8,000-token prompts)
+and `--chat-template-kwargs '{"enable_thinking": false}'`. Its speculative
+decoding options were left at their defaults (off); Locals' drafting is on by
+default. Locals ran again in the same session, right after llama.cpp, on 19
+October 2026 (commit `ca0306e`); its numbers matched the day before's within about 1%.
+llama.cpp supports `ignore_eos`, so Qwen3.5-4B also ran with replies of a fixed
+length, every reply as long on both servers.
+
+### Qwen3.5-4B, 1,000 tokens in, replies of natural length
+
+| Requests at once | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| First token, Locals | 1.4 s | 1.5 s | 1.4 s | 1.6 s |
+| First token, llama.cpp | 1.7 s | 1.8 s | 2.1 s | 2.1 s |
+| Time per token, Locals | 16 ms | 19 ms | 37 ms | 59 ms |
+| Time per token, llama.cpp | 21 ms | 43 ms | 76 ms | 85 ms |
+| Tokens/s (reply length), Locals | 47 (259) | 79 (387) | 86 (360) | 110 (325) |
+| Tokens/s (reply length), llama.cpp | 43 (507) | 44 (456) | 46 (546) | 71 (383) |
+
+### Qwen3.5-4B, 1,000 tokens in, replies of 820 to 1,024 tokens
+
+| Requests at once | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| Tokens/s, Locals | 86 | 97 | 123 | 174 |
+| Tokens/s, llama.cpp | 44 | 43 | 46 | 117 |
+| First token, Locals | 1.4 s | 1.5 s | 1.5 s | 1.7 s |
+| First token, llama.cpp | 1.8 s | 1.8 s | 2.1 s | 0.9 s |
+
+With one request, Locals' 86 tokens per second come partly from its drafts: past
+the end of a reply that `ignore_eos` skips, the model repeats itself, and drafts
+taken from earlier text are accepted. The natural-length table is the fair one
+for a single request (47 against 43). From 2 requests on, both run batches, and
+llama.cpp gains little until 8 requests on this model.
+
+### Qwen3.5-4B, 8,000 tokens in
+
+| Requests at once | 1 | 4 |
+|---|---|---|
+| First token, Locals | 11.0 s | 12.6 s |
+| First token, llama.cpp | 13.5 s | 19.0 s |
+| Time per token, Locals | 18 ms | 77 ms |
+| Time per token, llama.cpp | 22 ms | 139 ms |
+| Tokens/s (reply length), Locals | 18 (282) | 30 (470) |
+| Tokens/s (reply length), llama.cpp | 24 (534) | 20 (404) |
+
+### Gemma 4 E4B, 1,000 tokens in
+
+| Requests at once | 1 | 4 | 8 |
+|---|---|---|---|
+| First token, Locals | 1.0 s | 0.9 s | 1.1 s |
+| First token, llama.cpp | 1.6 s | 1.8 s | 1.9 s |
+| Time per token, Locals | 19 ms | 39 ms | 61 ms |
+| Time per token, llama.cpp | 21 ms | 80 ms | 88 ms |
+| Tokens/s (reply length), Locals | 41 (188) | 81 (225) | 107 (210) |
+| Tokens/s (reply length), llama.cpp | 35 (169) | 39 (171) | 67 (246) |
+
+llama.cpp's Gemma numbers match Ollama's above (35.2 tokens/s with one request,
+the same 676 tokens in all): the same model file, and Ollama runs Gemma on
+llama.cpp's code.
+
+### One request at a time
+
+The requests of [Against mlx-lm's own server](#against-mlx-lms-own-server), with
+llama.cpp started with `-np 1 -c 65536`:
+
+| Request | llama.cpp | Locals |
+|---|---|---|
+| Rewrite a 100-line Python file with one rename (689 tokens back) | 48 tokens/s | 153 tokens/s |
+| OpenCode's first request (its system prompt and tools), cold | first token 13.4 s | 11.9 s |
+| A question about a 48,614-token document | 129 s | 101 s |
+| Its follow-up | 0.5 s | 0.7 s |
+
+Both answer a follow-up from their prompt cache; llama.cpp's is a little quicker
+here. llama.cpp keeps no prompts across a restart unless `--slot-save-path` is
+set and a client saves its slots; Locals keeps system prompts on disk (1.7 s for
+OpenCode's first request after a restart, above). The rewrite was 128 tokens per
+second on Locals the day before, against mlx-lm's server measured with it: this
+Mac's speed varies from day to day, so only rows measured in one session are
+compared.
+
 ## Against mlx-lm's own server
 
 The same requests to mlx-lm's server (`python -m mlx_lm server`, mlx-lm 0.32.2,

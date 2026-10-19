@@ -76,16 +76,20 @@ at work, after a restart, and in long conversations:
 
 With 1, 2, 4, 8 and 16 requests at once, Locals writes 64, 116, 160, 271 and 341
 tokens per second, and mlx-lm 61, 82, 87, 87 and 157; a plain answer alone, with
-nothing to reuse, comes at about the same speed. A token is roughly a word piece.
-Ollama answers this model one request at a time, so the eighth waits for the other
-seven; Magnitude's first word came after 16 s. A file rewrite is faster even alone
-because the reply repeats the file, and Locals checks pieces of it taken from the
-prompt in the same pass as the next word. After a restart, Locals reads the
-agent's long system prompt from disk instead of again. On an M2 Max with 96 GB,
-eight requests at once get 403 tokens per second from Locals and 152 from mlx-lm,
-and bigger models gain more: 3.0x for Qwen3.5-9B and 3.1x for a 27B model. How
+nothing to reuse, comes at about the same speed. A token is roughly a word
+piece. Ollama answers this model one request at a time, so the eighth waits for
+the other seven; Magnitude's first word came after 16 s. llama.cpp, running the
+same model file as Ollama, writes 71 tokens per second with eight requests at
+once where Locals writes 110, and 48 where Locals writes 153 for one agent
+rewriting a file. A file rewrite is faster even alone because the reply repeats
+the file, and Locals checks pieces of it taken from the prompt in the same pass
+as the next word. After a restart, Locals reads the agent's long system prompt
+from disk instead of again. On an M2 Max with 96 GB, eight requests at once get
+403 tokens per second from Locals and 152 from mlx-lm, and bigger models gain
+more: 3.0x for Qwen3.5-9B and 3.1x for a 27B model. How
 each number was measured:
 [Ollama and Magnitude](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md#against-ollama-and-magnitude),
+[llama.cpp](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md#against-llamacpp),
 [mlx-lm's own server](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md#against-mlx-lms-own-server),
 [the M2 Max](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/m2-max.md).
 
