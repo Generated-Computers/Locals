@@ -150,7 +150,7 @@ The stock engine applies llguidance's mask on the CPU for each row and step. See
 **Memory.** Admission control and a growth guard keep the batch, the prompt
 cache and prefill within the GPU's memory, so many agents with long prompts do
 not end in an out-of-memory error that fails every request in flight. The
-context limit is sized from the memory as well (about 145,000 tokens for
+context limit is sized from the memory as well (about 178,000 tokens for
 Qwen3.5-4B on 16 GB).
 
 ## Where Locals is not faster

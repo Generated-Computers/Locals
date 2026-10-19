@@ -109,6 +109,15 @@ USE_GDN_KERNEL = os.environ.get("LOCALS_GDN_KERNEL", "1") != "0"  # one fused Me
 _GDN_MAX_S = 4  # longer passes (drafts) take the kernel too when per-token states are wanted; see below
 
 
+def _fast_gdn(layer, dtype, S: int) -> bool:
+    from .kernels import gdn_fast
+
+    try:
+        return gdn_fast(layer.num_k_heads, layer.num_v_heads, layer.head_k_dim, layer.head_v_dim, dtype, S)
+    except Exception:  # noqa: BLE001  # (an MLX without the op, or a shape it refuses: mlx-lm's kernel)
+        return False
+
+
 class FusedGatedDeltaNet(nn.Module):
     """Qwen3.5 GatedDeltaNet with in_proj_{qkv,z,b,a} as one matmul, and the
     whole single-token step after it as one kernel."""
@@ -187,7 +196,16 @@ class FusedGatedDeltaNet(nn.Module):
         eps = 1e-6 * inv_scale**2
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
         k = inv_scale * mx.fast.rms_norm(k, None, eps)
-        out, state = gated_delta_update(q, k, vv, a, b, self.A_log, self.dt_bias, state, mask, use_kernel=not self.training)
+        if (mask is None and not self.training and S > _GDN_MAX_S and getattr(cache, "lengths", None) is None
+                and _fast_gdn(self, q.dtype, S)):
+            # an unpadded prompt: MLX's chunked op where it is faster on this GPU (kernels.gdn_fast)
+            from mlx_lm.models.gated_delta import compute_g
+
+            if state is None:
+                state = mx.zeros((B, self.num_v_heads, self.head_v_dim, self.head_k_dim), dtype=mx.float32)
+            out, state = mx.fast.gated_delta_update(q, k, vv, compute_g(self.A_log, a, self.dt_bias), mx.sigmoid(b), state, None)
+        else:
+            out, state = gated_delta_update(q, k, vv, a, b, self.A_log, self.dt_bias, state, mask, use_kernel=not self.training)
         if cache is not None:
             cache[1] = state
             cache.advance(S)

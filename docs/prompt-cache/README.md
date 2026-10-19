@@ -171,11 +171,11 @@ According to the code's comments, `copy.deepcopy` of a cache does not duplicate 
 | Quantity | Code | Value |
 |---|---|---|
 | GPU limit | `mx.device_info()["max_recommended_working_set_size"]` | Depends on the Mac. |
-| MLX pool of freed buffers | `mx.set_cache_limit(1 << 30)` | 1 GiB. By default MLX keeps up to the whole memory limit. |
-| `memory_limit` | `limit - 1.5 GiB` | The limit minus 1.5 GiB (`LOCALS_MEMORY_MARGIN_GB`): 1 GiB for the pool, and 0.5 GiB for what the admission estimate misses, now that it counts each request's fixed state and what reading a prompt takes (see [Batch engine](../engine/README.md)). |
+| MLX pool of freed buffers | `mx.set_cache_limit` (`service.memory_plan`) | 1 GiB, or an eighth of what the weights leave when that is under 8 GiB (at least 256 MiB). By default MLX keeps up to the whole memory limit. |
+| `memory_limit` | `limit - margin` | The limit minus the pool and 0.5 GiB for what the admission estimate misses, now that it counts each request's fixed state and what reading a prompt takes (see [Batch engine](../engine/README.md)): 1.5 GiB for a 4B on 16 GB. `LOCALS_MEMORY_MARGIN_GB` sets the margin. |
 | `weights_bytes` | `mx.get_active_memory()` right after `Runtime.load` | |
 | KV bytes per token | `_kv_bytes_per_token()` | (number of `KVCache` layers) × (2 × KV heads × `head_dim`, raised to the widest `k_proj` + `v_proj` output) × 2 bytes. The widest-projection rule exists because Gemma 4's full-attention layers have 512-wide heads where the config says 256. Recurrent state has a fixed size and is not counted. Qwen3.5-4B: 32 KB per token. |
-| `context_fit()` | `(memory_limit - weights_bytes - (3 << 29)) // kv`, rounded down to a multiple of 1024 | The 1.5 GiB is a prefill's activations. Qwen3.5-4B on a 16 GB Mac: 145,408 tokens. |
+| `context_fit()` | `(memory_limit - weights_bytes - (3 << 29)) // kv`, rounded down to a multiple of 1024 | The 1.5 GiB is a prefill's activations. Qwen3.5-4B on a 16 GB Mac: 178,176 tokens (145,408 while the margin was 2.5 GiB). |
 | `max_context` | `--max-context`. Without it, 65,536 is raised to `context_fit()` once the engine loads (`_cap_context`), then capped at the model's own context length. | A prompt of `max_context` tokens or more gets `ContextTooLong`. So does one that leaves fewer than `min(max_tokens, 256)` tokens for the reply. The stock `mlx` engine keeps 65,536, because it has no memory guard. |
 | `cache_bytes` | `--cache-gb`. Without it, `min(max(free, longest, 1.5 GiB), 16 GiB)`, where `free = limit - active - 5 GiB` and `longest = context_fit() * kv`. | Room for one conversation as long as fits (`longest`), up to the 16 GiB cap, so its follow-up can continue from it. |
 

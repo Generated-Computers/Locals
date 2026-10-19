@@ -209,10 +209,29 @@ def _filter(cache, idx) -> None:
 
 
 def _append_rows(cache, merged) -> None:
-    """Append newly prefilled rows to the batch cache, one layer at a time (as _filter)."""
-    for a, b in zip(cache, merged):
-        a.extend(b)
+    """Append newly prefilled rows to the batch cache, one layer at a time (as _filter), each of ``merged``'s
+    layers released once copied."""
+    for i, a in enumerate(cache):
+        a.extend(merged[i])
         _eval_layer(a)
+        merged[i] = None
+
+
+def _merge_layerwise(caches) -> list:
+    """One batch cache of several requests' own caches (lists), a layer at a time, each request's layer released
+    (set to None) once copied: merged whole, every request's cache and its copy existed at once, and three
+    26.7k-token prompts joining at once took a 4B on a 16 GB Mac to 12.6 GB, past the GPU's limit."""
+    out = []
+    for i in range(len(caches[0])):
+        layer = caches[0][i].merge([c[i] for c in caches])
+        if isinstance(layer, ArraysCache):
+            layer.left_padding = None  # (as _prefill_batch: a merge of empty caches sets zeros, which mask out lengths)
+        _eval_layer(layer)
+        for c in caches:
+            if isinstance(c, list):
+                c[i] = None
+        out.append(layer)
+    return out
 
 
 _GROWTH_TRIM = os.environ.get("LOCALS_GROWTH_TRIM", "1") != "0"
@@ -536,7 +555,8 @@ class HybridBatchEngine(BatchEngine):
         """Memory ``rows`` new requests need besides their KV: each one's fixed state, held 2.2 times over while the
         batch decodes (Qwen3.5-4B: 14 requests admitted together added 1.68 GB, 120 MB each, against 52 MB of
         state: the step being computed and the one queued behind it each hold their own), and a first block of KV
-        (256 positions); and reading ``tokens`` of their prompts."""
+        (256 positions); and reading ``tokens`` of their prompts. Measured at the admission instead, the cost read
+        52 MB a request (no step in flight yet: half of what decoding holds), so it is not learned there."""
         per_row = int(2.2 * self._row_state()) + 256 * self._kv_bytes_per_token()
         return rows * per_row + self._read_bytes(tokens)
 
@@ -616,8 +636,11 @@ class HybridBatchEngine(BatchEngine):
 
     def _prefill_batch(self, prompts: List[List[int]], others: List[List[int]], chunk: int = 1024, starts=None, stop=None):
         """Prefill several prompts in one right-padded batch; returns a batch
-        cache. ``starts[i]``, if given, is a (cache, remaining tokens) pair.
+        cache. ``starts[i]``, if given, is a (cache, remaining tokens) pair; the
+        list is emptied once its caches are merged (the caller hands them over:
+        held there too, every prompt's KV existed twice at the join).
         ``stop()``, asked between chunks: true gives up the prefill (returns None)."""
+        given = starts
         caches, rests = [], []
         for i, p in enumerate(prompts):
             if starts is not None and starts[i] is not None:
@@ -635,7 +658,10 @@ class HybridBatchEngine(BatchEngine):
             if sub is None:
                 return None
             done_rows = {i: [c.extract(j) for c in sub] for j, i in enumerate(busy)}
-            cache = _merge([done_rows.get(i, caches[i]) for i in range(len(caches))])
+            del sub
+            cache = _merge_layerwise([done_rows.get(i, caches[i]) for i in range(len(caches))])
+            if given is not None:
+                given.clear()
             for c in cache:
                 if isinstance(c, ArraysCache):
                     c.left_padding = None
@@ -651,7 +677,9 @@ class HybridBatchEngine(BatchEngine):
             _reserve(caches[0], _cached(caches[0]) + L)
             cache = [_wrap_one(c) if isinstance(c, KVCache) else c.merge([c]) for c in caches[0]]
         else:
-            cache = _merge(starts)
+            cache = _merge_layerwise(starts)
+        if given is not None:
+            given.clear()
         del caches, starts
         for c in cache:
             if isinstance(c, ArraysCache):
@@ -1427,11 +1455,12 @@ class HybridBatchEngine(BatchEngine):
                 if filling and not rows:  # no rows decode alongside any more: the rest of the prompts at once
                     tp = time.perf_counter()
                     ready, filling[:] = list(filling), []
+                    self._fill_eval = []
                     self.counters["prefill_tokens"] += sum(e["end"] - e["pos"] for e in ready)  # mixed passes counted the rest
                     for e in ready:
                         self._fill_checkpoints(e, lru, lru_key)
                     attach([e["r"] for e in ready], self._prefill_batch(
-                        [e["r"].prompt[:-1] for e in ready], [], starts=[(e["cache"], list(e["r"].prompt[e["pos"]:e["end"]])) for e in ready]),
+                        [e["r"].prompt[:-1] for e in ready], [], starts=[(e.pop("cache"), list(e["r"].prompt[e["pos"]:e["end"]])) for e in ready]),
                         tp, count=False)
                     del ready
                 # a for-loop variable outlives its loop: it would hold a cancelled or joined request's cache
@@ -1440,8 +1469,9 @@ class HybridBatchEngine(BatchEngine):
                     tp = time.perf_counter()
                     ready = [e for e in filling if e["pos"] >= e["end"]]
                     filling[:] = [e for e in filling if e["pos"] < e["end"]]
+                    self._fill_eval = []  # (it holds the last-read prompt's arrays; the next step sets it again)
                     attach([e["r"] for e in ready], self._prefill_batch(
-                        [e["r"].prompt[:-1] for e in ready], [], starts=[(e["cache"], []) for e in ready]), tp, count=False)
+                        [e["r"].prompt[:-1] for e in ready], [], starts=[(e.pop("cache"), []) for e in ready]), tp, count=False)
                     del ready
                 new = []
                 while queue and len(rows) + len(filling) + len(new) < self.n_slots:
@@ -1515,6 +1545,7 @@ class HybridBatchEngine(BatchEngine):
                             done, rest = cp, list(r.prompt[cp:-1])
                         starts.append((c0, rest) if c0 is not None else None)
                     merged = None
+                    found = c0 = rest = None  # (the caches are handed to the prefill in starts)
                     if new and not left_all():
                         merged = self._prefill_batch([r.prompt[:-1] for r in new], [q.prompt[:-1] for q in queue], starts=starts,
                                                      stop=left_all)

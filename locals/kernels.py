@@ -409,13 +409,17 @@ _PAD: dict = {}  # (N, K, M, dtype) -> the rows M rows of this shape are compute
 def _pad_rows(N: int, K: int, M: int, dt: str) -> int:
     """The rows to compute M rows of this layer shape at: up to 2M rows where the tuned timings say the chosen
     kernel there is at least 7% faster. On an M5 Pro a Qwen3.5-4B decode step took 32.5 ms at 12 rows and 29.8 ms
-    at 16 (9B: 64.9 and 55.5): there MLX switches to another kernel between them. On an M2 Pro no larger size is
-    more than 3% faster, so nothing is padded. Needs the timings tuning keeps; ``LOCALS_PAD_ROWS=0`` never pads."""
+    at 16 (9B: 64.9 and 55.5): there MLX switches to another kernel between them, and 12 requests padded to 16 ran
+    10-13% faster end to end (9B: 19-20%). On an M2 Pro no larger size is more than 3% faster, so nothing is
+    padded. Below 8 rows the same timings also padded 2 rows to 3 and 4 to 5 on some layers, by gains no request
+    has shown, so batches of fewer than 8 stay as they are unless ``LOCALS_PAD_ROWS=all``. Needs the timings
+    tuning keeps; ``LOCALS_PAD_ROWS=0`` never pads."""
     hit = _PAD.get((N, K, M, dt))
     if hit is not None:
         return hit
     best = M
-    if _os.environ.get("LOCALS_PAD_ROWS", "1") != "0":
+    mode = _os.environ.get("LOCALS_PAD_ROWS", "1")
+    if mode != "0" and (M >= 8 or mode == "all"):
         tune = _load_tune()
         times = tune.get("__times__", {})
 
@@ -534,6 +538,104 @@ def _dense_prefill(mod, dtype) -> bool:
         if (N, K, dt) not in _DENSE:
             _tune_prefill(mod, N, K, dtype, key, tune)
         return _DENSE[(N, K, dt)]
+
+
+GDN_SIZES = (512, 2048)  # prompt tokens per pass the recurrent-layer choice is timed at (whole model)
+_GDN: dict = {}  # (Hk, Hv, Dk, Dv, dtype, size) -> True: MLX's mx.fast.gated_delta_update
+_GDN_FORCE = None  # while timing the whole model: True / False for every layer
+
+
+def _gdn_size(S: int) -> int:
+    return GDN_SIZES[-1] if S >= 1024 else GDN_SIZES[0]
+
+
+def _gdn_key(Hk, Hv, Dk, Dv, dt, size) -> str:
+    return f"GDN{Hk}x{Hv}x{Dk}x{Dv}xT{size}" + ("" if dt == "float16" else f"x{dt}")
+
+
+def gdn_fast(Hk: int, Hv: int, Dk: int, Dv: int, dtype, S: int) -> bool:
+    """Whether a Gated DeltaNet layer (Qwen3.5) reads ``S`` prompt tokens, unpadded, with MLX's built-in
+    mx.fast.gated_delta_update (a chunked algorithm of matrix products, with a version for the M5's neural
+    accelerators) rather than mlx-lm's step-by-step kernel. Chosen by timing the whole model reading a
+    prompt (gdn_model_tune, in locals tune): timed alone, the op is 1.3-1.9x faster on an M2 Pro, yet
+    inside the 4B reading 4,096 and 8,192 tokens it was 0.94x and 0.93x. Untimed: mlx-lm's kernel. With
+    padding (a mask) the op is 12-50x slower and never used. ``LOCALS_GDN_FAST``: 1 always, 0 never."""
+    if _GDN_FORCE is not None:
+        return _GDN_FORCE
+    dt = str(dtype).split(".")[-1]
+    size = _gdn_size(S)
+    hit = _GDN.get((Hk, Hv, Dk, Dv, dt, size))
+    if hit is not None:
+        return hit
+    force = _os.environ.get("LOCALS_GDN_FAST")
+    if force in ("0", "1"):
+        fast = force == "1" and hasattr(mx.fast, "gated_delta_update")
+    else:
+        c = _load_tune().get(_gdn_key(Hk, Hv, Dk, Dv, dt, size))
+        fast = c is not None and c[0] == "fast"
+    _GDN[(Hk, Hv, Dk, Dv, dt, size)] = fast
+    return fast
+
+
+def gdn_model_tune(model, log=None) -> dict:
+    """Time ``model`` reading 512- and 2,048-token prompts with mlx-lm's recurrent kernel and with MLX's op,
+    best of two runs each, and keep the op where it is at least 3% faster. Returns {size: (kernel s, op s)}."""
+    global _GDN_FORCE
+    layers = _gdn_layers(model)
+    if not layers or not hasattr(mx.fast, "gated_delta_update"):
+        return {}
+    tune = _load_tune()
+    keys = {T: [_gdn_key(Hk, Hv, Dk, Dv, str(dt).split(".")[-1], T) for _, Hk, Hv, Dk, Dv, dt in layers] for T in GDN_SIZES}
+    if all(k in tune for ks in keys.values() for k in ks):
+        return {}
+    from mlx_lm.models.cache import make_prompt_cache
+
+    lm = text_model(model)
+    body = getattr(lm, "model", None)
+    if body is None:
+        return {}
+    res = {}
+    try:
+        for T in GDN_SIZES:
+            x = mx.array([[(i * 7919) % 20000 + 100 for i in range(T)]])
+            best = {}
+            for _ in range(2):
+                for fast in (False, True):
+                    _GDN_FORCE = fast
+                    cache = make_prompt_cache(lm)
+                    mx.eval(body(x[:, :16], cache))  # (compiled and warm)
+                    mx.synchronize()
+                    t0 = _time.perf_counter()
+                    mx.eval(body(x, make_prompt_cache(lm)))
+                    mx.synchronize()
+                    best[fast] = min(best.get(fast, float("inf")), _time.perf_counter() - t0)
+            res[T] = (best[False], best[True])
+            for k in keys[T]:
+                tune[k] = ("fast",) if best[True] < 0.97 * best[False] else ("kernel",)
+                tune.setdefault("__times__", {})[k] = {"kernel": round(best[False] * 1e6, 1), "fast": round(best[True] * 1e6, 1)}
+    finally:
+        _GDN_FORCE = None
+        _GDN.clear()
+    _save_tune()
+    if log:
+        log("locals: prompt reading in the recurrent layers: " + ", ".join(
+            f"{T} tokens {k * 1e3:.0f} ms with mlx-lm's kernel, {f * 1e3:.0f} ms with MLX's op" for T, (k, f) in res.items()))
+    return res
+
+
+def _gdn_layers(model) -> list:
+    """(layer, Hk, Hv, Dk, Dv, dtype) for each distinct Gated DeltaNet shape of ``model``."""
+    seen, out = set(), []
+    for _, m in model.named_modules():
+        if hasattr(m, "num_v_heads") and hasattr(m, "head_k_dim") and hasattr(m, "A_log"):
+            dims = (m.num_k_heads, m.num_v_heads, m.head_k_dim, m.head_v_dim, m.A_log.dtype)
+            act = next((v.dtype for _, v in m.parameters().items() if hasattr(v, "dtype") and v.dtype in (mx.float16, mx.bfloat16)), None)
+            norm = getattr(getattr(m, "norm", None), "weight", None)
+            act = norm.dtype if norm is not None else (act or mx.float16)
+            if (dims[:4], act) not in seen:
+                seen.add((dims[:4], act))
+                out.append((m, *dims[:4], act))
+    return out
 
 
 def _tune_prefill(mod, N, K, dtype, key, tune) -> None:
@@ -981,6 +1083,15 @@ def tune_report(model) -> str:
             out.append(f"  {N}x{K} ({n} layers): not timed here")
             continue
         out.append(f"  {N}x{K} ({n} layers): MLX {t['mlx'] / 1e3:.2f} ms, dense {t['dense'] / 1e3:.2f} ms -> {c[0]}")
+    gdn = _gdn_layers(model)
+    if gdn:
+        out += ["", "reading prompts in the recurrent layers (unpadded): mlx-lm's kernel against MLX's mx.fast.gated_delta_update"]
+        for _, Hk, Hv, Dk, Dv, dt in gdn:
+            for b in GDN_SIZES:
+                key = _gdn_key(Hk, Hv, Dk, Dv, str(dt).split(".")[-1], b)
+                t, c = times.get(key), tune.get(key)
+                out.append(f"  {Hv} heads, the whole model reading {b:5d} tokens: " + (
+                    f"{t['kernel'] / 1e3:.0f} ms with the kernel, {t['fast'] / 1e3:.0f} ms with MLX's op -> {c[0]}" if t and c else "not timed here"))
     return "\n".join(out)
 
 
@@ -1027,9 +1138,11 @@ def tune_model(model, mode: str = "auto", log=None) -> dict:
                 f"For the full procedure, 10-20 minutes and the best batched throughput: locals tune --model <model>")
     if mode == "quick":
         pretune(model, max_m=16, log=log)
+        gdn_model_tune(model, log=log)
         warmup(model, range(1, 17))
         return {"mode": "quick"}
     pretune(model)
+    gdn_model_tune(model, log=log)
     picked = model_tune(model)
     warmup(model, range(1, 17))  # compile now, not in the first requests
     return {"mode": "full", "picked": picked}

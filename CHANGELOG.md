@@ -33,7 +33,7 @@ First public release.
 - **Safe defaults.** The server answers only apps on your Mac, and agents'
   commands can write only inside their own copy of the project.
 - **Long conversations.** A request can be as long as fits in your Mac's
-  memory next to the model, instead of a fixed 64k tokens: about 145,000 tokens
+  memory next to the model, instead of a fixed 64k tokens: about 178,000 tokens
   for Qwen3.5-4B on a 16 GB Mac (`--max-context` still sets it). The next turn
   continues from where the previous reply began, so a follow-up question about
   a 139,000-token document starts in 2.4 seconds; it used to read the whole
@@ -53,7 +53,12 @@ First public release.
 - **Measures itself on a new Mac.** How prompts are read (MLX's 4-bit kernel or
   a dense one) is timed on each GPU instead of fixed for M2-class chips, and
   `locals tune --report` shows where Locals gains on this Mac: MLX's matrix
-  kernels against the chosen ones for each number of requests at once.
+  kernels against the chosen ones for each number of requests at once. On
+  Qwen3.5, tuning also times the whole model reading prompts with MLX's own
+  recurrent-layer op (which has a version for the M5's neural accelerators)
+  and keeps it where it is faster. Batches of 8 or more requests are computed
+  at a larger, faster size where tuning finds one: on an M5 Pro, 12 requests
+  at once ran 10-13% faster on a 4B model and 19-20% on a 9B.
 - **Smoother commands.** `locals chat` and `locals generate` use the background
   server instead of loading a second copy of the model, so `--n` works with every
   model; `locals status`, `stop` and `--version` answer in a fraction of a second;
@@ -83,4 +88,8 @@ First public release.
   get "Connection reset by peer" on macOS 27; a model that nearly fills the
   Mac's memory (a 27B on 24 GB) runs several requests at once instead of one at
   a time, without running out of memory with sixteen: each request's own state
-  is counted, and the room kept for reading a prompt is what reading one took.
+  is counted, the room kept for reading a prompt is what reading one took, and
+  MLX keeps fewer freed buffers when the model leaves little room;
+  several long prompts joining the requests already answering no longer hold
+  their memory twice for a moment (three 27k-token prompts took a 4B model on
+  a 16 GB Mac past the GPU's memory limit).

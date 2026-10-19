@@ -121,6 +121,8 @@ The grid is `(32, NSG, B * Hv)` with `NSG=8` (`gdn_kernel.py:185`, `gdn_kernel.p
 
 When `want_states` is on and S > 1, the layer stores `cache.token_states` and `cache.token_conv`. `engine.rewind` uses them to roll back rejected draft tokens (`fuse.py:144-148`, `engine.py:545-563`). The `set_want_states` helper is defined at `engine.py:566-571`. Otherwise the stock recurrence (`gated_delta_update`) runs. Its q/k norm uses eps `1e-6 / Dk` so that it matches the reference l2norm, as mlx-lm 0.32 and later do (`fuse.py:184-189`).
 
+**Prompts and MLX's op.** An unpadded prompt (no mask, no `cache.lengths`, more than 4 tokens) can go through MLX's own `mx.fast.gated_delta_update` instead, a chunked algorithm of matrix products with a version for the M5's neural accelerators. `kernels.gdn_fast` decides per layer shape and dtype, from timings `locals tune` makes with the whole model reading 512- and 2,048-token prompts each way (`gdn_model_tune`, keys `GDN{Hk}x{Hv}x{Dk}x{Dv}xT{512|2048}`); the op is kept where it is at least 3% faster. Timed alone, the op is 1.3-1.9x faster on an M2 Pro, but inside Qwen3.5-4B it was not (909 against 898 ms for 512 tokens, 3,389 against 3,366 ms for 2,048), so it is timed whole. Untimed shapes keep mlx-lm's kernel. With a mask the op is 12-50x slower and is never used. `LOCALS_GDN_FAST=1` or `0` forces it; `locals tune --report` shows the timings.
+
 ## Switched-off kernels
 
 - **Fused add + RMS norm** (`norm_kernel.add_rms`). It computes `h = x + r` and `rms_norm(h) * w` in one kernel, which would halve the norm launches of a pre-norm layer (`norm_kernel.py:1-7`). It needs a hidden size divisible by 256 and uses 256 threads per row (`norm_kernel.py:67-80`). `FusedHybridBody` would use it, but `USE_ADD_RMS = False`: measured, it was no faster than MLX's two kernels. With the flag off, the body calls the stock `__call__` (`fuse.py:229`, `fuse.py:241-242`).
@@ -307,7 +309,8 @@ To re-tune from scratch, delete the cache file (or point `LOCALS_TUNE_CACHE` at 
 | `LOCALS_KERNELS` | `1` | `0`: MLX's matmul kernels for few rows (no tuned kernels) |
 | `LOCALS_GDN_KERNEL` | `1` | `0`: mlx-lm's Gated DeltaNet decode instead of `gdn_kernel.py` (`fuse.USE_GDN_KERNEL`) |
 | `LOCALS_DENSE_PREFILL` | timed | `1`: prompts always through dequantize + dense GEMM; `0`: through MLX's quantized GEMM |
-| `LOCALS_PAD_ROWS` | `1` | `0`: never compute a small batch at more rows (`_pad_rows`: where the tuned timings show a larger size, up to twice the rows, at least 7% faster, as on an M5 Pro at 9 to 15 rows) |
+| `LOCALS_PAD_ROWS` | `1` | `0`: never compute a batch at more rows. By default batches of 8 or more are computed at a larger size, up to twice the rows, where the tuned timings show it at least 7% faster (`_pad_rows`; on an M5 Pro 12 requests computed as 16 ran 10-20% faster). `all`: smaller batches too (the timings also pad 2 rows to 3 or 4 to 5 on some M5 layers, untested end to end) |
+| `LOCALS_GDN_FAST` | timed | `1`: unpadded prompts through MLX's `mx.fast.gated_delta_update` in Qwen3.5's recurrent layers; `0`: through mlx-lm's kernel (`kernels.gdn_fast`) |
 
 ## Code switches
 

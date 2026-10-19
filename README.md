@@ -284,7 +284,7 @@ Each model also has a thinking mode, in which it reasons before it answers: add
 models are good choices for a Mac with 8 GB of memory, and other models made for
 Apple silicon on [Hugging Face](https://huggingface.co/mlx-community) work too.
 
-Conversations can be long: about 145,000 tokens with the default model on a
+Conversations can be long: about 178,000 tokens with the default model on a
 16 GB Mac, a few hundred pages of text. A long document takes a few minutes to
 read the first time; follow-up questions about it start in seconds.
 

@@ -117,6 +117,21 @@ def _weights_fingerprint(model_id: str) -> str:
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
 
 
+def memory_plan(limit: int, weights: int) -> tuple:
+    """(MLX's pool of freed buffers, the memory guard's margin below the GPU limit) for a model whose weights take
+    ``weights`` of ``limit``. The margin is the pool and 0.5 GB for what the admission estimate misses. It was 1.5
+    GB more while the estimate left out each request's fixed state and kept 1.5 GB for reading a prompt that takes
+    2.1 GB; with them counted, a 2.5 GB margin made room by emptying the prompt cache (four agents at once: 71-88%
+    of their prompts from it, first token 5.1 s, against 87-95% and 1.2 s with 1.5); with 1.5 for a 4B on 16 GB, 16 x
+    2k, 8 x 8k and 4 x 30k-token prompts at once all finished, at most 9.06 GB of 11.45 in use. A model that leaves
+    less than 8 GB (a 27B on 24 GB: 3.7 GB) gets a pool of an eighth of what is left, 256 MB at least, so the
+    requests have the rest. LOCALS_MEMORY_MARGIN_GB sets the margin itself."""
+    room = max(0, limit - weights)
+    pool = 1 << 30 if room >= (8 << 30) else max(256 << 20, min(1 << 30, room // 8))
+    env = os.environ.get("LOCALS_MEMORY_MARGIN_GB")
+    return pool, (int(float(env) * (1 << 30)) if env else pool + (512 << 20))
+
+
 class BatchService:
     def __init__(self, engine: str, model: str, slots: int = 16, temp: float = 0.0, seed: int = 0, cache_gb: Optional[float] = None,
                  walk: bool = False, top_p: float = 0.0, top_k: int = 0):
@@ -316,13 +331,9 @@ class BatchService:
         eng.top_p, eng.top_k = self.top_p, self.top_k
         self._eng = eng
         limit = int(mx.device_info()["max_recommended_working_set_size"])
-        # MLX keeps up to 1 GB of freed buffers (set_cache_limit), and 0.5 GB covers what the admission
-        # estimate misses. It was 1.5 GB (2.5 in all) while the estimate left out each request's own state
-        # and kept 1.5 GB for reading a prompt that takes 2.1 GB; with them counted, 2.5 made room by emptying
-        # the prompt cache (four agents at once: 71-88% of their prompts from it, first token 5.1 s, against
-        # 87-95% and 1.2 s with 1.5). With 1.5 on a 16 GB Mac, 16 x 2k, 8 x 8k and 4 x 30k-token prompts at
-        # once all finished, at most 9.06 GB of 11.45 in use. LOCALS_MEMORY_MARGIN_GB sets the whole margin.
-        eng.memory_limit = limit - int(float(os.environ.get("LOCALS_MEMORY_MARGIN_GB", "1.5")) * (1 << 30))
+        pool, margin = memory_plan(limit, self.weights_bytes)
+        mx.set_cache_limit(pool)
+        eng.memory_limit = limit - margin
         if self.cache_bytes is None:  # what is left after the weights and 5 GB for running rows and prefill,
             free = limit - mx.get_active_memory() - (5 << 30)  # and at least one conversation as long as fits
             # (its follow-up question then continues from it: 1.5 s instead of 137 s at 60k tokens). The memory
