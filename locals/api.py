@@ -137,9 +137,7 @@ class GrammarCompiler:
         """A JSON schema. ``whitespace`` is the pattern allowed between tokens of
         the JSON text ("" = compact output). Schemas whose definitions refer to
         themselves (a ``$ref`` on a cycle) compile to a pushdown automaton."""
-        from outlines_core.json_schema import build_regex_from_schema
-
-        from .grammar import is_recursive, json_safe_schema
+        from .grammar import is_recursive, json_safe_schema, schema_regex
 
         s = json_safe_schema(schema if isinstance(schema, str) else json.dumps(schema))
         if is_recursive(s):
@@ -150,7 +148,7 @@ class GrammarCompiler:
                 cc = compile_pda_constraint(s, self.vocab.tokens, self.vocab.trie, self.max_dfa_states, self.work_budget)
                 self._cache[key] = CompiledGrammar(cc, self._planner(cc), recursive=True, kind="json_schema", source=s, vocab=self.vocab)
             return self._cache[key]
-        return self._regex(build_regex_from_schema(s, whitespace), "json_schema", s)
+        return self._regex(schema_regex(s, whitespace), "json_schema", s)
 
     def compile_tool_calls(self, tools: List[dict], tool_choice: Any = "auto", typed: bool = False, thinking: bool = False) -> CompiledGrammar:
         """Replies that may call ``tools`` (OpenAI ``{"type": "function", "function": {...}}``

@@ -128,4 +128,5 @@ First public release.
   with a clear message (it took 214 s with `maxLength: 6000`); a JSON schema
   with `allOf` (a base and an extension, as OpenAPI and zod write them) gets
   one object with all the properties, where the reply was two objects back to
-  back and no JSON.
+  back and no JSON; an integer stays within its schema's `minimum` and
+  `maximum` (a rating from 1 to 5 could come out as 7).

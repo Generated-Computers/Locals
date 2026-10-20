@@ -481,15 +481,14 @@ class BatchService:
                 return []
             import llguidance
             import llguidance.hf
-            from outlines_core.json_schema import build_regex_from_schema
 
             from .llg import LLGProcessor
 
             if llg_tok is None:
                 llg_tok = llguidance.hf.from_tokenizer(tok._tokenizer, n_vocab=n_vocab, eos_token=eos[0])
-            from .grammar import json_safe_schema
+            from .grammar import json_safe_schema, schema_regex
 
-            rx = regex if regex is not None else build_regex_from_schema(json.dumps(json_safe_schema(schema)), "")
+            rx = regex if regex is not None else schema_regex(json_safe_schema(schema))
             if rx not in grammars:
                 grammars[rx] = _llg_grammar(llguidance, rx, specials)
             key = rx

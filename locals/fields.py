@@ -20,10 +20,8 @@ import json
 import time
 from typing import List, Tuple
 
-from outlines_core.json_schema import build_regex_from_schema
-
 from .engine import LocalsController
-from .grammar import json_safe_schema
+from .grammar import json_safe_schema, schema_regex
 from .hybrid_batch import HybridBatchEngine
 from .packed import Request
 
@@ -34,7 +32,7 @@ def parallel_fields(rt, schema: dict, prompt_ids: List[int], max_tokens: int = 1
     keys = list(props)
     reqs = []
     for k in keys:
-        rx = build_regex_from_schema(json.dumps(json_safe_schema(props[k])), "") + "[,}]"
+        rx = schema_regex(json_safe_schema(props[k])) + "[,}]"
         c = rt.compile(regex=rx)
         prefix = rt.tokenizer.encode("{" + json.dumps(k) + ":", add_special_tokens=False)  # the key as JSON writes it
         reqs.append(Request(list(prompt_ids) + prefix, LocalsController(c.constraint, c.planner, True, True), max_tokens))

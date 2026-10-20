@@ -11,9 +11,11 @@ rest of the engine.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from .regex import CALL_BASE
 
@@ -211,6 +213,123 @@ def json_safe_schema(schema):
     return json.dumps(out) if as_text else out
 
 
+# --- integer bounds -------------------------------------------------------------------------------
+#
+# outlines-core leaves out minimum and maximum: {"type": "integer", "minimum": 1, "maximum": 5} allowed 7, or
+# -3. schema_regex writes such an integer as a placeholder string outlines-core copies as it is, and puts the
+# range's own regex in its place.
+
+def _same_length(a: str, b: str) -> str:
+    """Digit strings of len(a) == len(b) from a to b (leading zeros allowed: a suffix's digits)."""
+    if a == b:
+        return a
+    if len(a) == 1:
+        return f"[{a}-{b}]"
+    k = len(a) - 1
+    if a[1:] == "0" * k and b[1:] == "9" * k:
+        return (f"[{a[0]}-{b[0]}]" if a[0] != b[0] else a[0]) + f"[0-9]{{{k}}}"
+    if a[0] == b[0]:
+        return a[0] + _same_length(a[1:], b[1:])
+    alts = [a[0] + _same_length(a[1:], "9" * k)]
+    if int(b[0]) - int(a[0]) > 1:
+        lo, hi = int(a[0]) + 1, int(b[0]) - 1
+        alts.append((f"[{lo}-{hi}]" if lo != hi else str(lo)) + f"[0-9]{{{k}}}")
+    alts.append(b[0] + _same_length("0" * k, b[1:]))
+    return "(" + "|".join(alts) + ")"
+
+
+def _naturals(lo: int, hi):
+    """Alternatives for the decimal integers (no leading zeros) from lo >= 0 to hi (None: no end)."""
+    alts = []
+    d_lo = len(str(lo))
+    d_hi = len(str(hi)) if hi is not None else d_lo
+    for d in range(d_lo, d_hi + 1):
+        a = max(lo, 10 ** (d - 1) if d > 1 else 0)
+        b = min(hi, 10 ** d - 1) if hi is not None else 10 ** d - 1
+        if a <= b:
+            alts.append(_same_length(str(a), str(b)))
+    if hi is None:
+        alts.append(f"[1-9][0-9]{{{d_lo},}}")
+    return alts
+
+
+def integer_regex(lo: Optional[int], hi: Optional[int]) -> str:
+    """The JSON integers from lo to hi (either None: no bound) as a regex."""
+    alts = []
+    if hi is None or hi >= 0:
+        alts += _naturals(max(lo, 0) if lo is not None else 0, hi)
+    if lo is None or lo < 0:  # -v for v from max(1, -hi) to -lo
+        alts += ["-" + x for x in _naturals(max(1, -hi) if hi is not None else 1, -lo if lo is not None else None)]
+    return "(" + "|".join(alts) + ")"
+
+
+_BOUNDS = ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum")
+
+
+def _integer_bounds(n: dict):
+    """(lo, hi) of an integer schema with bounds (None for a side without one), or None when it has none or they
+    are not numbers. Draft 4's boolean exclusiveMinimum/exclusiveMaximum are read too."""
+    if not any(k in n for k in _BOUNDS):
+        return None
+    lo = hi = None
+    for k in _BOUNDS:
+        v = n.get(k)
+        if v is None or isinstance(v, bool) and k.startswith("exclusive"):
+            continue
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v):
+            raise GrammarError(f"{k} must be a number, not {json.dumps(v)}")
+        if k == "minimum":
+            b = math.ceil(v) + (1 if n.get("exclusiveMinimum") is True and v == math.ceil(v) else 0)
+            lo = b if lo is None else max(lo, b)
+        elif k == "maximum":
+            b = math.floor(v) - (1 if n.get("exclusiveMaximum") is True and v == math.floor(v) else 0)
+            hi = b if hi is None else min(hi, b)
+        elif k == "exclusiveMinimum":
+            b = math.floor(v) + 1
+            lo = b if lo is None else max(lo, b)
+        else:
+            b = math.ceil(v) - 1
+            hi = b if hi is None else min(hi, b)
+    # a bound past JavaScript's safe integers is no bound (zod writes -9007199254740991 and 9007199254740991 for
+    # every int; their regex costs ~50 automaton states, 90 MB of token table, a field)
+    lo = None if lo is not None and lo <= -(2**53 - 1) else lo
+    hi = None if hi is not None and hi >= 2**53 - 1 else hi
+    if lo is not None and hi is not None and lo > hi:
+        raise GrammarError(f"no integer is between the bounds ({lo} > {hi})")
+    return (lo, hi) if lo is not None or hi is not None else None
+
+
+def schema_regex(safe_schema, whitespace: str = "") -> str:
+    """The regex of a schema made safe by json_safe_schema (a dict or its JSON text): outlines-core's, with
+    integers kept within their minimum and maximum."""
+    from outlines_core.json_schema import build_regex_from_schema
+
+    node = json.loads(safe_schema) if isinstance(safe_schema, str) else safe_schema
+    tag = "LOCALSINT" + hashlib.sha1(json.dumps(node, sort_keys=True).encode()).hexdigest()[:10]
+    ranges = []
+
+    def walk(n):
+        if isinstance(n, list):
+            return [walk(x) for x in n]
+        if not isinstance(n, dict):
+            return n
+        t = n.get("type")
+        if isinstance(t, list) and "integer" in t and any(k in n for k in _BOUNDS):  # Optional[int] with bounds
+            return walk({"anyOf": [_for_type(n, x) for x in t]})
+        if t == "integer" and "enum" not in n and "const" not in n:
+            b = _integer_bounds(n)
+            if b is not None:
+                ranges.append(integer_regex(*b))
+                return {"const": f"{tag}Z{len(ranges) - 1}Z"}
+        return {k: (v if k in ("enum", "const", "default", "examples") else walk(v)) for k, v in n.items()}
+
+    out = walk(node)
+    rx = build_regex_from_schema(json.dumps(out), whitespace)
+    for i, r in enumerate(ranges):
+        rx = rx.replace(f'"{tag}Z{i}Z"', r)
+    return rx
+
+
 _TYPE_KEYS = {
     "object": {"properties", "required", "additionalProperties", "minProperties", "maxProperties"},
     "array": {"items", "prefixItems", "minItems", "maxItems", "uniqueItems"},
@@ -235,9 +354,7 @@ def _literal(text: str) -> str:
 
 
 def _leaf(sub: dict) -> str:
-    from outlines_core.json_schema import build_regex_from_schema
-
-    return build_regex_from_schema(json.dumps(sub), "")
+    return schema_regex(sub)
 
 
 def _resolve(root: dict, ref: str) -> dict:

@@ -98,3 +98,36 @@ def test_regex_syntax_is_honoured_or_refused():
         with pytest.raises(rx.RegexError):
             rx.compile_dfa(bad)
     assert issubclass(rx.BudgetExceeded, ValueError)  # a request error (400), not the server's
+
+
+def test_integers_stay_within_their_bounds():
+    """outlines-core leaves minimum and maximum out: a rating from 1 to 5 could be 7."""
+    from locals.grammar import integer_regex, schema_regex
+
+    rnd = random.Random(1)
+    ranges = [(1, 5), (0, 100), (-40, -1), (13, 2017), (0, None), (10, None), (None, 0), (None, -3), (7, 7), (-1000, 999)]
+    ranges += [tuple(sorted(rnd.randint(-3000, 3000) for _ in range(2))) for _ in range(40)]
+    for lo, hi in ranges:
+        d = rx.compile_dfa(integer_regex(lo, hi))
+        start = (lo if lo is not None else (hi or 0) - 2000) - 30
+        for v in range(start, (hi if hi is not None else (lo or 0) + 2000) + 30):
+            assert d.matches(str(v).encode()) == ((lo is None or v >= lo) and (hi is None or v <= hi)), (lo, hi, v)
+        assert not any(d.matches(b) for b in (b"-0", b"01", b"+1", b"1.0", b""))
+
+    def dfa(schema):
+        return rx.compile_dfa(schema_regex(json_safe_schema(schema)))
+
+    d = dfa({"type": "object", "properties": {"rating": {"type": "integer", "minimum": 1, "maximum": 5},
+                                              "t": {"type": ["integer", "null"], "exclusiveMinimum": -10, "exclusiveMaximum": 0}},
+             "required": ["rating", "t"]})
+    assert d.matches(b'{"rating":5,"t":-9}') and d.matches(b'{"rating":1,"t":null}')
+    assert not any(d.matches(b) for b in (b'{"rating":7,"t":-1}', b'{"rating":0,"t":-1}', b'{"rating":3,"t":0}',
+                                          b'{"rating":3,"t":-10}'))
+    assert dfa({"type": "integer", "minimum": 0, "exclusiveMinimum": True}).matches(b"1")  # (draft 4)
+    assert not dfa({"type": "integer", "minimum": 0, "exclusiveMinimum": True}).matches(b"0")
+    # zod writes the safe-integer bounds for every int: no bound, not a 16-digit range (~50 states a field)
+    zod = dfa({"type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991})
+    assert zod.n == dfa({"type": "integer"}).n
+    for bad in ({"type": "integer", "minimum": 5, "maximum": 2}, {"type": "integer", "minimum": "5"}):
+        with pytest.raises(GrammarError):
+            dfa(bad)

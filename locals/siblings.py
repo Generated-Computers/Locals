@@ -38,10 +38,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from outlines_core.json_schema import build_regex_from_schema
-
 from .engine import LocalsController
-from .grammar import GrammarError, _resolve, json_safe_schema
+from .grammar import GrammarError, _resolve, json_safe_schema, schema_regex
 from .hybrid_batch import HybridBatchEngine
 from .packed import Request
 
@@ -109,7 +107,7 @@ def skeleton_schema(shape: TreeShape, schema: dict) -> dict:
 
 def items_regex(shape: TreeShape, schema: dict, key: str) -> str:
     """Contents of a recursive array after its ``[``: leaf items, then ``]``."""
-    leaf = build_regex_from_schema(json.dumps(json_safe_schema(leaf_schema(shape, schema))), "")
+    leaf = schema_regex(json_safe_schema(leaf_schema(shape, schema)))
     p = shape.node["properties"][key]
     lo, hi = int(p.get("minItems", 0)), p.get("maxItems")
     more = f"(,{leaf})*" if hi is None else (f"(,{leaf}){{0,{int(hi) - 1}}}" if int(hi) > 1 else "")

@@ -46,7 +46,8 @@ The theory behind this part, its proofs and its full measurements are in the pap
 
 `is_recursive` then picks the path:
 
-- **Non-recursive schemas** (no `$ref` on a cycle) become one regex through outlines-core's `build_regex_from_schema(schema, whitespace)`. `whitespace` defaults to `""`, which means compact output.
+- **Non-recursive schemas** (no `$ref` on a cycle) become one regex through `schema_regex(schema, whitespace)`: outlines-core's `build_regex_from_schema`, with the integer bounds it leaves out put back. `whitespace` defaults to `""`, which means compact output.
+  - outlines-core ignores `minimum` and `maximum` (a rating from 1 to 5 could come out as 7). `schema_regex` writes each bounded integer as a placeholder string, which outlines-core copies as it is, and puts the range's own regex (`integer_regex`) in its place. Draft 4's boolean `exclusiveMinimum`/`exclusiveMaximum` are read too; a bound past JavaScript's safe integers (zod writes ±9007199254740991 for every int) counts as none, since its regex would cost about 50 automaton states a field. Bounds on `number` are not enforced.
 - **Recursive schemas** go to the pushdown path (see below).
 
 The server compiles `response_format: {"type": "json_object"}` with its own whitespace, `JSON_OBJECT_WS = r"( |\n *)?"` (a space, or a newline and an indent). In compact form, a model that habitually writes `{` and a newline was pushed into keys such as `"/a"`. Schemas stay compact because their keys are forced.

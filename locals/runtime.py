@@ -335,14 +335,12 @@ class Runtime:
         """compile's cache key: ("regex", the regex), or ("pda", the schema's text) for a recursive schema."""
         if regex is not None:
             return ("regex", regex)  # typed keys: a regex text never looks like a schema's
-        from outlines_core.json_schema import build_regex_from_schema
-
-        from .grammar import is_recursive, json_safe_schema
+        from .grammar import is_recursive, json_safe_schema, schema_regex
 
         s = json_safe_schema(schema if isinstance(schema, str) else json.dumps(schema))
         if is_recursive(s):
             return ("pda", s)
-        return ("regex", build_regex_from_schema(s, whitespace))
+        return ("regex", schema_regex(s, whitespace))
 
     def _host_compile(self, regex: str) -> Compiled:
         cc = compile_constraint(regex, self.vocab, self.trie)
@@ -352,12 +350,10 @@ class Runtime:
         """A constraint for the walk kernel (no token table): the automaton and
         a planner, cached by regex. Regular constraints only."""
         if regex is None:
-            from outlines_core.json_schema import build_regex_from_schema
-
-            from .grammar import json_safe_schema
+            from .grammar import json_safe_schema, schema_regex
 
             s = json_safe_schema(schema if isinstance(schema, str) else json.dumps(schema))
-            regex = build_regex_from_schema(s, whitespace)
+            regex = schema_regex(s, whitespace)
         key = ("walk", regex)
         c = self._cget(key)
         if c is None:
