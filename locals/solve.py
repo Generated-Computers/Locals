@@ -625,11 +625,11 @@ def cmd_solve(args) -> None:
         sys.exit("locals solve needs a way to tell a good result from a bad one: give the command, e.g.\n"
                  "  --check 'python3 -m pytest -q'   or   --check 'python3 app.py --selftest'\n"
                  "(no tests were found in the project; without --no-write-check an agent writes a check first)")
+    app.fetch_model(args.model)  # a mistyped or too large model is refused here, before OpenCode is set up for it
     if not app._opencode_ready(args.model, args.port):
         print(f"setting up OpenCode for {args.model} ...", flush=True)
         app.setup_opencode(args)
     oc = app.opencode_bin()
-    app.fetch_model(args.model)
     app.ensure_server(args)
     app.remember(model=args.model, port=args.port)
     short = app.model_short(args.model)
