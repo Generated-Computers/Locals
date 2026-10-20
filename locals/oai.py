@@ -202,19 +202,17 @@ def _value_regex(schema: Optional[dict]) -> str:
     free = not_containing("</parameter>")
     if not schema:
         return free
-    if isinstance(schema.get("enum"), list) and schema["enum"]:
-        return "(" + "|".join(re.escape(str(v)) for v in schema["enum"]) + ")"
+    if isinstance(schema.get("enum"), list) and schema["enum"]:  # (as coerce reads them: null, true, not None, True)
+        return "(" + "|".join(re.escape(v if isinstance(v, str) else json.dumps(v)) for v in schema["enum"]) + ")"
     t = schema.get("type")
+    nullable = isinstance(t, list) and "null" in t  # (Optional[int] could not be null)
     if isinstance(t, list):
         t = [x for x in t if x != "null"]
         t = t[0] if len(t) == 1 else None
-    if t == "integer":
-        return r"-?[0-9]+"
-    if t == "number":
-        return r"-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?"
-    if t == "boolean":
-        return "(true|false)"
-    return free
+    typed = {"integer": r"-?[0-9]+", "number": r"-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?", "boolean": "(true|false)"}.get(t)
+    if typed is None:
+        return free
+    return "(" + typed + "|null)" if nullable else typed
 
 
 def typed_call_regex(tools: List[dict]) -> str:
@@ -410,7 +408,9 @@ class CallStream:
             seen.add(pname)
             schema = props.get(pname)
             key = json.dumps(pname, ensure_ascii=False) + ": "
-            text_kind = not _types(schema) or "string" in _types(schema)
+            enum = schema.get("enum") if isinstance(schema, dict) else None
+            text_kind = (not _types(schema) or "string" in _types(schema)) and not (
+                isinstance(enum, list) and any(not isinstance(v, str) for v in enum))  # (null, true: coerce decides)
             if text_kind:
                 body = value if done else _held_back(value)
                 parts.append(key + '"' + json.dumps(body, ensure_ascii=False)[1:-1] + ('"' if done else ""))
@@ -547,6 +547,11 @@ def coerce(value: str, schema: Optional[dict]):
         return value
     types = _types(schema)
     s = value.strip()
+    enum = schema.get("enum") if isinstance(schema, dict) else None
+    if isinstance(enum, list) and value not in enum:  # an enum's null or true, as the typed grammar writes them
+        for v in enum:
+            if not isinstance(v, str) and s == json.dumps(v):
+                return v
     if not types or "string" in types:
         return value
     if "null" in types and s == "null":

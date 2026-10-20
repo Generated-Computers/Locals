@@ -201,3 +201,19 @@ def test_parameter_names_outside_the_usual_letters_can_be_written():
     _, calls, got, _, _ = _run(reply, tools=tools)
     assert json.loads(got[0]) == {"$select": "name", "größe": 42, "user id": "u1", "plain": "x"}
 
+
+@pytest.mark.parametrize("step", [1, 4])
+def test_typed_enum_and_nullable_values(step):
+    """--typed-tools wrote an enum's null as None and true as True (back as the strings "None" and "True"), and an
+    Optional[int] could not be null; the stream sends what the final parse gives."""
+    from locals.regex import compile_dfa
+
+    tools = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {
+        "mode": {"enum": ["a", None]}, "flag": {"enum": [True, False]}, "n": {"type": ["integer", "null"]},
+        "s": {"enum": ["null", "x"]}}, "required": ["mode", "flag", "n", "s"]}}}]
+    reply = _call("f", mode="null", flag="true", n="null", s="null")
+    assert compile_dfa(oai.reply_regex(tools, "required", typed=True, preamble=False), 200_000).matches(reply.encode())
+    _, calls, got, _, _ = _run(reply, step=step, tools=tools)
+    assert json.loads(calls[0]["function"]["arguments"]) == {"mode": None, "flag": True, "n": None, "s": "null"}
+    assert got[0] == calls[0]["function"]["arguments"]
+
