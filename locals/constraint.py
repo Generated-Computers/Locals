@@ -16,7 +16,7 @@ from typing import List, Optional
 
 import numpy as np
 
-from .regex import DEAD, DFA, compile_dfa
+from .regex import DEAD, DFA, TooManyStates, compile_dfa
 from .vocab import ByteTrie, TokenVocab
 
 
@@ -120,16 +120,26 @@ def compile_constraint(
     import os
 
     t0 = time.perf_counter()
-    dfa = compile_dfa(pattern, max_dfa_states)
-    t1 = time.perf_counter()
     # the token table and its copies take about 7 bytes per (state, token): a string with maxLength 1000
-    # (10k states) on a 248k-token vocabulary would need 17 GB, and end the server with a Metal error
-    gb = 7 * dfa.n * vocab.n_model / 1e9
+    # (10k states) on a 248k-token vocabulary would need 17 GB, and end the server with a Metal error.
+    # The DFA's minimization stops once it is past what fits (a request with maxLength 6000 took 214 s
+    # to be refused, with every other request stopped meanwhile; 7 s now).
     limit = float(os.environ.get("LOCALS_MAX_TABLE_GB", "3"))
-    if gb > limit:
-        raise WorkBudgetExceeded(f"the grammar needs a {gb:.1f} GB token table ({dfa.n} states x {vocab.n_model} tokens; "
-                                 f"the limit is {limit:g} GB, LOCALS_MAX_TABLE_GB): make it smaller (shorter maxLength or "
-                                 "maxItems, fewer alternatives), or serve with --walk, which needs no table")
+    cap = int(limit * 1e9 / (7 * vocab.n_model))
+
+    def too_big(size: str) -> WorkBudgetExceeded:
+        return WorkBudgetExceeded(f"the schema or regex is too large: its token table would take {size} (the limit is "
+                                  f"{limit:g} GB, LOCALS_MAX_TABLE_GB). Make it smaller (a shorter maxLength or maxItems, "
+                                  "fewer alternatives), or serve with --walk, which needs no table")
+
+    try:
+        dfa = compile_dfa(pattern, max_dfa_states, max_minimal=cap)
+    except TooManyStates:
+        raise too_big(f"more than {limit:g} GB (over {cap} states x {vocab.n_model} tokens)") from None
+    t1 = time.perf_counter()
+    gb = 7 * dfa.n * vocab.n_model / 1e9
+    if gb > limit:  # (cannot happen: cap is the most states that fit)
+        raise too_big(f"{gb:.1f} GB ({dfa.n} states x {vocab.n_model} tokens)")
     T, work = token_table(trie, dfa, vocab.n_model, work_budget)
     t2 = time.perf_counter()
     allowed = (T != DEAD).T.copy()

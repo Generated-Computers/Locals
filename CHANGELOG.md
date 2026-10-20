@@ -122,4 +122,7 @@ First public release.
   serving after an error; a tool parameter that is a nested model (`$ref`, as
   FastMCP and Pydantic write it) or an optional number arrives as an object or
   a number instead of its JSON text, and a parameter schema written as `true`
-  no longer fails the request.
+  no longer fails the request; a request with a large JSON schema no longer
+  pauses every other reply while its grammar is made (31 s for one with
+  `maxItems: 50`, now 0.1 s), and one too large to serve is refused in seconds
+  with a clear message (it took 214 s with `maxLength: 6000`).

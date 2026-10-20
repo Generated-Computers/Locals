@@ -9,7 +9,7 @@ from typing import List, Optional
 import mlx.core as mx
 import numpy as np
 
-from .engine import NEG_INF, ConstraintExhausted, Controller, _TABLES, _token_lengths
+from .engine import NEG_INF, ConstraintExhausted, Controller, _TABLES, _tok_len_np, _token_lengths
 from .forced import ForcedPlanner
 from .pda import MAX_POP, MAX_PUSH, RET, STACK_DEPTH, PDAConstraint
 from .regex import DEAD
@@ -254,13 +254,6 @@ class PDAController(Controller):
 
     def finished_at(self, cfg) -> bool:
         return cfg[0] == self.c.pda.n
-
-
-def _tok_len_np(vocab):
-    k = ("toklen_np", id(vocab))
-    if k not in _TABLES:
-        _TABLES[k] = (vocab, np.array([len(b) if b else 0 for b in vocab.token_bytes], dtype=np.int32))
-    return _TABLES[k][1]
 
 
 def _may_force(c: PDAConstraint, planner) -> np.ndarray:

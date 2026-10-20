@@ -124,3 +124,31 @@ def test_lossless_planner_holds_back_last_block(tok, setup):
         if p is not None:
             assert p.cover == 0
             assert p.committed_forced_bytes < len(c.forced_bytes[q])
+
+
+def test_precompile_does_the_host_work_for_compile(tok, setup, monkeypatch):
+    """The batch engine makes a grammar's host tables outside its loop (Runtime.precompile, in the request's
+    thread); compile then only copies them to the GPU, and a grammar that failed fails at once."""
+    import threading
+    import types
+    from collections import OrderedDict
+
+    from locals import runtime
+    from locals.engine import _TABLES
+
+    vocab, trie = setup
+    rt = runtime.Runtime.__new__(runtime.Runtime)
+    rt.vocab, rt.trie, rt.tokenizer = vocab, trie, types.SimpleNamespace(_tokenizer=tok)
+    rt._compiled, rt.max_compiled, rt._precompiled, rt._pre_lock = OrderedDict(), 16, OrderedDict(), threading.Lock()
+    rt.precompile(SCHEMA)
+    rt.precompile(regex="(")
+    (key, pre), (bad_key, bad) = rt._precompiled.items()
+    assert ("T_host", id(pre.constraint)) in _TABLES and isinstance(bad, ValueError)
+    built = []
+    monkeypatch.setattr(runtime, "compile_constraint", lambda *a, **k: built.append(a))
+    c = rt.compile(SCHEMA)
+    assert c is pre and rt.compile(SCHEMA) is c and not built  # (not made again in the batch loop)
+    assert key not in rt._precompiled and ("T_host", id(c.constraint)) not in _TABLES  # (the GPU's copy is kept)
+    with pytest.raises(ValueError) as e:
+        rt.compile(regex="(")
+    assert e.value is bad and not built

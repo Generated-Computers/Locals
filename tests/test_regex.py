@@ -64,3 +64,25 @@ def test_json_schema_regex_compiles():
     assert dfa.matches(b'{"name":"x","n":3}')
     assert dfa.matches(b'{ "name" : "x" , "n" : -12 }')
     assert not dfa.matches(b'{"name":"x"}')
+
+
+def test_minimizing_stops_once_past_the_cap(monkeypatch):
+    """A grammar whose token table would not fit is refused while its DFA is minimized (a string with maxLength
+    6000 took 214 s to be refused, inside the batch loop); the cap is exact."""
+    from locals.constraint import WorkBudgetExceeded, compile_constraint
+    from locals.regex import TooManyStates
+    from locals.vocab import ByteTrie, TokenVocab
+
+    pat = '"[a-z]{0,100}"'
+    n = compile_dfa(pat).n
+    assert compile_dfa(pat, max_minimal=n).n == n
+    with pytest.raises(TooManyStates):
+        compile_dfa(pat, max_minimal=n - 1)
+    # a large DFA whose minimal one is small (an enum of ids: a trie of 5000 leaves) still compiles
+    assert compile_dfa("(" + "|".join(f"id-{i:04d}" for i in range(5000)) + ")", max_minimal=20).n < 20
+    toks = [bytes([b]) for b in b'"abcdefghijklmnopqrstuvwxyz'] + [b""]
+    vocab = TokenVocab(toks, eos_ids=[len(toks) - 1], n_model=len(toks))
+    monkeypatch.setenv("LOCALS_MAX_TABLE_GB", str(50 * 7 * vocab.n_model / 1e9))  # room for 50 states
+    assert compile_constraint('"[a-z]{0,40}"', vocab, ByteTrie.build(vocab)).dfa.n <= 50
+    with pytest.raises(WorkBudgetExceeded, match="over 50 states"):
+        compile_constraint(pat, vocab, ByteTrie.build(vocab))

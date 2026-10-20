@@ -481,7 +481,8 @@ How the worker runs:
 
 - **Model and batching.** It loads with `Runtime.load(model, tune=LOCALS_TUNE)` (default `background`) and runs `HybridBatchEngine(model, tokenizer, n_slots=slots)`: fused layers, small-batch kernels, and pipelined continuous batching.
 - **Constraints.** A schema or regex is compiled per job.
-  - By default, `rt.compile` builds token tables for a `LocalsController`.
+  - By default, `rt.compile` builds token tables for a `LocalsController`. Their host part (the automaton, the token table, the budget tables: seconds for a large grammar) is made by `rt.precompile` in a thread of its own after `submit`, one grammar at a time, and the job is queued once it is done; the batch loop only copies the tables to the GPU. A grammar that fails keeps its error, so the same one fails at once next time. Made in the batch loop, a schema with `maxItems: 50` (1302 states) stopped every running reply for 8 s, 31 s on a 16 GB Mac.
+  - A grammar whose token table would pass `LOCALS_MAX_TABLE_GB` is refused while its automaton is minimized, as soon as it has more states than fit (a string with `maxLength: 6000`: 7 s, from 214 s).
   - With `walk`, `rt.compile_walk` builds a `WalkController`, with no token tables and any grammar size.
   - Without `--walk`, recursive schemas (`$ref` cycles) are refused; the walk path has no such check.
   - A compile error ends only that job, with `invalid:`; the batch goes on.

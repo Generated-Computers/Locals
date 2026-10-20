@@ -210,19 +210,13 @@ class LocalsController(Controller):
         return _TABLES[k][1]
 
     def _tok_len_np(self):
-        k = ("toklen_np", id(self.planner.vocab))
-        if k not in _TABLES:
-            v = self.planner.vocab
-            _TABLES[k] = (v, np.array([len(b) if b else 0 for b in v.token_bytes], dtype=np.int32))
-        return _TABLES[k][1]
+        return _tok_len_np(self.planner.vocab)
 
     def _gpu_T(self):
         k = ("T", id(self.c))
         if k not in _TABLES:
-            T = self.c.next_state.copy()
-            T[T == DEAD] = self.c.dfa.start  # unreachable under the mask
-            dt = np.int16 if self.c.n_states < 2**15 else np.int32
-            _TABLES[k] = (self.c, mx.array(T.astype(dt)))
+            _TABLES[k] = (self.c, mx.array(_host_T(self.c)))
+            _TABLES.pop(("T_host", id(self.c)))  # (the device's copy is the one read)
         return _TABLES[k][1]
 
     def _gpu_cover(self):
@@ -239,12 +233,9 @@ class LocalsController(Controller):
     budget = True
 
     def budget_tables(self):
-        from .budget import budget_tables
-
         k = ("budget", id(self.c), id(self.planner), self.use_forced, self.canonical)
         if k not in _TABLES:
-            tl = self._tok_len_np() if self.planner is not None else None
-            bt = budget_tables(self.c, self.planner if self.use_forced else None, self.planner if self.canonical else None, tl)
+            bt = _host_budget(self.c, self.planner, self.use_forced, self.canonical)
             eos = np.zeros(self.c.next_state.shape[0], dtype=bool)
             eos[list(self.eos_ids)] = True
             dev = (mx.array(bt.cost), mx.array(bt.need), mx.array(eos))
@@ -310,6 +301,34 @@ class LocalsController(Controller):
 
     def finished_at(self, cfg) -> bool:
         return bool(self.c.only_eos[cfg])
+
+
+def _tok_len_np(vocab) -> np.ndarray:
+    k = ("toklen_np", id(vocab))
+    if k not in _TABLES:
+        _TABLES[k] = (vocab, np.array([len(b) if b else 0 for b in vocab.token_bytes], dtype=np.int32))
+    return _TABLES[k][1]
+
+
+def _host_T(c: CompiledConstraint) -> np.ndarray:
+    """The transition table as the device holds it (int16 where it fits), made on the host."""
+    k = ("T_host", id(c))
+    if k not in _TABLES:
+        T = np.where(c.next_state == DEAD, c.dfa.start, c.next_state)  # (DEAD is unreachable under the mask)
+        _TABLES[k] = (c, T.astype(np.int16 if c.n_states < 2**15 else np.int32))
+    return _TABLES[k][1]
+
+
+def _host_budget(c: CompiledConstraint, planner, use_forced: bool, canonical: bool):
+    """locals/budget.py's tables for a controller with these settings."""
+    from .budget import budget_tables
+
+    use_forced, canonical = use_forced and planner is not None, canonical and planner is not None
+    k = ("budget_host", id(c), id(planner), use_forced, canonical)
+    if k not in _TABLES:
+        tl = _tok_len_np(planner.vocab) if planner is not None else None
+        _TABLES[k] = ((c, planner), budget_tables(c, planner if use_forced else None, planner if canonical else None, tl))
+    return _TABLES[k][1]
 
 
 def _may_force(c: CompiledConstraint) -> np.ndarray:
@@ -397,6 +416,9 @@ class _TableCache:
     def get(self, k, default=None):
         with self._lock:
             return self[k] if k in self._d else default
+
+    def pop(self, k) -> None:
+        self._drop(k)
 
     def clear(self) -> None:
         with self._lock:

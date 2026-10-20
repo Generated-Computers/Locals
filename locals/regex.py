@@ -526,8 +526,14 @@ def _row_classes(sig: np.ndarray) -> np.ndarray:
     return inv.reshape(-1)
 
 
-def trim_and_minimize(dfa: DFA) -> DFA:
-    """Drop states that cannot reach acceptance, then Moore minimization."""
+class TooManyStates(BudgetExceeded):
+    """The minimal DFA has more states than asked for."""
+
+
+def trim_and_minimize(dfa: DFA, max_states: Optional[int] = None) -> DFA:
+    """Drop states that cannot reach acceptance, then Moore minimization. ``max_states``: fail as soon as the
+    refinement has more classes (they only grow, and end as the minimal DFA's states): minimizing a long chain
+    takes a round per link (a string with maxLength 3000, 66k states: 55 s) for a table that was refused after."""
     live = coreachable(dfa)
     if not live[dfa.start]:
         raise ValueError("the pattern matches nothing")
@@ -542,13 +548,20 @@ def trim_and_minimize(dfa: DFA) -> DFA:
     # Moore refinement: class id per state, with DEAD as its own class. Bytes
     # that every state sends to the same place (most of them) are one column.
     Q = len(keep)
-    _, first = np.unique(table, axis=1, return_index=True)
-    narrow = table[:, np.sort(first)]
+    seen, first = set(), []  # (np.unique(table, axis=1) held the GIL 1.3 s on 132k states: every other thread stopped)
+    for b in range(table.shape[1]):
+        col = table[:, b].tobytes()
+        if col not in seen:
+            seen.add(col)
+            first.append(b)
+    narrow = table[:, first]
     cls = acc.astype(np.int64)
     while True:
         succ = np.where(narrow == DEAD, -1, cls[np.maximum(narrow, 0)])
         sig = np.concatenate([cls[:, None], succ], axis=1)
         new = _row_classes(sig)
+        if max_states is not None and new.max() + 1 > max_states:
+            raise TooManyStates(f"the minimal DFA has more than {max_states} states")
         if new.max() + 1 == len(np.unique(cls)):
             break
         cls = new
@@ -568,5 +581,5 @@ def trim_and_minimize(dfa: DFA) -> DFA:
     return DFA(new_table, new_acc, 0)
 
 
-def compile_dfa(pattern: str, max_states: int = 200_000, n_calls: int = 0) -> DFA:
-    return trim_and_minimize(determinize(compile_nfa(pattern), max_states, 256 + n_calls))
+def compile_dfa(pattern: str, max_states: int = 200_000, n_calls: int = 0, max_minimal: Optional[int] = None) -> DFA:
+    return trim_and_minimize(determinize(compile_nfa(pattern), max_states, 256 + n_calls), max_minimal)

@@ -59,6 +59,16 @@ def _prepare_device_tables(c) -> None:
     mx.eval(ctl._gpu_T(), ctl._gpu_cover(), ctl.allowed, *ctl.budget_tables()[1])
 
 
+def _prepare_host_tables(c) -> None:
+    """The part of _prepare_device_tables computed on the host (numpy: 2.6 s for a 1302-state grammar), for
+    Runtime.precompile; the device tables are then copies of these."""
+    from .engine import _host_budget, _host_T, _may_force
+
+    _may_force(c.constraint)
+    _host_T(c.constraint)
+    _host_budget(c.constraint, c.planner, True, True)
+
+
 def native_bf16() -> bool:
     """Apple GPUs before the M3 generation (g13 = M1, g14 = M2) emulate bf16
     arithmetic; there MLX's fp16 kernels run up to 1.7x faster than bf16."""
@@ -253,6 +263,11 @@ class Runtime:
         # request at a time. A running request keeps its own constraint alive.
         self._compiled: "OrderedDict[str, Compiled]" = OrderedDict()
         self.max_compiled = int(os.environ.get("LOCALS_MAX_COMPILED", "16"))
+        import threading
+
+        # made by precompile in another thread, for compile to take (or the error it raised)
+        self._precompiled: "OrderedDict[tuple, object]" = OrderedDict()
+        self._pre_lock = threading.Lock()
         # Radix trie of previously fed token sequences -> KV (mlx-lm's LRU
         # prompt cache). Our KV caches never mutate arrays in place, so a hit
         # shares arrays instead of copying them.
@@ -266,33 +281,72 @@ class Runtime:
         return cls(model, tok, **kw)
 
     def compile(self, schema: Optional[Union[dict, str]] = None, regex: Optional[str] = None, whitespace: str = "") -> Compiled:
-        if regex is None:
-            from outlines_core.json_schema import build_regex_from_schema
+        key = self._key(schema, regex, whitespace)
+        if key[0] == "pda":
+            # Recursive schemas (a $ref on a cycle) get a pushdown automaton
+            # (locals/pda.py) instead of a depth-unrolled regex.
+            c = self._cget(key)
+            if c is None:
+                from .pda import compile_pda_constraint
 
-            from .grammar import is_recursive, json_safe_schema
-
-            s = json_safe_schema(schema if isinstance(schema, str) else json.dumps(schema))
-            if is_recursive(s):
-                # Recursive schemas (a $ref on a cycle) get a pushdown automaton
-                # (locals/pda.py) instead of a depth-unrolled regex.
-                key = ("pda", s)  # typed keys: a regex text never looks like a schema's
-                c = self._cget(key)
-                if c is None:
-                    from .pda import compile_pda_constraint
-
-                    cc = compile_pda_constraint(s, self.vocab, self.trie)
-                    c = Compiled(cc, ForcedPlanner(self.tokenizer._tokenizer, self.vocab, cc), recursive=True)
-                    self._cput(key, c)
-                    _prepare_device_tables(c)
-                return c
-            regex = build_regex_from_schema(s, whitespace)
-        c = self._cget(("regex", regex))
+                cc = compile_pda_constraint(key[1], self.vocab, self.trie)
+                c = Compiled(cc, ForcedPlanner(self.tokenizer._tokenizer, self.vocab, cc), recursive=True)
+                self._cput(key, c)
+                _prepare_device_tables(c)
+            return c
+        c = self._cget(key)
         if c is None:
-            cc = compile_constraint(regex, self.vocab, self.trie)
-            c = Compiled(cc, ForcedPlanner(self.tokenizer._tokenizer, self.vocab, cc))
-            self._cput(("regex", regex), c)
+            with self._pre_lock:
+                c = self._precompiled.get(key)
+                if isinstance(c, ValueError):
+                    raise c  # (kept: the same grammar fails the same way)
+                self._precompiled.pop(key, None)
+            if c is None:
+                c = self._host_compile(key[1])
+            self._cput(key, c)
             _prepare_device_tables(c)
         return c
+
+    def precompile(self, schema: Optional[Union[dict, str]] = None, regex: Optional[str] = None, whitespace: str = "") -> None:
+        """compile's host work (the automaton, its token table, and the tables decoding derives from them:
+        numpy, seconds for a large grammar) in the caller's thread; compile then only copies the tables to the
+        GPU. The batch engine calls it before a request enters the batch loop, where it stopped every running
+        reply meanwhile. A grammar that does not compile keeps its error, for compile to raise at once."""
+        try:
+            key = self._key(schema, regex, whitespace)
+        except Exception:  # noqa: BLE001  # (compile raises it again, at once)
+            return
+        if key[0] != "regex" or key in self._compiled:
+            return
+        with self._pre_lock:
+            if key in self._precompiled:
+                return
+        try:
+            c = self._host_compile(key[1])
+            _prepare_host_tables(c)
+        except ValueError as e:  # (an invalid or too large grammar; anything else is left for compile)
+            c = e
+        with self._pre_lock:
+            self._precompiled[key] = c
+            while len(self._precompiled) > 4:  # (a request cancelled before compile took its grammar)
+                self._precompiled.popitem(last=False)
+
+    def _key(self, schema, regex: Optional[str], whitespace: str = "") -> tuple:
+        """compile's cache key: ("regex", the regex), or ("pda", the schema's text) for a recursive schema."""
+        if regex is not None:
+            return ("regex", regex)  # typed keys: a regex text never looks like a schema's
+        from outlines_core.json_schema import build_regex_from_schema
+
+        from .grammar import is_recursive, json_safe_schema
+
+        s = json_safe_schema(schema if isinstance(schema, str) else json.dumps(schema))
+        if is_recursive(s):
+            return ("pda", s)
+        return ("regex", build_regex_from_schema(s, whitespace))
+
+    def _host_compile(self, regex: str) -> Compiled:
+        cc = compile_constraint(regex, self.vocab, self.trie)
+        return Compiled(cc, ForcedPlanner(self.tokenizer._tokenizer, self.vocab, cc))
 
     def compile_walk(self, schema: Optional[Union[dict, str]] = None, regex: Optional[str] = None, whitespace: str = ""):
         """A constraint for the walk kernel (no token table): the automaton and

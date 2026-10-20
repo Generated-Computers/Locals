@@ -535,7 +535,7 @@ Variables read by the server process must be set in the environment of the comma
 | `LOCALS_DTYPE`, `LOCALS_FUSE`, `LOCALS_KERNELS`, `LOCALS_GDN_KERNEL`, `LOCALS_GDN_FAST`, `LOCALS_DENSE_PREFILL`, `LOCALS_PAD_ROWS` | `auto`, `1`, `1`, `1`, timed, timed, `1` | Switches for measuring what each part of the engine gives on a new GPU (see [Runtime](../runtime/README.md)). | `runtime.py`, `fuse.py`, `kernels.py` |
 | `LOCALS_PREFILL_RESERVE_GB` | learned | Room an admission keeps for a prompt being read, fixed. By default the engine keeps what its own reads of that size needed (1.5 GB until it has seen one); see [Batch engine](../engine/README.md). | `hybrid_batch.py` |
 | `LOCALS_MEMORY_MARGIN_GB` | `1.5`, less for a model that leaves under 8 GB | Margin below the GPU limit the memory guard keeps: MLX's pool of freed buffers (1 GB, or an eighth of the room a large model leaves, at least 256 MB) and 0.5 GB for what the admission estimate misses (`memory_plan`). | `service.py` |
-| `LOCALS_MAX_TABLE_GB` | `3` | Largest token table a grammar may need. Above it, the request fails and the error suggests `--walk`. | `constraint.py:128` |
+| `LOCALS_MAX_TABLE_GB` | `3` | Largest token table a grammar may need. Above it, the request fails and the error suggests `--walk`. | `constraint.py:127` |
 | `LOCALS_TABLE_CACHE_GB` | `0.5` | LRU limit on per-state constraint tables. | `engine.py:345` |
 | `LOCALS_MAX_COMPILED` | `16` | Compiled constraints kept, least recently used first. | `runtime.py:162` |
 | `LOCALS_COMPILED_GB` | `1.5` | Limit, in units of 1e9 bytes, on the tables of kept compiled constraints. | `runtime.py:245` |

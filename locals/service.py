@@ -137,6 +137,12 @@ _SERVICES: "weakref.WeakSet" = weakref.WeakSet()  # the engines of this process 
 _POOL_PLANNED = False  # our engine sized MLX's pool of freed buffers (memory_plan): the stock engine keeps it
 
 
+def _reason(e: BaseException) -> str:
+    """A request's error as the client reads it: a ValueError's message says what is wrong (the grammar
+    compilers' own say which part of the schema); anything else is named."""
+    return str(e) if isinstance(e, ValueError) and str(e) else f"{type(e).__name__}: {e}"
+
+
 class BatchService:
     def __init__(self, engine: str, model: str, slots: int = 16, temp: float = 0.0, seed: int = 0, cache_gb: Optional[float] = None,
                  walk: bool = False, top_p: float = 0.0, top_k: int = 0):
@@ -149,6 +155,7 @@ class BatchService:
         # (the stock engine keeps 1.5 GB)
         self.cache_bytes = int(cache_gb * (1 << 30)) if cache_gb else None
         self._q: "queue.Queue[Job]" = queue.Queue()
+        self._compile_lock = threading.Lock()
         self._inflight = {}  # id(job) -> job, taken by the worker and not yet finished
         self._closed = False
         self._ready = threading.Event()
@@ -181,8 +188,25 @@ class BatchService:
             raise ValueError("empty prompt")
         job = Job(list(prompt), schema, max_tokens, regex, t_submit=time.perf_counter(), on_token=on_token,
                   checkpoints=list(checkpoints or []), temp=temp, ignore_eos=ignore_eos)
-        self._q.put(job)
+        rt = getattr(self, "_rt", None)
+        if rt is not None and not self.walk and (schema is not None or regex is not None):
+            # its grammar is made in a thread of its own, and the job queued once it is: made in the batch loop, a
+            # JSON schema with maxItems 50 (1302 states) stopped every running reply for 8 s (31 s on a 16 GB Mac
+            # next to the model)
+            threading.Thread(target=self._compile_then_queue, args=(rt, job), name="locals-compile", daemon=True).start()
+        else:
+            self._q.put(job)
         return job
+
+    def _compile_then_queue(self, rt, job: "Job") -> None:
+        try:
+            with self._compile_lock:  # (one at a time: each holds its token table while it is made)
+                if not job.cancelled:
+                    rt.precompile(job.schema, job.regex)
+        except Exception:  # noqa: BLE001  # (compile in the batch loop raises it again: this request's error)
+            pass
+        finally:
+            self._q.put(job)
 
     def prime(self, tokens: List[int]) -> None:
         """Prefill ``tokens`` once and store them in the prompt cache (e.g. the
@@ -304,6 +328,7 @@ class BatchService:
         from .runtime import Runtime
 
         rt = Runtime.load(self.model_id, tune=os.environ.get("LOCALS_TUNE", "background"))
+        self._rt = rt
         self.weights_bytes = mx.get_active_memory()
         self.tokenizer = rt.tokenizer
         eos = list(rt.vocab.eos_ids)
@@ -386,7 +411,7 @@ class BatchService:
                     else:
                         ctl = Endless() if job.ignore_eos else Free()
                 except Exception as e:  # noqa: BLE001
-                    self._finish(job, [], f"invalid: {type(e).__name__}: {e}")
+                    self._finish(job, [], f"invalid: {_reason(e)}")
                     continue
                 r = Request(job.prompt, ctl, job.max_tokens)
                 r.on_token = job.on_token
@@ -506,7 +531,7 @@ class BatchService:
                     try:
                         procs = processors(job.schema, job.regex)
                     except Exception as e:  # noqa: BLE001  # a regex or schema that does not compile: this request's error
-                        self._finish(job, [], f"invalid: {type(e).__name__}: {e}")
+                        self._finish(job, [], f"invalid: {_reason(e)}")
                         continue
                     more = {}
                     if job.ignore_eos and not procs:  # no stop tokens for this row (a grammar's end still ends it)
