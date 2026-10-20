@@ -58,6 +58,19 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".000000Z"
 
 
+def _ollama_options(req: dict) -> dict:
+    """Ollama's options, checked: a number where one is due (num_predict "x" failed inside the server with
+    "TypeError: '>' not supported between instances of 'str' and 'int'")."""
+    got = req.get("options") or {}
+    if not isinstance(got, dict):
+        raise ValueError("options must be an object")
+    for k in ("num_predict", "temperature", "top_p", "top_k", "seed", "num_ctx"):
+        v = got.get(k)
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
+            raise ValueError(f"options.{k} must be a number")
+    return got
+
+
 def ollama_to_chat(req: dict, model: str, generate: bool = False) -> dict:
     """An Ollama /api/chat (or /api/generate) request as a Chat Completions request."""
     msgs: List[dict] = []
@@ -85,7 +98,7 @@ def ollama_to_chat(req: dict, model: str, generate: bool = False) -> dict:
             if m.get("role") == "tool":  # paired by position, as Ollama does, when it names no call
                 msg["tool_call_id"] = m.get("tool_call_id") or (pending.pop(0) if pending else m.get("tool_name") or "")
             msgs.append(msg)
-    opts = req.get("options") or {}
+    opts = _ollama_options(req)
     out = {"model": model, "messages": msgs, "stream": req.get("stream", True) is not False}
     if opts.get("num_predict") and opts["num_predict"] > 0:
         out["max_tokens"] = opts["num_predict"]
@@ -110,7 +123,7 @@ def ollama_to_chat(req: dict, model: str, generate: bool = False) -> dict:
 def ollama_to_text(req: dict, model: str) -> dict:
     """An Ollama /api/generate request with ``raw`` (the prompt as it is, no chat template: a code
     completion's prefix) as a /v1/completions request."""
-    opts = req.get("options") or {}
+    opts = _ollama_options(req)
     out = {"model": model, "prompt": req.get("prompt") or "", "stream": req.get("stream", True) is not False}
     if opts.get("num_predict") and opts["num_predict"] > 0:
         out["max_tokens"] = opts["num_predict"]

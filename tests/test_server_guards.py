@@ -4,6 +4,7 @@ cannot be swapped in, and what the server would silently ignore is refused."""
 
 import http.client
 import json
+import re
 import threading
 
 import pytest
@@ -126,3 +127,33 @@ def test_errors_come_in_each_apis_own_shape(http_server):
         c.request("POST", path, "{", {"Content-Type": "application/json"})
         r = c.getresponse()
         assert r.status == 400 and check(json.loads(r.read())), path
+
+
+def test_requests_of_the_wrong_shape_are_told_what_is_wrong():
+    """A malformed request failed inside the server with Python's words ("AttributeError: 'str' object has no
+    attribute 'get'"); each shape gets its own sentence now, and a lone surrogate (a JavaScript client that cut a
+    string inside an emoji) is replaced instead of failing the request."""
+    for req, said in (({"messages": ["hi"]}, "messages[0] must be an object"),
+                      ({"messages": [{"role": "user", "content": 5}]}, "messages[0].content must be a string"),
+                      ({"messages": [{"role": "assistant", "tool_calls": "x"}]}, "tool_calls must be a list"),
+                      ({"messages": [], "tools": "x"}, "tools must be a list"),
+                      ({"messages": [], "stop": 5}, "stop must be a string"),
+                      ({"messages": [], "model": 5}, "model must be a string")):
+        with pytest.raises(ValueError, match=re.escape(said)):
+            srv._check_shape(req)
+    assert srv._clean_text({"a": ["x\ud800y", 3]}) == {"a": ["x\ufffdy", 3]}
+    assert srv._bad(ValueError("n must be 1")) == "n must be 1"
+    assert srv._bad(KeyError("x")).startswith("invalid request (KeyError")
+
+
+def test_wrong_methods_and_short_bodies_get_answers(http_server):
+    import socket
+
+    c = http.client.HTTPConnection("127.0.0.1", http_server, timeout=10)
+    c.request("PUT", "/v1/chat/completions", "{}")
+    r = c.getresponse()
+    assert r.status == 405 and "error" in json.loads(r.read())
+    s = socket.create_connection(("127.0.0.1", http_server), timeout=10)
+    s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\n{}")
+    s.shutdown(socket.SHUT_WR)  # the client stops sending: the body ends short
+    assert b" 400 " in s.recv(200)

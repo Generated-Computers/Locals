@@ -64,6 +64,7 @@ class BadRequest(ValueError):
 
 
 MAX_BODY = 64 << 20  # bytes of a request body
+BODY_TIMEOUT = 60  # seconds a request body may take to arrive (Handler.do_POST)
 _LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 _APP_SCHEMES = ("app", "file", "tauri", "vscode-webview", "vscode-file",  # desktop apps and VS Code
                 "chrome-extension", "moz-extension", "safari-web-extension")  # browser extensions (as Ollama allows)
@@ -303,6 +304,7 @@ class Server:
         if os.environ.get("LOCALS_DEBUG"):
             _dump_request(req)
         _unsupported(req)
+        _check_shape(req)
         model = req.get("model") or f"locals/{self.short}"
         engine = oai.engine_of(model)
         thinking = oai.thinking_of(model, self.thinking)
@@ -391,6 +393,7 @@ class Server:
         if os.environ.get("LOCALS_DEBUG"):
             _dump_request(req, "text")
         _unsupported(req)
+        _check_shape(req)
         if req.get("echo") or req.get("suffix"):  # the prompt echoed back, or text to fill in before a suffix
             raise ValueError("echo and suffix are not supported")
         model = req.get("model") or f"locals/{self.short}"
@@ -1257,6 +1260,25 @@ def make_handler(server: Server, ollama_root: bool = False):
             self._json({"error": {"message": msg, "type": "invalid_request_error" if status < 500 else "server_error",
                                   "param": "messages" if code else None, "code": code}}, status)
 
+        def _no_method(self):
+            path = urlparse(self.path).path.rstrip("/")
+            if path == "/api/delete":  # `ollama rm`: an answer the ollama command can show
+                return self._error("locals does not delete models: they are in ~/.cache/huggingface/hub (delete a "
+                                   "model's folder there to free the space)", 400)
+            return self._error(f"{self.command} is not supported here: use GET or POST", 405)
+
+        def do_PUT(self):
+            if self._allowed():
+                self._no_method()
+
+        def do_DELETE(self):
+            if self._allowed():
+                self._no_method()
+
+        def do_PATCH(self):
+            if self._allowed():
+                self._no_method()
+
         def do_OPTIONS(self):
             if not self._allowed():
                 return
@@ -1289,6 +1311,12 @@ def make_handler(server: Server, ollama_root: bool = False):
                 data = [dict(m, type="model", display_name=m.get("id"), created_at=apis._now_iso()) for m in server.models()]
                 return self._json({"object": "list", "data": data, "has_more": False,
                                    "first_id": data[0]["id"] if data else None, "last_id": data[-1]["id"] if data else None})
+            if path.startswith(("/v1/models/", "/models/")):  # the OpenAI SDK's models.retrieve(id)
+                # the model served, under the name asked for, as a chat request with that name is answered by it
+                asked = path.split("/models/", 1)[1]
+                ms = server.models()
+                m = next((x for x in ms if x.get("id") == asked), None) or (dict(ms[0], id=asked) if ms else None)
+                return self._json(m) if m else self._error("no model is loaded", 404)
             if path == "/" and ollama_root:  # what Ollama answers, and some apps check
                 return self._text("Ollama is running")
             if path == "/api/version":
@@ -1320,7 +1348,7 @@ def make_handler(server: Server, ollama_root: bool = False):
             except ContextTooLong as e:
                 return fail(str(e), 400)
             except (ValueError, TypeError, KeyError, AttributeError) as e:
-                return fail(f"{type(e).__name__}: {e}", 400)
+                return fail(_bad(e), 400)
             if not text_req["stream"]:
                 p["alive"] = self._alive
                 try:
@@ -1384,7 +1412,7 @@ def make_handler(server: Server, ollama_root: bool = False):
                 server.log(f"rejected: {e}")
                 return fail(f"prompt is too long: {e.n} tokens > {e.limit} maximum", 400)
             except (ValueError, TypeError, KeyError, AttributeError) as e:
-                return fail(f"{type(e).__name__}: {e}", 400)
+                return fail(_bad(e), 400)
             except Exception as e:  # noqa: BLE001
                 import traceback
 
@@ -1477,7 +1505,7 @@ def make_handler(server: Server, ollama_root: bool = False):
                 server.log(f"rejected: {e}")
                 return fail(str(e), 400)
             except (ValueError, TypeError, KeyError, AttributeError) as e:
-                return fail(f"{type(e).__name__}: {e}", 400)
+                return fail(_bad(e), 400)
             except Exception as e:  # noqa: BLE001
                 import traceback
 
@@ -1536,22 +1564,34 @@ def make_handler(server: Server, ollama_root: bool = False):
             if not self._allowed():
                 return
             path = urlparse(self.path).path.rstrip("/")
-            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
-                # a body sent in chunks (Go's io.Pipe, streamed bodies of requests/httpx/Node): read as empty, it got
-                # a misleading 400 and its bytes stayed on the connection, read as the next request
-                body = self._chunked_body()
-                if body is None:
-                    self.close_connection = True
-                    return self._error(f"the request body must be 0 to {MAX_BODY} bytes, in valid chunks", 413)
-            else:
-                try:
-                    n = int(self.headers.get("Content-Length") or 0)
-                except ValueError:
-                    return self._error("invalid Content-Length")
-                if n < 0 or n > MAX_BODY:
-                    self.close_connection = True
-                    return self._error(f"the request body must be 0 to {MAX_BODY} bytes", 413)
-                body = self.rfile.read(n)
+            # a client that stops sending its body (it crashed mid-upload, or announced more than it sent) held this
+            # thread waiting forever: the body is read with a time limit, then the reply has none (long streams)
+            self.connection.settimeout(BODY_TIMEOUT)
+            try:
+                if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                    # a body sent in chunks (Go's io.Pipe, streamed bodies of requests/httpx/Node): read as empty, it
+                    # got a misleading 400 and its bytes stayed on the connection, read as the next request
+                    body = self._chunked_body()
+                    if body is None:
+                        self.close_connection = True
+                        return self._error(f"the request body must be 0 to {MAX_BODY} bytes, in valid chunks", 413)
+                else:
+                    try:
+                        n = int(self.headers.get("Content-Length") or 0)
+                    except ValueError:
+                        return self._error("invalid Content-Length")
+                    if n < 0 or n > MAX_BODY:
+                        self.close_connection = True
+                        return self._error(f"the request body must be 0 to {MAX_BODY} bytes", 413)
+                    body = self.rfile.read(n)
+                    if len(body) < n:
+                        self.close_connection = True
+                        return self._error(f"the request body ended after {len(body)} of {n} bytes", 400)
+            except (TimeoutError, OSError):
+                self.close_connection = True
+                return self._error(f"the request body did not arrive within {BODY_TIMEOUT} s", 408)
+            finally:
+                self.connection.settimeout(None)
             enc = (self.headers.get("Content-Encoding") or "").strip().lower()
             if enc in ("gzip", "deflate"):  # Claude Code can compress its request bodies (CLAUDE_CODE_GZIP_REQUEST_BODIES)
                 import zlib
@@ -1572,13 +1612,17 @@ def make_handler(server: Server, ollama_root: bool = False):
                 return self._error("invalid JSON body")
             if not isinstance(req, dict):
                 return self._error("the request body must be a JSON object")
+            req = _clean_text(req)
             text_api = path in ("/v1/completions", "/completions")
             if path in OTHER_POSTS:
                 return self._other_api(path, req)
             if path in apis.ANTHROPIC_POSTS:
                 return self._messages_api(path, req)
             if path not in ("/v1/chat/completions", "/chat/completions") and not text_api:
-                return self._error("not found", 404)
+                if path.endswith("/embeddings"):
+                    return self._error("embeddings are not served: locals answers chat and text completions (and the "
+                                       "Anthropic and Ollama APIs)", 404)
+                return self._error(f"no such endpoint: POST {path}", 404)
             if not text_api and (not isinstance(req.get("messages"), list) or not req["messages"]):
                 return self._error("messages must be a non-empty list")
             server.requests += 1
@@ -1588,7 +1632,7 @@ def make_handler(server: Server, ollama_root: bool = False):
                 server.log(f"rejected: {e}")
                 return self._error(str(e), 400, "context_length_exceeded")
             except (ValueError, TypeError, KeyError, AttributeError) as e:  # a malformed request (messages, tools, schema)
-                return self._error(f"{type(e).__name__}: {e}", 400)
+                return self._error(_bad(e), 400)
             except Exception as e:  # noqa: BLE001  # our bug, not the client's
                 import traceback
 
@@ -1657,6 +1701,54 @@ def _check_tool_choice(tc, names: List[str]) -> None:
             raise ValueError(f"tool_choice names {name!r}, which is not one of the tools")
     elif tc not in ("auto", "required", "none", None):
         raise ValueError("tool_choice must be auto, required, none, or a named function")
+
+
+def _clean_text(x):
+    """The request with every lone surrogate replaced by U+FFFD: JSON allows "\\ud83d" alone (a JavaScript client
+    that cut a string inside an emoji sends one), the tokenizer does not, and the whole request failed with
+    "TextEncodeInput must be Union[...]"."""
+    if isinstance(x, str):
+        try:
+            x.encode("utf-8")
+            return x
+        except UnicodeEncodeError:
+            return x.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    if isinstance(x, dict):
+        return {k: _clean_text(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_clean_text(v) for v in x]
+    return x
+
+
+def _check_shape(req: dict) -> None:
+    """A clear 400 for a request of the wrong shape, which otherwise failed inside the server with Python's words
+    ("AttributeError: 'str' object has no attribute 'get'")."""
+    if "model" in req and req["model"] is not None and not isinstance(req["model"], str):
+        raise ValueError("model must be a string")
+    msgs = req.get("messages")
+    if isinstance(msgs, list):
+        for i, m in enumerate(msgs):
+            if not isinstance(m, dict):
+                raise ValueError(f"messages[{i}] must be an object with a role and a content")
+            c = m.get("content")
+            if c is not None and not isinstance(c, (str, list)):
+                raise ValueError(f"messages[{i}].content must be a string or a list of parts")
+            if isinstance(c, list) and not all(isinstance(part, (str, dict)) for part in c):
+                raise ValueError(f"messages[{i}].content: every part must be an object such as {{\"type\": \"text\", \"text\": ...}}")
+            calls = m.get("tool_calls")
+            if calls is not None and (not isinstance(calls, list) or not all(isinstance(t, dict) for t in calls)):
+                raise ValueError(f"messages[{i}].tool_calls must be a list of objects")
+    tools = req.get("tools")
+    if tools is not None and (not isinstance(tools, list) or not all(isinstance(t, dict) for t in tools)):
+        raise ValueError("tools must be a list of objects such as {\"type\": \"function\", \"function\": {...}}")
+    stop = req.get("stop")
+    if stop is not None and not (isinstance(stop, str) or (isinstance(stop, list) and all(isinstance(x, str) for x in stop))):
+        raise ValueError("stop must be a string or a list of strings")
+
+
+def _bad(e: Exception) -> str:
+    """The message of a 400: ours as it is, Python's (a shape _check_shape does not catch) with what it was."""
+    return str(e) if isinstance(e, ValueError) and str(e) else f"invalid request ({type(e).__name__}: {e})"
 
 
 def _unsupported(req: dict) -> None:
