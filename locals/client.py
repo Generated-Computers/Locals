@@ -9,6 +9,7 @@ it: one model in memory, and its prompt cache keeps a conversation between turns
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -25,7 +26,7 @@ def connect(model: Optional[str]) -> tuple:
     from .defaults import DEFAULT_MODEL, model_id
 
     saved = app._load_saved()
-    port = int(saved.get("port") or 8321)
+    port = int(os.environ.get("LOCALS_PORT") or saved.get("port") or 8321)  # (locals --port N chat)
     chosen = model_id(model) if model else (saved.get("model") or DEFAULT_MODEL)
     args = Namespace(port=port, model=chosen, engine=None, engines=None)
     app.fetch_model(chosen)

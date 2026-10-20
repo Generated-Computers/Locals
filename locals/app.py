@@ -668,7 +668,7 @@ def remember(**kw) -> None:
             print(f"note: a locals server still runs on port {was} (the port used before), with its own copy of the "
                   f"model; locals stop --port {was} stops it", flush=True)
         cfg.update({k: v for k, v in kw.items() if v is not None})
-        path.write_text(json.dumps(cfg, indent=1))
+        _write_atomic(path, json.dumps(cfg, indent=1))  # (two commands at once, or a crash, never leave half a file)
     except (OSError, ValueError):
         pass
 
@@ -2101,6 +2101,10 @@ def main(argv=None):
         step = 1 if "=" in argv[i] else 2
         if argv[i].startswith("--model"):  # their parsers take --model; the port is not theirs
             lead += argv[i:i + step]
+        else:  # the port: for the server chat and generate use (client.connect), which ignored it
+            value = argv[i].split("=", 1)[1] if step == 1 else (argv[i + 1] if i + 1 < len(argv) else "")
+            if value.isdigit():
+                os.environ["LOCALS_PORT"] = value
         i += step
     if i < len(argv) and _delegate(argv[i]) is not None:
         return _delegate(argv[i])((lead if argv[i] != "menubar" else []) + argv[i + 1:])  # its own options last: they win

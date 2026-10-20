@@ -421,3 +421,20 @@ def test_a_restart_keeps_the_options_the_server_was_started_with(tmp_path, monke
         app.ensure_server(argparse.Namespace(port=8399, model="mlx-community/Qwen3.5-4B-MLX-4bit", slots=None))
     cmd = " ".join(seen["cmd"])
     assert "--ollama-port 11434" in cmd and "--max-context 32000" in cmd and "--slots 8" in cmd
+
+
+def test_a_port_before_chat_is_the_one_it_uses(monkeypatch):
+    """`locals --port 9000 chat` talked to the remembered port: the leading --port was not passed on."""
+    from locals import client
+
+    monkeypatch.delenv("LOCALS_PORT", raising=False)
+    seen = {}
+    monkeypatch.setattr(app, "_delegate", lambda name: (lambda argv: seen.update(argv=argv)) if name == "chat" else None)
+    app.main(["--port", "9000", "chat"])
+    assert app.os.environ.get("LOCALS_PORT") == "9000" and seen["argv"] == []
+    monkeypatch.setattr(app, "_load_saved", lambda: {"port": 8321})
+    monkeypatch.setattr(app, "fetch_model", lambda m: None)
+    monkeypatch.setattr(app, "ensure_server", lambda args: seen.update(port=args.port))
+    monkeypatch.setattr(app, "remember", lambda **kw: None)
+    assert client.connect("mlx-community/Qwen3.5-4B-MLX-4bit")[0].endswith(":9000") and seen["port"] == 9000
+    monkeypatch.delenv("LOCALS_PORT")
