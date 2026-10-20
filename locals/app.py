@@ -580,12 +580,12 @@ def check_model(model: str) -> None:
     """Exit with what to do if ``model`` cannot run here: a GGUF model, too big for this Mac, or a name that
     is neither a folder nor a model on Hugging Face (a typo). Nothing is downloaded; offline, a model not
     downloaded yet passes (its download says what is wrong)."""
-    from .defaults import cached_snapshot, gguf_hint, too_big
+    from .defaults import cached_snapshot, gguf_hint, ollama_hint, too_big
 
     remembered = _load_saved().get("model") == model
     hint = (f" ({model} is the model locals remembered from an earlier command; choose one with --model, e.g. "
             f"--model qwen)") if remembered else ""
-    why = gguf_hint(model) or too_big(model, remote=True)  # before a download of gigabytes that cannot run
+    why = gguf_hint(model) or ollama_hint(model) or too_big(model, remote=True)  # before a download that cannot run
     if why:
         sys.exit(f"locals: {why}{hint}")
     if Path(model).expanduser().exists() or cached_snapshot(model, _MODEL_FILES) is not None:
@@ -1371,8 +1371,17 @@ def cmd_launch(args) -> None:
         args.ollama_port = args.ollama_port or OLLAMA_PORT
         holder = _listener_pid(args.ollama_port)
         if holder is not None and not _answers_as_locals(args.ollama_port):
-            sys.exit(f"port {args.ollama_port} is taken (Ollama itself?): quit it first, or point the app at "
-                     f"{base_url(args.port)} (locals answers Ollama's API there too)")
+            what = subprocess.run(["ps", "-o", "command=", "-p", str(holder)], capture_output=True, text=True).stdout.strip()
+            if "ollama" in what.lower():  # how to quit it, whichever way it was installed
+                how = ("quit Ollama first, then run  locals launch ollama  again:\n"
+                       "  the Ollama app:   osascript -e 'quit app \"Ollama\"'   (or Quit in its menu bar icon)\n"
+                       "  with Homebrew:    brew services stop ollama\n"
+                       "  in a terminal:    Ctrl-C where  ollama serve  runs\n"
+                       "Your Ollama models stay where they are; quit Locals (locals stop) and start Ollama to go back.")
+            else:
+                how = f"it is held by another program ({what.split()[0] if what else 'pid ' + str(holder)}); quit it first."
+            sys.exit(f"port {args.ollama_port}, where apps look for Ollama, is in use (pid {holder}): {how}\n"
+                     f"Or point the app at {base_url(args.port)} instead: locals answers Ollama's API there too.")
         if holder is None and server_alive(args.port):  # running without the Ollama port: start it again with it
             try:
                 busy = len(get_json(base_url(args.port) + "/stats", timeout=5).get("active") or [])

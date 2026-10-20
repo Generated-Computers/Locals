@@ -207,7 +207,8 @@ class Server:
             m = apis.ollama_model_entry(self.ollama_name(e), self.short, family, self.context_for(e))
             if running:
                 m["expires_at"] = "2099-01-01T00:00:00Z"
-                m["size_vram"] = 0
+                # the weights, all in GPU memory: `ollama ps` showed "100% CPU" and 0 B for size_vram 0
+                m["size"] = m["size_vram"] = int(getattr(self._svc.get(e), "weights_bytes", 0) or 0)
             out.append(m)
         return out
 

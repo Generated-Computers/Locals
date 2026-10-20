@@ -64,6 +64,7 @@ The `type=model_id` converter in `locals/defaults.py` resolves names as follows:
   | `lfm2.5-2.6b` | `lfm`, `lfm2.5` | `LiquidAI/LFM2.5-2.6B-MLX-4bit` |
   | `minicpm5-2b` | `minicpm`, `minicpm5` | `mlx-community/MiniCPM5-2B-mlx-4Bit` |
 
+- Ollama's names for these models (`qwen3.5:4b`, `qwen3.5:2b`, `gemma4:e4b`, `qwen3.5:latest`) map to them too: a `:` becomes `-`, and `:latest` is dropped.
 - An existing local path (a folder or a file, with `~` expanded) becomes its absolute path. Links are kept, not resolved., because the background server runs from another directory and later commands may run from other folders. A short name takes precedence over a folder with the same name.
 - Anything else passes through unchanged as a Hugging Face id.
 
@@ -171,7 +172,8 @@ The server also serves a status page at `GET /` (`STATUS_HTML` in `server.py`) t
 
 `check_model(model)` comes first (`fetch_model` calls it, and `locals setup` calls it alone, before any config names the model). It downloads nothing and refuses:
 
-- GGUF models (`defaults.gguf_hint` names MLX versions instead).
+- GGUF models (`defaults.gguf_hint` names MLX versions instead: the same model and size first, then `mlx-community`'s, then 4-bit ones).
+- Ollama names it does not know, such as `llama3.2:3b` (`defaults.ollama_hint` names MLX versions on Hugging Face, the tag's size first). Without it, the download failed with "Repo id must use alphanumeric chars".
 - Models whose weights plus `HEADROOM_GB = 2.0` exceed the GPU's recommended working set (`defaults.too_big`, skipped with `LOCALS_IGNORE_MEMORY=1`). The message suggests a smaller model for this Mac.
 - A name that is neither a folder nor a model on Hugging Face (a typo), with the nearest short name (`did you mean --model gemma?`). Offline, a model not downloaded yet passes, and its download says what is wrong.
 

@@ -180,6 +180,54 @@ From then on it starts in seconds. If you already use the uv package manager,
 you can install with `uv tool install git+https://github.com/Generated-Computers/Locals`
 instead.
 
+### Coming from Ollama, LM Studio, mlx-lm or llama.cpp
+
+Locals installs next to them and changes nothing of theirs: it has its own port
+(8321) and its own folders. Only the memory is shared, so quit the other one
+while Locals runs; two models at once rarely fit. Locals remembers the model and
+port you start it with for later commands.
+
+**Ollama.** Quit Ollama, then let Locals answer on Ollama's port. Apps set up
+for Ollama (Open WebUI, Raycast, Continue) and the `ollama` command itself keep
+working unchanged, whatever model name they ask for:
+
+```bash
+osascript -e 'quit app "Ollama"'      # or: brew services stop ollama
+locals launch --model qwen3.5:4b ollama
+```
+
+Ollama's model names work in Locals, and for a model Locals does not know it
+names the MLX version on Hugging Face to use instead. Ollama's own downloads
+are in another format (GGUF), so a model is downloaded once more, in MLX's. To
+go back, run `locals stop` and start Ollama.
+
+**LM Studio.** LM Studio's MLX models run in Locals where they are, with no
+second download. Stop LM Studio's server and start Locals on its port, so apps
+that use it keep working:
+
+```bash
+locals start --model ~/.lmstudio/models/mlx-community/Qwen3.5-4B-MLX-4bit --port 1234
+```
+
+**mlx-lm.** The same models and the same download folder, so nothing downloads
+again. `locals serve` takes the place of `mlx_lm.server`, with the same API:
+
+```bash
+locals serve --model mlx-community/Qwen3.5-4B-MLX-4bit --port 8080
+```
+
+**llama.cpp.** Locals runs MLX models, not GGUF files; give it one and it names
+the MLX version of the same model. Start it on `llama-server`'s port to keep
+your clients:
+
+```bash
+locals start --model qwen --port 8080
+```
+
+**Any other server with the OpenAI API** (vLLM, LocalAI): point your client at
+`http://127.0.0.1:8321/v1`, or start Locals on the port the client already uses
+with `--port`.
+
 ## Examples
 
 **Work on a project with an assistant.** This opens OpenCode in your project, where

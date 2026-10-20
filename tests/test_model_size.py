@@ -48,6 +48,46 @@ def test_a_gguf_model_is_named_as_such(tmp_path, monkeypatch):
     assert d.gguf_hint("mlx-community/Qwen3.5-4B-MLX-4bit", remote=False) is None
 
 
+def test_a_gguf_model_is_pointed_at_the_mlx_version_of_the_same_size(tmp_path, monkeypatch):
+    """By downloads alone, a 4B GGUF was pointed at lmstudio-community/Qwen3.5-9B-MLX-4bit."""
+    import huggingface_hub
+    from types import SimpleNamespace
+
+    class Hub:  # Hugging Face's answer, most downloaded first
+        def list_models(self, **kw):
+            return [SimpleNamespace(id=i) for i in ("lmstudio-community/Qwen3.5-9B-MLX-4bit", "someone/Qwen3.5-4B-mlx-8bit",
+                                                    "mlx-community/Qwen3.5-4B-MLX-4bit")]
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", Hub)
+    f = tmp_path / "Qwen3.5-4B-Q4_K_M.gguf"
+    f.write_bytes(b"GGUF")
+    assert "(--model mlx-community/Qwen3.5-4B-MLX-4bit)" in d.gguf_hint(str(f))
+
+
+def test_ollamas_names_for_the_models():
+    """Someone coming from Ollama types its names: qwen3.5:4b, gemma4:e4b, qwen3.5 (its latest)."""
+    assert d.model_id("qwen3.5:4b") == d.MODELS["qwen3.5-4b"] and d.model_id("qwen3.5:2b") == d.MODELS["qwen3.5-2b"]
+    assert d.model_id("gemma4:e4b") == d.MODELS["gemma-4-e4b"] and d.model_id("qwen3.5:latest") == d.MODELS["qwen3.5-4b"]
+    assert d.model_id("llama3.2:3b") == "llama3.2:3b"  # not one of these: as given (and refused with a reason)
+
+
+def test_an_ollama_name_is_pointed_at_its_mlx_version(monkeypatch):
+    """An Ollama name locals does not know failed with "Repo id must use alphanumeric chars" (its download)."""
+    import huggingface_hub
+    from types import SimpleNamespace
+
+    class Hub:
+        def list_models(self, search, **kw):
+            assert search in ("llama-3.2", "llama3.2")
+            return [SimpleNamespace(id=i) for i in ("mlx-community/Llama-3.2-1B-Instruct-4bit",
+                                                    "someone/Llama-3.2-3B-Instruct-8bit", "mlx-community/Llama-3.2-3B-Instruct-4bit")]
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", Hub)
+    why = d.ollama_hint("llama3.2:3b")
+    assert "is an Ollama model name" in why and "(--model mlx-community/Llama-3.2-3B-Instruct-4bit)" in why
+    assert d.ollama_hint("mlx-community/Qwen3.5-4B-MLX-4bit") is None and d.ollama_hint("qwen") is None
+
+
 def test_the_name_a_model_has_in_the_api():
     """locals/<name>: the repository or folder name without its 4-bit suffix, in any capitalization."""
     assert d.short_name("mlx-community/Qwen3.5-4B-MLX-4bit") == "qwen3.5-4b"

@@ -17,6 +17,11 @@ First public release.
   model; `locals launch` does the same for Claude Code, OpenHands, Cline, Kilo
   Code, OpenClaw, Hermes Agent, Aider, editor extensions and apps that work with
   Ollama. `locals models` says which model to use for agents.
+- **Switching from Ollama, LM Studio, mlx-lm or llama.cpp** in a command or two
+  (README, "Coming from"): `locals launch ollama` answers apps set up for
+  Ollama and the `ollama` command itself, Ollama's model names work, LM
+  Studio's MLX models run where they are, and a GGUF file or an Ollama name
+  Locals does not know gets the MLX version of the same model to use.
 - **An OpenAI-, Anthropic- and Ollama-compatible server** on MLX, running in the
   background (`locals start`, `locals status`, `locals stop`) or in the menu bar.
   Anthropic's Messages API (`/v1/messages`) is what Claude Code and the Anthropic

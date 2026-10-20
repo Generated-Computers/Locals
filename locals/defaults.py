@@ -173,13 +173,44 @@ def gguf_hint(model: str, remote: bool = True) -> "str | None":
         from huggingface_hub import HfApi
 
         for q in dict.fromkeys([base, base.split("_", 1)[-1]]):  # bartowski's "Qwen_Qwen3.5-0.8B"
-            found += [m.id for m in HfApi().list_models(search=q, filter="mlx", sort="downloads", limit=3) if m.id not in found]
+            found += [m.id for m in HfApi().list_models(search=q, filter="mlx", sort="downloads", limit=12) if m.id not in found]
     except Exception:  # noqa: BLE001
         pass
+    # the same model first (its size in the name: by downloads alone, a 9B came before the 4B asked for), then
+    # mlx-community's conversions, then 4-bit ones
+    want = base.split("_", 1)[-1].lower()
+    found.sort(key=lambda mid: (want not in mid.split("/")[-1].lower(), not mid.startswith("mlx-community/"),
+                                "4bit" not in mid.lower()))
     see = (f" MLX versions of it: {', '.join(found[:3])} (--model {found[0]})." if found else
            " Look for an MLX version of it on Hugging Face (mlx-community), or convert the original weights with "
            "mlx_lm.convert --hf-path ORIGINAL -q.")
     return f"{model} is a GGUF model (the format of llama.cpp, Ollama and LM Studio); locals runs MLX models.{see}"
+
+
+def ollama_hint(model: str) -> "str | None":
+    """If ``model`` is an Ollama model name (name:tag, no publisher; qwen3.5:4b and the others locals knows are
+    taken by model_id), what to use instead: locals runs MLX models from Hugging Face, whose MLX versions of it are
+    named, the size of the tag first. None for any other name. (Without it: "Repo id must use alphanumeric chars".)"""
+    import re
+
+    if ":" not in model or "/" in model or Path(model).expanduser().exists():
+        return None
+    name, tag = (model.lower().split(":", 1) + [""])[:2]
+    found = []
+    try:
+        from huggingface_hub import HfApi
+
+        for q in dict.fromkeys([re.sub(r"([a-z])(\d)", r"\1-\2", name), name]):  # llama3.2 is Llama-3.2 there
+            found += [m.id for m in HfApi().list_models(search=q, filter="mlx", sort="downloads", limit=20) if m.id not in found]
+    except Exception:  # noqa: BLE001
+        pass
+    size = tag if tag and tag != "latest" else ""
+    found.sort(key=lambda mid: (bool(size) and not re.search(rf"(^|[-_.]){re.escape(size)}([-_.]|$)", mid.split("/")[-1].lower()),
+                                not mid.startswith("mlx-community/"), "4bit" not in mid.lower()))
+    see = (f" MLX versions of it on Hugging Face: {', '.join(found[:3])} (--model {found[0]})." if found else
+           " Look for an MLX version of it on Hugging Face (huggingface.co/mlx-community).")
+    return (f"{model} is an Ollama model name; locals runs MLX models from Hugging Face.{see} Or one of locals's own: "
+            f"qwen, gemma, lfm, minicpm.")
 
 
 def default_model() -> str:
@@ -207,11 +238,16 @@ def short_name(model: str) -> str:
 
 
 def model_id(name: str) -> str:
-    """The model id for a short name (qwen, gemma, qwen3.5-4b, gemma-4-e4b, ...); a local folder as its
+    """The model id for a short name (qwen, gemma, qwen3.5-4b, gemma-4-e4b, ..., and Ollama's names for them:
+    qwen3.5:4b, gemma4:e4b); a local folder as its
     absolute path (the background server runs elsewhere, and later commands from other folders);
     other names unchanged. A short name wins over a folder of the same name in the current one."""
     name = str(name)  # a Path too, as mlx_lm.load takes
     key = name.strip().lower()
+    if ":" in key and key not in ALIASES and key not in MODELS and not Path(name).expanduser().exists():
+        ollama = key.removesuffix(":latest").replace(":", "-")  # Ollama's names: qwen3.5:4b, gemma4:e4b, qwen3.5
+        if ollama in ALIASES or ollama in MODELS:
+            key = ollama
     if key in ALIASES or key in MODELS:
         return MODELS[ALIASES.get(key, key)]
     path = Path(name).expanduser()
