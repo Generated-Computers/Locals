@@ -358,7 +358,7 @@ fallback     the hermes form; the tools are described in the system prompt
 
 | `name` | Families (formats.py) | Several calls per reply | Arguments in the grammar | `replay_raw` |
 |---|---|---|---|---|
-| `qwen_xml` | Qwen3.5, Qwen3-Coder | yes, separated by `\n` | Parameter names `[A-Za-z0-9_.\-]+`, values any text without `</parameter>` (typed with `--typed-tools`) | yes |
+| `qwen_xml` | Qwen3.5, Qwen3-Coder | yes, separated by `\n` | Parameter names `[A-Za-z0-9_.\-]+` or one of the offered tools' own (`$select`, `größe`), values any text without `</parameter>` (typed with `--typed-tools`) | yes |
 | `hermes` | Qwen2.5, Qwen3, Hermes | yes, separated by `\n` | `json_args_regex()` | yes |
 | `llama3_json` | Llama 3.1-3.3 | no | `json_args_regex()` under `"parameters"` | yes |
 | `mistral` | Mistral 7B v0.3 | yes, in one JSON list | `json_args_regex()` | no |
@@ -369,7 +369,7 @@ fallback     the hermes form; the tools are described in the system prompt
 | `gemma4` | Gemma 4 | yes | Keys `[A-Za-z_][A-Za-z0-9_.\-]*`; values `<\|"\|>`-quoted strings, numbers, booleans, `null`, nested objects and lists three levels deep | no |
 | `fallback` | Templates without tools (Gemma 3, ...) | no: a model without tool training chains dependent calls blindly | `json_args_regex()` | yes |
 
-`json_args_regex(space=r"[ ]?")` accepts any JSON object nested four levels deep (objects of lists of objects of lists, as Hermes Agent's clarify tool needs). It allows JSON string escapes including `\uXXXX`, JSON numbers, and an optional single space between JSON tokens, because templates write `", "` and `": "`. Its docstring puts it at about 700 automaton states.
+`json_args_regex(space=r"[ ]?")` accepts any JSON object nested four levels deep (objects of lists of objects of lists, as Hermes Agent's clarify tool needs). It allows JSON string escapes including `\uXXXX`, JSON numbers, and an optional single space between JSON tokens, because templates write `", "` and `": "`. Its docstring puts it at about 700 automaton states. Arguments nested deeper cannot be written in these formats: Claude Code's `AskUserQuestion` puts its option objects at level five, so a model in one of them writes the options as strings. Five levels would take 1420 states, a 2.5 GB token table per tool set; Qwen's XML, MiniCPM's and LFM2's values have no such limit, and `--walk` needs no table.
 
 In every format, tool names are restricted to the offered names by `_alts(names)`, with `[A-Za-z0-9_.\-]+` when no names are given.
 
