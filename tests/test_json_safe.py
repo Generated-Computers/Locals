@@ -131,3 +131,31 @@ def test_integers_stay_within_their_bounds():
     for bad in ({"type": "integer", "minimum": 5, "maximum": 2}, {"type": "integer", "minimum": "5"}):
         with pytest.raises(GrammarError):
             dfa(bad)
+
+
+def test_patterns_are_searched_and_unknown_formats_are_annotations():
+    """JSON Schema reads a pattern as a search: zod's startsWith("https://") is "^https:\\/\\/", and read as a whole
+    string the only value it allowed was "https://". A format outlines-core does not know (Pydantic's Path,
+    SecretStr) is an annotation, not a 400; ipv4 is enforced."""
+    def dfa(schema):
+        from locals.grammar import schema_regex
+
+        return rx.compile_dfa(schema_regex(json_safe_schema(schema)))
+
+    def ok(schema, good, bad):
+        d = dfa(schema)
+        assert all(d.matches(json.dumps(g).encode()) for g in good), schema
+        assert not any(d.matches(json.dumps(b).encode()) for b in bad), schema
+
+    ok({"type": "string", "pattern": "^https:\\/\\/"}, ["https://", "https://a.b/c"], ["http://a", "xhttps://"])
+    ok({"type": "string", "pattern": "\\.json$"}, ["a.json", ".json"], ["a.jsonx"])
+    ok({"type": "string", "pattern": "foo"}, ["foo", "a foo\nb"], ["fo"])
+    ok({"type": "string", "pattern": "^[a-z]+$"}, ["abc"], ["abc1", ""])
+    ok({"type": "string", "pattern": "^a|b$"}, ["ax", "xb"], ["xa"])
+    ok({"type": "string", "pattern": "cost\\$"}, ["cost$ 5"], ["cost"])
+    ok({"type": "string", "pattern": "(x|y)z"}, ["xz", "-yz-"], ["x", "z"])
+    ok({"type": "string", "format": "ipv4"}, ["10.0.0.1", "255.255.255.0"], ["256.1.1.1", "1.2.3", "a.b.c.d"])
+    for fmt in ("path", "password", "hostname", "uri-reference", "custom-thing"):
+        ok({"type": "string", "format": fmt}, ["anything at all"], [])
+    ok({"type": "string", "format": "date"}, ["2026-10-21"], ["yesterday"])
+

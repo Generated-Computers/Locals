@@ -53,9 +53,48 @@ _ANY = {"anyOf": [{"type": "string"}, {"type": "number"}, {"type": "boolean"}, {
 _UNSAFE = [(0x00, 0x1F), (0x22, 0x22), (0x5C, 0x5C)]  # what a JSON string writes as an escape
 
 
+def _top_branches(pattern: str) -> List[str]:
+    """``pattern`` split at its top-level ``|`` (not inside a group, a class or after a backslash)."""
+    out, cur, depth, in_class, i = [], "", 0, False, 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "\\":
+            cur += pattern[i:i + 2]
+            i += 2
+            continue
+        if in_class:
+            in_class = c != "]"
+        elif c == "[":
+            in_class = True
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif c == "|" and depth == 0:
+            out.append(cur)
+            cur, i = "", i + 1
+            continue
+        cur += c
+        i += 1
+    return out + [cur]
+
+
+def _searched(pattern: str) -> str:
+    """``pattern`` as JSON Schema reads it, a search: a branch without ``^`` may have text before its match, one
+    without ``$`` text after (zod's startsWith("https://") is "^https:\\/\\/"; read as a whole string, the only
+    value it allowed was "https://")."""
+    out = []
+    for b in _top_branches(pattern):
+        start = b.startswith("^")
+        end = b.endswith("$") and not b.endswith("\\$") or b.endswith("\\\\$")
+        core = b[1 if start else 0:len(b) - 1 if end else len(b)]
+        out.append(("" if start else "(?:.|\\n)*") + "(?:" + core + ")" + ("" if end else "(?:.|\\n)*"))
+    return "|".join(out)
+
+
 def _json_pattern(pattern: str) -> str:
-    """``pattern`` (anchored, as outlines-core and the engine read it) as a regex over the text of a
-    JSON string's contents."""
+    """``pattern`` (a search, as JSON Schema reads it: _searched) as a regex over the text of a JSON string's
+    contents, which the engine matches whole."""
     from . import regex as rx
 
     def safe(node):
@@ -100,7 +139,7 @@ def _json_pattern(pattern: str) -> str:
         raise GrammarError(f"unsupported pattern {pattern!r}")
 
     try:
-        tree = rx.parse(pattern)
+        tree = rx.parse(_searched(pattern))
     except rx.RegexError as e:
         raise GrammarError(f"pattern {pattern!r}: {e}") from None
     return "(?:" + show(safe(tree)) + ")"
@@ -173,6 +212,11 @@ def _merge2(a: dict, b: dict) -> dict:
     return out
 
 
+_FORMATS = {"date-time", "date", "time", "uuid", "email", "uri"}  # (the ones outlines-core writes a regex for)
+_OCTET = "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
+_FORMAT_PATTERNS = {"ipv4": "^(" + _OCTET + "\\.){3}" + _OCTET + "$"}
+
+
 def json_safe_schema(schema):
     """The schema (a dict or its JSON text) rewritten for the regex compilers (see above); the same
     type back. Property names that JSON would escape are refused, as are bounds that contradict; an
@@ -185,6 +229,13 @@ def json_safe_schema(schema):
             return [walk(x, depth) for x in n]
         if not isinstance(n, dict):
             return n
+        fmt = n.get("format")
+        if isinstance(fmt, str) and fmt not in _FORMATS:
+            # a format outlines-core does not know is an annotation, as JSON Schema reads formats by default (Pydantic's
+            # Path, SecretStr and IPv4Address were a 400: "Format path is not supported by Outlines"); ipv4 is a pattern
+            n = {k: v for k, v in n.items() if k != "format"}
+            if fmt in _FORMAT_PATTERNS and "pattern" not in n:
+                n["pattern"] = _FORMAT_PATTERNS[fmt]
         if isinstance(n.get("allOf"), list) and (len(n["allOf"]) > 1 or set(n) - {"allOf", *_NOTES}):
             if depth > 32:
                 raise GrammarError("allOf nested too deeply")

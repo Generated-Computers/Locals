@@ -132,4 +132,7 @@ First public release.
   `maximum` (a rating from 1 to 5 could come out as 7); a request with tools
   and a `response_format` at once (an OpenAI Agents SDK agent with an output
   type) can call the tools, where the model made their answers up as JSON;
-  Qwen can write tool parameters named like `$select`, `größe` or `user id`.
+  Qwen can write tool parameters named like `$select`, `größe` or `user id`;
+  a JSON schema `pattern` is a search, as JSON Schema says (zod's
+  `startsWith("https://")` allowed only `"https://"` itself), and a `format`
+  without a regex (Pydantic's `Path`, `SecretStr`) is no longer a 400.

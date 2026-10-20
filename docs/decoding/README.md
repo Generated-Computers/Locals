@@ -39,7 +39,8 @@ The theory behind this part, its proofs and its full measurements are in the pap
 
 `json_safe_schema` fixes this as follows:
 
-- **Patterns.** Each `pattern` is rewritten (`_json_pattern`) into a grouped regex over the string's contents as JSON writes them: a quote becomes `\"` and a newline becomes `\n`. The decoded string is then exactly what the pattern matches.
+- **Patterns.** Each `pattern` is rewritten (`_json_pattern`) into a grouped regex over the string's contents as JSON writes them: a quote becomes `\"` and a newline becomes `\n`. The decoded string is then exactly what the pattern matches. A pattern is a search, as JSON Schema reads it (`_searched`): a top-level branch without `^` may have text before its match, one without `$` text after. zod's `startsWith("https://")` is `^https:\/\/`; read as a whole string, the only value it allowed was `"https://"`.
+- **Formats.** A `format` outlines-core has no regex for (it knows `date-time`, `date`, `time`, `uuid`, `email` and `uri`) is dropped as an annotation, which is how JSON Schema reads formats by default; `ipv4` becomes a pattern. Pydantic's `Path`, `SecretStr` and `IPv4Address` were a 400 ("Format path is not supported by Outlines").
 - **Unconstrained properties.** A property whose schema is `{}` or `true` becomes an explicit `anyOf` of the six JSON types (`_ANY`).
 - **`allOf`.** Its parts are merged into one schema (`_merge_all_of`): properties and `required` joined, the tighter of two bounds, a `$ref` part resolved, a property in two parts as the `allOf` of both. outlines-core wrote the parts' JSON one after the other (`{"a":1}{"b":"x"}`), and ignored an `allOf` next to `properties`. Parts that cannot be joined (no type in common, two different patterns) raise `GrammarError`.
 - **Refusals.** Property names that contain quotes, backslashes or control characters are refused with `GrammarError`. So are contradictory bounds (`minItems` > `maxItems`, and the same check for lengths and property counts).
@@ -64,7 +65,7 @@ The server compiles `response_format: {"type": "json_object"}` with its own whit
 | `\d \w \s`, `\D \W \S` | ASCII only |
 | `( )`, `(?: )`, `\|` | Lookaround and named groups raise `RegexError` |
 | `* + ? {m} {m,} {m,n} {,n}` | `{,n}` means `{0,n}`; a lazy `?` is accepted (same language); counts above `MAX_REPEAT = 10_000` are rejected |
-| `^ $` | Ignored: matching is always whole-string |
+| `^ $` | Ignored inside the regex, which is matched whole (a `response_format` regex, `guided_regex`); a JSON Schema `pattern`'s top-level `^` and `$` say where it may not be searched (`_searched`) |
 
 How the automaton is built:
 
