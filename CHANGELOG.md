@@ -111,7 +111,9 @@ First public release.
   with the same name as the running model is loaded instead of ignored; a
   server restarted after an upgrade keeps its `--ollama-port`, `--max-context`
   and other options; `locals --port N chat` uses that port; `locals bench` no
-  longer leaves a second engine loaded.
+  longer leaves a second engine loaded; `locals start` while `locals serve` is
+  still fetching the model on the same port waits for it instead of loading
+  the model a second time.
 - **Fixed, APIs:** web pages using the OpenAI SDK can call the server
   (`Authorization` passes the CORS check); request bodies sent in chunks are
   read; Anthropic `stop_sequences` report `stop_sequence`; an Anthropic

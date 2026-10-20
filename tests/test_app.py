@@ -382,6 +382,45 @@ def test_a_foreground_server_loading_is_not_started_twice(tmp_path, monkeypatch)
     assert app._background_pid(8399) is None  # never taken for a background server (not locals's to restart)
 
 
+def test_serve_holds_the_start_lock_until_it_is_the_server(tmp_path, monkeypatch):
+    """`locals serve` checked for a server starting, then fetched the model (minutes for a download) before it
+    wrote its pid: `locals start` meanwhile started a second server. It now holds the port's start lock, which
+    ensure_server waits on, and refuses while another command holds it."""
+    import fcntl
+    from types import SimpleNamespace
+
+    import pytest
+
+    monkeypatch.setattr(app, "LOCALS_DIR", tmp_path)
+    monkeypatch.setattr(app, "remember", lambda **kw: None)
+    args = SimpleNamespace(port=8399, model="m/x", engine=None, engines=None)
+    held = []
+
+    def fetch(model):  # while serve fetches the model, the lock is taken
+        with open(tmp_path / "server-8399.lock", "w") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                held.append(True)
+
+    class Exec(Exception):
+        pass
+
+    def execv(*a):
+        raise Exec()
+
+    monkeypatch.setattr(app, "fetch_model", fetch)
+    monkeypatch.setattr(app.os, "execv", execv)
+    with pytest.raises(Exec):
+        app.cmd_serve(args)
+    assert held == [True]
+    (tmp_path / "serve-8399.pid").unlink()
+    with open(tmp_path / "server-8399.lock", "w") as f:  # another command is starting the server
+        fcntl.flock(f, fcntl.LOCK_EX)
+        with pytest.raises(SystemExit, match="another locals command is starting"):
+            app.cmd_serve(args)
+
+
 def test_the_old_single_pid_file_counts_for_the_default_port_only(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "LOCALS_DIR", tmp_path)
     (tmp_path / "server.pid").write_text("4242")

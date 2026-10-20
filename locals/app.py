@@ -691,6 +691,18 @@ def _same_server(a: int, b: int) -> bool:
 
 
 def cmd_serve(args) -> None:
+    import fcntl
+
+    LOCALS_DIR.mkdir(parents=True, exist_ok=True)
+    # The port's start lock (ensure_server's), held until this process is the server: `locals start` or `locals
+    # code` meanwhile (a download can take minutes) started a second server, and the model was loaded twice. The
+    # lock goes at exec (the file is not inherited); a command after it sees the server loading and waits.
+    lock = open(LOCALS_DIR / f"server-{args.port}.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(f"another locals command is starting the server on port {args.port}; wait for it (locals status), "
+                 f"or use another port (--port)")
     loading = _starting_pid(args.port)
     if loading is not None:  # a server loading the model: a second one would load it twice
         sys.exit(f"a locals server is starting on port {args.port} (pid {loading}); wait for it (locals status), "
@@ -699,7 +711,6 @@ def cmd_serve(args) -> None:
     remember(model=args.model, port=args.port)  # `locals setup` / `locals code` then use the same model
     # this process becomes the server (same pid): while it loads, another command waits for it instead of
     # starting a second copy of the model next to it (16 GB Macs swap, or the GPU panics)
-    LOCALS_DIR.mkdir(parents=True, exist_ok=True)
     _serve_pid_file(args.port).write_text(str(os.getpid()))
     os.execv(python(), server_cmd(args))
 
