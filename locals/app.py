@@ -232,6 +232,15 @@ def _pid_file(port: int) -> Path:
     return LOCALS_DIR / f"server-{port}.pid"
 
 
+def _serve_pid_file(port: int) -> Path:
+    """The pid of a server started in the foreground (locals serve): read only to see that one is loading, never
+    to stop or restart it (a server started by hand is not locals's to replace)."""
+    return LOCALS_DIR / f"serve-{port}.pid"
+
+
+def _legacy_pid_files(port: int) -> list:
+    return [LOCALS_DIR / "server.pid"] if port == DEFAULT_PORT else []  # locals 0.2.0 before per-port files: 8321
+
 def _is_locals_server(pid: int) -> bool:
     """Whether the process is a locals server (a pid file can outlive its process, and its number be reused)."""
     p = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True)
@@ -667,11 +676,15 @@ def _same_server(a: int, b: int) -> bool:
 
 def cmd_serve(args) -> None:
     loading = _starting_pid(args.port)
-    if loading is not None:  # a background server loading the model: a second one would load it twice
+    if loading is not None:  # a server loading the model: a second one would load it twice
         sys.exit(f"a locals server is starting on port {args.port} (pid {loading}); wait for it (locals status), "
                  f"or stop it (locals stop) first")
     fetch_model(args.model)  # a model that cannot run is refused here, before it becomes the default
     remember(model=args.model, port=args.port)  # `locals setup` / `locals code` then use the same model
+    # this process becomes the server (same pid): while it loads, another command waits for it instead of
+    # starting a second copy of the model next to it (16 GB Macs swap, or the GPU panics)
+    LOCALS_DIR.mkdir(parents=True, exist_ok=True)
+    _serve_pid_file(args.port).write_text(str(os.getpid()))
     os.execv(python(), server_cmd(args))
 
 
@@ -761,10 +774,15 @@ def _ensure_server(args, wait_s: float) -> None:
 
 
 def _starting_pid(port: int) -> Optional[int]:
-    """A locals server started in the background on this port that is still loading (running, not listening yet)."""
-    pid = _saved_pid(port)
-    if pid and _is_locals_server(pid) and _listener_pid(port) is None:
-        return pid
+    """A locals server started on this port (in the background, or by locals serve) that is still loading (running,
+    not listening yet)."""
+    try:
+        serving = int(_serve_pid_file(port).read_text() or 0)
+    except (OSError, ValueError):
+        serving = 0
+    for pid in (_saved_pid(port), serving):
+        if pid and _is_locals_server(pid) and _listener_pid(port) is None:
+            return pid
     return None
 
 
@@ -803,7 +821,7 @@ def _follow(args, running, log_path: Path, start: int, t0: float, seen: int, wai
 
 
 def _saved_pid(port: int) -> Optional[int]:
-    for f in (_pid_file(port), LOCALS_DIR / "server.pid"):  # server.pid: locals 0.2.0 before per-port files
+    for f in (_pid_file(port), *_legacy_pid_files(port)):
         try:
             pid = int(f.read_text() or 0)
         except (OSError, ValueError):
@@ -847,7 +865,7 @@ def cmd_stop(args) -> None:
         target = listener
     elif saved is not None and _is_locals_server(saved):  # started, not listening yet (loading the model)
         target = saved
-    for f in (_pid_file(args.port), LOCALS_DIR / "server.pid"):
+    for f in (_pid_file(args.port), *_legacy_pid_files(args.port)):
         if saved is not None and f.exists() and f.read_text().strip() == str(saved):
             f.unlink(missing_ok=True)
     if target is None:

@@ -106,7 +106,7 @@ def test_switching_models_restarts_only_our_idle_background_server(tmp_path, mon
     args = argparse.Namespace(port=8399, model="mlx-community/gemma-4-e4b-it-4bit")
     with pytest.raises(SystemExit, match="already running"):  # not started by locals
         app.ensure_server(args)
-    (tmp_path / "server.pid").write_text("4242")
+    (tmp_path / "server-8399.pid").write_text("4242")
     stats["active"] = [{"engine": "locals"}]
     with pytest.raises(SystemExit, match="busy"):
         app.ensure_server(args)
@@ -253,7 +253,7 @@ def test_a_background_server_on_older_code_is_restarted(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "_listener_pid", lambda port: 4242)
     args = argparse.Namespace(port=8399, model="mlx-community/Qwen3.5-4B-MLX-4bit")
     app.ensure_server(args)  # not ours (no pid file): used as it is
-    (tmp_path / "server.pid").write_text("4242")
+    (tmp_path / "server-8399.pid").write_text("4242")
     killed = []
 
     def kill(pid, sig):
@@ -340,3 +340,40 @@ def test_a_loading_server_is_waited_for_not_started_twice(tmp_path, monkeypatch)
 
     with pytest.raises(SystemExit, match="starting"):
         app.cmd_serve(args)
+
+
+def test_a_foreground_server_loading_is_not_started_twice(tmp_path, monkeypatch):
+    """`locals serve` loading the model (it writes no background pid file) was invisible to a second command, which
+    started another server and loaded the model a second time. Its pid is written before it becomes the server."""
+    from types import SimpleNamespace
+
+    import pytest
+
+    monkeypatch.setattr(app, "LOCALS_DIR", tmp_path)
+    monkeypatch.setattr(app, "fetch_model", lambda model: None)
+    monkeypatch.setattr(app, "remember", lambda **kw: None)
+
+    class Exec(Exception):
+        pass
+
+    def execv(*a):
+        raise Exec()
+
+    monkeypatch.setattr(app.os, "execv", execv)
+    args = SimpleNamespace(port=8399, model="m/x", engine=None, engines=None)
+    with pytest.raises(Exec):
+        app.cmd_serve(args)
+    assert app._serve_pid_file(8399).read_text() == str(app.os.getpid())
+    monkeypatch.setattr(app, "_is_locals_server", lambda pid: pid == app.os.getpid())  # (it is the server now)
+    monkeypatch.setattr(app, "_listener_pid", lambda port: None)  # loading: not listening yet
+    assert app._starting_pid(8399) == app.os.getpid()
+    with pytest.raises(SystemExit, match="starting"):
+        app.cmd_serve(args)
+    assert app._background_pid(8399) is None  # never taken for a background server (not locals's to restart)
+
+
+def test_the_old_single_pid_file_counts_for_the_default_port_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "LOCALS_DIR", tmp_path)
+    (tmp_path / "server.pid").write_text("4242")
+    assert app._saved_pid(app.DEFAULT_PORT) == 4242
+    assert app._saved_pid(9000) is None  # (it made `locals stop --port 9000` stop the 8321 server)
