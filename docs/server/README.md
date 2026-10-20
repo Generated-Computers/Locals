@@ -186,10 +186,11 @@ The server ignores per-request `top_p`, `top_k` and `seed`. `prepare` passes onl
 2. `response_format.type == "regex"`, or `guided_regex`, uses that regex. It must be a non-empty string.
 3. `json_schema` passes the schema to the engine, which compiles it.
 4. On our engine, with no schema and tools offered, it uses `oai.reply_regex(tools, tool_choice, thinking, typed=--typed-tools, fmt=fmt, preamble=False, parallel=parallel_tool_calls is not False)`.
+5. On our engine, with tools and a `response_format` (or `guided_regex`) at once, as the OpenAI Agents SDK sends for an agent with an output type, the reply is the calls or the output, as OpenAI's is: the alternation of `reply_regex(tools, "required", ...)` and the format's regex (`grammar.schema_regex` for a schema). `tool_choice: required` or a named function gives the calls only, `none` the output only. With the format's grammar alone, the model could not call: asked for the weather in Paris, it wrote a forecast as JSON.
 
 This order has three consequences:
 
-- A `response_format` wins over tools.
+- On the stock engine, a `response_format` wins over tools.
 - The stock engine never gets a tool grammar. With tools, its replies are free text, parsed afterwards.
 - A regex or schema that does not compile ends the job with `invalid: ...`, which the server raises as `BadRequest`. A non-streamed request gets a 400. A streamed request gets an error event, because the grammar is compiled in the worker after the stream's headers have been sent.
 

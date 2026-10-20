@@ -403,6 +403,24 @@ def test_a_call_that_repeats_with_no_other_tool_ends_the_turn(monkeypatch):
     assert not any(d.get("tool_calls") for d in deltas)
 
 
+def test_with_a_response_format_a_repeated_call_gets_the_output(monkeypatch):
+    """Tools and a response format (an agent with an output type): once the tool's result is in, a reply that
+    calls again is decoded once more as the output itself; the steering text and "I am stuck" are not JSON."""
+    from locals import formats
+
+    fmt = formats.FORMATS["qwen_xml"]
+    out = '\\{"summary":"[a-z ]+"\\}'
+    srv, svc, p, req = _scripted_server(monkeypatch, fmt, [_qwen_call("bash", "command", "ls"), '{"summary":"done"}'],
+                                        thinking=False)
+    p["tools"] = [t for t in p["tools"] if t["function"]["name"] == "bash"]
+    p["regex"] = "(" + oai.reply_regex(p["tools"], "required", False, fmt=fmt, preamble=False) + "|" + out + ")"
+    p["output_regex"] = out
+    deltas = _events(srv, req, p)
+    assert svc.regexes[1] == out
+    assert "".join(d.get("content") or "" for d in deltas) == '{"summary":"done"}'
+    assert not any(d.get("tool_calls") for d in deltas)
+
+
 def test_ignore_eos_and_usage_chunk_on_text_completions():
     """Benchmarks (InferenceX, vLLM's, aiperf) send ignore_eos for fixed output lengths and read the
     token count from a last chunk with no choices (stream_options.include_usage, as OpenAI streams it)."""

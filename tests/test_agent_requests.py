@@ -184,3 +184,29 @@ def test_unknown_response_format_is_an_error(server):
     with pytest.raises(ValueError, match="response_format type 'grammar'"):
         server.prepare({"model": f"locals/{server.short}", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}],
                         "response_format": {"type": "grammar", "grammar": "x"}})
+
+
+def test_tools_and_a_response_format_together(server):
+    """An agent with tools and an output type (the OpenAI Agents SDK): the reply is the calls or the output, as
+    OpenAI's is. With the format's grammar alone the model could not call: asked for the weather in Paris, it wrote
+    a forecast as JSON."""
+    from locals.regex import compile_dfa
+
+    tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {
+        "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+    schema = {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}
+    base = {"model": f"locals/{server.short}", "max_tokens": 64, "tools": tools,
+            "messages": [{"role": "user", "content": "The weather in Paris?"}]}
+    for rf in ({"type": "json_schema", "json_schema": {"name": "R", "schema": schema}}, {"type": "json_object"}):
+        p = server.prepare(dict(base, response_format=rf))
+        assert p["schema"] is None
+        d = compile_dfa(p["regex"])
+        assert d.matches(b'{"summary":"rain"}') and not d.matches(b"It rains.")
+        if p["fmt"].name == "qwen_xml":
+            call = model_reply(p["fmt"], "", [{"function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}}])
+            assert d.matches(call.encode())
+        calls_only = server.prepare(dict(base, response_format=rf, tool_choice="required"))
+        assert not compile_dfa(calls_only["regex"]).matches(b'{"summary":"rain"}')
+    none = server.prepare(dict(base, response_format={"type": "json_schema", "json_schema": {"name": "R", "schema": schema}},
+                               tool_choice="none"))
+    assert none["schema"] == schema and none["regex"] is None  # (the output only)

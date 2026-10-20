@@ -365,7 +365,7 @@ class Server:
                                  f"length of the messages.", len(prompt) + min(max_tokens, 256), limit)
         max_tokens = max(1, min(max_tokens, self.max_tokens, room))
         schema = oai.response_schema(req)
-        regex = None
+        regex = output_regex = None
         rf = req.get("response_format") if isinstance(req.get("response_format"), dict) else {}
         if rf.get("type") not in (None, "text", "json_object", "json_schema", "regex"):  # never unconstrained by mistake
             raise ValueError(f"response_format type {rf.get('type')!r} is not one of text, json_object, json_schema, regex")
@@ -382,9 +382,25 @@ class Server:
             if not req.get("ignore_eos") or tc == "required" or isinstance(tc, dict):
                 regex = oai.reply_regex(tools, tc, thinking, typed=self.typed_tools, fmt=fmt, preamble=False,
                                         parallel=req.get("parallel_tool_calls") is not False)
+        if engine == "locals" and tools and (schema is not None or rf.get("type") == "json_object" or
+                                             rf.get("type") == "regex" or req.get("guided_regex")):
+            tc = req.get("tool_choice", "auto")
+            _check_tool_choice(tc, [t["function"]["name"] for t in tools])
+            if tc != "none":
+                # tools and a response format at once (the OpenAI Agents SDK's agent with an output type): the reply
+                # is the calls or the output, as OpenAI's is. With the format's grammar alone the model could not
+                # call, and made the tool's answer up (asked for the weather in Paris, it wrote a forecast as JSON).
+                from .grammar import json_safe_schema, schema_regex
+
+                out = regex if regex is not None else schema_regex(json_safe_schema(schema))
+                calls = oai.reply_regex(tools, "required" if tc == "auto" else tc, thinking, typed=self.typed_tools,
+                                        fmt=fmt, preamble=False, parallel=req.get("parallel_tool_calls") is not False)
+                schema, regex = None, ("(" + calls + "|" + out + ")" if tc == "auto" else calls)
+                output_regex = out if tc == "auto" else None
         cps = self._checkpoints(tok, msgs, tpl_tools, think_kw, text, prompt) if engine == "locals" and self._needs_checkpoints(engine) else []
         return {"engine": engine, "thinking": thinking, "svc": svc, "prompt": prompt, "checkpoints": cps, "text": text,
-                "tools": tools, "schema": schema, "regex": regex, "max_tokens": max_tokens, "model": model, "fmt": fmt,
+                "tools": tools, "schema": schema, "regex": regex, "output_regex": output_regex, "max_tokens": max_tokens,
+                "model": model, "fmt": fmt,
                 "tool_choice": req.get("tool_choice", "auto"), "stop": _stops(req), "temp": _temperature(req),
                 "ignore_eos": bool(req.get("ignore_eos")), "include_usage": _include_usage(req)}
 
@@ -861,6 +877,12 @@ class Server:
                     # are the whole reply (Llama's JSON, Mistral 7B's) cannot hold
                     steerable = p["fmt"].name not in ("llama3_json", "mistral", "mistral_legacy")
                     named = isinstance(req.get("tool_choice"), dict)
+                    if p.get("output_regex") and attempt == 0:
+                        # with a response format, the answer once a call's result is in is the output itself (steering
+                        # text would not be the format's; Qwen3.5 called again, and the turn ended with "I am stuck")
+                        self.log(f"[{p['engine']}] reply repeats the previous call; writing the response format instead")
+                        p = dict(p, regex=p["output_regex"])
+                        continue
                     if attempt == 0 and steerable:
                         # The model wants to repeat the previous turn's call. Decode
                         # the turn again with its text started for it (a grammar that

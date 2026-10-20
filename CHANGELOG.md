@@ -129,4 +129,6 @@ First public release.
   with `allOf` (a base and an extension, as OpenAPI and zod write them) gets
   one object with all the properties, where the reply was two objects back to
   back and no JSON; an integer stays within its schema's `minimum` and
-  `maximum` (a rating from 1 to 5 could come out as 7).
+  `maximum` (a rating from 1 to 5 could come out as 7); a request with tools
+  and a `response_format` at once (an OpenAI Agents SDK agent with an output
+  type) can call the tools, where the model made their answers up as JSON.
