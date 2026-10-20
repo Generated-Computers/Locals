@@ -333,13 +333,30 @@ def write_config(cfg: dict, path: Optional[Path] = None) -> None:
     _write_atomic(path, json.dumps(merged, indent=2) + "\n")
 
 
+def _locals_providers(provs) -> set:
+    """The providers of an OpenCode config that are locals's: "locals" (and its old names), and "mlx" where locals
+    wrote it (by the name it gives it). A provider of the user's own called "mlx" (another MLX server) is theirs:
+    taken for locals's, it was neither backed up nor kept by a disconnect."""
+    if not isinstance(provs, dict):
+        return set()
+    out = {p for p in ("locals", *LEGACY) if p in provs}
+    if isinstance(provs.get("mlx"), dict) and provs["mlx"].get("name") == PROVIDERS["mlx"][0]:
+        out.add("mlx")
+    return out
+
+
+def _locals_model(cfg: dict, value) -> bool:
+    """Whether a model setting of an OpenCode config (``model``, ``small_model``) names one of locals's providers."""
+    head = str(value or "").split("/")[0]
+    provs = cfg.get("provider") if isinstance(cfg, dict) else None
+    return head in ("locals", *LEGACY) or (head in PROVIDERS and head in _locals_providers(provs))
+
+
 def _opencode_has_locals(cfg: dict) -> bool:
     """Whether an OpenCode config already holds locals's settings (a provider or the default model)."""
     if not isinstance(cfg, dict):
         return False
-    provs = cfg.get("provider") if isinstance(cfg.get("provider"), dict) else {}
-    mine = (*PROVIDERS, *LEGACY)
-    return any(p in provs for p in mine) or str(cfg.get("model") or "").split("/")[0] in mine
+    return bool(_locals_providers(cfg.get("provider"))) or _locals_model(cfg, cfg.get("model"))
 
 
 def _users_agents(old: dict, path: Path) -> List[str]:
@@ -996,7 +1013,7 @@ def _tool_settings(tool: str) -> Optional[dict]:
         prov = provs.get("locals")
         model = str(cfg.get("model") or "") if isinstance(cfg, dict) else ""
         return {"url": ((prov or {}).get("options") or {}).get("baseURL") if isinstance(prov, dict) else None,
-                "model": model, "ours": model.split("/")[0] in PROVIDERS, "legacy": any(n in provs for n in LEGACY)}
+                "model": model, "ours": _locals_model(cfg, model), "legacy": any(n in provs for n in LEGACY)}
     if tool == "openclaw":
         path = _openclaw_config()
         if not path.exists():
@@ -1076,19 +1093,22 @@ def _before_locals(tool: str) -> dict:
     if tool == "hermes":
         d = _read_yaml(keep) or {}
         m = d.get("model") if isinstance(d.get("model"), dict) else {}
-        if str(m.get("default") or "").split("/")[0] in ("locals", *LEGACY) or "127.0.0.1" in str(m.get("base_url") or ""):
+        # locals's own settings (backed up by a second launch): its model names, or its server's address. Another
+        # server on this Mac (LM Studio, llama.cpp, vLLM: 127.0.0.1 too) is the user's, set back by a disconnect
+        if (str(m.get("default") or "").split("/")[0] in ("locals", *LEGACY)
+                or str(m.get("base_url") or "").startswith(base_url(DEFAULT_PORT) + "/")):
             d = {k: v for k, v in d.items() if k != "model"}
         return d
     d = _loads_jsonish(keep.read_text())
     if not isinstance(d, dict):
         return {}
     if tool == "opencode":
-        mine = (*PROVIDERS, *LEGACY)
+        mine = _locals_providers(d.get("provider"))
+        for key in ("model", "small_model"):
+            if _locals_model(d, d.get(key)):
+                d.pop(key)
         if isinstance(d.get("provider"), dict):
             d["provider"] = {k: v for k, v in d["provider"].items() if k not in mine}
-        for key in ("model", "small_model"):
-            if str(d.get(key) or "").split("/")[0] in mine:
-                d.pop(key)
         if isinstance(d.get("agent"), dict):  # locals's own agents written by an earlier locals
             d["agent"] = {k: v for k, v in d["agent"].items() if not (k in AGENTS and isinstance(v, dict)
                                                                      and v.get("description") == AGENTS[k]["description"])}
@@ -1148,14 +1168,18 @@ def disconnect_opencode() -> List[str]:
         sys.exit(f"{path} is not plain JSON, so locals does not rewrite it; remove the \"locals\" provider by hand")
     before, changed = _before_locals("opencode"), []
     prov, prov_before = cfg.get("provider") or {}, before.get("provider") or {}
-    for pid in (*PROVIDERS, *LEGACY):
-        if pid in prov and pid not in prov_before:
+    mine = _locals_providers(prov)
+    model_ours = {key: _locals_model(cfg, cfg.get(key)) for key in ("model", "small_model")}  # (before the providers go)
+    for pid in sorted(mine):
+        if pid in prov_before:  # the user's own provider of that name, which locals's replaced (--engine mlx)
+            prov[pid] = prov_before[pid]
+            changed.append(f"your {pid} provider, back as it was")
+        else:
             del prov[pid]
             changed.append(f"the {pid} provider")
     if "provider" in cfg and not prov and "provider" not in before:
         del cfg["provider"]
-    mine = (*PROVIDERS, *LEGACY)
-    ours = {"model": lambda v: str(v).split("/")[0] in mine, "small_model": lambda v: str(v).split("/")[0] in mine,
+    ours = {"model": lambda v: model_ours["model"], "small_model": lambda v: model_ours["small_model"],
             "default_agent": lambda v: v in AGENTS, "subagent_depth": lambda v: v == 1,
             "$schema": lambda v: v == "https://opencode.ai/config.json"}
     for key, is_ours in ours.items():

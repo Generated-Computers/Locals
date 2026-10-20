@@ -387,3 +387,40 @@ def test_launch_aider_uses_search_replace_edits(monkeypatch):
     assert argv[:5] == ["/opt/aider", "--model", "openai/locals/qwen3.5-4b", "--no-show-model-warnings", "--edit-format"]
     assert argv[5] == "diff" and argv[6:] == ["--edit-format", "whole", "a.py"]
     assert seen["env"]["OPENAI_API_BASE"] == "http://127.0.0.1:8321/v1"
+
+
+def test_a_users_own_mlx_provider_is_theirs():
+    """An OpenCode provider of the user's called "mlx" (another MLX server) was taken for locals's: no backup, and a
+    disconnect deleted it. It is kept now, and set back where `--engine mlx` replaced it."""
+    mine = {"provider": {"mlx": {"npm": "@ai-sdk/openai-compatible", "name": "my mlx_lm.server",
+                                 "options": {"baseURL": "http://localhost:8080/v1"}, "models": {"qwen-coder": {}}}},
+            "model": "mlx/qwen-coder"}
+    _opencode(mine)
+    assert not app._opencode_has_locals(mine)
+    app.write_config(app.opencode_config(QWEN, 8321))
+    cfg = json.loads(app.OPENCODE_CONFIG.read_text())
+    assert cfg["provider"]["mlx"] == mine["provider"]["mlx"] and cfg["model"] == "locals/locals/qwen3.5-4b"
+    app.disconnect_opencode()
+    assert json.loads(app.OPENCODE_CONFIG.read_text()) == mine
+    app.write_config(app.opencode_config(QWEN, 8321, default_engine="mlx"))  # locals's mlx provider replaces it
+    assert json.loads(app.OPENCODE_CONFIG.read_text())["provider"]["mlx"]["name"] == app.PROVIDERS["mlx"][0]
+    changed = app.disconnect_opencode()
+    assert "your mlx provider, back as it was" in changed
+    assert json.loads(app.OPENCODE_CONFIG.read_text()) == mine
+
+
+def test_hermes_on_another_local_server_is_set_back(tmp_path, monkeypatch):
+    """Hermes set up for LM Studio (127.0.0.1 too) before locals: a disconnect sets those settings back instead of
+    taking them for locals's and unsetting them (and the backup is not lost before that)."""
+    yaml = pytest.importorskip("yaml")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    lmstudio = {"provider": "custom", "base_url": "http://127.0.0.1:1234/v1", "default": "qwen2.5-coder-7b"}
+    ours = {k.split(".", 1)[1]: v for k, v in app.hermes_settings(QWEN, 8321).items()}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"model": lmstudio}))
+    app._back_up_once(app._hermes_config(), "hermes")  # what a launch does before `hermes config set`
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"model": ours}))
+    monkeypatch.setattr(app, "_tool_bin", lambda name, env: "/opt/hermes")
+    seen = _record_runs(monkeypatch)
+    app.disconnect_hermes()
+    assert ["/opt/hermes", "config", "set", "model.base_url", "http://127.0.0.1:1234/v1"] in seen
+    assert ["/opt/hermes", "config", "set", "model.default", "qwen2.5-coder-7b"] in seen
