@@ -551,7 +551,7 @@ def cmd_setup(args) -> None:
     check_model(args.model)  # a model that cannot run (a typo, too big) is refused before any config names it
     if target in ("openclaw", "hermes"):
         if not (setup_openclaw if target == "openclaw" else setup_hermes)(args):
-            return
+            sys.exit(1)  # (the tool is not installed: said above; a script took status 0 for a finished setup)
         remember(model=args.model, port=args.port)  # a later `locals start` serves the model the agent asks for
         if getattr(args, "no_start", False):
             print(f"Next:  locals start  (or locals serve in another terminal), then:  {target}")
@@ -597,13 +597,16 @@ def check_model(model: str) -> None:
         from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
 
         HfApi().model_info(model, timeout=10)
-    except (RepositoryNotFoundError, GatedRepoError):
+    except GatedRepoError:  # (it was "not a model on Hugging Face", with another model suggested)
+        sys.exit(f"locals: {model} is gated on Hugging Face: accept its license at https://huggingface.co/{model}, sign "
+                 f"in on this Mac (hf auth login, or set HF_TOKEN), then run this again{hint}")
+    except RepositoryNotFoundError:
         from .defaults import ALIASES
 
         import difflib
 
         near = difflib.get_close_matches(model.split("/")[-1].lower(), list(ALIASES), n=1)
-        sys.exit(f"locals: {model} is not a model on Hugging Face (or it needs a sign-in){hint}"
+        sys.exit(f"locals: {model} is not a model on Hugging Face (or it is private: sign in with hf auth login){hint}"
                  + (f"; did you mean --model {near[0]}?" if near else "; locals models lists the tested ones"))
     except Exception:  # noqa: BLE001  # offline or Hugging Face slow: the download tells
         pass
@@ -831,7 +834,13 @@ def _follow(args, running, log_path: Path, start: int, t0: float, seen: int, wai
         if not running():
             # ``start`` counts bytes (the log has multi-byte progress bars), so slice before decoding
             tail = log_path.read_bytes()[start:].decode(errors="replace").strip().splitlines()[-15:] if log_path.exists() else []
-            sys.exit("the server stopped:\n  " + "\n  ".join(tail))
+            low = "\n".join(tail).lower()
+            hint = ("It ran out of GPU memory: choose a smaller model (--model qwen3.5-2b), or quit apps that use much memory."
+                    if "insufficient memory" in low or "out of memory" in low else
+                    f"Port {args.port} is in use by another program: choose another with --port." if "address already in use" in low else
+                    f"If it fails again, locals serve --model {args.model} shows all of its output in the terminal.")
+            sys.exit(f"the server stopped while starting; the last lines of its log ({log_path}):\n  " + "\n  ".join(tail)
+                     + f"\n{hint}")
         if server_alive(args.port):
             print(f"server ready in {time.time() - t0:.0f}s")
             return
@@ -1486,19 +1495,61 @@ The server stays up in the background (locals stop stops it).""")
     sys.exit(f"unknown tool {tool!r}; locals launch list shows the tools")
 
 
+def check_local_load(model: str, command: str) -> None:
+    """Before a command loads a model in its own process (generate/chat --local, agents, tune): the checks a server
+    start makes (a typo, GGUF, too big, gated: they failed with Hugging Face's or mlx-lm's traceback), and no second
+    copy of a model next to a running server where two do not fit (a 16 GB Mac swaps, or the GPU panics)."""
+    from .defaults import HEADROOM_GB, gpu_limit_gb, weights_gb
+
+    check_model(model)
+    running = _locals_server_pids()
+    if not running:
+        return
+    w, limit = weights_gb(model), gpu_limit_gb()
+    pids = ", ".join(map(str, running))
+    if w and limit and 2 * w + HEADROOM_GB > limit and not os.environ.get("LOCALS_IGNORE_MEMORY"):
+        sys.exit(f"locals {command}: a locals server is running (pid {pids}) with its own copy of a model, and a second "
+                 f"copy of {model_short(model)} ({w:.1f} GB) does not fit next to it in this Mac's {limit:.1f} GB of GPU "
+                 f"memory. Stop the server first (locals stop)" + (", or leave out --local to use it" if command in ("chat", "generate") else ""))
+    print(f"note: a locals server is running too (pid {pids}); both copies of a model share the GPU's memory",
+          file=sys.stderr, flush=True)
+
+
+def project_folder(path, command: str, create_ok: bool = False) -> Path:
+    """The project folder a command works on. Refused when it is the home folder or a disk: agents edit files and
+    run commands in it without asking (a new terminal opens in the home folder), and locals run / solve / swarm copy
+    and hash all of it first (hours, the disk filled, macOS asking for Photos). A missing one is created on a yes
+    when ``create_ok`` and someone is at the terminal (the README's first command names ~/my-project), else named
+    with how to create it."""
+    import shlex
+
+    d = Path(path).expanduser().resolve()
+    usage = f"locals {command} ~/my-project" if command == "code" else f"locals {command} ... --dir ~/my-project"
+    if not d.exists():
+        if create_ok and sys.stdin.isatty() and sys.stdout.isatty():
+            try:
+                ok = input(f"{d} does not exist yet. Create it as a new project folder? [Y/n] ").strip().lower() in ("", "y", "yes")
+            except (EOFError, KeyboardInterrupt):
+                ok = False
+            if ok:
+                d.mkdir(parents=True)
+                return d
+        sys.exit(f"no such folder: {d}\nFor a new project, create it first:  mkdir -p {shlex.quote(str(d))}")
+    if not d.is_dir():
+        sys.exit(f"{d} is a file; locals {command} works on a project folder")
+    if d in (HOME.resolve(), Path("/")) or d in HOME.resolve().parents:
+        sys.exit(f"locals {command} works on a project folder, and {d} is your {'home folder' if d == HOME.resolve() else 'disk'}: "
+                 f"the agents edit files and run commands there"
+                 + ("" if command == "code" else ", and all of it would be copied first") +
+                 f". Run it on a project:  {usage}  (mkdir it first for a new one)")
+    return d
+
+
 def cmd_code(args) -> None:
     """One command for a project: OpenCode set up for the model (first run), the
     model downloaded, the server started, then OpenCode on the project, or one
     task run to the end with --run."""
-    d = Path(args.dir).expanduser().resolve()
-    if not d.is_dir():
-        sys.exit(f"no such directory: {d}")
-    if d in (HOME.resolve(), Path("/")) or d in HOME.resolve().parents:
-        # the agent edits files and runs commands in its folder without asking: a new terminal opens in the home
-        # folder, and `locals code` there would hand it every file the user has
-        sys.exit(f"locals code works on a project folder, and {d} is your {'home folder' if d == HOME.resolve() else 'disk'}: "
-                 f"the agent edits files and runs commands there. Run it on a project:  locals code ~/my-project  "
-                 f"(mkdir it first for a new one)")
+    d = project_folder(args.dir, "code", create_ok=True)
     from .defaults import agent_note
 
     if agent_note(args.model):
@@ -1774,21 +1825,30 @@ def cmd_swarm(args) -> None:
     if oc is None:
         sys.exit("run  locals setup  first")
     if args.tasks:
-        raw = Path(args.tasks).read_text()
+        try:
+            raw = Path(args.tasks).expanduser().read_text()
+        except OSError as e:
+            sys.exit(f"cannot read the task list {args.tasks}: {e.strerror or e}")
         try:
             tasks = json.loads(raw)
-            tasks = [t if isinstance(t, str) else t["task"] for t in tasks]
         except ValueError:
             tasks = [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.startswith("#")]
+        else:
+            if not isinstance(tasks, list) or not all(isinstance(t, str) or (isinstance(t, dict) and isinstance(t.get("task"), str))
+                                                      for t in tasks):
+                sys.exit(f"{args.tasks}: a JSON task list is a list of strings, or of objects with a \"task\" text")
+            tasks = [t if isinstance(t, str) else t["task"] for t in tasks]
+        if not tasks:
+            sys.exit(f"{args.tasks} holds no tasks (one per line; lines starting with # are skipped)")
     elif args.task:
         tasks = [args.task] * args.n
     else:
         sys.exit("give --tasks FILE (one task per line) or --task TEXT [--n N]")
+    base = project_folder(args.dir, "swarm")  # (before the model server starts)
     ensure_server(args)
     short = model_short(args.model)
     run_dir = Path(args.out) / time.strftime("%Y%m%d-%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
-    base = Path(args.dir).resolve()
     dirs = []
     for i in range(len(tasks)):
         d = base
@@ -2043,6 +2103,7 @@ def cmd_tune(argv: List[str]) -> None:
                     "chosen ones per batch size, and how prompts are read (for a new GPU: tells where Locals gains)")
     ap.add_argument("--force", action="store_true", help="tune even while a locals server runs (its work skews the timings)")
     a = ap.parse_args(argv)
+    check_model(a.model)
     running = _locals_server_pids()
     if running and not a.force:  # tuning times kernels: a server on the same GPU (serving, or tuning while idle) skews
         sys.exit(f"a locals server is running (pid {', '.join(map(str, running))}): stop it first (locals stop), "
@@ -2099,6 +2160,14 @@ def _platform_ok() -> Optional[str]:
 
 
 def main(argv=None):
+    try:
+        return _main(argv)
+    except KeyboardInterrupt:  # Ctrl-C at a prompt, while waiting or tuning: a word, not a traceback
+        print("\nstopped", file=sys.stderr)
+        sys.exit(130)
+
+
+def _main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if not any(a in ("--version", "-h", "--help") for a in argv[:1]):
         why = _platform_ok()

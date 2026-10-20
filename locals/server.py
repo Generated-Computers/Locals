@@ -2012,7 +2012,8 @@ def main(argv=None):
                  + ("stop it with `locals stop`, or " if busy.startswith("a locals") else "") + "choose another port with --port")
     if args.ollama_port:  # checked now too, not after loading the model (minutes on a first start)
         if args.ollama_port == args.port:
-            sys.exit("locals serve: --ollama-port must differ from --port (the Ollama API is served at --port's /api too)")
+            sys.exit("locals serve: the Ollama port (--ollama) must differ from --port (the Ollama API is served at "
+                     "--port's /api too)")
         busy = _port_taken(args.host, args.ollama_port)
         if busy:
             sys.exit(f"locals serve: Ollama's port {args.ollama_port} is in use by {busy} (Ollama itself?); quit it, "
@@ -2065,7 +2066,10 @@ def _port_taken(host: str, port: int) -> Optional[str]:
 def _load_error(model: str, e: Exception) -> Optional[str]:
     """A one-line explanation of why ``model`` could not be loaded, or None for an unexpected error."""
     name = type(e).__name__
-    if name in ("RepositoryNotFoundError", "GatedRepoError") or (name == "HfHubHTTPError" and "404" in str(e)):
+    if name == "GatedRepoError":
+        return (f"model {model!r} is gated on Hugging Face: accept its license at https://huggingface.co/{model}, sign "
+                f"in on this Mac (hf auth login, or set HF_TOKEN), then start it again.")
+    if name == "RepositoryNotFoundError" or (name == "HfHubHTTPError" and "404" in str(e)):
         return (f"model {model!r} was not found on Hugging Face (or it is private or gated). Use a model id such as "
                 f"mlx-community/Qwen3.5-4B-MLX-4bit, or the path of a local MLX model folder.")
     if name in ("LocalEntryNotFoundError", "OfflineModeIsEnabled") or isinstance(e, (ConnectionError, TimeoutError)):

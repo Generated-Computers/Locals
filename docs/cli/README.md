@@ -408,7 +408,7 @@ output tokens over wall time per round, the median per engine and the `locals/ml
 
 ## `locals run` and `locals solve` options
 
-These commands are parsed in `app.py`. Both also accept the server options above.
+These commands are parsed in `app.py`. Both also accept the server options above. Both refuse the home folder and a disk as `--dir` (`project_folder`: the agents edit and run commands there, and the folder is copied whole first), and check that `--check` can run before the model loads. `locals solve` exits 0 when the winning changes are in the project (or `--no-apply` asked for none), 2 when an attempt passed but nothing was applied (files changed meanwhile, tests changed, paths outside), and 1 when no attempt passed.
 
 | `locals run TASK` | Default | |
 |---|---|---|

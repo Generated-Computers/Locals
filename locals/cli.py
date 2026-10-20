@@ -6,6 +6,7 @@
 
 import argparse
 import json
+import os
 import sys
 
 from .defaults import DEFAULT_MODEL, MODEL_HELP, model_id
@@ -15,6 +16,7 @@ from .runtime import Runtime
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="locals generate")
     ap.add_argument("--model", default=None, type=model_id, help=MODEL_HELP + " (default: the model used last)")
+    ap.add_argument("--port", type=int, default=None, help="the server's port (default: the last one used, else 8321)")
     ap.add_argument("--prompt", required=True, help="prompt text, or @file to read it")
     ap.add_argument("--schema", default=None, help="JSON schema file for structured output")
     ap.add_argument("--regex", default=None, help="regex constraint instead of a schema")
@@ -30,6 +32,8 @@ def main(argv=None):
     ap.add_argument("--local", action="store_true", help="load the model in this process instead of using the background "
                     "server (implied by --dtype, --no-fuse, --no-forced; stop the server first)")
     args = ap.parse_args(argv)
+    if args.port:  # (client.connect reads it, as for locals --port N chat)
+        os.environ["LOCALS_PORT"] = str(args.port)
 
     # the inputs first: a wrong path or a broken schema used to surface as a traceback after the model loaded
     try:
@@ -46,6 +50,9 @@ def main(argv=None):
 
         return generate(args, prompt, schema)  # on the background server (started if it is not running)
     args.model = args.model or DEFAULT_MODEL
+    from .app import check_local_load
+
+    check_local_load(args.model, "generate")
     print(f"loading {args.model} ...", file=sys.stderr, flush=True)
     rt = Runtime.load(args.model, fuse=not args.no_fuse, dtype=args.dtype)
     if args.n > 1:

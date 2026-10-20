@@ -326,6 +326,9 @@ def run(args) -> dict:
     console = Console(stderr=True)
     tasks = [Task("custom", args.task)] * args.agents if args.task else [SUITE[i % len(SUITE)] for i in range(args.agents)]
     out_dir = Path(args.out) / f"{time.strftime('%Y%m%d-%H%M%S')}-{args.engine}"
+    from .app import check_local_load
+
+    check_local_load(args.model, "agents")
     console.print(f"loading {args.model} on engine [bold]{args.engine}[/] ...")
     t = time.perf_counter()
     svc = BatchService(args.engine, args.model, slots=args.slots, temp=args.temp, seed=args.seed)
@@ -409,7 +412,7 @@ def compare(args, argv=None) -> None:
         p = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
         if p.returncode != 0:
             console.print(f"[red]{engine} run failed[/]")
-            return
+            sys.exit(p.returncode or 1)
         results[engine] = json.loads(p.stdout.strip().splitlines()[-1])
         if results[engine].get("errors"):
             console.print(f"[red]{engine}: {results[engine]['errors']} agents hit engine errors; not comparing[/]")

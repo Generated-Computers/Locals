@@ -78,7 +78,7 @@ def test_an_ollama_name_is_pointed_at_its_mlx_version(monkeypatch):
 
     class Hub:
         def list_models(self, search, **kw):
-            assert search in ("llama-3.2", "llama3.2")
+            assert search.startswith(("llama-3.2", "llama3.2"))
             return [SimpleNamespace(id=i) for i in ("mlx-community/Llama-3.2-1B-Instruct-4bit",
                                                     "someone/Llama-3.2-3B-Instruct-8bit", "mlx-community/Llama-3.2-3B-Instruct-4bit")]
 

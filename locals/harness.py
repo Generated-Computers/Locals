@@ -1084,9 +1084,7 @@ def cmd_run(args) -> None:
     from . import app
     from .solve import detect_check
 
-    root = Path(args.dir).expanduser().resolve()
-    if not root.is_dir():
-        sys.exit(f"no such directory: {root}")
+    root = app.project_folder(args.dir, "run")
     if args.check:  # before the model loads and the agents start: a check that cannot run would fail them all
         from .solve import check_cannot_run
 

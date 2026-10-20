@@ -617,9 +617,11 @@ class Race:
 def cmd_solve(args) -> None:
     from . import app
 
-    project = Path(args.dir).expanduser().resolve()
-    if not project.is_dir():
-        sys.exit(f"no such directory: {project}")
+    project = app.project_folder(args.dir, "solve")
+    if args.check:  # before the model loads and the attempts start: a check that cannot run fails every one of them
+        why = check_cannot_run(args.check, project)
+        if why:
+            sys.exit(f"locals solve: {why}")
     check = args.check or detect_check(project)
     if not check and args.no_write_check:
         sys.exit("locals solve needs a way to tell a good result from a bad one: give the command, e.g.\n"
@@ -755,7 +757,9 @@ def cmd_solve(args) -> None:
         for a in race.attempts:
             remove_workspace(project, a.ws, a.kind)
     (run_dir / "summary.json").write_text(json.dumps(report, indent=1))
-    sys.exit(0 if w is not None else 1)
+    # 0 only when the project has the result (or --no-apply asked for none): a winner left unapplied (drift, tests
+    # changed, paths outside) exited 0 too, and a script took the unchanged project for the solved one
+    sys.exit(0 if w is not None and (args.no_apply or report.get("applied")) else (2 if w is not None else 1))
 
 
 def _apply(project: Path, ws: Path, write: List[str], delete: List[str]) -> None:

@@ -13,7 +13,11 @@ say() { printf '%s\n' "$*"; }
 fail() { printf 'locals install: %s\n' "$*" >&2; exit 1; }
 
 [ "$(uname -s)" = "Darwin" ] || fail "locals runs on macOS with Apple silicon (MLX); this is $(uname -s)."
-[ "$(uname -m)" = "arm64" ] || fail "locals needs an Apple-silicon Mac (M1 or later); this machine is $(uname -m)."
+if [ "$(uname -m)" != "arm64" ]; then
+  # a Terminal running under Rosetta reports x86_64 on an M-series Mac: say so instead of "not Apple silicon"
+  [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ] && fail "this terminal runs under Rosetta (as an Intel Mac); open a Terminal that runs natively (in Finder: Get Info on Terminal, untick \"Open using Rosetta\") and run this again."
+  fail "locals needs an Apple-silicon Mac (M1 or later); this machine is $(uname -m)."
+fi
 MACOS="$(sw_vers -productVersion 2>/dev/null || echo 0)"
 [ "${MACOS%%.*}" -ge 14 ] 2>/dev/null || fail "locals needs macOS 14 (Sonoma) or newer (MLX ships for those); this Mac runs macOS $MACOS."
 

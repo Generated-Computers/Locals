@@ -8,6 +8,7 @@ it: one model in memory, and its prompt cache keeps a conversation between turns
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import sys
@@ -35,6 +36,10 @@ def connect(model: Optional[str]) -> tuple:
     return app.base_url(port), f"locals/{app.model_short(chosen)}"
 
 
+NOT_ANSWERING = ("the server at {base} is not answering (another command may have stopped or restarted it): "
+                 "locals status shows it, locals start starts it again")
+
+
 def _post(url: str, body: dict, timeout: float = 3600):
     req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     try:
@@ -45,6 +50,8 @@ def _post(url: str, body: dict, timeout: float = 3600):
         except Exception:  # noqa: BLE001
             msg = str(e)
         raise ValueError(msg) from None
+    except (urllib.error.URLError, OSError, http.client.HTTPException):  # (a traceback ended locals chat here)
+        raise ValueError(NOT_ANSWERING.format(base=url.split("/v1/")[0])) from None
 
 
 def complete(base: str, body: dict) -> dict:
@@ -224,6 +231,11 @@ def _stream(base: str, body: dict):
     except KeyboardInterrupt:
         if thinking:
             print(END, end="")
+        return None, None, None
+    except (OSError, http.client.HTTPException, ValueError):  # the server went away mid-reply
+        if thinking:
+            print(END, end="")
+        print(f"\n(error: {NOT_ANSWERING.format(base=base)})")
         return None, None, None
     if thinking:
         print(END, end="")

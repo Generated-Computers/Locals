@@ -152,9 +152,13 @@ def test_agent_setup_without_the_agent_installed(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(app, "fetch_model", boom)
     monkeypatch.setattr(app, "ensure_server", boom)
     monkeypatch.setattr(app, "check_model", lambda model: None)  # (checks the name on Hugging Face; downloads nothing)
+    import pytest
+
     for target in ("openclaw", "hermes"):
-        app.cmd_setup(argparse.Namespace(target=target, model="mlx-community/gemma-4-e4b-it-4bit", port=8321, context=None,
-                                         output=4096, no_start=False))
+        with pytest.raises(SystemExit) as e:  # status 1: a script took 0 for a finished setup
+            app.cmd_setup(argparse.Namespace(target=target, model="mlx-community/gemma-4-e4b-it-4bit", port=8321,
+                                             context=None, output=4096, no_start=False))
+        assert e.value.code == 1
         out = capsys.readouterr().out
         assert "is not installed" in out and f"locals setup {target}" in out and "Next:" not in out
 
@@ -438,3 +442,63 @@ def test_a_port_before_chat_is_the_one_it_uses(monkeypatch):
     monkeypatch.setattr(app, "remember", lambda **kw: None)
     assert client.connect("mlx-community/Qwen3.5-4B-MLX-4bit")[0].endswith(":9000") and seen["port"] == 9000
     monkeypatch.delenv("LOCALS_PORT")
+
+
+def test_a_project_folder_is_never_the_home_folder_and_a_missing_one_is_named(tmp_path, monkeypatch):
+    """locals run / solve / swarm in a new terminal (the home folder) copied and hashed all of it; the README's first
+    command names ~/my-project, which a new user does not have."""
+    import pytest
+
+    monkeypatch.setattr(app, "HOME", tmp_path)
+    for command in ("run", "solve", "swarm", "code"):
+        with pytest.raises(SystemExit, match="is your home folder"):
+            app.project_folder(str(tmp_path), command)
+    with pytest.raises(SystemExit, match="mkdir -p"):
+        app.project_folder(str(tmp_path / "new-project"), "run")
+    monkeypatch.setattr(app.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(app.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: "")  # Enter: yes
+    assert app.project_folder(str(tmp_path / "new-project"), "code", create_ok=True).is_dir()
+
+
+def test_ctrl_c_ends_a_command_with_a_word(monkeypatch, capsys):
+    import pytest
+
+    def interrupted(argv):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(app, "_main", interrupted)
+    with pytest.raises(SystemExit) as e:
+        app.main(["status"])
+    assert e.value.code == 130 and "stopped" in capsys.readouterr().err
+
+
+def test_chat_says_when_the_server_is_not_answering():
+    import socket
+
+    import pytest
+
+    from locals import client
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()  # a port nothing listens on
+    with pytest.raises(ValueError, match="not answering"):
+        client._post(f"http://127.0.0.1:{port}/v1/chat/completions", {})
+
+
+def test_swarm_task_lists_are_checked_before_the_server_starts(tmp_path, monkeypatch):
+    import argparse
+
+    import pytest
+
+    monkeypatch.setattr(app, "opencode_bin", lambda: "/x/opencode")
+    monkeypatch.setattr(app, "ensure_server", lambda args: (_ for _ in ()).throw(AssertionError("server started")))
+    args = argparse.Namespace(tasks=str(tmp_path / "missing.txt"), task=None, n=1, dir=str(tmp_path / "p"), port=8399, model="m/x")
+    with pytest.raises(SystemExit, match="cannot read the task list"):
+        app.cmd_swarm(args)
+    (tmp_path / "t.json").write_text('[{"what": "x"}]')
+    args.tasks = str(tmp_path / "t.json")
+    with pytest.raises(SystemExit, match='"task"'):
+        app.cmd_swarm(args)

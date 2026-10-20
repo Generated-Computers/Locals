@@ -89,6 +89,7 @@ def parallel_replies(rt, ids, n, max_tokens, temp, top_p):
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="locals chat")
     ap.add_argument("--model", default=None, type=model_id, help=MODEL_HELP + " (default: the model used last)")
+    ap.add_argument("--port", type=int, default=None, help="the server's port (default: the last one used, else 8321)")
     ap.add_argument("--system", default=None)
     ap.add_argument("--temp", type=float, default=0.7)
     ap.add_argument("--top-p", type=float, default=0.9)
@@ -100,6 +101,8 @@ def main(argv=None):
     ap.add_argument("--local", action="store_true",
                     help="load the model in this process instead of using the background server (stop the server first)")
     args = ap.parse_args(argv)
+    if args.port:  # (client.connect reads it, as for locals --port N chat)
+        os.environ["LOCALS_PORT"] = str(args.port)
     args.local = args.local or args.dtype != "auto"
 
     if not args.local:  # on the background server: one copy of the model in memory, kept between commands
@@ -107,6 +110,9 @@ def main(argv=None):
 
         return chat(args)
     args.model = args.model or DEFAULT_MODEL
+    from .app import check_local_load
+
+    check_local_load(args.model, "chat")
     print(f"loading {args.model} ...", file=sys.stderr, flush=True)
     rt = Runtime.load(args.model, dtype=args.dtype)
     tok = rt.tokenizer

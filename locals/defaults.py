@@ -196,17 +196,20 @@ def ollama_hint(model: str) -> "str | None":
     if ":" not in model or "/" in model or Path(model).expanduser().exists():
         return None
     name, tag = (model.lower().split(":", 1) + [""])[:2]
+    size = tag if tag and tag != "latest" else ""
+    names = list(dict.fromkeys([re.sub(r"([a-z])(\d)", r"\1-\2", name), name]))  # llama3.2 is Llama-3.2 there
     found = []
     try:
         from huggingface_hub import HfApi
 
-        for q in dict.fromkeys([re.sub(r"([a-z])(\d)", r"\1-\2", name), name]):  # llama3.2 is Llama-3.2 there
+        # with the size first: by downloads alone, qwen3's first 20 held no 4B (a 27B was named for qwen3:4b)
+        for q in ([f"{n}-{size}" for n in names] if size else []) + names:
             found += [m.id for m in HfApi().list_models(search=q, filter="mlx", sort="downloads", limit=20) if m.id not in found]
     except Exception:  # noqa: BLE001
         pass
-    size = tag if tag and tag != "latest" else ""
-    found.sort(key=lambda mid: (bool(size) and not re.search(rf"(^|[-_.]){re.escape(size)}([-_.]|$)", mid.split("/")[-1].lower()),
-                                not mid.startswith("mlx-community/"), "4bit" not in mid.lower()))
+    if size:  # another size is another model: none of those is named
+        found = [m for m in found if re.search(rf"(^|[-_.]){re.escape(size)}([-_.]|$)", m.split("/")[-1].lower())]
+    found.sort(key=lambda mid: (not mid.startswith("mlx-community/"), "4bit" not in mid.lower()))
     see = (f" MLX versions of it on Hugging Face: {', '.join(found[:3])} (--model {found[0]})." if found else
            " Look for an MLX version of it on Hugging Face (huggingface.co/mlx-community).")
     return (f"{model} is an Ollama model name; locals runs MLX models from Hugging Face.{see} Or one of locals's own: "
