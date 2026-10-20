@@ -114,3 +114,15 @@ def test_a_chunked_body_is_read(http_server):
     c.request("POST", "/v1/chat/completions", body, {"Content-Type": "application/json"})  # the same connection after it
     r = c.getresponse()
     assert r.status == 200 and json.loads(r.read()) == {"ok": True}
+
+
+def test_errors_come_in_each_apis_own_shape(http_server):
+    """An invalid body on /v1/messages or /api/chat was answered in OpenAI's error shape, which Anthropic's SDKs
+    and Ollama clients do not read."""
+    for path, check in (("/v1/messages", lambda d: d["type"] == "error" and d["error"]["type"] == "invalid_request_error"),
+                        ("/api/chat", lambda d: isinstance(d["error"], str)),
+                        ("/v1/chat/completions", lambda d: d["error"]["type"] == "invalid_request_error")):
+        c = http.client.HTTPConnection("127.0.0.1", http_server, timeout=10)
+        c.request("POST", path, "{", {"Content-Type": "application/json"})
+        r = c.getresponse()
+        assert r.status == 400 and check(json.loads(r.read())), path

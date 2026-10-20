@@ -1245,6 +1245,13 @@ def make_handler(server: Server, ollama_root: bool = False):
         def _error(self, msg: str, status=400, code=None):
             server.errors += 1
             server.log(f"{status} {self.command} {self.path}: {msg[:200]}")
+            path = urlparse(self.path).path.rstrip("/")
+            if path.endswith(("/v1/messages", "/v1/messages/count_tokens")):  # in each API's own shape (its SDK reads it)
+                kind = {403: "permission_error", 404: "not_found_error", 413: "request_too_large"}.get(
+                    status, "invalid_request_error" if status < 500 else "api_error")
+                return self._json(apis.anthropic_error(msg, kind), status)
+            if path.startswith("/api/"):  # Ollama's
+                return self._json({"error": msg}, status)
             self._json({"error": {"message": msg, "type": "invalid_request_error" if status < 500 else "server_error",
                                   "param": "messages" if code else None, "code": code}}, status)
 
