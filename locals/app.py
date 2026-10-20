@@ -238,6 +238,17 @@ def _is_locals_server(pid: int) -> bool:
     return "locals.server" in p.stdout
 
 
+def _locals_server_pids() -> List[int]:
+    """Every locals server running on this Mac (any port, started by any command)."""
+    p = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True)
+    out = []
+    for line in p.stdout.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if "locals.server" in cmd and pid.isdigit() and int(pid) != os.getpid():
+            out.append(int(pid))
+    return out
+
+
 def model_short(model: str) -> str:
     from .defaults import short_name
 
@@ -1982,7 +1993,12 @@ def cmd_tune(argv: List[str]) -> None:
                     "timing (10-20 minutes, best throughput); quick: shapes for batch sizes up to 16 (a few minutes)")
     ap.add_argument("--report", action="store_true", help="then print what was measured: MLX's matrix kernels against the "
                     "chosen ones per batch size, and how prompts are read (for a new GPU: tells where Locals gains)")
+    ap.add_argument("--force", action="store_true", help="tune even while a locals server runs (its work skews the timings)")
     a = ap.parse_args(argv)
+    running = _locals_server_pids()
+    if running and not a.force:  # tuning times kernels: a server on the same GPU (serving, or tuning while idle) skews
+        sys.exit(f"a locals server is running (pid {', '.join(map(str, running))}): stop it first (locals stop), "
+                 f"or the timings, kept for good, are taken on a shared GPU (--force tunes anyway)")
     from .runtime import Runtime
 
     t0 = time.time()

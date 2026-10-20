@@ -198,25 +198,51 @@ def _load_tune():
     return _TUNE
 
 
+def _merge_tune(mine: dict, theirs: dict) -> dict:
+    """Two tuning caches as one: ``mine`` (this process's) wins a key both have; the timings (``__times__``) and
+    the lists of whole-step-tuned row counts are merged inside."""
+    out = dict(theirs)
+    for k, v in mine.items():
+        w = out.get(k)
+        if isinstance(v, dict) and isinstance(w, dict):
+            out[k] = {**w, **v}
+        elif k.startswith("__") and isinstance(v, list) and isinstance(w, list):
+            out[k] = list(dict.fromkeys([*w, *v]))
+        else:
+            out[k] = v
+    return out
+
+
 def _save_tune():
-    """The cache, written whole and atomically (a crash or a second process never leaves half a file)."""
+    """The cache, written atomically (a crash never leaves half a file) and merged with the file as it is now
+    under a lock: another process tuning at the same time (`locals tune` next to a server tuning while idle)
+    rewrote the whole file from its own copy, so the last writer erased the other's results. This process
+    takes the other's keys too."""
+    import fcntl
     import tempfile
 
     with _TUNE_LOCK:
-        data = dict(_TUNE)
         d = _os.path.dirname(_TUNE_PATH)
         _os.makedirs(d, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=d, prefix=".tune-", suffix=".json")
-        try:
-            with _os.fdopen(fd, "w") as f:
-                _json.dump(data, f)
-            _os.replace(tmp, _TUNE_PATH)
-        except BaseException:
+        with open(_TUNE_PATH + ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
             try:
-                _os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+                theirs = _read_tune(_TUNE_PATH) if _os.path.exists(_TUNE_PATH) else {}
+            except Exception:  # noqa: BLE001  (a file that does not parse: ours replaces it)
+                theirs = {}
+            data = _merge_tune(_TUNE, theirs)
+            _TUNE.update({k: v for k, v in data.items() if k not in _TUNE or isinstance(v, (dict, list))})
+            fd, tmp = tempfile.mkstemp(dir=d, prefix=".tune-", suffix=".json")
+            try:
+                with _os.fdopen(fd, "w") as f:
+                    _json.dump(data, f)
+                _os.replace(tmp, _TUNE_PATH)
+            except BaseException:
+                try:
+                    _os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
 
 
 def _time_us(fn, reps=12):
@@ -1126,7 +1152,7 @@ def tune_model(model, mode: str = "auto", log=None) -> dict:
             warmup(model, range(1, 17))  # the shapes tuned already (a shipped preset): compiled now, checked
             pending = len(pending_work(model))
             log(f"locals: no tuned kernels for this model on {mx.device_info()['architecture']} yet: serving now, and tuning "
-                f"{pending} kernel shapes while the server is idle (cached afterwards). locals tune --model <model> does the "
+                f"{pending} kernel shapes while the server is idle (cached afterwards). locals stop, then locals tune --model <model>, does the "
                 f"full procedure at once (10-20 minutes, the best batched throughput).")
             return {"mode": "background", "pending": pending}
         else:
