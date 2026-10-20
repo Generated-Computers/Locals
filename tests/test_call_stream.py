@@ -186,3 +186,18 @@ def test_other_formats_read_nested_parameters_too():
     assert oai.param_schemas("not json") == oai.param_schemas(None) == oai.param_schemas({"properties": [1]}) == {}
     assert oai.typed_call_regex(NESTED)  # (the typed grammar read the same schemas: true ended it with a TypeError)
 
+
+def test_parameter_names_outside_the_usual_letters_can_be_written():
+    """MCP tools with OData-style ($select), non-English (größe) or spaced parameter names: the grammar allowed only
+    [A-Za-z0-9_.-], so the model could not write them."""
+    from locals.regex import compile_dfa
+
+    tools = [{"type": "function", "function": {"name": "query", "parameters": {"type": "object", "properties": {
+        "$select": {"type": "string"}, "größe": {"type": "integer"}, "user id": {"type": "string"}, "plain": {"type": "string"}}}}}]
+    d = compile_dfa(oai.reply_regex(tools, "required", preamble=False), 100_000)
+    reply = _call("query", **{"$select": "name", "größe": "42", "user id": "u1", "plain": "x"})
+    assert d.matches(reply.encode())
+    assert not d.matches(_call("query", **{"a>b": "1"}).encode())
+    _, calls, got, _, _ = _run(reply, tools=tools)
+    assert json.loads(got[0]) == {"$select": "name", "größe": 42, "user id": "u1", "plain": "x"}
+

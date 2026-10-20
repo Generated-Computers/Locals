@@ -235,12 +235,15 @@ def typed_call_regex(tools: List[dict]) -> str:
     return "(" + "|".join(calls) + ")"
 
 
-def call_regex(names: Optional[Iterable[str]] = None) -> str:
-    """One tool call. ``names``: the tool names allowed (None: any name)."""
+def call_regex(names: Optional[Iterable[str]] = None, params: Iterable[str] = ()) -> str:
+    """One tool call. ``names``: the tool names allowed (None: any name). ``params``: the tools' parameter names;
+    those outside PARAM_RE_ ($select, größe, "user id") are allowed too (the model could not write them)."""
     names = [n for n in (names or []) if n]
     name = "(" + "|".join(re.escape(n) for n in names) + ")" if names else NAME_RE
     value = not_containing("</parameter>")
-    param = "<parameter=" + PARAM_RE_ + ">\\n" + value + "\\n</parameter>\\n"
+    odd = sorted({q for q in params if q and not re.fullmatch(PARAM_RE_, q) and not set(q) & set("<>\n")})
+    pname = "(" + "|".join([PARAM_RE_] + [re.escape(q) for q in odd]) + ")" if odd else PARAM_RE_
+    param = "<parameter=" + pname + ">\\n" + value + "\\n</parameter>\\n"
     return "<tool_call>\\n<function=" + name + ">\\n(" + param + ")*</function>\\n</tool_call>"
 
 
@@ -264,18 +267,19 @@ def reply_regex(tools: List[dict], tool_choice: Any = "auto", thinking: bool = F
     if not names:
         return None
     specs = tool_specs(tools)
+    params = [q for t in specs for q in param_schemas(t["function"].get("parameters"))]
     lead = free if preamble else ""
     if tool_choice == "none":
         body = free
     elif isinstance(tool_choice, dict):
         fn = (tool_choice.get("function") or {}).get("name") or tool_choice.get("name")
         chosen = [t for t in specs if t["function"]["name"] == fn] or specs
-        body = lead + (typed_call_regex(chosen) if typed else call_regex([fn] if fn in names else names))
+        body = lead + (typed_call_regex(chosen) if typed else call_regex([fn] if fn in names else names, params))
     elif tool_choice == "required":
-        call = typed_call_regex(specs) if typed else call_regex(names)
+        call = typed_call_regex(specs) if typed else call_regex(names, params)
         body = lead + call + ("(\\n" + call + ")*" if parallel else "")
     else:
-        call = typed_call_regex(specs) if typed else call_regex(names)
+        call = typed_call_regex(specs) if typed else call_regex(names, params)
         body = free + "(" + call + ("(\\n" + call + ")*" if parallel else "") + ")?"
     if thinking:
         body = not_containing(THINK_CLOSE) + "</think>\\n\\n" + body
