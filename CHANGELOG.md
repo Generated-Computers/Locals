@@ -125,4 +125,7 @@ First public release.
   no longer fails the request; a request with a large JSON schema no longer
   pauses every other reply while its grammar is made (31 s for one with
   `maxItems: 50`, now 0.1 s), and one too large to serve is refused in seconds
-  with a clear message (it took 214 s with `maxLength: 6000`).
+  with a clear message (it took 214 s with `maxLength: 6000`); a JSON schema
+  with `allOf` (a base and an extension, as OpenAPI and zod write them) gets
+  one object with all the properties, where the reply was two objects back to
+  back and no JSON.

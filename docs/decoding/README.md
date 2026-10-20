@@ -41,6 +41,7 @@ The theory behind this part, its proofs and its full measurements are in the pap
 
 - **Patterns.** Each `pattern` is rewritten (`_json_pattern`) into a grouped regex over the string's contents as JSON writes them: a quote becomes `\"` and a newline becomes `\n`. The decoded string is then exactly what the pattern matches.
 - **Unconstrained properties.** A property whose schema is `{}` or `true` becomes an explicit `anyOf` of the six JSON types (`_ANY`).
+- **`allOf`.** Its parts are merged into one schema (`_merge_all_of`): properties and `required` joined, the tighter of two bounds, a `$ref` part resolved, a property in two parts as the `allOf` of both. outlines-core wrote the parts' JSON one after the other (`{"a":1}{"b":"x"}`), and ignored an `allOf` next to `properties`. Parts that cannot be joined (no type in common, two different patterns) raise `GrammarError`.
 - **Refusals.** Property names that contain quotes, backslashes or control characters are refused with `GrammarError`. So are contradictory bounds (`minItems` > `maxItems`, and the same check for lengths and property counts).
 
 `is_recursive` then picks the path:
@@ -194,7 +195,7 @@ The compiler assembles objects, arrays and alternatives itself. Leaf types (stri
 
 - **Objects.** Properties come in schema order. Optional properties before the first required one are `(p,)?`, and later ones are `(,p)?`. If every property is optional, the object is any non-empty subset in schema order, or empty. `additionalProperties` other than absent or `false` raises.
 - **Arrays** need `items`, and honour `minItems`/`maxItems`.
-- **`anyOf` and `oneOf`** both compile to an alternation. `allOf` is supported with exactly one schema.
+- **`anyOf` and `oneOf`** both compile to an alternation. `allOf` arrives merged by `json_safe_schema` (below).
 - **A `type` list** is split per type, keeping only that type's keywords (`_for_type`).
 - **Not supported:** `{}`/`true` values, and references inside a leaf type.
 

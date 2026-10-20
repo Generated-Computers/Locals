@@ -104,17 +104,89 @@ def _json_pattern(pattern: str) -> str:
     return "(?:" + show(safe(tree)) + ")"
 
 
+_LOWER = ("minimum", "exclusiveMinimum", "minLength", "minItems", "minProperties", "minContains")
+_UPPER = ("maximum", "exclusiveMaximum", "maxLength", "maxItems", "maxProperties", "maxContains")
+_SUBSCHEMA = ("items", "additionalProperties", "contains", "propertyNames", "not")
+_NOTES = ("title", "description", "default", "examples", "$comment", "$id", "$schema", "deprecated", "readOnly",
+          "writeOnly")
+
+
+def _merge_all_of(n: dict, root: dict, refs: frozenset = frozenset()) -> dict:
+    """``n`` with its allOf merged into it: one schema that allows what all the parts allow (properties and
+    required joined, bounds the tighter, a property in two parts as the allOf of both). outlines-core writes an
+    allOf's parts one after the other ({"a":1}{"b":"x"}: no JSON), and ignores one next to "properties"."""
+    out = {k: v for k, v in n.items() if k != "allOf"}
+    for part in n["allOf"]:
+        seen = refs
+        while isinstance(part, dict) and isinstance(part.get("$ref"), str):  # (a part that names a definition)
+            ref = part["$ref"]
+            if ref in seen:
+                raise GrammarError(f"allOf: {ref} is a part of itself")
+            seen = seen | {ref}
+            part = {**_resolve(root, ref), **{k: v for k, v in part.items() if k != "$ref"}}
+        if part is True or part == {}:
+            continue
+        if not isinstance(part, dict):
+            raise GrammarError("allOf: a part that allows nothing (false) or is not a schema")
+        if isinstance(part.get("allOf"), list):
+            part = _merge_all_of(part, root, seen)
+        out = _merge2(out, part)
+    return out
+
+
+def _merge2(a: dict, b: dict) -> dict:
+    out = dict(a)
+    for k, v in b.items():
+        if k not in out or out[k] == v or k in _NOTES:
+            out.setdefault(k, v)
+        elif k == "properties" and isinstance(v, dict) and isinstance(out[k], dict):
+            props = dict(out[k])
+            for name, sub in v.items():
+                props[name] = sub if name not in props or props[name] == sub else {"allOf": [props[name], sub]}
+            out[k] = props
+        elif k == "required" and isinstance(v, list) and isinstance(out[k], list):
+            out[k] = list(dict.fromkeys(out[k] + v))
+        elif k == "type":
+            ta = set(out[k]) if isinstance(out[k], list) else {out[k]}
+            tb = set(v) if isinstance(v, list) else {v}
+            both = (ta & tb) | {"integer" for x, y in ((ta, tb), (tb, ta)) if "integer" in x and "number" in y}
+            if not both:
+                raise GrammarError(f"allOf: its parts allow no type in common ({out[k]} and {v})")
+            out[k] = sorted(both)[0] if len(both) == 1 else sorted(both)
+        elif k == "enum" and isinstance(v, list) and isinstance(out[k], list):
+            out[k] = [x for x in out[k] if x in v]
+            if not out[k]:
+                raise GrammarError("allOf: its parts' enums have no value in common")
+        elif k in _LOWER and isinstance(v, (int, float)) and isinstance(out[k], (int, float)):
+            out[k] = max(out[k], v)
+        elif k in _UPPER and isinstance(v, (int, float)) and isinstance(out[k], (int, float)):
+            out[k] = min(out[k], v)
+        elif k == "additionalProperties" and (v is False or out[k] is False):
+            out[k] = False
+        elif k in _SUBSCHEMA:
+            out[k] = v if out[k] is True else out[k] if v is True else {"allOf": [out[k], v]}
+        else:
+            raise GrammarError(f"allOf: its parts give {k} two values ({json.dumps(out[k])} and {json.dumps(v)}), "
+                               "which is not supported")
+    return out
+
+
 def json_safe_schema(schema):
     """The schema (a dict or its JSON text) rewritten for the regex compilers (see above); the same
-    type back. Property names that JSON would escape are refused, as are bounds that contradict."""
+    type back. Property names that JSON would escape are refused, as are bounds that contradict; an
+    allOf is merged into one schema."""
     as_text = isinstance(schema, str)
     node = json.loads(schema) if as_text else schema
 
-    def walk(n):
+    def walk(n, depth=0):
         if isinstance(n, list):
-            return [walk(x) for x in n]
+            return [walk(x, depth) for x in n]
         if not isinstance(n, dict):
             return n
+        if isinstance(n.get("allOf"), list) and (len(n["allOf"]) > 1 or set(n) - {"allOf", *_NOTES}):
+            if depth > 32:
+                raise GrammarError("allOf nested too deeply")
+            return walk(_merge_all_of(n, node), depth + 1)
         out = {}
         for k, v in n.items():
             if k == "pattern" and isinstance(v, str):
@@ -124,12 +196,12 @@ def json_safe_schema(schema):
                 for name, sub in v.items():
                     if any(c in name for c in '"\\') or any(ord(c) < 0x20 for c in name):
                         raise GrammarError(f"property name {name!r}: quotes, backslashes and control characters are not supported")
-                    props[name] = _ANY if sub is True or sub == {} else walk(sub)
+                    props[name] = _ANY if sub is True or sub == {} else walk(sub, depth)
                 out[k] = props
             elif k in ("enum", "const", "default", "examples"):
                 out[k] = v  # values, not schemas
             else:
-                out[k] = walk(v)
+                out[k] = walk(v, depth)
         for lo, hi in (("minItems", "maxItems"), ("minLength", "maxLength"), ("minProperties", "maxProperties")):
             if isinstance(n.get(lo), int) and isinstance(n.get(hi), int) and n[lo] > n[hi]:
                 raise GrammarError(f"{lo} {n[lo]} is more than {hi} {n[hi]}")

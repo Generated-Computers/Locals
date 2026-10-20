@@ -29,6 +29,18 @@ CASES = [
     ({"type": "string", "pattern": "\""}, ['"\\""'], ['"""']),
     ({"type": "object", "properties": {"a": {}}, "required": ["a"]}, ['{"a":1}', '{"a":"s"}', '{"a":null}'], ['{"a":true', "null"]),
     ({"type": "string", "pattern": "[a-z]+@[a-z]+\\.com"}, ['"ab@cd.com"'], ['"ab@cdxcom"']),
+    # allOf is one object that has all the parts' properties (outlines-core wrote {"a":1}{"b":"x"}, and ignored an
+    # allOf next to "properties"); a part may name a definition (an OpenAPI or zod "base and extension" schema)
+    ({"allOf": [{"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]},
+                {"type": "object", "properties": {"b": {"type": "string"}}, "required": ["b"]}]},
+     ['{"a":1,"b":"x"}'], ['{"a":1}{"b":"x"}', '{"a":1}']),
+    ({"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"],
+      "allOf": [{"properties": {"b": {"type": "string"}}, "required": ["b"]}]}, ['{"a":1,"b":"x"}'], ['{"a":1}']),
+    ({"$defs": {"Base": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}},
+      "allOf": [{"$ref": "#/$defs/Base"}, {"properties": {"name": {"type": "string", "maxLength": 3}}, "required": ["name"]}]},
+     ['{"id":3,"name":"bob"}'], ['{"id":3}', '{"id":3,"name":"bobby"}', '{"name":"bob"}']),
+    ({"type": "object", "properties": {"s": {"allOf": [{"type": "string", "minLength": 2}, {"maxLength": 3}]}},
+      "required": ["s"]}, ['{"s":"ab"}', '{"s":"abc"}'], ['{"s":"a"}', '{"s":"abcd"}']),
 ]
 
 
@@ -69,6 +81,15 @@ def test_schemas_that_cannot_be_honoured():
         json_safe_schema({"type": "object", "properties": {'a"b': {"type": "string"}}})
     with pytest.raises(GrammarError):
         json_safe_schema({"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 1})
+
+
+def test_allof_parts_that_cannot_be_joined_are_refused():
+    for bad in ({"allOf": [{"type": "string"}, {"type": "integer"}]},
+                {"allOf": [{"type": "string", "pattern": "a+"}, {"pattern": "b+"}]},
+                {"allOf": [{"enum": [1, 2]}, {"enum": [3]}]},
+                {"$defs": {"A": {"allOf": [{"$ref": "#/$defs/A"}]}}, "allOf": [{"$ref": "#/$defs/A"}, {"type": "object"}]}):
+        with pytest.raises(GrammarError, match="allOf"):
+            json_safe_schema(bad)
 
 
 def test_regex_syntax_is_honoured_or_refused():
