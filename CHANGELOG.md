@@ -56,7 +56,7 @@ First public release.
   kernels against the chosen ones for each number of requests at once. On
   Qwen3.5, tuning also times the whole model reading prompts with MLX's own
   recurrent-layer op (which has a version for the M5's neural accelerators)
-  and keeps it where it is faster. Batches of 8 or more requests are computed
+  and keeps it where it is faster. Batches of 8 to 16 requests are computed
   at a larger, faster size where tuning finds one: on an M5 Pro, 12 requests
   at once ran 10-13% faster on a 4B model and 19-20% on a 9B.
 - **Smoother commands.** `locals chat` and `locals generate` use the background

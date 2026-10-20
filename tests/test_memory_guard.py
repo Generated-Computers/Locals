@@ -102,6 +102,16 @@ def test_fewer_than_eight_rows_stay_unless_asked(tmp_path, monkeypatch):
     assert kernels._pad_rows(1024, 512, 4, "float16") == 5
 
 
+def test_more_than_sixteen_rows_stay_unless_asked(tmp_path, monkeypatch):
+    """24 requests padded to 32 gained nothing on an M5 Pro (+0.7% on a 9B, -0.4% on a 4B)."""
+    monkeypatch.delenv("LOCALS_PAD_ROWS", raising=False)
+    _tuned(tmp_path, monkeypatch, {24: 100.0, 32: 80.0})
+    assert kernels._pad_rows(1024, 512, 24, "float16") == 24
+    monkeypatch.setattr(kernels, "_PAD", {})
+    monkeypatch.setenv("LOCALS_PAD_ROWS", "all")
+    assert kernels._pad_rows(1024, 512, 24, "float16") == 32
+
+
 def test_recurrent_op_choice(tmp_path, monkeypatch):
     monkeypatch.delenv("LOCALS_GDN_FAST", raising=False)
     monkeypatch.setattr(kernels, "_TUNE_PATH", str(tmp_path / "tune.json"))

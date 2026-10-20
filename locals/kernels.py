@@ -437,15 +437,16 @@ def _pad_rows(N: int, K: int, M: int, dt: str) -> int:
     kernel there is at least 7% faster. On an M5 Pro a Qwen3.5-4B decode step took 32.5 ms at 12 rows and 29.8 ms
     at 16 (9B: 64.9 and 55.5): there MLX switches to another kernel between them, and 12 requests padded to 16 ran
     10-13% faster end to end (9B: 19-20%). On an M2 Pro no larger size is more than 3% faster, so nothing is
-    padded. Below 8 rows the same timings also padded 2 rows to 3 and 4 to 5 on some layers, by gains no request
-    has shown, so batches of fewer than 8 stay as they are unless ``LOCALS_PAD_ROWS=all``. Needs the timings
-    tuning keeps; ``LOCALS_PAD_ROWS=0`` never pads."""
+    padded. Outside 8 to 16 rows the same timings also padded 2 rows to 3, 4 to 5 and 24 to 32 on some layers, by
+    gains the M5 Pro's sweeps did not show (2 to 6 requests: -2.8% to +4.4%, within the 4% two servers of the same
+    code differ by; 24: +0.7% on a 9B, -0.4% on a 4B), so only 8 to 16 rows are padded unless ``LOCALS_PAD_ROWS=all``.
+    Needs the timings tuning keeps; ``LOCALS_PAD_ROWS=0`` never pads."""
     hit = _PAD.get((N, K, M, dt))
     if hit is not None:
         return hit
     best = M
     mode = _os.environ.get("LOCALS_PAD_ROWS", "1")
-    if mode != "0" and (M >= 8 or mode == "all"):
+    if mode != "0" and (8 <= M <= 16 or mode == "all"):
         tune = _load_tune()
         times = tune.get("__times__", {})
 
