@@ -190,12 +190,61 @@ def _load_tune():
                         pass
             tune.update(user or {})
             _TUNE = tune
-            if user is None and tune:
+            crashed = _crashed_shapes(tune)
+            if (user is None and tune) or crashed:
                 try:
                     _save_tune()
                 except OSError:
                     pass
     return _TUNE
+
+
+def _marker(pid: int) -> str:
+    return f"{_TUNE_PATH}.tuning-{pid}"
+
+
+def _alive(pid: int) -> bool:
+    try:
+        _os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # (another user's process)
+        return True
+    return True
+
+
+def _crashed_shapes(tune: dict) -> bool:
+    """Shapes a dead process was timing (its marker file is left: a Metal error MLX raises in a command buffer's
+    completion handler aborts the process, and no except catches it). Each counts in ``__crashed__``; a shape
+    that stopped a process twice keeps MLX's kernel, where it would be tuned again, and abort the server again,
+    at every start. One death (a kill, a power cut) only tunes the shape again. Whether anything changed."""
+    import glob
+    import sys
+
+    changed = False
+    for m in glob.glob(glob.escape(_TUNE_PATH) + ".tuning-*"):
+        try:
+            pid = int(m.rsplit("-", 1)[1])
+            with open(m) as f:
+                key = f.read().strip()
+        except (ValueError, OSError):
+            continue
+        if pid == _os.getpid() or _alive(pid):
+            continue
+        try:
+            _os.unlink(m)
+        except OSError:
+            continue  # (another process took it)
+        if not key:
+            continue
+        crashed = tune.setdefault("__crashed__", {})
+        crashed[key] = crashed.get(key, 0) + 1
+        changed = True
+        if crashed[key] >= 2 and not isinstance(tune.get(key), tuple):
+            tune[key] = ("mlx",)
+            print(f"locals: timing the tuned kernels for the shape {key} stopped locals twice; that shape keeps MLX's "
+                  f"kernel", file=sys.stderr, flush=True)
+    return changed
 
 
 def _merge_tune(mine: dict, theirs: dict) -> dict:
@@ -354,6 +403,25 @@ def _choose(x2, mod):
 
 
 def _tune_shape(x2, mod, M, K, N, dt, key, tune):
+    """_time_shape, with the shape named in this process's marker file while it runs (_crashed_shapes)."""
+    marker = _marker(_os.getpid())
+    try:
+        _os.makedirs(_os.path.dirname(marker), exist_ok=True)
+        with open(marker, "w") as f:
+            f.write(key)
+    except OSError:
+        marker = None
+    try:
+        return _time_shape(x2, mod, M, K, N, dt, key, tune)
+    finally:
+        if marker:
+            try:
+                _os.unlink(marker)
+            except OSError:
+                pass
+
+
+def _time_shape(x2, mod, M, K, N, dt, key, tune):
     from . import qmv_frag, qmv_multi
 
     cands = [("mlx",)]

@@ -29,3 +29,32 @@ def test_tune_refuses_while_a_server_runs(monkeypatch):
         assert "4242" in str(e) and "locals stop" in str(e)
     else:
         raise AssertionError("tuned next to a running server")
+
+
+def test_a_shape_that_stops_the_process_twice_keeps_mlx(tmp_path, monkeypatch):
+    """A Metal error MLX raises in a command buffer's completion handler aborts the process (no except catches
+    it): the shape being timed would be tuned again, and abort the server again, at every start. A marker names
+    it while it is timed; two deaths there pin it to MLX's kernel, one (a kill, a power cut) only tunes it again."""
+    import os
+    import subprocess
+
+    path = tmp_path / "tune.json"
+    monkeypatch.setattr(kernels, "_TUNE_PATH", str(path))
+    monkeypatch.setattr(kernels, "_preset_path", lambda: None)
+    seen = []
+    monkeypatch.setattr(kernels, "_time_shape", lambda *a: seen.append(os.path.exists(kernels._marker(os.getpid()))) or ("mlx",))
+    kernels._tune_shape(None, None, 8, 0, 0, "float16", "k", {})
+    assert seen == [True] and not os.path.exists(kernels._marker(os.getpid()))
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    for deaths in (1, 2):
+        monkeypatch.setattr(kernels, "_TUNE", None)
+        (tmp_path / f"tune.json.tuning-{dead.pid}").write_text("2560x4096x8")
+        tune = kernels._load_tune()
+        assert tune["__crashed__"] == {"2560x4096x8": deaths} and not list(tmp_path.glob("*.tuning-*"))
+        assert ("2560x4096x8" in tune) == (deaths == 2)
+    assert tune["2560x4096x8"] == ("mlx",) and json.loads(path.read_text())["2560x4096x8"] == ["mlx"]
+    monkeypatch.setattr(kernels, "_TUNE", None)
+    live = tmp_path / f"tune.json.tuning-{os.getppid()}"  # a process still tuning: left alone
+    live.write_text("9216x2560x8")
+    assert "9216x2560x8" not in kernels._load_tune() and live.exists()
