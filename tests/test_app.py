@@ -383,3 +383,41 @@ def test_the_old_single_pid_file_counts_for_the_default_port_only(tmp_path, monk
     (tmp_path / "server.pid").write_text("4242")
     assert app._saved_pid(app.DEFAULT_PORT) == 4242
     assert app._saved_pid(9000) is None  # (it made `locals stop --port 9000` stop the 8321 server)
+
+
+def test_a_restart_keeps_the_options_the_server_was_started_with(tmp_path, monkeypatch):
+    """Restarted after an upgrade by a command without them (locals chat), the server lost --ollama-port (Ollama apps
+    stopped working), --max-context and --slots."""
+    import argparse
+
+    import pytest
+
+    from locals import defaults
+
+    monkeypatch.setattr(app, "LOCALS_DIR", tmp_path)
+    monkeypatch.setattr(app, "server_alive", lambda port: {"status": "ok", "build": "old-build"})
+    monkeypatch.setattr(app, "get_json", lambda url, timeout=5.0: {"model": "mlx-community/Qwen3.5-4B-MLX-4bit", "active": []})
+    monkeypatch.setattr(defaults, "build_id", lambda: "new-build")
+    monkeypatch.setattr(app, "_listener_pid", lambda port: 4242)
+    (tmp_path / "server-8399.pid").write_text("4242")
+    (tmp_path / "server-8399.json").write_text('{"ollama_port": 11434, "max_context": 32000, "slots": 8}')
+
+    def kill(pid, sig):
+        monkeypatch.setattr(app, "_listener_pid", lambda port: None)
+        monkeypatch.setattr(app, "_is_locals_server", lambda pid: False)  # (gone)
+
+    class Started(Exception):
+        pass
+
+    seen = {}
+
+    def popen(cmd, **k):
+        seen["cmd"] = cmd
+        raise Started()
+
+    monkeypatch.setattr(app.os, "kill", kill)
+    monkeypatch.setattr(app.subprocess, "Popen", popen)
+    with pytest.raises(Started):
+        app.ensure_server(argparse.Namespace(port=8399, model="mlx-community/Qwen3.5-4B-MLX-4bit", slots=None))
+    cmd = " ".join(seen["cmd"])
+    assert "--ollama-port 11434" in cmd and "--max-context 32000" in cmd and "--slots 8" in cmd

@@ -634,14 +634,23 @@ def fetch_model(model: str) -> None:
 
 # --- the server ---------------------------------------------------------------------------------
 
+_CMD_OPTS = ("engines", "preload", "slots", "temp", "top_p", "top_k", "max_tokens", "cache_gb", "max_calls", "max_context",
+             "ollama_port")
+_CMD_FLAGS = ("thinking", "walk", "typed_tools")
+_KEPT = tuple(k for k in _CMD_OPTS + _CMD_FLAGS if k not in ("engines", "preload"))  # (a restart keeps these)
+
+
+def _opts_file(port: int) -> Path:
+    return LOCALS_DIR / f"server-{port}.json"
+
+
 def server_cmd(args, extra: List[str] = ()) -> List[str]:
     cmd = [python(), "-m", "locals.server", "--port", str(args.port), "--model", args.model]
-    for k in ("engines", "preload", "slots", "temp", "top_p", "top_k", "max_tokens", "cache_gb", "max_calls", "max_context",
-              "ollama_port"):
+    for k in _CMD_OPTS:
         v = getattr(args, k, None)
         if v is not None:
             cmd += ["--" + k.replace("_", "-"), str(v)]
-    for flag in ("thinking", "walk", "typed_tools"):
+    for flag in _CMD_FLAGS:
         if getattr(args, flag, False):
             cmd.append("--" + flag.replace("_", "-"))
     return cmd + list(extra)
@@ -744,6 +753,13 @@ def _ensure_server(args, wait_s: float) -> None:
                      f"stop it with  locals stop  (or use another --port) to use {args.model}")
         print(f"restarting the background server: it runs older locals code ..." if same else
               f"switching the background server from {running} to {args.model} ...", flush=True)
+        try:  # the options it was started with (--ollama-port, --max-context, --slots, ...) that this command leaves unset
+            kept = json.loads(_opts_file(args.port).read_text())
+        except (OSError, ValueError):
+            kept = {}
+        for k in _KEPT:
+            if kept.get(k) not in (None, False) and getattr(args, k, None) in (None, False):
+                setattr(args, k, kept[k])
         os.kill(pid, signal.SIGTERM)
         for _ in range(120):
             if _listener_pid(args.port) is None:
@@ -771,6 +787,7 @@ def _ensure_server(args, wait_s: float) -> None:
     p = subprocess.Popen(server_cmd(args), stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
                          cwd=str(Path(__file__).resolve().parent.parent))
     _pid_file(args.port).write_text(str(p.pid))
+    _opts_file(args.port).write_text(json.dumps({k: getattr(args, k, None) for k in _KEPT}))
     print(f"starting the locals server for {args.model} on port {args.port} (log {log_path}) ...", flush=True)
     _wait_for_server(args, lambda: p.poll() is None, log_path, start, wait_s)
 
@@ -1879,10 +1896,12 @@ def cmd_bench(args) -> None:
               f"{limit:.1f} GB of GPU memory; measuring Locals only", file=sys.stderr)
         engines = [e for e in engines if e != "mlx"]
     args.engines = ",".join(dict.fromkeys(["locals", *engines]))
+    before = _background_pid(args.port) if server_alive(args.port) else None
     started = server_alive(args.port) is None
     with contextlib.redirect_stdout(sys.stderr):
         fetch_model(args.model)
         ensure_server(args)
+    started = started or _background_pid(args.port) != before  # (an idle server of another model, switched to this one)
     try:
         _bench_run(args, bench, engines, chip, memory_gb)
     finally:
