@@ -367,7 +367,8 @@ def chat_to_anthropic(resp: dict, model: str) -> dict:
         content.append({"type": "tool_use", "id": c.get("id") or _uid("toolu_"), "name": fn.get("name") or "",
                         "input": _args_obj(fn.get("arguments"))})
     return {"id": _uid("msg_"), "type": "message", "role": "assistant", "model": model, "content": content,
-            "stop_reason": _STOP_REASONS.get(ch.get("finish_reason"), "end_turn"), "stop_sequence": None,
+            "stop_reason": "stop_sequence" if isinstance(ch.get("stop_reason"), str) else _STOP_REASONS.get(ch.get("finish_reason"), "end_turn"),
+            "stop_sequence": ch.get("stop_reason") if isinstance(ch.get("stop_reason"), str) else None,
             "usage": _anthropic_usage(resp.get("usage") or {})}
 
 
@@ -442,6 +443,8 @@ class AnthropicStream:
                         self._delta({"type": "input_json_delta", "partial_json": _args_text(fn["arguments"])})
                 if ch.get("finish_reason"):
                     self.finish = ch["finish_reason"]
+                    if isinstance(ch.get("stop_reason"), str):  # a stop sequence matched
+                        self.stop_seq = ch["stop_reason"]
 
     def error(self, message: str, kind: str = "api_error") -> None:
         self._end()
@@ -453,6 +456,8 @@ class AnthropicStream:
             return
         self._end()
         u = _anthropic_usage(self.usage)
+        seq = getattr(self, "stop_seq", None)
         self._event("message_delta", {"type": "message_delta", "delta": {
-            "stop_reason": _STOP_REASONS.get(self.finish, "end_turn"), "stop_sequence": None}, "usage": u})
+            "stop_reason": "stop_sequence" if seq else _STOP_REASONS.get(self.finish, "end_turn"), "stop_sequence": seq},
+            "usage": u})
         self._event("message_stop", {"type": "message_stop"})

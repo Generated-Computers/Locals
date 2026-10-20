@@ -91,3 +91,26 @@ def test_bodies_that_are_not_requests(http_server):
     for body in ("[]", "null", '"x"', "[" * 5000 + "]" * 5000, "{"):
         status, _, _ = _post(http_server, body)
         assert status == 400, body[:20]
+
+
+def test_a_preflight_names_the_headers_asked_for(http_server):
+    """"*" never covers Authorization (the Fetch standard): a page using the OpenAI SDK failed its preflight."""
+    c = http.client.HTTPConnection("127.0.0.1", http_server, timeout=10)
+    c.request("OPTIONS", "/v1/chat/completions", headers={"Origin": "http://localhost:3000", "Access-Control-Request-Method": "POST",
+                                                          "Access-Control-Request-Headers": "authorization,content-type"})
+    r = c.getresponse()
+    r.read()
+    assert r.getheader("Access-Control-Allow-Headers") == "authorization,content-type"
+
+
+def test_a_chunked_body_is_read(http_server):
+    """A body sent in chunks (no Content-Length) was read as empty, got a 400, and its bytes stayed on the connection."""
+    body = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
+    c = http.client.HTTPConnection("127.0.0.1", http_server, timeout=10)
+    c.request("POST", "/v1/chat/completions", iter([body[:10], body[10:]]), {"Content-Type": "application/json"},
+              encode_chunked=True)
+    r = c.getresponse()
+    assert r.status == 200 and json.loads(r.read()) == {"ok": True}
+    c.request("POST", "/v1/chat/completions", body, {"Content-Type": "application/json"})  # the same connection after it
+    r = c.getresponse()
+    assert r.status == 200 and json.loads(r.read()) == {"ok": True}

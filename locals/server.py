@@ -739,12 +739,16 @@ class Server:
                  f"  {calls} call(s)  finish={job.finish}" + (f"  stopped={stopped}" if stopped else ""))
         return usage
 
-    def _guard(self, toks: List[int], text: str, fmt=None, tools: bool = True) -> Optional[str]:
+    def _guard(self, toks: List[int], text: str, fmt=None, tools: bool = True, state=None) -> Optional[str]:
         """Why to stop a reply early: enough tool calls, a repeated call, or a
         token loop (a small model can repeat forever; the grammar cannot see it).
         A reply may also repeat on purpose: without tools ("write it ten times")
         and inside a call's arguments (a file of identical lines), so there it
-        takes many more repeats to count as a loop."""
+        takes many more repeats to count as a loop, and then LOOP_GRACE tokens
+        more of it (``state`` keeps where it began): a loop goes on to the token
+        limit, a repetition asked for ends. Cut at once, "the line 50 times" had
+        13 lines, and a write call of 40 identical lines streamed arguments that
+        never closed."""
         in_call = False
         if text:
             if fmt is None or fmt.name == "qwen_xml":
@@ -767,10 +771,11 @@ class Server:
             # a file written through a call repeats lines on purpose (a grid, a table, test data): 16 repeats over
             # 256 tokens or more (8 over 128 cut an 8 x 8 board out of a write call, and the call was dropped)
             looping = _looping(toks, reps=16, min_span=256, short_span=256)
-            return "loop_in_call" if looping else None
+            return "loop_in_call" if _past_grace(looping, len(toks), state) else None
+        elif tools:
+            looping = _looping(toks) or _line_looping(text)
         else:
-            looping = _looping(toks) if tools else _looping(toks, reps=12, min_span=96, short_span=256)
-            looping = looping or (tools and _line_looping(text))
+            looping = _past_grace(_looping(toks, reps=12, min_span=96, short_span=256), len(toks), state)
         return "loop" if looping else None
 
     def _run(self, req: dict, write=None, p: Optional[dict] = None) -> Optional[dict]:
@@ -784,7 +789,7 @@ class Server:
 
         role = [True]
 
-        def chunk(delta: dict, finish=None, usage=None):
+        def chunk(delta: dict, finish=None, usage=None, stop_seq=None):
             if write is None:
                 return
             if role[0]:  # with the first delta, after the prefill (as vLLM and SGLang): sent before it, clients
@@ -792,6 +797,8 @@ class Server:
                 delta = {"role": "assistant", **delta}
             d = dict(head)
             d["choices"] = [{"index": 0, "delta": delta, "finish_reason": finish}]
+            if stop_seq is not None:  # the stop sequence matched, as vLLM's stop_reason
+                d["choices"][0]["stop_reason"] = stop_seq
             if usage is not None:
                 d["usage"] = usage
             write(("data: " + json.dumps(d, ensure_ascii=False) + "\n\n").encode())
@@ -887,9 +894,10 @@ class Server:
             usage = self._account(p, job, len(job.tokens), len(calls), t0, stopped)
             # a reply cut by the loop guard inside a call (the call is dropped), or inside a JSON answer, is cut short:
             # "length" says so (with "stop" an agent took the reply without its call as the end of its task)
-            cut = stopped == "loop_in_call" or (stopped == "loop" and not p["tools"] and (p["schema"] or p["regex"]))
+            cut = stopped == "loop_in_call" or (stopped == "loop" and not p["tools"])
             finish = "tool_calls" if calls else ("length" if job.finish in ("length", "exhausted") or cut else "stop")
-            chunk({}, finish=finish, usage=None if p.get("include_usage") else usage)
+            stop_seq = getattr(job, "stop_sequence", None) if finish == "stop" else None
+            chunk({}, finish=finish, usage=None if p.get("include_usage") else usage, stop_seq=stop_seq)
             if write is not None:
                 if p.get("include_usage"):
                     write(_usage_chunk(head, usage))
@@ -900,8 +908,11 @@ class Server:
                 msg["reasoning_content"] = reasoning
             if calls:
                 msg["tool_calls"] = calls
+            choice = {"index": 0, "message": msg, "finish_reason": finish}
+            if stop_seq is not None:
+                choice["stop_reason"] = stop_seq
             return {"id": cid, "object": "chat.completion", "created": _now(), "model": p["model"],
-                    "choices": [{"index": 0, "message": msg, "finish_reason": finish}], "usage": usage}
+                    "choices": [choice], "usage": usage}
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):  # the client went away
             if job is not None:
                 job.cancel()
@@ -929,7 +940,7 @@ class Server:
                 if stopped is None:
                     if not p.get("ignore_eos"):  # a benchmark's reply runs to its length, loops too
                         seen = oai.split_reasoning(text, p.get("fmt"), _in_think(p))[1] if p["tools"] else ""  # drafts in thoughts are not calls
-                        stopped = self._guard(toks, seen, p.get("fmt"), bool(p["tools"]))
+                        stopped = self._guard(toks, seen, p.get("fmt"), bool(p["tools"]), state=job)
                     cut = _stop_cut(text, stops)
                     if cut is not None:
                         stopped, text = "stop", text[:cut]
@@ -1010,6 +1021,7 @@ class Server:
             raise RuntimeError(job.finish)
         text = job.text
         if stopped == "stop" or (stops and _stop_cut(text, stops) is not None):
+            job.stop_sequence = _stop_which(text, stops)  # (Anthropic's stop_sequence; vLLM's stop_reason)
             text, stopped = text[:_stop_cut(text, stops)], "stop"
         if stopped == "max_calls":
             text = p["fmt"].cut_after(text, self.max_calls)
@@ -1176,8 +1188,30 @@ def make_handler(server: Server, ollama_root: bool = False):
             if origin and _origin_ok(origin):  # a page allowed to call (see _origin_ok); others get no CORS headers
                 self.send_header("Access-Control-Allow-Origin", origin)
                 self.send_header("Vary", "Origin")
-                self.send_header("Access-Control-Allow-Headers", "*")
+                # the headers the page asks for, by name: "*" never covers Authorization (the Fetch standard), so a
+                # page with the OpenAI SDK (dangerouslyAllowBrowser) failed its preflight
+                asked = self.headers.get("Access-Control-Request-Headers")
+                self.send_header("Access-Control-Allow-Headers", asked if asked else "*")
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
+        def _chunked_body(self) -> Optional[bytes]:
+            """A body in HTTP/1.1 chunked transfer encoding; None if malformed or past MAX_BODY."""
+            parts, total = [], 0
+            while True:
+                line = self.rfile.readline(1024)
+                try:
+                    n = int(line.split(b";")[0].strip(), 16)
+                except ValueError:
+                    return None
+                if n == 0:
+                    while self.rfile.readline(1024).strip():  # trailers, up to the blank line
+                        pass
+                    return b"".join(parts)
+                total += n
+                if total > MAX_BODY:
+                    return None
+                parts.append(self.rfile.read(n))
+                self.rfile.readline(4)  # the CRLF after each chunk
 
         def _allowed(self) -> bool:
             """False (with a 403 sent) for a request a web page may not make: from another site's page,
@@ -1488,14 +1522,22 @@ def make_handler(server: Server, ollama_root: bool = False):
             if not self._allowed():
                 return
             path = urlparse(self.path).path.rstrip("/")
-            try:
-                n = int(self.headers.get("Content-Length") or 0)
-            except ValueError:
-                return self._error("invalid Content-Length")
-            if n < 0 or n > MAX_BODY:
-                self.close_connection = True
-                return self._error(f"the request body must be 0 to {MAX_BODY} bytes", 413)
-            body = self.rfile.read(n)
+            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                # a body sent in chunks (Go's io.Pipe, streamed bodies of requests/httpx/Node): read as empty, it got
+                # a misleading 400 and its bytes stayed on the connection, read as the next request
+                body = self._chunked_body()
+                if body is None:
+                    self.close_connection = True
+                    return self._error(f"the request body must be 0 to {MAX_BODY} bytes, in valid chunks", 413)
+            else:
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    return self._error("invalid Content-Length")
+                if n < 0 or n > MAX_BODY:
+                    self.close_connection = True
+                    return self._error(f"the request body must be 0 to {MAX_BODY} bytes", 413)
+                body = self.rfile.read(n)
             enc = (self.headers.get("Content-Encoding") or "").strip().lower()
             if enc in ("gzip", "deflate"):  # Claude Code can compress its request bodies (CLAUDE_CODE_GZIP_REQUEST_BODIES)
                 import zlib
@@ -1643,6 +1685,12 @@ def _stop_cut(text: str, stops: List[str]) -> Optional[int]:
     return min(found) if found else None
 
 
+def _stop_which(text: str, stops: List[str]) -> Optional[str]:
+    """The stop sequence that ends ``text`` first (None if none does)."""
+    found = [(i, s) for s, i in ((s, text.find(s)) for s in stops) if i >= 0]
+    return min(found)[1] if found else None
+
+
 def native_context(model_id: str) -> Optional[int]:
     """The model's context length from its config (max_position_embeddings), if known."""
     try:
@@ -1679,6 +1727,22 @@ def _temperature(req: dict) -> Optional[float]:
         return min(2.0, max(0.0, float(t)))
     except (TypeError, ValueError):
         raise ValueError("temperature must be a number")
+
+
+LOOP_GRACE = 1024  # tokens a repetition that may be wanted goes on after it looks like a loop (Server._guard)
+
+
+def _past_grace(looping: bool, n: int, state) -> bool:
+    """Whether a reply that looks like a loop has gone on looking like one for LOOP_GRACE tokens (``n`` tokens so
+    far; ``state.loop_at`` where it began, cleared when the repetition stops)."""
+    if state is None:
+        return looping
+    if not looping:
+        state.loop_at = None
+        return False
+    if getattr(state, "loop_at", None) is None:
+        state.loop_at = n
+    return n - state.loop_at >= LOOP_GRACE
 
 
 def _looping(toks: List[int], reps: int = 3, max_period: int = 256, min_span: int = 24, short_span: int = 128) -> bool:

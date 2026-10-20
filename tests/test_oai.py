@@ -462,6 +462,7 @@ def test_keepalive_is_a_blank_line(monkeypatch):
 
     from locals import server as srv_mod
     from locals.server import Server
+    from locals.server import Server
 
     clock = [0.0]
     real = time.perf_counter
@@ -518,6 +519,7 @@ def test_context_limit_is_what_fits_in_memory(monkeypatch):
 
     from locals import server as srv_mod
     from locals.server import Server
+    from locals.server import Server
     from locals.service import BatchService
 
     svc = BatchService.__new__(BatchService)
@@ -553,3 +555,28 @@ def test_context_limit_is_what_fits_in_memory(monkeypatch):
     s._cap_context()
     assert s.context_for("locals") == 65536 and s.limit_for("locals") == 20480
     assert server(40000, 262144, fit) == 40000  # asked for
+
+
+def test_a_repetition_asked_for_gets_its_grace():
+    """Without tools and inside a call a repetition may be wanted ("the line 50 times", a file of identical lines):
+    it is cut only after LOOP_GRACE more tokens of it, and a repetition that ends is not cut at all."""
+    from types import SimpleNamespace
+
+    from locals import server as srv_mod
+    from locals.server import Server
+
+    s = Server.__new__(Server)
+    s.max_calls = 8
+    state = SimpleNamespace()
+    line = list(range(100, 112))
+    toks = line * 13
+    assert s._guard(toks, "", None, tools=False, state=state) is None  # looks like a loop: the grace starts
+    assert state.loop_at == len(toks)
+    toks = line * (13 + srv_mod.LOOP_GRACE // len(line))
+    assert s._guard(toks, "", None, tools=False, state=state) is None
+    toks = toks + line
+    assert s._guard(toks, "", None, tools=False, state=state) == "loop"  # LOOP_GRACE tokens later: a loop
+    state = SimpleNamespace()
+    assert s._guard(line * 13, "", None, tools=False, state=state) is None
+    assert s._guard(line * 13 + [7, 8, 9] * 3 + list(range(300, 330)), "", None, tools=False, state=state) is None
+    assert state.loop_at is None  # it ended: the grace starts again next time

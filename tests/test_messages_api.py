@@ -266,3 +266,28 @@ def test_launch_claude_points_claude_code_at_locals(monkeypatch):
     assert seen["argv"] == ["/opt/claude", "-p", "hi"]
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8321" and env["ANTHROPIC_MODEL"] == "locals/qwen3.5-4b"
     assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "145408" and "ANTHROPIC_API_KEY" not in env
+
+
+def test_a_stop_sequence_is_reported_as_one():
+    """stop_sequences cut the reply, but the answer said end_turn and stop_sequence null (the server's choice carries
+    the sequence matched as vLLM's stop_reason)."""
+    import json
+
+    from locals import apis
+
+    resp = {"choices": [{"index": 0, "message": {"role": "assistant", "content": "1 2 3 "}, "finish_reason": "stop",
+                         "stop_reason": "END"}], "usage": {"prompt_tokens": 5, "completion_tokens": 4}}
+    out = apis.chat_to_anthropic(resp, "m")
+    assert out["stop_reason"] == "stop_sequence" and out["stop_sequence"] == "END"
+    resp["choices"][0].pop("stop_reason")
+    out = apis.chat_to_anthropic(resp, "m")
+    assert out["stop_reason"] == "end_turn" and out["stop_sequence"] is None
+    sent = bytearray()
+    s = apis.AnthropicStream(sent.extend, "m", 5)
+    s.start()
+    for d in ({"choices": [{"index": 0, "delta": {"content": "1 2 3 "}, "finish_reason": None}]},
+              {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop", "stop_reason": "END"}]}):
+        s.feed(("data: " + json.dumps(d) + "\n\n").encode())
+    s.close()
+    delta = [json.loads(line[5:]) for line in sent.decode().splitlines() if line.startswith("data:") and "message_delta" in line][0]
+    assert delta["delta"] == {"stop_reason": "stop_sequence", "stop_sequence": "END"}
