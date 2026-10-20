@@ -119,4 +119,7 @@ First public release.
   through a tool call is no longer cut; replies stream as they are written
   when no tools are offered (Llama and Mistral formats); errors on the
   Anthropic and Ollama APIs come in their own shapes; the stock engine keeps
-  serving after an error.
+  serving after an error; a tool parameter that is a nested model (`$ref`, as
+  FastMCP and Pydantic write it) or an optional number arrives as an object or
+  a number instead of its JSON text, and a parameter schema written as `true`
+  no longer fails the request.

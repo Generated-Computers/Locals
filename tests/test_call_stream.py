@@ -20,16 +20,16 @@ def _call(name, **params):
     return f"<tool_call>\n<function={name}>\n{body}</function>\n</tool_call>"
 
 
-def _run(reply, prev=(), step=1):
+def _run(reply, prev=(), step=1, tools=TOOLS):
     """Feed ``reply`` ``step`` characters at a time: (deltas, final calls, the arguments each index added up to)."""
-    cs = oai.CallStream(TOOLS, prev)
+    cs = oai.CallStream(tools, prev)
     deltas = []
     start = reply.find("<tool_call>")
     for n in range(1, len(reply) + 1, step):
         if start >= 0 and n > start:
             deltas += cs.feed(reply[start:n])
     deltas += cs.feed(reply[start:]) if start >= 0 else []
-    _, _, calls = oai.parse_reply(reply, TOOLS)
+    _, _, calls = oai.parse_reply(reply, tools)
     deltas += cs.finish(calls)
     got, names, ids = {}, {}, {}
     for d in deltas:
@@ -152,3 +152,37 @@ def test_the_anthropic_sdk_gets_the_call_in_pieces():
         assert len(pieces) > 20 and final.stop_reason == "tool_use"
     finally:
         httpd.shutdown()
+
+
+# FastMCP and Pydantic write a nested model as a $ref and Optional[...] as an anyOf; some clients send a property
+# schema that is no object (true, or the shorthand "string")
+NESTED = [{"type": "function", "function": {"name": "search", "parameters": {
+    "type": "object", "$defs": {"P": {"type": "object", "properties": {"q": {"type": "string"}, "n": {"type": "integer"}}}},
+    "properties": {"params": {"$ref": "#/$defs/P"}, "limit": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                   "note": {"anyOf": [{"type": "string"}, {"type": "null"}]}, "flag": True, "kind": "string",
+                   "mode": {"enum": ["fast", "slow"]}, "size": {"const": 3}}}}}]
+
+
+@pytest.mark.parametrize("step", [1, 5])
+def test_nested_and_optional_parameters_arrive_typed(step):
+    reply = _call("search", params='{"q": "x", "n": 3}', limit="5", note="null", flag="yes", kind="file", mode="fast",
+                  size="3")
+    _, calls, got, _, _ = _run(reply, step=step, tools=NESTED)
+    want = {"params": {"q": "x", "n": 3}, "limit": 5, "note": "null", "flag": "yes", "kind": "file", "mode": "fast",
+            "size": 3}
+    assert json.loads(calls[0]["function"]["arguments"]) == want  # (params came as the text '{"q": ...}'; flag crashed)
+    assert got[0] == calls[0]["function"]["arguments"]
+
+
+def test_other_formats_read_nested_parameters_too():
+    from locals import formats
+
+    fmt = formats.FORMATS["hermes"]
+    reply = '<tool_call>\n{"name": "search", "arguments": {"params": "{\\"q\\": \\"x\\"}", "limit": "5", "note": "null"}}\n</tool_call>'
+    _, _, calls = oai.parse_reply(reply, NESTED, fmt=fmt)
+    # a string the model wrote stays one where the schema allows strings
+    assert json.loads(calls[0]["function"]["arguments"]) == {"params": {"q": "x"}, "limit": 5, "note": "null"}
+    assert oai.param_schemas('{"properties": {"a": {"type": "integer"}}}') == {"a": {"type": "integer"}}
+    assert oai.param_schemas("not json") == oai.param_schemas(None) == oai.param_schemas({"properties": [1]}) == {}
+    assert oai.typed_call_regex(NESTED)  # (the typed grammar read the same schemas: true ended it with a TypeError)
+

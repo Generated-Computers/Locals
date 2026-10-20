@@ -202,7 +202,7 @@ def _value_regex(schema: Optional[dict]) -> str:
     free = not_containing("</parameter>")
     if not schema:
         return free
-    if "enum" in schema:
+    if isinstance(schema.get("enum"), list) and schema["enum"]:
         return "(" + "|".join(re.escape(str(v)) for v in schema["enum"]) + ")"
     t = schema.get("type")
     if isinstance(t, list):
@@ -224,8 +224,9 @@ def typed_call_regex(tools: List[dict]) -> str:
     calls = []
     for t in tool_specs(tools):
         fn = t["function"]
-        params = (fn.get("parameters") or {}).get("properties") or {}
-        required = set((fn.get("parameters") or {}).get("required") or [])
+        params = param_schemas(fn.get("parameters"))
+        req = fn["parameters"].get("required") if isinstance(fn.get("parameters"), dict) else None
+        required = {r for r in req if isinstance(r, str)} if isinstance(req, list) else set()
         body = ""
         for p, sc in params.items():
             piece = "<parameter=" + re.escape(p) + ">\\n" + _value_regex(sc) + "\\n</parameter>\\n"
@@ -371,7 +372,7 @@ class CallStream:
     def __init__(self, tools: Optional[List[dict]], prev=(), max_calls: int = 6):
         self.schemas: Dict[str, dict] = {}
         for t in tool_specs(tools):
-            self.schemas[t["function"]["name"]] = (t["function"].get("parameters") or {}).get("properties") or {}
+            self.schemas[t["function"]["name"]] = param_schemas(t["function"].get("parameters"))
         self.prev = [(name, json.loads(args)) for name, args in prev]  # (name, arguments) of the previous turn's calls
         self.max_calls = max_calls
         self.ids: List[str] = []
@@ -405,7 +406,7 @@ class CallStream:
             seen.add(pname)
             schema = props.get(pname)
             key = json.dumps(pname, ensure_ascii=False) + ": "
-            text_kind = not schema or not _types(schema) or "string" in _types(schema)
+            text_kind = not _types(schema) or "string" in _types(schema)
             if text_kind:
                 body = value if done else _held_back(value)
                 parts.append(key + '"' + json.dumps(body, ensure_ascii=False)[1:-1] + ('"' if done else ""))
@@ -470,14 +471,64 @@ def _call_id() -> str:
     return "call_" + uuid.uuid4().hex[:24]
 
 
-def _types(schema: dict) -> set:
-    """The JSON types a schema allows: its "type" (one or a list) and its anyOf/oneOf branches' types."""
+_JSON_TYPE = {bool: "boolean", int: "integer", float: "number", str: "string", type(None): "null", list: "array",
+              dict: "object"}
+
+
+def _types(schema) -> set:
+    """The JSON types a schema allows: its "type" (one or a list), its anyOf/oneOf/allOf branches' types, and else
+    what its keywords imply (properties: an object, items: an array, enum or const: their values' types)."""
+    if not isinstance(schema, dict):
+        return set()
     out = set()
     t = schema.get("type")
-    out |= set(t) if isinstance(t, list) else ({t} if t else set())
-    for br in (schema.get("anyOf") or schema.get("oneOf") or []):
-        if isinstance(br, dict):
+    out |= set(t) if isinstance(t, list) else ({t} if isinstance(t, str) else set())
+    for key in ("anyOf", "oneOf", "allOf"):
+        for br in schema.get(key) or []:
             out |= _types(br)
+    if not out:
+        if "properties" in schema or isinstance(schema.get("additionalProperties"), dict):
+            out.add("object")
+        if "items" in schema or "prefixItems" in schema:
+            out.add("array")
+        values = schema.get("enum") if isinstance(schema.get("enum"), list) else ([schema["const"]] if "const" in schema else [])
+        out |= {_JSON_TYPE.get(type(v), "string") for v in values}
+    return out
+
+
+def param_schemas(parameters) -> Dict[str, dict]:
+    """A tool's parameter schemas by name, as coerce reads them: $ref resolved against the tool's own schema
+    (FastMCP and Pydantic write nested models so, and their objects came back as JSON strings), parameters sent as
+    a JSON string read, and a schema that is no object (true, or the shorthand "string") taken as untyped or as that
+    type (it ended the request with an AttributeError once the model had written the call)."""
+    if isinstance(parameters, str):
+        try:
+            parameters = json.loads(parameters)
+        except ValueError:
+            return {}
+    if not isinstance(parameters, dict) or not isinstance(parameters.get("properties"), dict):
+        return {}
+    return {k: _resolved(v, parameters) for k, v in parameters["properties"].items() if isinstance(k, str)}
+
+
+def _resolved(schema, root: dict, depth: int = 0) -> dict:
+    if isinstance(schema, str):
+        return {"type": schema}
+    if not isinstance(schema, dict) or depth > 8:
+        return {}
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        from .grammar import _resolve
+
+        try:
+            target = _resolve(root, ref)
+        except Exception:  # noqa: BLE001  # (a reference elsewhere: untyped)
+            target = {}
+        return {**_resolved(target, root, depth + 1), **{k: v for k, v in schema.items() if k != "$ref"}}
+    out = dict(schema)
+    for key in ("anyOf", "oneOf", "allOf"):
+        if isinstance(out.get(key), list):
+            out[key] = [_resolved(b, root, depth + 1) for b in out[key]]
     return out
 
 
@@ -556,8 +607,7 @@ def parse_reply(text: str, tools: Optional[List[dict]] = None, fmt=None,
     reasoning, text = split_reasoning(text, fmt, thinking)
     schemas: Dict[str, dict] = {}
     for t in tool_specs(tools):
-        props = (t["function"].get("parameters") or {}).get("properties") or {}
-        schemas[t["function"]["name"]] = props
+        schemas[t["function"]["name"]] = param_schemas(t["function"].get("parameters"))
     if fmt is not None and fmt.name != "qwen_xml":
         content, part = fmt.split(text)
         calls = []
@@ -568,8 +618,10 @@ def parse_reply(text: str, tools: Optional[List[dict]] = None, fmt=None,
             found = [(n, a) for n, a in found if n in schemas]
         for name, args in found:
             props = schemas.get(name, {})
-            args = {k: (coerce(v, props.get(k)) if isinstance(v, str) and (props.get(k) or {}).get("type") not in (None, "string")
-                        else v) for k, v in args.items()}
+            # (by _types, not the bare "type": Optional[int], an anyOf, came back as the text "5"; a string the model
+            # wrote stays one where the schema allows strings)
+            args = {k: (coerce(v, props.get(k)) if isinstance(v, str) and "string" not in _types(props.get(k)) else v)
+                    for k, v in args.items()}
             calls.append({"id": fmt.new_id(), "type": "function",
                           "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
         if part and not calls:  # the calls part did not parse (only without our grammar): keep it as text
