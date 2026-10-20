@@ -324,6 +324,9 @@ class Server:
             thinking = False  # the grammar writes the JSON from the first token: a think block the prompt opened would hold it
         if thinking and not self._can_think(engine, tok):
             thinking = False  # a model without a thinking mode (Qwen3-Instruct-2507) never closes a think block
+        prefill = req.get("_prefill") if isinstance(req.get("_prefill"), str) else ""  # (an Anthropic prefill)
+        if prefill:
+            thinking = False
         msgs = oai.convert_messages(req.get("messages") or [], raw=self._raw if fmt.replay_raw else None)
         tools = oai.tool_specs(req.get("tools"))
         _volatile_to_end(msgs, tools)
@@ -344,6 +347,7 @@ class Server:
             # the template opens a think block whatever the switch says (LFM2.5): closed empty here, the model
             # answers at once (a short request answered nothing, every token spent thinking; JSON started in it)
             text += fmt.think_close
+        text += prefill  # the reply goes on from it
         prompt = self._tokens_for(engine, tok, text)
         limit = self.limit_for(engine)
         if len(prompt) >= limit:

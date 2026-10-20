@@ -339,6 +339,13 @@ def anthropic_to_chat(req: dict, model: str) -> dict:
         chat["chat_template_kwargs"] = {"enable_thinking": True}
     elif thinking.get("type") == "disabled":
         chat["chat_template_kwargs"] = {"enable_thinking": False}
+    last = chat["messages"][-1] if chat.get("messages") else None
+    if last and last["role"] == "assistant" and not last.get("tool_calls") and last.get("content"):
+        # a prefill: the reply continues this text (the answer holds only the continuation); rendered as a finished
+        # turn, the model began a new reply (prefill {"name": then {"name": "Ann", ...})
+        chat["messages"].pop()
+        chat["_prefill"] = last["content"]
+        chat["chat_template_kwargs"] = {"enable_thinking": False}  # (Anthropic allows no prefill with thinking)
     return chat
 
 

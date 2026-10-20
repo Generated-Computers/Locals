@@ -22,6 +22,7 @@ import queue
 import sys
 import threading
 import time
+import weakref
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
 
@@ -132,6 +133,10 @@ def memory_plan(limit: int, weights: int) -> tuple:
     return pool, (int(float(env) * (1 << 30)) if env else pool + (512 << 20))
 
 
+_SERVICES: "weakref.WeakSet" = weakref.WeakSet()  # the engines of this process (locals bench serves two at once)
+_POOL_PLANNED = False  # our engine sized MLX's pool of freed buffers (memory_plan): the stock engine keeps it
+
+
 class BatchService:
     def __init__(self, engine: str, model: str, slots: int = 16, temp: float = 0.0, seed: int = 0, cache_gb: Optional[float] = None,
                  walk: bool = False, top_p: float = 0.0, top_k: int = 0):
@@ -153,6 +158,7 @@ class BatchService:
         self.tokens_out = 0
         self.prompt_tokens = 0
         self.cached_tokens = 0
+        _SERVICES.add(self)
         self._thread = threading.Thread(target=self._main, name=f"batch-{engine}", daemon=True)
         self._thread.start()
         self._ready.wait()
@@ -239,6 +245,8 @@ class BatchService:
         work = getattr(self, "_tune_work", None)
         if not work:
             return
+        if any(s is not self and (s._inflight or not s._q.empty()) for s in list(_SERVICES)):
+            return  # the other engine works (locals bench): timings on a shared GPU would be kept for good
         mod, M = work.pop(0)
         try:
             from .kernels import tune_one
@@ -262,7 +270,8 @@ class BatchService:
             import mlx.core as mx
 
             mx.random.seed(self.seed)
-            mx.set_cache_limit(1 << 30)  # MLX keeps freed buffers up to the whole memory limit by default
+            if not _POOL_PLANNED:  # (loaded after ours, the stock engine set it back to 1 GB under ours's margin)
+                mx.set_cache_limit(1 << 30)  # MLX keeps freed buffers up to the whole memory limit by default
             (self._run_locals if self.engine == "locals" else self._run_stock)()
         except BaseException as e:  # surface load errors to the constructor, others to clients
             import sys
@@ -332,6 +341,8 @@ class BatchService:
         self._eng = eng
         limit = int(mx.device_info()["max_recommended_working_set_size"])
         pool, margin = memory_plan(limit, self.weights_bytes)
+        global _POOL_PLANNED
+        _POOL_PLANNED = True
         mx.set_cache_limit(pool)
         eng.memory_limit = limit - margin
         if self.cache_bytes is None:  # what is left after the weights and 5 GB for running rows and prefill,

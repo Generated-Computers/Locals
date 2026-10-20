@@ -291,3 +291,16 @@ def test_a_stop_sequence_is_reported_as_one():
     s.close()
     delta = [json.loads(line[5:]) for line in sent.decode().splitlines() if line.startswith("data:") and "message_delta" in line][0]
     assert delta["delta"] == {"stop_reason": "stop_sequence", "stop_sequence": "END"}
+
+
+def test_a_final_assistant_message_is_a_prefill():
+    """The Messages API continues a final assistant message; rendered as a finished turn, the model began a new
+    reply ({"name": then {"name": "Ann", ...}). It becomes the start of the reply, thinking off."""
+    from locals import apis
+
+    chat = apis.anthropic_to_chat({"max_tokens": 50, "messages": [
+        {"role": "user", "content": "JSON for Ann, 31"}, {"role": "assistant", "content": '{"name":'}]}, "m")
+    assert chat["messages"][-1]["role"] == "user" and chat["_prefill"] == '{"name":'
+    assert chat["chat_template_kwargs"] == {"enable_thinking": False}
+    chat = apis.anthropic_to_chat({"max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]}, "m")
+    assert "_prefill" not in chat
