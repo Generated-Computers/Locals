@@ -1117,26 +1117,27 @@ def _before_locals(tool: str) -> dict:
 
 def _loads_jsonish(text: str):
     """JSON, or JSON5 / JSONC as OpenClaw and OpenCode allow it (comments, trailing commas, unquoted keys,
-    single quotes); None if it still does not parse."""
+    single quotes); None if it still does not parse. Read as tokens, so that nothing inside a string changes
+    (regular expressions over the whole text turned "Hello, world: hi" into a broken key)."""
     try:
         return json.loads(text)
     except ValueError:
         pass
     import re
 
-    out, i, n = [], 0, len(text)
-    while i < n:  # comments out, strings kept as they are (single-quoted ones in double quotes)
+    toks, i, n = [], 0, len(text)  # (kind, text): s a string (now JSON), p punctuation, w space, a anything else
+    while i < n:
         ch = text[i]
         if ch in "\"'":
             j, buf = i + 1, []
             while j < n and text[j] != ch:
                 if text[j] == "\\" and j + 1 < n:
-                    buf.append(text[j:j + 2])
+                    buf.append("'" if text[j + 1] == "'" else text[j:j + 2])  # JSON has no \'
                     j += 2
                     continue
-                buf.append('\\"' if text[j] == '"' and ch == "'" else text[j])
+                buf.append('\\"' if text[j] == '"' else text[j])  # a double quote inside single quotes
                 j += 1
-            out.append('"' + "".join(buf) + '"')
+            toks.append(("s", '"' + "".join(buf) + '"'))
             i = j + 1
         elif text.startswith("//", i):
             while i < n and text[i] != "\n":
@@ -1144,14 +1145,29 @@ def _loads_jsonish(text: str):
         elif text.startswith("/*", i):
             end = text.find("*/", i + 2)
             i = n if end < 0 else end + 2
-        else:
-            out.append(ch)
+        elif ch.isspace():
+            toks.append(("w", ch))
             i += 1
-    s = "".join(out)
-    s = re.sub(r",(\s*[}\]])", r"\1", s)  # trailing commas
-    s = re.sub(r'([{,]\s*)([A-Za-z_$][\w$]*)(\s*:)', r'\1"\2"\3', s)  # unquoted keys
+        elif ch in "{}[],:":
+            toks.append(("p", ch))
+            i += 1
+        else:
+            j = i + 1
+            while j < n and not text[j].isspace() and text[j] not in "{}[],:\"'" and not text.startswith(("//", "/*"), j):
+                j += 1
+            toks.append(("a", text[i:j]))
+            i = j
+    sig = [k for k, t in enumerate(toks) if t[0] != "w"]
+    after = {a: toks[b][1] for a, b in zip(sig, sig[1:])}  # the next token that is not space
+    out = []
+    for k, (kind, t) in enumerate(toks):
+        if kind == "p" and t == "," and after.get(k) in ("}", "]"):  # a trailing comma
+            continue
+        if kind == "a" and after.get(k) == ":" and re.fullmatch(r"[A-Za-z_$][\w$]*", t):  # an unquoted key
+            t = '"' + t + '"'
+        out.append(t)
     try:
-        return json.loads(s)
+        return json.loads("".join(out))
     except ValueError:
         return None
 

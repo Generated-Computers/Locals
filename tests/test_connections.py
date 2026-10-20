@@ -424,3 +424,16 @@ def test_hermes_on_another_local_server_is_set_back(tmp_path, monkeypatch):
     app.disconnect_hermes()
     assert ["/opt/hermes", "config", "set", "model.base_url", "http://127.0.0.1:1234/v1"] in seen
     assert ["/opt/hermes", "config", "set", "model.default", "qwen2.5-coder-7b"] in seen
+
+
+@pytest.mark.parametrize("text,want", [
+    ('{"note": "Hello, world: hi", a: 1,}', {"note": "Hello, world: hi", "a": 1}),
+    ("{a: 1, b: '{c: 2}'}", {"a": 1, "b": "{c: 2}"}),
+    ('["a,]", 2,]', ["a,]", 2]),
+    ("{x: 'it\\'s', y: 'say \"hi\"'}", {"x": "it's", "y": 'say "hi"'}),
+    ('{\n // c\n u: "http://x/y", /* b */ v: [1,2,],\n}', {"u": "http://x/y", "v": [1, 2]}),
+])
+def test_json5_strings_are_left_as_they_are(text, want):
+    """OpenClaw's JSON5: commas, colons and braces inside strings are text (a regular expression over the whole file
+    once broke "Hello, world: hi"; then the config could not be read, and a disconnect refused)."""
+    assert app._loads_jsonish(text) == want
