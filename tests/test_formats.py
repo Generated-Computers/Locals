@@ -413,3 +413,18 @@ def test_minicpm5_call_tokens_are_text_a_grammar_may_write():
     ids = tok._tokenizer.convert_tokens_to_ids(["<function", "</function>", "<param", "</param>"])
     assert [v.token_bytes[i] for i in ids] == [b"<function", b"</function>", b"<param", b"</param>"]
     assert v.token_bytes[tok._tokenizer.convert_tokens_to_ids("<|im_end|>")] is None  # a control token stays out
+
+
+def test_lfm2_reads_every_call_its_grammar_allows():
+    """LFM2's grammar lets the model write a tool's own name and any parameter name; Python's parser dropped
+    Context7's resolve-library-id(...) and Grep(-n=True), and the call came back as the reply's text."""
+    from locals.regex import compile_dfa
+
+    f = formats.FORMATS["lfm2_python"]
+    reply = ("<|tool_call_start|>[resolve-library-id(libraryName='react'), Grep(pattern='a, (b)', -n=True), "
+             "run(cmd='x=1', n=-3, opts={\"a\": [1, true]})]<|tool_call_end|>")
+    assert compile_dfa(f.reply_regex(["resolve-library-id", "Grep", "run"], "auto", False), 200_000).matches(reply.encode())
+    assert f.parse_calls(reply) == [("resolve-library-id", {"libraryName": "react"}),
+                                    ("Grep", {"pattern": "a, (b)", "-n": True}),
+                                    ("run", {"cmd": "x=1", "n": -3, "opts": {"a": [1, True]}})]
+    assert f.parse_calls("<|tool_call_start|>[run('positional')]<|tool_call_end|>") == []

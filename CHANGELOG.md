@@ -135,4 +135,6 @@ First public release.
   Qwen can write tool parameters named like `$select`, `größe` or `user id`;
   a JSON schema `pattern` is a search, as JSON Schema says (zod's
   `startsWith("https://")` allowed only `"https://"` itself), and a `format`
-  without a regex (Pydantic's `Path`, `SecretStr`) is no longer a 400.
+  without a regex (Pydantic's `Path`, `SecretStr`) is no longer a 400; LFM2
+  calls to tools named like `resolve-library-id` (Context7) are read as calls
+  instead of coming back as text.

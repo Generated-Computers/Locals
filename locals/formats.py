@@ -270,6 +270,33 @@ def _py_calls(inner: str) -> List[Tuple[int, int]]:
     return spans
 
 
+def _py_args(body: str) -> List[str]:
+    """A Python-style call's arguments, split at the commas outside quotes and brackets."""
+    parts, cur, depth, quote, i = [], "", 0, "", 0
+    while i < len(body):
+        c = body[i]
+        if quote:
+            if c == "\\":
+                cur += body[i:i + 2]
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+        elif c in "'\"":
+            quote = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "," and depth == 0:
+            parts.append(cur)
+            cur, i = "", i + 1
+            continue
+        cur += c
+        i += 1
+    return parts + [cur] if cur.strip() else parts
+
+
 class LFM2Python(ToolFormat):
     """LFM2.5 (Liquid): the calls of a reply as one Python-style list,
     ``<|tool_call_start|>[get_weather(city='Paris'), run(cmd='ls')]<|tool_call_end|>``; a string argument in
@@ -302,17 +329,29 @@ class LFM2Python(ToolFormat):
         return s[1:] if s.startswith("[") else ""
 
     def parse_calls(self, part: str) -> List[Tuple[str, dict]]:
+        """The calls, by name and keyword arguments. Names are read as the grammar lets the model write them,
+        not as Python's: Context7's resolve-library-id(...) and Grep(-n=True) were valid under the grammar,
+        and Python's parser dropped them (the call came back as the reply's text)."""
         import ast
 
         inner, out = self._inner(part), []
         for a, b in _py_calls(inner):
+            text = inner[a:b].strip()
+            i = text.find("(")
+            name = text[:i].strip()
+            if i <= 0 or not text.endswith(")") or not name:
+                continue
+            args = {}
             try:
-                node = ast.parse(inner[a:b].strip(), mode="eval").body
-                if isinstance(node, ast.Call) and isinstance(node.func, (ast.Name, ast.Attribute)):
-                    name = ast.unparse(node.func)
-                    out.append((name, {k.arg: _py_value(k.value) for k in node.keywords if k.arg}))
+                for piece in _py_args(text[i + 1:-1]):
+                    key, eq, value = piece.partition("=")
+                    key = key.strip()
+                    if not eq or not key or any(c in key for c in "'\"()[]{} "):
+                        raise ValueError(piece)
+                    args[key] = _py_value(ast.parse(value.strip(), mode="eval").body)
             except (SyntaxError, ValueError):
                 continue
+            out.append((name, args))
         return out
 
     def count_complete(self, text: str) -> int:
