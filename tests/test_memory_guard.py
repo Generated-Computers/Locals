@@ -6,6 +6,7 @@ Batches computed at more rows where the tuned kernels are faster there, and prom
 it is faster."""
 
 import os
+import time
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -203,3 +204,54 @@ def test_layerwise_merge_matches_and_releases():
         for x, y in zip(a.state, b.state):
             if isinstance(x, mx.array):
                 assert x.shape == y.shape and bool(mx.array_equal(x, y))
+
+
+@pytest.mark.model
+def test_growth_trim_runs_while_a_request_waits(service, monkeypatch):
+    """While a request waits for memory every step is a boundary; the KV growth trim ran only in chained steps, so
+    it stopped exactly then (398 steps, no trim), and the wait counted once a step (397 for one request)."""
+    eng = service._eng
+    monkeypatch.setattr(eng, "memory_limit", mx.get_active_memory() + (8 << 30))
+    calls, seen = [], [0]
+    orig = eng._trim_for
+    monkeypatch.setattr(eng, "_trim_for", lambda lru, need: (calls.append(need), orig(lru, need))[1])
+    tok = service.tokenizer
+    jobs = [service.submit(tok.encode("Count from one to one thousand."), max_tokens=500, ignore_eos=True,
+                           on_token=lambda t: seen.__setitem__(0, seen[0] + len(t)))]
+    jobs.append(service.submit(tok.encode("Name every country in Europe."), max_tokens=500, ignore_eos=True))
+    while seen[0] < 100:
+        time.sleep(0.02)
+    monkeypatch.setattr(eng, "_fits", lambda *a, **k: False)
+    d0 = eng.counters.get("deferred", 0)
+    held = service.submit(tok.encode("Hello"), max_tokens=4)
+    s0, n0 = eng.counters["steps"], len(calls)
+    while seen[0] < 400:
+        time.sleep(0.02)
+    steps, trims = eng.counters["steps"] - s0, len(calls) - n0
+    monkeypatch.setattr(eng, "_fits", type(eng)._fits.__get__(eng))
+    for j in jobs + [held]:
+        j.wait(900)
+    assert steps >= 200 and trims >= steps // 32 - 1, (steps, trims)
+    assert eng.counters.get("deferred", 0) - d0 == 1
+
+
+@pytest.mark.model
+def test_a_prompt_read_alone_stops_when_its_client_goes(service):
+    """A long prompt read beside a short request that then finished is read on alone (up to its reply checkpoint):
+    a cancel there went unheard, and the prompt was read to its end (43.6 s after the cancel for 30k tokens)."""
+    import random
+
+    rng = random.Random(5)
+    eng = service._eng
+    short = service.submit([rng.randrange(1000, 100000) for _ in range(200)], max_tokens=6, ignore_eos=True)
+    time.sleep(0.3)
+    p = [rng.randrange(1000, 100000) for _ in range(16000)]
+    long_ = service.submit(p, max_tokens=8, checkpoints=[(len(p) - 3, "reply")])
+    short.wait(600)
+    gave_up = eng.counters.get("prefills_given_up", 0)
+    time.sleep(1.0)
+    t0 = time.time()
+    long_.cancel()
+    long_.wait(600)
+    assert long_.finish == "cancelled" and time.time() - t0 < 6, time.time() - t0
+    assert eng.counters.get("prefills_given_up", 0) == gave_up + 1

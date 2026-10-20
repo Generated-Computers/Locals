@@ -417,6 +417,7 @@ class HybridBatchEngine(BatchEngine):
         self._kv_tok = None
         self._kv_layers = 1
         self._row_bytes = None  # fixed state bytes per request (_row_state)
+        self._next_trim = 0  # the step of the next growth trim (_growth_trim)
         self._reads: Dict[int, int] = {}  # tokens per prefill pass (power of 2) -> most bytes one needed
         self.disk = None  # a DiskPromptCache: system-prompt snapshots kept across restarts
 
@@ -570,6 +571,16 @@ class HybridBatchEngine(BatchEngine):
         after = (n + len(new_lens)) * max([top] + list(new_lens))
         self._kv_bytes_per_token()  # sets _kv_layers
         return after - n * top + after // self._kv_layers
+
+    def _growth_trim(self, n_rows: int, positions: int = 32) -> None:
+        """Every 32 steps: the rows' KV grows every step, past what their admission counted, so room for the next
+        ``positions`` of each comes out of the prompt cache now, before Metal runs out (which fails every row).
+        Called by every kind of step: chained, boundary (all of them while a request waits for memory: the trim
+        never ran then, when memory is tightest) and a lone row's passes."""
+        lru = getattr(self, "_serve_lru", None)
+        if lru is not None and self.memory_limit and _GROWTH_TRIM and self.counters["steps"] >= self._next_trim:
+            self._next_trim = self.counters["steps"] + 32  # (a multiple of 32 can be passed by in a lone row's passes)
+            self._trim_for(lru, n_rows * positions * self._kv_bytes_per_token())
 
     def _keep_reply(self, r, n: int, cache) -> None:
         _keep_reply_state(r, n, cache)
@@ -983,6 +994,7 @@ class HybridBatchEngine(BatchEngine):
             self.counters["steps"] += 1
             self.counters["rows"] += 1
             self.counters["solo_steps"] = self.counters.get("solo_steps", 0) + 1
+            self._growth_trim(1, 64)  # (a pass feeds up to 33 tokens)
             logits = head_logits(self.lm, h[:, len(span):, :])[0]  # the last certain token, then each draft token
             gs = g
             if constrained and span:
@@ -1118,6 +1130,7 @@ class HybridBatchEngine(BatchEngine):
         r, c = e["r"], e["cache"]
         stop = e["cps"][0][0] if e["cps"] else e["end"]
         if e["reserved"] < stop and any(isinstance(l, KVCache) and l.keys is not None for l in c):
+            self._fill_eval = []  # (it holds the old buffers, which then lived on next to the grown ones)
             _reserve(c, stop)  # the KV buffers for the prompt (or up to its next checkpoint) at once
             e["reserved"] = stop
         # the pass's rows (decode rows and prompt tokens) a whole number of matmul tiles: one row past
@@ -1158,13 +1171,16 @@ class HybridBatchEngine(BatchEngine):
         if os.environ.get("LOCALS_PREFILL_LOG"):
             print(f"[checkpoint] {kind} at {cp} (mixed; disk {'on' if self.disk is not None else 'off'})", flush=True)
 
-    def _fill_checkpoints(self, e: dict, lru, lru_key) -> None:
-        """Prefill a filling request up to its remaining checkpoints at once (no rows decode alongside)."""
+    def _fill_checkpoints(self, e: dict, lru, lru_key, stop=None) -> bool:
+        """Prefill a filling request up to its remaining checkpoints at once (no rows decode alongside). False if
+        ``stop()`` (asked between chunks) gave it up."""
         while e["cps"]:
             cp = e["cps"][0][0]
-            self._run(e["cache"], list(e["r"].prompt[e["pos"]:cp]))
+            if not self._run(e["cache"], list(e["r"].prompt[e["pos"]:cp]), stop=stop):
+                return False
             e["pos"] = cp
             self._checkpoint(e, lru, lru_key)
+        return True
 
     def run_drip(self, requests: List[Request], temp: float = 0.0) -> BatchStats:
         """Pipelined continuous batching with one token per row per step.
@@ -1315,6 +1331,8 @@ class HybridBatchEngine(BatchEngine):
         prefill_s = 0.0
         self.tokens_out = 0
         self.counters = {"steps": 0, "rows": 0, "prefill_s": 0.0, "prefill_tokens": 0, "admissions": 0, "idle_s": 0.0}
+        self._next_trim = 0  # (the counters start again: a restart after an engine error kept the old step count)
+        self._serve_lru = lru
         t0 = time.perf_counter()
 
         def arrive(block):
@@ -1457,12 +1475,23 @@ class HybridBatchEngine(BatchEngine):
                     ready, filling[:] = list(filling), []
                     self._fill_eval = []
                     self.counters["prefill_tokens"] += sum(e["end"] - e["pos"] for e in ready)  # mixed passes counted the rest
-                    for e in ready:
-                        self._fill_checkpoints(e, lru, lru_key)
-                    attach([e["r"] for e in ready], self._prefill_batch(
-                        [e["r"].prompt[:-1] for e in ready], [], starts=[(e.pop("cache"), list(e["r"].prompt[e["pos"]:e["end"]])) for e in ready]),
-                        tp, count=False)
-                    del ready
+                    # every client gone (Esc while its long prompt is read): the reading stops between chunks, as at
+                    # an admission, instead of going on to the prompt's end for nobody with the queue waiting
+                    left_all = lambda: all(getattr(e["r"], "cancel", False) for e in ready)  # noqa: E731
+                    merged = None
+                    if all(self._fill_checkpoints(e, lru, lru_key, stop=left_all) for e in ready) and not left_all():
+                        merged = self._prefill_batch(
+                            [e["r"].prompt[:-1] for e in ready], [], starts=[(e.pop("cache"), list(e["r"].prompt[e["pos"]:e["end"]])) for e in ready],
+                            stop=left_all)
+                    if merged is not None:
+                        attach([e["r"] for e in ready], merged, tp, count=False)
+                    else:
+                        for e in ready:
+                            e["r"].finish = "cancelled"
+                            if on_done is not None:
+                                on_done(e["r"])
+                        self.counters["prefills_given_up"] = self.counters.get("prefills_given_up", 0) + 1
+                    del ready, merged
                 # a for-loop variable outlives its loop: it would hold a cancelled or joined request's cache
                 e = gone = None
                 if any(e["pos"] >= e["end"] for e in filling):  # prefilled in mixed passes: join the batch
@@ -1479,7 +1508,9 @@ class HybridBatchEngine(BatchEngine):
                     held0 = self._merge_tokens(rows, [len(e["r"].prompt) for e in filling] + [len(q.prompt) for q in new + [queue[0]]])
                     if (rows or new or filling) and not self._fits(lru, queue[0], held0 + sum(len(q.prompt) for q in new),
                                                                    rows=len(new) + 1, tokens=sum(len(q.prompt) for q in new + [queue[0]])):
-                        self.counters["deferred"] = self.counters.get("deferred", 0) + 1
+                        if not getattr(queue[0], "held", False):  # (once a request: while it waits, every step asks)
+                            queue[0].held = True
+                            self.counters["deferred"] = self.counters.get("deferred", 0) + 1
                         break
                     new.append(queue.pop(0))
                 if new:
@@ -1583,6 +1614,7 @@ class HybridBatchEngine(BatchEngine):
                 nrows += len(rows)
                 self.counters["steps"] += 1
                 self.counters["rows"] += len(rows)
+                self._growth_trim(len(rows))  # (every step is a boundary while a request waits for memory)
                 continue
             # Chained step: launch s+1 before reading s.
             live = [not r.pend for r in rows]
@@ -1601,11 +1633,7 @@ class HybridBatchEngine(BatchEngine):
             nrows += len(rows)
             self.counters["steps"] += 1
             self.counters["rows"] += len(rows)
-            if lru is not None and self.memory_limit and self.counters["steps"] >= getattr(self, "_next_trim", 0) and _GROWTH_TRIM:
-                self._next_trim = self.counters["steps"] + 32  # (a multiple of 32 can be passed by in a lone row's passes)
-                # the rows' KV grows every step, past what their admission counted: room for the next 32
-                # steps comes out of the prompt cache now, before Metal runs out (which fails every row)
-                self._trim_for(lru, len(rows) * 32 * self._kv_bytes_per_token())
+            self._growth_trim(len(rows))
             ys = cur.tolist()
             for i, (r, yv, lv) in enumerate(zip(rows, ys, live)):
                 r.fed.append(hv[i] if hm[i] else yv)

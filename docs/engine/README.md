@@ -74,7 +74,7 @@ A boundary step runs when any of the following holds:
 
 The batch's rows change only at boundaries. The per-boundary flag `free` (no constrained rows) therefore stays valid through the chained steps that follow.
 
-A request deferred for memory leaves the queue condition true. While it waits, every step is a boundary, so the loop runs unpipelined, and the counter `deferred` increases on each of those steps rather than once per request.
+A request deferred for memory leaves the queue condition true. While it waits, every step is a boundary, so the loop runs unpipelined; the counter `deferred` counts it once. The growth trim (`_growth_trim`, every 32 steps) runs on boundary steps, chained steps and a lone row's passes alike: run only on chained steps, it stopped while a request waited for memory, when memory is tightest.
 
 ### Boundary step, in order
 
@@ -300,7 +300,7 @@ A Metal out-of-memory error fails every request in flight, while a prompt-cache 
 | `_make_room(lru, tokens, copies, held)` | Calls `_trim_for` for `(tokens * (1 + copies) + held) * kv + 1.5 GiB` before an admission. The 1.5 GiB is the prefill transient, which `PREFILL_SCORES` bounds. |
 | `_fits` | The admission check described under "Admission". |
 | `_room_for_copy(lru, positions)` | Before a checkpoint copy: trims, then skips the copy if `positions * kv + 1.5 GiB` still does not fit. The copy shares the request's KV buffers, so the request's next write duplicates them. |
-| Growth trim | Every 32 steps (`counters["steps"] % 32 == 0`, in chained steps), calls `_trim_for(lru, len(rows) * 32 * kv)`. The rows' KV grows past what admission counted, so room for the next 32 steps comes out of the prompt cache in advance. `LOCALS_GROWTH_TRIM=0` turns this off (default `"1"`). |
+| Growth trim | Every 32 steps (`_growth_trim`: boundary steps, chained steps and a lone row's passes, which count 64 positions), calls `_trim_for(lru, len(rows) * 32 * kv)`. The rows' KV grows past what admission counted, so room for the next 32 steps comes out of the prompt cache in advance. `LOCALS_GROWTH_TRIM=0` turns this off (default `"1"`). |
 | Retire trim | See "Retiring rows". |
 
 `LOCALS_MEMLOG=1` prints active and peak GPU memory, prompt-cache size and the limit around each admission, reservation and trim. `LOCALS_PREFILL_LOG=1` prints each batch prefill (rows, prompt lengths, tokens to prefill) and each checkpoint.
@@ -382,7 +382,7 @@ Any other exception escapes `serve`, for example a Metal out-of-memory error. `B
 | `admissions` | Number of `attach` calls |
 | `idle_s` | Time spent blocked in `source(True)` |
 | `mixed_steps` | Mixed passes run |
-| `deferred` | Boundary steps at which the head of the queue was held back for memory |
+| `deferred` | Requests held back for memory (each counted once, however many steps it waits) |
 | `cache_trims` | Times `_trim_for` evicted prompt-cache entries |
 | `solo_steps`, `drafted` | Steps of a request alone (`_solo`), and the draft tokens they kept |
 
