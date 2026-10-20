@@ -129,6 +129,12 @@ def test_switching_models_restarts_only_our_idle_background_server(tmp_path, mon
         app.ensure_server(args)
     assert killed == [4242]
     app.ensure_server(argparse.Namespace(port=8399, model="mlx-community/Qwen3.5-4B-MLX-4bit"))  # same model: nothing to do
+    killed.clear()
+    stats["model"] = "mlx-community/Qwen3.5-4B-MLX-4bit"
+    monkeypatch.setattr(app, "_listener_pid", lambda port: 4242)
+    with pytest.raises(Started):  # a fine-tune with the same short name is another model: it is loaded
+        app.ensure_server(argparse.Namespace(port=8399, model="/Users/x/ft/Qwen3.5-4B-MLX-4bit"))
+    assert killed == [4242]
 
 
 def test_agent_setup_without_the_agent_installed(tmp_path, monkeypatch, capsys):

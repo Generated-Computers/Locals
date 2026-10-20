@@ -723,7 +723,9 @@ def _ensure_server(args, wait_s: float) -> None:
 
         health = server_alive(args.port) or {}
         stale = bool(health.get("build")) and health["build"] != build_id()  # started before locals was upgraded
-        same = not running or running == args.model or model_short(running) == model_short(args.model)
+        # (args.model is a full id or an absolute path by now; short names matched a fine-tune folder, or another
+        # publisher's conversion, to the model running, which then kept serving in its place)
+        same = not running or running == args.model
         if same and not stale:
             given = [k for k in _SERVER_OPTS if k != "engines" and getattr(args, k, None) is not None]
             if given:
