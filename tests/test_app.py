@@ -326,7 +326,7 @@ def test_a_loading_server_is_waited_for_not_started_twice(tmp_path, monkeypatch)
     monkeypatch.setattr(app, "LOCALS_DIR", tmp_path)
     up = {"now": False}
     monkeypatch.setattr(app, "_saved_pid", lambda port: 4242)
-    monkeypatch.setattr(app, "_is_locals_server", lambda pid: True)
+    monkeypatch.setattr(app, "_is_locals_server", lambda pid, port=None: True)
     monkeypatch.setattr(app, "_listener_pid", lambda port: 4242 if up["now"] else None)
     monkeypatch.setattr(app, "server_alive", lambda port: {"status": "ok", "engines": {"locals": True}} if up["now"] else None)
     monkeypatch.setattr(app, "get_json", lambda url, timeout=5: {"model": "m/x", "active": []})
@@ -374,7 +374,7 @@ def test_a_foreground_server_loading_is_not_started_twice(tmp_path, monkeypatch)
     with pytest.raises(Exec):
         app.cmd_serve(args)
     assert app._serve_pid_file(8399).read_text() == str(app.os.getpid())
-    monkeypatch.setattr(app, "_is_locals_server", lambda pid: pid == app.os.getpid())  # (it is the server now)
+    monkeypatch.setattr(app, "_is_locals_server", lambda pid, port=None: pid == app.os.getpid())  # (it is the server now)
     monkeypatch.setattr(app, "_listener_pid", lambda port: None)  # loading: not listening yet
     assert app._starting_pid(8399) == app.os.getpid()
     with pytest.raises(SystemExit, match="starting"):
@@ -408,7 +408,7 @@ def test_a_restart_keeps_the_options_the_server_was_started_with(tmp_path, monke
 
     def kill(pid, sig):
         monkeypatch.setattr(app, "_listener_pid", lambda port: None)
-        monkeypatch.setattr(app, "_is_locals_server", lambda pid: False)  # (gone)
+        monkeypatch.setattr(app, "_is_locals_server", lambda pid, port=None: False)  # (gone)
 
     class Started(Exception):
         pass

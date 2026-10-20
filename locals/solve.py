@@ -140,6 +140,25 @@ def make_workspace(project: Path, dest: Path) -> str:
     return "copy"
 
 
+def cleanup_stale_runs(project: Path, root: Path) -> int:
+    """Workspaces that solve runs of ``project`` left when their terminal was closed or they were killed (no cleanup
+    runs then): git worktrees still registered in the project (git worktree list), and copies of it. Their
+    transcripts and diffs stay. A run counts as dead when the pid it wrote is no running process. How many."""
+    removed = 0
+    for run in root.glob(f"{project.name}-*"):
+        try:
+            os.kill(int((run / "pid").read_text()), 0)  # (only asks whether it still runs)
+            continue
+        except (OSError, ValueError):  # no pid file (an older run, or done) or a dead one
+            if not (run / "pid").exists():
+                continue
+        for ws in [d for d in run.iterdir() if d.is_dir() and d.name[:1] in ("a", "c", "p")]:  # aN, checkN, probeN
+            remove_workspace(project, ws, "worktree" if (ws / ".git").is_file() else "copy")
+            removed += 1
+        (run / "pid").unlink(missing_ok=True)
+    return removed
+
+
 def remove_workspace(project: Path, ws: Path, kind: str) -> None:
     if kind == "worktree":
         _git(project, "worktree", "remove", "--force", str(ws), check=False)
@@ -636,8 +655,18 @@ def cmd_solve(args) -> None:
     app.remember(model=args.model, port=args.port)
     short = app.model_short(args.model)
     stamp = time.strftime("%Y%m%d-%H%M%S")
+    if cleanup_stale_runs(project, app.LOCALS_DIR / "solve"):
+        print("removed the workspaces an interrupted earlier run left behind", flush=True)
     run_dir = app.LOCALS_DIR / "solve" / f"{project.name}-{stamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "pid").write_text(str(os.getpid()))
+    import signal
+
+    def _stop(sig, frame):  # a closed terminal (SIGHUP) or kill (SIGTERM): the cleanup below runs, as for Ctrl-C
+        raise SystemExit(128 + sig)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _stop)
     base_project = manifest(project)
     ocs = app.OpenCodeServer(oc, project, run_dir / "opencode-serve.log")
     ocs.start_approver()
@@ -757,6 +786,7 @@ def cmd_solve(args) -> None:
         for a in race.attempts:
             remove_workspace(project, a.ws, a.kind)
     (run_dir / "summary.json").write_text(json.dumps(report, indent=1))
+    (run_dir / "pid").unlink(missing_ok=True)  # finished: a later run leaves its workspaces (--keep) alone
     # 0 only when the project has the result (or --no-apply asked for none): a winner left unapplied (drift, tests
     # changed, paths outside) exited 0 too, and a script took the unchanged project for the solved one
     sys.exit(0 if w is not None and (args.no_apply or report.get("applied")) else (2 if w is not None else 1))

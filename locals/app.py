@@ -186,6 +186,8 @@ def _write_atomic(path: Path, text: str) -> None:
     try:
         with os.fdopen(fd, "w") as f:
             f.write(text)
+            f.flush()
+            os.fsync(f.fileno())  # (renamed after a power cut, a config came back empty: OpenCode's then refused to load)
         if path.exists():
             os.chmod(tmp, path.stat().st_mode & 0o777)
         os.replace(tmp, path)
@@ -241,10 +243,12 @@ def _serve_pid_file(port: int) -> Path:
 def _legacy_pid_files(port: int) -> list:
     return [LOCALS_DIR / "server.pid"] if port == DEFAULT_PORT else []  # locals 0.2.0 before per-port files: 8321
 
-def _is_locals_server(pid: int) -> bool:
-    """Whether the process is a locals server (a pid file can outlive its process, and its number be reused)."""
+def _is_locals_server(pid: int, port: Optional[int] = None) -> bool:
+    """Whether the process is a locals server (a pid file can outlive its process, and its number be reused), and,
+    with ``port``, the one for that port (a stale server-A.pid naming the server on port B made locals stop
+    --port A stop that one)."""
     p = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True)
-    return "locals.server" in p.stdout
+    return "locals.server" in p.stdout and (port is None or f"--port {port}" in p.stdout)
 
 
 def _locals_server_pids() -> List[int]:
@@ -664,7 +668,7 @@ def remember(**kw) -> None:
     try:
         LOCALS_DIR.mkdir(exist_ok=True)
         path = LOCALS_DIR / "config.json"
-        cfg = json.loads(path.read_text()) if path.exists() else {}
+        cfg = _load_saved()
         was = cfg.get("port")
         if kw.get("port") is not None and was not in (None, kw["port"]) and server_alive(int(was)) \
                 and not _same_server(int(was), kw["port"]):
@@ -803,7 +807,7 @@ def _starting_pid(port: int) -> Optional[int]:
     except (OSError, ValueError):
         serving = 0
     for pid in (_saved_pid(port), serving):
-        if pid and _is_locals_server(pid) and _listener_pid(port) is None:
+        if pid and _is_locals_server(pid, port) and _listener_pid(port) is None:
             return pid
     return None
 
@@ -891,7 +895,7 @@ def cmd_stop(args) -> None:
         if not (_answers_as_locals(args.port) or _is_locals_server(listener)):
             sys.exit(f"port {args.port} is held by another program (pid {listener}), not a locals server; nothing stopped")
         target = listener
-    elif saved is not None and _is_locals_server(saved):  # started, not listening yet (loading the model)
+    elif saved is not None and _is_locals_server(saved, args.port):  # started, not listening yet (loading the model)
         target = saved
     for f in (_pid_file(args.port), *_legacy_pid_files(args.port)):
         if saved is not None and f.exists() and f.read_text().strip() == str(saved):
@@ -2144,10 +2148,22 @@ def _delegate(name: str):
 
 
 def _load_saved() -> dict:
-    """The choices saved by earlier commands (the model, the port)."""
+    """The choices saved by earlier commands (the model, the port). One that does not parse (written as the Mac lost
+    power) is moved to config.json.bad with a note: ignored, it was never rewritten, and every command took the
+    default model and port without a word (and started a second server next to the one on the remembered port)."""
+    path = LOCALS_DIR / "config.json"
     try:
-        return json.loads((LOCALS_DIR / "config.json").read_text())
-    except (OSError, ValueError):
+        cfg = json.loads(path.read_text())
+        return cfg if isinstance(cfg, dict) else {}
+    except OSError:
+        return {}
+    except ValueError:
+        try:
+            os.replace(path, path.with_suffix(".json.bad"))
+            print(f"note: {path} did not parse; moved to {path.with_suffix('.json.bad')}, and the defaults are used "
+                  f"(the model and port of earlier commands are forgotten)", file=sys.stderr, flush=True)
+        except OSError:
+            pass
         return {}
 
 
@@ -2169,6 +2185,11 @@ def main(argv=None):
 
 def _main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    try:  # this user's only: agent transcripts, diffs and logs of locals run / solve are kept there
+        LOCALS_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(LOCALS_DIR, 0o700)
+    except OSError:
+        pass
     if not any(a in ("--version", "-h", "--help") for a in argv[:1]):
         why = _platform_ok()
         if why:

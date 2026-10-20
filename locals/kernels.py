@@ -236,6 +236,8 @@ def _save_tune():
             try:
                 with _os.fdopen(fd, "w") as f:
                     _json.dump(data, f)
+                    f.flush()
+                    _os.fsync(f.fileno())  # (renamed after a power cut, the file could come back empty: tuning lost)
                 _os.replace(tmp, _TUNE_PATH)
             except BaseException:
                 try:

@@ -240,6 +240,15 @@ _GROWTH_TRIM = os.environ.get("LOCALS_GROWTH_TRIM", "1") != "0"
 _SOLO = os.environ.get("LOCALS_SOLO", "1") != "0"
 
 
+def _fsync(path) -> None:
+    """``path``'s data on the disk itself (renamed after a power cut, a file came back empty or half written)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class DiskPromptCache:
     """System-prompt snapshots on the SSD, so that a restarted server does not prefill an agent's
     system prompt again (Hermes' is 14k tokens, OpenClaw's 8.5k: 10-30 s on a 4B model). A
@@ -257,6 +266,13 @@ class DiskPromptCache:
         os.chmod(self.dir, 0o700)  # system prompts and tool definitions: this user's only
         self.max_bytes = int(max_gb * (1 << 30))
         self.index = {}  # file name -> token tuple
+        for f in self.dir.glob(".*.tmp.*"):  # a save that a crash or a full disk cut short (pid in the name)
+            try:
+                os.kill(int(f.name.split(".")[2]), 0)  # (only asks whether that process still runs)
+            except (ValueError, IndexError, ProcessLookupError):
+                f.unlink(missing_ok=True)
+            except PermissionError:
+                pass
         for f in self.dir.glob("*.tokens.json"):
             try:
                 self.index[f.name[: -len(".tokens.json")]] = tuple(json.loads(f.read_text()))
@@ -276,32 +292,54 @@ class DiskPromptCache:
         name = self._name(tokens)
         if name in self.index:
             return
-        try:  # written under temporary names and renamed: a crash or a second server never leaves half a file
-            tmp = self.dir / f".{name}.{os.getpid()}.tmp.safetensors"
-            save_prompt_cache(str(tmp), cache)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, self.dir / f"{name}.safetensors")
-            tmp = self.dir / f".{name}.{os.getpid()}.tmp.json"
-            tmp.write_text(json.dumps(list(tokens)))
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, self.dir / f"{name}.tokens.json")
+        import shutil
+
+        size = sum(a.nbytes for c in cache for a in (c.state if isinstance(c.state, (list, tuple)) else [c.state])
+                   if isinstance(a, mx.array))
+        if shutil.disk_usage(self.dir).free < 2 * size + (1 << 30):  # a nearly full disk: no snapshot (only slower)
+            return
+        tmps = [self.dir / f".{name}.{os.getpid()}.tmp.safetensors", self.dir / f".{name}.{os.getpid()}.tmp.json"]
+        try:  # written under temporary names, flushed to the disk and renamed: a crash or a power cut leaves no half
+            # file under the real name, and a second server sharing the folder none either
+            save_prompt_cache(str(tmps[0]), cache)
+            _fsync(tmps[0])
+            os.chmod(tmps[0], 0o600)
+            os.replace(tmps[0], self.dir / f"{name}.safetensors")
+            tmps[1].write_text(json.dumps(list(tokens)))
+            _fsync(tmps[1])
+            os.chmod(tmps[1], 0o600)
+            os.replace(tmps[1], self.dir / f"{name}.tokens.json")
             self.index[name] = tuple(tokens)
             self._prune()
         except Exception as e:  # noqa: BLE001  # a cache that cannot be saved is only a slower restart
             import sys
 
+            for t in tmps:  # (left behind, each failed save kept up to a snapshot's size of a full disk, for good)
+                t.unlink(missing_ok=True)
             print(f"locals: the system prompt was not saved to disk ({type(e).__name__}: {e})", file=sys.stderr, flush=True)
 
     def _prune(self) -> None:
-        files = sorted(self.dir.glob("*.safetensors"), key=lambda f: f.stat().st_mtime)
-        total = sum(f.stat().st_size for f in files)
+        """The oldest snapshots go past ``max_bytes``, across every model's folder (the cap was per model, and a
+        model served once kept its 4 GB for good); a folder left empty goes too."""
+        root = self.dir.parent
+        files = []
+        for f in root.glob("*/*.safetensors"):
+            try:
+                files.append((f.stat().st_mtime, f.stat().st_size, f))
+            except OSError:
+                pass
+        files.sort()
+        total = sum(size for _, size, _ in files)
         while files and total > self.max_bytes:
-            f = files.pop(0)
-            total -= f.stat().st_size
+            _, size, f = files.pop(0)
+            total -= size
             name = f.name[: -len(".safetensors")]
-            for g in (f, self.dir / f"{name}.tokens.json"):
+            for g in (f, f.parent / f"{name}.tokens.json"):
                 g.unlink(missing_ok=True)
-            self.index.pop(name, None)
+            if f.parent == self.dir:
+                self.index.pop(name, None)
+            elif not any(f.parent.iterdir()):
+                f.parent.rmdir()
 
     def restore(self, lru, key, prompt) -> int:
         """Load the longest saved snapshot that the prompt starts with into ``lru``, unless
