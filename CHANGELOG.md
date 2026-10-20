@@ -92,4 +92,26 @@ First public release.
   MLX keeps fewer freed buffers when the model leaves little room;
   several long prompts joining the requests already answering no longer hold
   their memory twice for a moment (three 27k-token prompts took a 4B model on
-  a 16 GB Mac past the GPU's memory limit).
+  a 16 GB Mac past the GPU's memory limit); while a request waits for memory,
+  the running ones' growth is still made room for; a long prompt stops being
+  read as soon as its client leaves; on a Mac where less than 64k tokens fit
+  next to a large model, a longer request gets a context error instead of
+  running the GPU out of memory.
+- **Fixed, settings and commands:** `locals disconnect` no longer deletes an
+  OpenCode provider of your own named "mlx", nor Hermes settings for another
+  local server (LM Studio, llama.cpp); OpenClaw configs with commas or colons
+  inside strings are read; `locals tune` next to a running server no longer
+  erases tuning results (it asks to stop the server first); a model loading in
+  `locals serve` is not loaded a second time by another command; a fine-tune
+  with the same name as the running model is loaded instead of ignored; a
+  server restarted after an upgrade keeps its `--ollama-port`, `--max-context`
+  and other options; `locals --port N chat` uses that port; `locals bench` no
+  longer leaves a second engine loaded.
+- **Fixed, APIs:** web pages using the OpenAI SDK can call the server
+  (`Authorization` passes the CORS check); request bodies sent in chunks are
+  read; Anthropic `stop_sequences` report `stop_sequence`; an Anthropic
+  assistant prefill is continued; a file of many identical lines written
+  through a tool call is no longer cut; replies stream as they are written
+  when no tools are offered (Llama and Mistral formats); errors on the
+  Anthropic and Ollama APIs come in their own shapes; the stock engine keeps
+  serving after an error.
