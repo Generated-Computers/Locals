@@ -210,3 +210,23 @@ def test_tools_and_a_response_format_together(server):
     none = server.prepare(dict(base, response_format={"type": "json_schema", "json_schema": {"name": "R", "schema": schema}},
                                tool_choice="none"))
     assert none["schema"] == schema and none["regex"] is None  # (the output only)
+
+
+def test_a_request_for_another_model_by_our_names_is_refused(server):
+    """Another locals command switched the server's model under a connected agent (`locals chat --model gemma`
+    while OpenCode ran on Qwen), and the agent's requests were answered by the new model without a word. Our own
+    names for another model are refused with a sentence; any other name is the model loaded, as before."""
+    import pytest
+
+    base = {"max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+    for ok in (f"locals/{server.short}", f"locals/{server.short}-thinking", "gpt-4o", "locals", "",
+               f"locals/locals/{server.short}"):
+        server.prepare(dict(base, model=ok))
+    other = "gemma-4-e4b" if "gemma" not in server.short else "qwen3.5-4b"
+    for bad in (f"locals/{other}", f"locals/locals/{other}"):
+        with pytest.raises(ValueError, match=f"runs {server.short}, not {other}"):
+            server.prepare(dict(base, model=bad))
+        with pytest.raises(ValueError, match="another locals command switched"):
+            server.chat_model(bad)
+    assert server.chat_model("llama3.2:latest").endswith(server.short)  # (Ollama's names: the model loaded)
+

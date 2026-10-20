@@ -113,7 +113,10 @@ First public release.
   and other options; `locals --port N chat` uses that port; `locals bench` no
   longer leaves a second engine loaded; `locals start` while `locals serve` is
   still fetching the model on the same port waits for it instead of loading
-  the model a second time.
+  the model a second time; an agent left running when another command
+  switched the server to another model gets a message saying so, where its
+  requests were answered by the other model; a kernel shape whose tuning
+  stops locals twice is left on MLX's kernel instead of stopping every start.
 - **Fixed, APIs:** web pages using the OpenAI SDK can call the server
   (`Authorization` passes the CORS check); request bodies sent in chunks are
   read; Anthropic `stop_sequences` report `stop_sequence`; an Anthropic

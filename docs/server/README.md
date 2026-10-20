@@ -65,6 +65,7 @@ Handler.do_POST
    - `n` other than 1;
    - a truthy `logprobs` or `top_logprobs`. `logprobs: false` and `top_logprobs: 0` pass (server.py:1321-1322).
 3. It picks the engine with `oai.engine_of(model)` and thinking with `oai.thinking_of(model, --thinking)`.
+   - A request for another model by the server's own names (`locals/<name>`, `mlx/<name>`) is a 400 that says which model runs (`check_model`): another locals command had switched the model under a connected agent, and the agent's requests were answered by the new model without a word. Any other name (`gpt-4o` in an app, Ollama's names) is the model loaded.
    - A bool in `chat_template_kwargs.enable_thinking` (the switch vLLM and SGLang use) overrides thinking.
    - `reasoning_effort: "none"`, or `reasoning.effort` in the Responses API shape, turns thinking off.
 4. `Server.service(engine)` loads the engine on first use. Each engine has its own lock, so the other engine keeps serving during a load. After a failed load, the engine is not loaded again for 60 s. Requests in that window get a 500 that repeats the error.
@@ -367,7 +368,7 @@ guards and hang-up handling:
 | `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences` | the same |
 | `thinking` `enabled` or `adaptive` / `disabled` | thinking on / off (`chat_template_kwargs.enable_thinking`) |
 
-Any model name is served by the server's model (`chat_model`), and the reply carries the name asked for.
+Any model name is served by the server's model (`chat_model`), and the reply carries the name asked for; our own names for another model are refused (`check_model`, as above; a 404 on Ollama's API).
 `apis.AnthropicStream` reads the server's SSE output and writes the Messages API's events: `message_start` at once,
 a content block per kind (`thinking` with `thinking_delta` and an empty `signature_delta`, `text` with `text_delta`,
 each tool call as `tool_use` with `input_json_delta`), `ping` for the server's keepalives, `message_delta` (stop

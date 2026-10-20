@@ -187,10 +187,35 @@ class Server:
         self._cap_context()
 
     # -- the names other APIs' clients use ------------------------------------------------------
+    def check_model(self, name) -> None:
+        """A request for another model by this server's own names (locals/<name>, mlx/<name>) is refused: the model
+        was switched under a connected agent by another locals command (`locals chat --model gemma` while
+        OpenCode ran on Qwen), and the agent's requests were answered by the new model without a word. Any
+        other name (gpt-4o in an app, Ollama's names) is the model loaded, as before."""
+        if not isinstance(name, str):
+            return
+        parts = name.strip().lower().split("/")
+        if len(parts) < 2 or parts[0] not in ("locals", "mlx", "stock"):
+            return
+        want = parts[-1].removesuffix(":latest").removesuffix("-thinking")
+        if want in ("", self.short):
+            return
+        from .defaults import model_id, short_name
+
+        try:
+            if short_name(model_id(want)) == self.short:  # (an alias: locals/qwen)
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        raise ValueError(f"this server runs {self.short}, not {want} (another locals command switched its model). "
+                         f"Start the agent again through locals (locals code, locals launch ...) to use {self.short}, "
+                         f"or serve {want} on another port: locals start --model {want} --port <another port>")
+
     def chat_model(self, name: str) -> str:
         """The model id for a name an Ollama client sends: the server has one model, so any name is it
         (apps ask for what /api/tags lists); mlx/... picks the stock engine, and a name with "think"
-        in it turns thinking on."""
+        in it turns thinking on. A request for another model by our own names is refused (check_model)."""
+        self.check_model(name)
         engine = oai.engine_of(name) if name else "locals"
         if engine not in self.engines:
             engine = self.engines[0]
@@ -306,6 +331,7 @@ class Server:
         _unsupported(req)
         _check_shape(req)
         model = req.get("model") or f"locals/{self.short}"
+        self.check_model(model)
         engine = oai.engine_of(model)
         thinking = oai.thinking_of(model, self.thinking)
         kw = req.get("chat_template_kwargs") or {}
@@ -413,6 +439,7 @@ class Server:
         if req.get("echo") or req.get("suffix"):  # the prompt echoed back, or text to fill in before a suffix
             raise ValueError("echo and suffix are not supported")
         model = req.get("model") or f"locals/{self.short}"
+        self.check_model(model)
         engine = oai.engine_of(model)
         svc = self.service(engine)
         tok = svc.tokenizer
@@ -1508,7 +1535,10 @@ def make_handler(server: Server, ollama_root: bool = False):
                 return self._json({"status": "success"})  # the model is the server's; nothing to pull
             if path in ("/api/embed", "/api/embeddings"):
                 return fail("embeddings are not served yet", 501)
-            model = server.chat_model(name)
+            try:
+                model = server.chat_model(name)
+            except ValueError as e:
+                return fail(str(e), 404)
             if (path == "/api/chat" and not req.get("messages")) or (path == "/api/generate" and not req.get("prompt")):
                 # Ollama's way to load a model (or, with keep_alive 0, unload it): an answer at once, nothing generated
                 reason = "unload" if str(req.get("keep_alive")) in ("0", "0s", "0m") else "load"
