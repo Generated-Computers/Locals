@@ -514,6 +514,10 @@ def _launcher(choice, M, K, N, dtype):
             if split > 1:
                 y = y.reshape(split, M, N).sum(axis=0).astype(dtype)
             return y
+    elif kind == "nax":
+        from .nax_kernel import launch as _nax_launch
+
+        f = _nax_launch(M, K, N, dtype, *choice[1:])
     elif kind == "small":
         R, NSG = small_config(N)
 
@@ -607,6 +611,10 @@ def _time_shape(x2, mod, M, K, N, dt, key, tune):
             if N % BN or K % (BK * split) or (K // split) % 64 or BN % (8 * WN):
                 continue
             cands.append(("mma", BM, BN, BK, WM, WN, split))
+        from . import nax_kernel
+
+        if nax_kernel.available():  # the M5's neural accelerators
+            cands += [("nax", *c) for c in nax_kernel.CANDIDATES if nax_kernel.supported(M, K, N, c)]
     xr = mx.random.normal(x2.shape, key=mx.random.key(M * 131 + K)).astype(x2.dtype)  # not the global random state
     ref = _run(("mlx",), xr, mod).astype(mx.float32)
     tol = 0.05 * (1.0 + float(mx.max(mx.abs(ref))))
@@ -1107,7 +1115,7 @@ def forward_last(model, tokens: mx.array, cache) -> mx.array:
     return head_logits(model, h)[:, -1, :]
 
 
-def model_tune(model, ms=range(2, MAX_M + 1), families=("v3", "multi", "fragh", "frag", "mma"), steps: int = 16, rounds: int = 5, verbose: bool = False) -> dict:
+def model_tune(model, ms=range(2, MAX_M + 1), families=("v3", "multi", "fragh", "frag", "mma", "nax"), steps: int = 16, rounds: int = 5, verbose: bool = False) -> dict:
     """Pick one kernel family per row count M by timing the real decode step.
 
     Per-shape timings in isolation miss interactions inside a model (cache
