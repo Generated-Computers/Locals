@@ -594,7 +594,7 @@ class ReplyStream:
     while inside the think block, ``content`` up to the first ``<tool_call>``.
     A possible partial tag at the end is held back until it is decided."""
 
-    def __init__(self, thinking: bool = False, fmt=None):
+    def __init__(self, thinking: bool = False, fmt=None, calls: bool = True):
         self.think_open = getattr(fmt, "think_open", "<think>")
         self.think_close = getattr(fmt, "think_close", THINK_CLOSE)
         # a model that opens its reasoning itself (Gemma 4) may or may not start with it
@@ -613,6 +613,9 @@ class ReplyStream:
         # models without tool training write calls as JSON blocks: from a fence (or a JSON
         # reply's first brace) on, text is held back until the reply shows what it is
         self.loose = bool(getattr(fmt, "loose_calls", False))
+        if not calls:  # no tools offered: nothing to hold back as a possible call (a JSON answer streamed nothing
+            # until it was complete on Llama and Mistral formats, nor text after a code fence on others)
+            self.at_start, self.bare, self.loose, self.opener, self.after_text = False, None, False, "\x00", "\x00"
         self.content_sent = ""  # content emitted so far
 
     @staticmethod

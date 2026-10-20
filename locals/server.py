@@ -990,7 +990,8 @@ class Server:
                               checkpoints=p.get("checkpoints"))
         job.prefix_tokens = len(prompt) - len(p["prompt"])
         toks: List[int] = []
-        rs = oai.ReplyStream(p["thinking"] and (not prefix or _in_think(p)), p.get("fmt"))
+        rs = oai.ReplyStream(p["thinking"] and (not prefix or _in_think(p)), p.get("fmt"),
+                             calls=bool(p["tools"]) and p.get("tool_choice") != "none")
         fmt = p.get("fmt")
         # a streamed reply's calls go out while they are written (Qwen3.5's format; others when they are complete)
         job.call_stream = (oai.CallStream(p["tools"], p.get("prev_calls") or (), self.max_calls)

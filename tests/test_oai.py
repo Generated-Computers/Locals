@@ -580,3 +580,14 @@ def test_a_repetition_asked_for_gets_its_grace():
     assert s._guard(line * 13, "", None, tools=False, state=state) is None
     assert s._guard(line * 13 + [7, 8, 9] * 3 + list(range(300, 330)), "", None, tools=False, state=state) is None
     assert state.loop_at is None  # it ended: the grace starts again next time
+
+
+def test_without_tools_a_reply_streams_as_it_comes():
+    """Llama 3's and Mistral's calls are the whole reply, so a reply starting with "{" or "[" was held back as a
+    possible call to its end, even with no tools offered (a JSON answer streamed nothing until complete)."""
+    from locals import formats
+
+    for name, head in (("llama3_json", '{"answer": 4'), ("mistral", "[1, 2, 3")):
+        fmt = formats.FORMATS[name]
+        assert oai.ReplyStream(False, fmt).feed(head) == []  # with tools: it may be a call
+        assert oai.ReplyStream(False, fmt, calls=False).feed(head) == [("content", head)]
