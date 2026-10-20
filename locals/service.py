@@ -473,8 +473,11 @@ class BatchService:
         # mlx-lm's prompt processing computes logits at every prompt position; with
         # a 248k vocabulary a 16 x 2048 prefill chunk needs ~16 GB for them alone,
         # so prefill runs in batches of <= 4 prompts and 512-token chunks.
-        gen = BatchGenerator(model, stop_tokens=[[t] for t in eos], completion_batch_size=self.slots,
-                             prefill_batch_size=min(self.slots, 4), prefill_step_size=512)
+        def new_gen():
+            return BatchGenerator(model, stop_tokens=[[t] for t in eos], completion_batch_size=self.slots,
+                                  prefill_batch_size=min(self.slots, 4), prefill_step_size=512)
+
+        gen = new_gen()
         lru = LRUPromptCache(max_size=256, max_bytes=self.cache_bytes or int(1.5 * (1 << 30)))
         self._lru = lru
         sampler = make_sampler(self.temp, top_p=self.top_p, top_k=self.top_k)
@@ -483,62 +486,82 @@ class BatchService:
         from mlx_lm.models.cache import make_prompt_cache
 
         while not self._closed:
-            for job in self._take(block=not live):
-                if getattr(job, "prime", False):
-                    if lru.fetch_nearest_cache("stock", job.prompt)[1]:
-                        c = make_prompt_cache(model)
-                        for i in range(0, len(job.prompt), 2048):
-                            model(mx.array([job.prompt[i : i + 2048]]), cache=c)
-                        mx.eval([x.state for x in c])
-                        lru.insert_cache("stock", list(job.prompt), c)
-                    self._finish(job, [], "primed")
-                    continue
-                cache, rest = lru.fetch_nearest_cache("stock", job.prompt[:-1])
-                rest = list(rest) + job.prompt[-1:]
-                job.cached = len(job.prompt) - len(rest)
-                self.cached_tokens += job.cached
-                self.prompt_tokens += len(job.prompt)
-                s = sampler if job.temp is None else make_sampler(job.temp, top_p=self.top_p, top_k=self.top_k)
-                try:
-                    procs = processors(job.schema, job.regex)
-                except Exception as e:  # noqa: BLE001  # a regex or schema that does not compile: this request's error
-                    self._finish(job, [], f"invalid: {type(e).__name__}: {e}")
-                    continue
-                more = {}
-                if job.ignore_eos and not procs:  # no stop tokens for this row (a grammar's end still ends it)
-                    from mlx_lm.generate import StopSequences
+            try:
+                for job in self._take(block=not live):
+                    if getattr(job, "prime", False):
+                        if lru.fetch_nearest_cache("stock", job.prompt)[1]:
+                            c = make_prompt_cache(model)
+                            for i in range(0, len(job.prompt), 2048):
+                                model(mx.array([job.prompt[i : i + 2048]]), cache=c)
+                            mx.eval([x.state for x in c])
+                            lru.insert_cache("stock", list(job.prompt), c)
+                        self._finish(job, [], "primed")
+                        continue
+                    cache, rest = lru.fetch_nearest_cache("stock", job.prompt[:-1])
+                    rest = list(rest) + job.prompt[-1:]
+                    job.cached = len(job.prompt) - len(rest)
+                    self.cached_tokens += job.cached
+                    self.prompt_tokens += len(job.prompt)
+                    s = sampler if job.temp is None else make_sampler(job.temp, top_p=self.top_p, top_k=self.top_k)
+                    try:
+                        procs = processors(job.schema, job.regex)
+                    except Exception as e:  # noqa: BLE001  # a regex or schema that does not compile: this request's error
+                        self._finish(job, [], f"invalid: {type(e).__name__}: {e}")
+                        continue
+                    more = {}
+                    if job.ignore_eos and not procs:  # no stop tokens for this row (a grammar's end still ends it)
+                        from mlx_lm.generate import StopSequences
 
-                    more["stop_sequences"] = [StopSequences()]
-                (uid,) = gen.insert([rest], [job.max_tokens], caches=[cache], all_tokens=[job.prompt[: job.cached]],
-                                    samplers=[s], logits_processors=[procs], **more)
-                live[uid] = (job, [])
-            if not live:
-                continue
-            drop = [uid for uid, (job, _) in live.items() if job.cancelled]
-            for uid in drop:
-                gen.remove([uid])
-                job, toks = live.pop(uid)
-                self._finish(job, toks, "cancelled")
-            if not live:
-                continue
-            for r in gen.next_generated():
-                job, toks = live[r.uid]
-                if r.finish_reason != "stop":
-                    toks.append(r.token)
-                    self.tokens_out += 1
-                    if job.on_token is not None:
-                        job.on_token([r.token])
-                if r.finish_reason is not None:
-                    if r.prompt_cache is not None:
-                        # mlx-lm extracts recurrent-layer rows as views of the whole
-                        # batch buffer; copy them, or each cached conversation pins
-                        # every row's state (~0.3 GB at 16 rows on Qwen3.5-2B).
-                        for c in r.prompt_cache:
-                            if isinstance(c, ArraysCache):
-                                c.cache = [None if a is None else a + 0 for a in c.cache]
-                        mx.eval([c.state for c in r.prompt_cache])
-                        lru.insert_cache("stock", list(r.all_tokens), r.prompt_cache)
-                    del live[r.uid]
-                    self._finish(job, toks, r.finish_reason)
-            self.active = len(live)
+                        more["stop_sequences"] = [StopSequences()]
+                    (uid,) = gen.insert([rest], [job.max_tokens], caches=[cache], all_tokens=[job.prompt[: job.cached]],
+                                        samplers=[s], logits_processors=[procs], **more)
+                    live[uid] = (job, [])
+                if not live:
+                    continue
+                drop = [uid for uid, (job, _) in live.items() if job.cancelled]
+                for uid in drop:
+                    gen.remove([uid])
+                    job, toks = live.pop(uid)
+                    self._finish(job, toks, "cancelled")
+                if not live:
+                    continue
+                for r in gen.next_generated():
+                    job, toks = live[r.uid]
+                    if r.finish_reason != "stop":
+                        toks.append(r.token)
+                        self.tokens_out += 1
+                        if job.on_token is not None:
+                            job.on_token([r.token])
+                    if r.finish_reason is not None:
+                        if r.prompt_cache is not None:
+                            # mlx-lm extracts recurrent-layer rows as views of the whole
+                            # batch buffer; copy them, or each cached conversation pins
+                            # every row's state (~0.3 GB at 16 rows on Qwen3.5-2B).
+                            for c in r.prompt_cache:
+                                if isinstance(c, ArraysCache):
+                                    c.cache = [None if a is None else a + 0 for a in c.cache]
+                            mx.eval([c.state for c in r.prompt_cache])
+                            lru.insert_cache("stock", list(r.all_tokens), r.prompt_cache)
+                        del live[r.uid]
+                        self._finish(job, toks, r.finish_reason)
+                self.active = len(live)
+            except Exception as e:  # noqa: BLE001  # e.g. Metal out of memory: fail what is in flight, keep serving
+                import gc
+                import traceback
+
+                traceback.print_exc(file=sys.stderr)  # (one error left the stock engine failing every later request)
+                for job in [j for j, _ in live.values()] + list(self._inflight.values()):
+                    if not job._event.is_set():
+                        self._finish(job, [], f"error: {e!r}")
+                live.clear()
+                self._inflight.clear()
+                try:
+                    gen.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                gen = new_gen()
+                lru.trim_to(n_bytes=lru.nbytes // 2)
+                gc.collect()
+                mx.clear_cache()
+                self.active = 0
         gen.close()
