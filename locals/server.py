@@ -147,7 +147,7 @@ class Server:
         self._recent_systems: List[str] = []  # the system messages of recent sessions (see _session_start)
         # Prompt + reply tokens per request; longer prompts get a context_length_exceeded error (past
         # what fits, a Metal out-of-memory error would end every request in flight). None: what fits
-        # this Mac's GPU memory next to the model (service.context_fit: 140k tokens for Qwen3.5-4B on
+        # this Mac's GPU memory next to the model (service.context_fit: 178k tokens for Qwen3.5-4B on
         # 16 GB), at least 64k and at most the model's own context, set once our engine is loaded.
         self._auto_context = max_context is None
         self.max_context = max_context or 65536
@@ -345,7 +345,7 @@ class Server:
             # answers at once (a short request answered nothing, every token spent thinking; JSON started in it)
             text += fmt.think_close
         prompt = self._tokens_for(engine, tok, text)
-        limit = self.context_for(engine)
+        limit = self.limit_for(engine)
         if len(prompt) >= limit:
             raise ContextTooLong(f"This model's maximum context length is {limit} tokens. However, your messages "
                                  f"resulted in {len(prompt)} tokens. Please reduce the length of the messages.", len(prompt), limit)
@@ -414,7 +414,7 @@ class Server:
                 ids.insert(0, bos)  # the model saw every sequence start with it (Gemma 4, Ministral: encode leaves it out)
         if not ids:
             raise ValueError("empty prompt")
-        limit = self.context_for(engine)
+        limit = self.limit_for(engine)
         if len(ids) >= limit:
             raise ContextTooLong(f"This model's maximum context length is {limit} tokens. However, your prompt "
                                  f"resulted in {len(ids)} tokens. Please reduce the length of the prompt.", len(ids), limit)
@@ -530,6 +530,13 @@ class Server:
             fit = svc.context_fit() if hasattr(svc, "context_fit") else None
             if fit and fit > self.max_context:
                 self.max_context = fit
+            elif fit:
+                # less fits than the 64k declared to tools (Hermes refuses a model with less): a request past the
+                # fit is refused, as one past the context, instead of admitted (alone, nothing checks its memory)
+                # into a Metal out-of-memory error that fails every request in flight
+                self._fit_limit = fit
+                self.log(f"this Mac's GPU memory fits about {fit} tokens next to {self.model_id}: longer requests get "
+                         f"a context_length_exceeded error (tools are told {self.max_context}, as some need that much)")
         self._context_capped = True
         if n and n < self.max_context:
             if not auto:
@@ -540,8 +547,13 @@ class Server:
                      f"up to its own context; --max-context sets it)")
 
     def context_for(self, engine: str) -> int:
-        """Prompt + reply tokens a request may have on ``engine``."""
+        """Prompt + reply tokens a request may have on ``engine``, as declared to clients."""
         return self.max_context if engine == "locals" else min(self.max_context, getattr(self, "_stock_context", self.max_context))
+
+    def limit_for(self, engine: str) -> int:
+        """Prompt + reply tokens a request is held to: ``context_for``, or what fits in memory where that is less."""
+        fit = getattr(self, "_fit_limit", None)
+        return min(self.context_for(engine), fit) if fit and engine == "locals" else self.context_for(engine)
 
     def format_of(self, engine: str):
         """The tool-call format and thinking style of the model's chat template."""

@@ -545,5 +545,11 @@ def test_context_limit_is_what_fits_in_memory(monkeypatch):
     s._svc = {"locals": SimpleNamespace(context_fit=lambda: fit)}
     s._cap_context()
     assert s.context_for("locals") == fit and s.context_for("mlx") == 65536
-    assert server(None, 262144, 20480) == 65536  # a small Mac: never below what it was
+    assert server(None, 262144, 20480) == 65536  # a small Mac: never below what it was, as tools are told
+    s = Server.__new__(Server)  # but a request past what fits is refused (alone, nothing else checks its memory)
+    s.log, s.model_id, s.engines = (lambda m: None), "m", ("locals",)
+    s._auto_context, s.max_context = True, 65536
+    s._svc = {"locals": SimpleNamespace(context_fit=lambda: 20480)}
+    s._cap_context()
+    assert s.context_for("locals") == 65536 and s.limit_for("locals") == 20480
     assert server(40000, 262144, fit) == 40000  # asked for

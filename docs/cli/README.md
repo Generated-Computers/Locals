@@ -116,7 +116,7 @@ The description in `--help` is the module docstring of `app.py`. argparse adds t
 | `--top-k` | `0` (off) | Top-k sampling at temp > 0. |
 | `--max-tokens` | `4096` | Cap on completion tokens per request. |
 | `--cache-gb` | sized from free GPU memory | Prompt cache of Locals's engine. |
-| `--max-context` | what fits in GPU memory, at least 65536, at most the model's own | Prompt plus reply tokens per request. |
+| `--max-context` | what fits in GPU memory, at most the model's own (declared as at least 65536) | Prompt plus reply tokens per request. |
 | `--thinking` | off | Think before every reply. |
 | `--max-calls` | `6` | Tool calls kept per reply. |
 | `--walk` | off | Constraints by the walk kernel (no token tables). |

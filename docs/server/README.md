@@ -322,8 +322,9 @@ Each request has a limit on prompt plus reply tokens, `context_for(engine)`.
 
 - With `--max-context`, that value.
 - Otherwise it is sized once, when our engine loads: `max(65536, BatchService.context_fit())`.
+- Where less than 65536 fits (a large model with full attention on a small Mac), clients are still told 65536 (Hermes refuses a model with less), but a request is held to the fit (`limit_for`, `_fit_limit`): past it, it gets `context_length_exceeded`. Admitted alone, nothing else checks a request's memory, and a Metal out-of-memory error fails every request in flight.
 - In both cases it is then capped at the model's own context, `native_context(model_id)`, which reads `max_position_embeddings` from `config.json` or from its `text_config`.
-- The code's comment gives 140k tokens for Qwen3.5-4B on 16 GB as an example.
+- Qwen3.5-4B on a 16 GB Mac gets 178,176 tokens.
 
 **The stock engine** uses `--max-context`, or 65536 without it, capped at the model's own context and at `max_context`. It is never sized from our engine's memory model, because the stock engine has no memory guard.
 
