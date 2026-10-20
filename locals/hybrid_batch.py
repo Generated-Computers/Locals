@@ -565,7 +565,11 @@ class HybridBatchEngine(BatchEngine):
         """KV positions that merging new rows (prompt lengths ``new_lens``) into
         the running batch holds at its peak, beyond their own prefill: every row
         padded to the longest one, and one attention layer of the merged batch
-        copied at a time (_append_rows)."""
+        copied at a time (_append_rows). Counting the new rows' KV only once
+        (their caches are handed to the merge a layer at a time) let three
+        26.7k-token prompts in beside a running one and took a 4B on a 16 GB Mac
+        to 11.07 GB against a 9.84 GB limit: reading prompts up to their
+        checkpoints holds more than the KV and one pass."""
         n = len(rows)
         top = max((len(q.prompt) + len(q.out) for q in rows), default=0)
         after = (n + len(new_lens)) * max([top] + list(new_lens))

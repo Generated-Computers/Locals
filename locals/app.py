@@ -253,7 +253,7 @@ def _locals_server_pids() -> List[int]:
     out = []
     for line in p.stdout.splitlines():
         pid, _, cmd = line.strip().partition(" ")
-        if "locals.server" in cmd and pid.isdigit() and int(pid) != os.getpid():
+        if "-m locals.server" in cmd and pid.isdigit() and int(pid) != os.getpid():  # (not a grep or an editor)
             out.append(int(pid))
     return out
 

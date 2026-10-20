@@ -896,8 +896,9 @@ class Server:
             for d in ends:
                 chunk({"tool_calls": [d]})
             usage = self._account(p, job, len(job.tokens), len(calls), t0, stopped)
-            # a reply cut by the loop guard inside a call (the call is dropped), or inside a JSON answer, is cut short:
-            # "length" says so (with "stop" an agent took the reply without its call as the end of its task)
+            # a reply cut by the loop guard inside a call (the call is dropped), or without tools (a JSON answer, text
+            # that went on repeating past LOOP_GRACE), is cut short: "length" says so (with "stop" an agent took the
+            # reply without its call as the end of its task, and a client the cut text as the whole answer)
             cut = stopped == "loop_in_call" or (stopped == "loop" and not p["tools"])
             finish = "tool_calls" if calls else ("length" if job.finish in ("length", "exhausted") or cut else "stop")
             stop_seq = getattr(job, "stop_sequence", None) if finish == "stop" else None
