@@ -198,3 +198,92 @@ def test_a_pass_that_needs_most_experts_reads_the_layers_tensors_whole(tiny, mon
     whole = model(tokens)
     monkeypatch.setattr(flint.StreamedExperts, "__call__", _in_memory(model, w))
     assert mx.allclose(whole, model(tokens), atol=1e-4).item()
+
+
+def test_in_float16_the_reads_convert_the_scales_on_the_way_into_the_slots(tmp_path, monkeypatch):
+    """Locals computes in float16 on M1 and M2: an expert's bf16 scales and biases are converted as they are read
+    into float16 slots, and the experts give what they give in memory in float16."""
+    import mlx_lm.utils as mlx_utils
+
+    w = _save(tmp_path)
+    model, _ = mlx_utils.load_model(tmp_path)
+    model.set_dtype(mx.float16)
+    tokens = mx.array([[3, 17, 42, 5, 88, 9, 61, 2, 33]])
+    cache = model.make_cache()
+    got = [model(tokens[:, i:i + 1], cache=cache)[0, -1] for i in range(9)]
+    assert model.expert_store.dtype == mx.float16 and model.expert_store.arrays[1][1].dtype == mx.float16
+    monkeypatch.setattr(flint.StreamedExperts, "__call__", _in_memory(model, w))
+    cache = model.make_cache()
+    want = [model(tokens[:, i:i + 1], cache=cache)[0, -1] for i in range(9)]
+    assert all(mx.allclose(a, b, atol=2e-3).item() for a, b in zip(got, want))
+
+
+WIDE = dict(CFG, hidden_size=512, intermediate_size=512, head_dim=128, moe_intermediate_size=512, num_experts=32,
+            shared_expert_intermediate_size=512, num_hidden_layers=3, layer_types=["full_attention", "sliding_attention", "full_attention"],
+            no_rope_layer_indices=[0, 2])
+
+
+def _save_wide(folder):
+    """A model as wide as the decode kernels need (hidden, expert and shared widths multiples of 512, experts a
+    multiple of 32)."""
+    rng = np.random.default_rng(1)
+    r = lambda *s: mx.array(rng.normal(0, 0.05, s).astype(np.float32))  # noqa: E731
+    w, D, H, KV, d = {}, 512, 4, 2, 128
+
+    def lin(name, out, inp, bits=4):
+        w[f"{name}.weight"], w[f"{name}.scales"], w[f"{name}.biases"] = _q(r(out, inp), bits)
+
+    lin("model.embed_tokens", 96, D, bits=8)
+    lin("lm_head", 96, D)
+    w["model.norm.weight"] = mx.ones((D,), dtype=mx.bfloat16)
+    for i in range(3):
+        p = f"model.layers.{i}"
+        for n, o, k in (("q_proj", H * d, D), ("k_proj", KV * d, D), ("v_proj", KV * d, D), ("o_proj", D, H * d)):
+            lin(f"{p}.self_attn.{n}", o, k)
+        w[f"{p}.self_attn.q_norm.weight"] = (1 + r(d)).astype(mx.bfloat16)
+        w[f"{p}.self_attn.k_norm.weight"] = (1 + r(d)).astype(mx.bfloat16)
+        w[f"{p}.self_attn.softmax_offset"] = r(H).astype(mx.bfloat16) * 10
+        w[f"{p}.input_layernorm.weight"] = mx.ones((D,), dtype=mx.bfloat16)
+        w[f"{p}.post_attention_layernorm.weight"] = mx.ones((D,), dtype=mx.bfloat16)
+        if i == 0:
+            lin(f"{p}.mlp.gate_proj", 512, D), lin(f"{p}.mlp.up_proj", 512, D), lin(f"{p}.mlp.down_proj", D, 512)
+            continue
+        w[f"{p}.mlp.gate.weight"] = r(32, D).astype(mx.bfloat16)  # (logits of a few units: no sigmoid at 1.0, no ties)
+        for n, o, k in (("gate_proj", 512, D), ("up_proj", 512, D), ("down_proj", D, 512)):
+            lin(f"{p}.mlp.shared_expert.{n}", o, k)
+            stack = [_q(r(o, k)) for _ in range(32)]
+            for j, kind in enumerate(("weight", "scales", "biases")):
+                w[f"{p}.mlp.switch_mlp.{n}.{kind}"] = mx.stack([s[j] for s in stack])
+    mx.save_safetensors(str(folder / "model-00000.safetensors"), w)
+    (folder / "config.json").write_text(json.dumps(WIDE))
+    return w
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_the_decode_kernels_give_what_the_experts_in_memory_give(tmp_path, monkeypatch, dtype):
+    """Decoding one token at a time, a model as wide as Flint's kernels need routes with the fused router kernels
+    and computes its MoE blocks with the fused expert kernels: the experts already in slots and the shared one
+    first, the ones being read added after (the first tokens find no expert in a slot, later ones most). It gives
+    what MLX's own ops on the experts in memory give."""
+    import mlx_lm.utils as mlx_utils
+
+    w = _save_wide(tmp_path)
+    model, _ = mlx_utils.load_model(tmp_path)
+    model.set_dtype(dtype, predicate=lambda t: t == mx.bfloat16)
+    tokens = [3, 17, 42, 5, 88, 9, 61, 2, 33, 70, 11, 4]
+    calls = []
+    fused = flint.SparseMoe._fused
+    monkeypatch.setattr(flint.SparseMoe, "_fused", lambda self, *a: calls.append(1) or fused(self, *a))
+    cache = model.make_cache()
+    got = [model(mx.array([[t]]), cache=cache)[0, -1] for t in tokens]
+    assert len(calls) == 2 * len(tokens)  # both MoE layers, every token, took the kernels
+    store = model.expert_store
+    assert store.misses > 0 and store.hits > 0
+    monkeypatch.setattr(flint, "FUSED", False)
+    monkeypatch.setattr(flint.StreamedExperts, "__call__", _in_memory(model, w))
+    cache = model.make_cache()
+    want = [model(mx.array([[t]]), cache=cache)[0, -1] for t in tokens]
+    tol = 0.05 if dtype == mx.bfloat16 else 0.01
+    for a, b in zip(got, want):
+        a, b = a.astype(mx.float32), b.astype(mx.float32)
+        assert float(mx.max(mx.abs(a - b))) <= tol * (1 + float(mx.max(mx.abs(b))))

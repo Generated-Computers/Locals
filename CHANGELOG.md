@@ -68,8 +68,15 @@
 - Recursive's own 4-bit build of Flint (RecursiveSI/flint-int4, 22.6 GB) runs on a 16 GB Mac: the GPU holds its
   weights without the experts (1.2 GB) and slots for recently used experts (40% of GPU memory), and the rest are
   read from the weight files as tokens need them (locals/models/flint_streamed.py, which loads that build on any
-  Mac; mlx-community's builds load whole as before). On the M2 Pro: about 4 tokens per second, a 6,000-token prompt
+  Mac; mlx-community's builds load whole as before). On the M2 Pro: about 6 tokens per second, a 6,000-token prompt
   read in 19 s, and OpenCode fixed a bug in a small project with it.
+- Flint's decode passes run its MoE blocks in Metal kernels of their own: the layer's router and the routers that
+  guess the next layers' experts in one product and one selection (0.27 ms of a layer's GPU time became 0.04),
+  and the routed and shared experts in two kernels instead of about fourteen; the experts already on the GPU are
+  computed while the others are read. Without reads a token takes 31 ms instead of 40.
+- Experts are read the most urgent first, the parts of one expert at once, bypassing macOS's file cache (which
+  held the same experts a second time); the slot taken is the least used one (uses counted less as they age), and
+  more experts are read ahead the more surely they are guessed.
 - A model can set its own prompt passes (HybridBatchEngine.prefill_tokens).
 
 ## 0.2.1 (2026-10-21)
