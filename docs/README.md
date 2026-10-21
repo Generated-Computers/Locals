@@ -16,6 +16,7 @@ and settings involved.
 | [Runtime and kernels](runtime/README.md) | Loading models, compute precision, fused layers, the Metal kernels for small batches, autotuning, model names and checks |
 | [Command line](cli/README.md) | The `locals` commands, how the background server is managed, the integrations with coding tools and editors, files and environment variables |
 | [Team of agents](agents/README.md) | `locals run`: planning, versions of each part, the check after every write, combining and repairing, the sandbox |
+| [Benchmarks](benchmarks/README.md) | Every result measured so far, in one place: speed by requests, Mac and model, other servers, agents end to end, long conversations, quality, sampling and reliability |
 | [Measurements](measurements/README.md) | Every benchmark behind the numbers in the README, what else was measured, and how to repeat it |
 
 The [tests](../tests/README.md) and [examples](../examples/README.md) folders
