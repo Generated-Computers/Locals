@@ -140,7 +140,7 @@ The description in `--help` is the module docstring of `app.py`. argparse adds t
    - Otherwise the command restarts the server only when it is ours and idle. `_background_pid` returns the pid saved in the pid file only if that pid is the one listening (`lsof`), and the server must have no `active` rows. A server that is not ours or is busy is used as-is when `same` (with a note that it runs older code). Otherwise the command exits and names `locals stop` or `--port`. A restart sends `SIGTERM` and waits up to 60 s (120 polls of 0.5 s) for the port to free. The new server gets the options the old one was started with (`_KEPT`, saved in `~/.locals/server-<port>.json`: `--ollama-port`, `--max-context` and the others except `engines` and `preload`) where this command leaves them unset.
 3. If some other process holds the port (`_listener_pid` finds a process whose command line lacks `locals.server`), the command exits before loading anything.
    If a server this tool started is still loading (`_starting_pid`: the saved pid is a running `locals.server` that does not listen yet, for example after a command was stopped with Ctrl-C while it waited), the command waits for it and follows its log instead of starting a second copy of the model, then applies the checks above. `locals serve` refuses to start next to it, and `locals status` reports it as starting. Ctrl-C while waiting stops the waiting, not the server.
-4. If `~/.locals/server.log` is larger than 50 MiB (`50 << 20`), it is moved to `server.log.1`.
+4. If the port's log (`_log_file`: `~/.locals/server.log` on 8321, `server-<port>.log` on another port) is larger than 50 MiB (`50 << 20`), it is moved to `<name>.1`. No server writes it then: one is started only when none runs on that port.
 5. It `Popen`s `server_cmd(args)`, which runs `python -m locals.server ...` with `sys.executable`. Output is appended to the log, the process gets `start_new_session=True`, and the working directory is the folder that contains the `locals` package. The child inherits the environment of this command. The pid is written to `~/.locals/server-<port>.pid`.
 6. Once a second, until `wait_s`, it prints new log lines that start with `locals:`, `loading ` or `engine `, or that contain `tuning`. The docstring explains the reason: a first load tunes kernels for minutes, so there is no short timeout while the process is alive. If the process exits, the last 15 log lines written since the start are printed and the command exits. As soon as `/health` answers, it prints `server ready in Ns`.
 
@@ -192,7 +192,7 @@ Local paths are used as-is. Hugging Face repositories are fetched with `snapshot
 | `~/.locals/serve-<port>.pid` | `cmd_serve` | Pid of a `locals serve` server, written before it loads the model, so another command waits for it. |
 | `~/.locals/server-<port>.json` | `_ensure_server` | The options a background server was started with, kept for a restart. |
 | `~/.locals/config.json.bad` | `_load_saved` | A `config.json` that did not parse, set aside with a note; the defaults are used. |
-| `~/.locals/server.log`, `server.log.1` | `_ensure_server` | Output of background servers. One file for all ports. Rotated once past 50 MiB. |
+| `~/.locals/server.log`, `server-<port>.log` (and `.1`) | `_ensure_server` | Output of the background server: `server.log` on port 8321, `server-<port>.log` on another. Rotated past 50 MiB when a server starts on that port. |
 | `~/.locals/backups/<tool>-<file>.before-locals` | `_back_up_once` | OpenClaw's `openclaw.json` / Hermes's `config.yaml` as it was before Locals changed it (`{}` when the tool had none). Taken once, never of a config that already holds Locals's settings, and removed by `locals disconnect`, so a later connect keeps the config as it is then. The undo command is printed. |
 | `~/.locals/openclaw-locals.json5` | `setup_openclaw` | The config fragment patched into OpenClaw. |
 | `~/.locals/cline/` | `cmd_launch` | Cline config folder used with `--config`. `~/.cline` is left alone. |
@@ -582,7 +582,6 @@ Variables read by the server process must be set in the environment of the comma
 - **Some delegated commands ignore saved defaults.** `generate` and `chat` on the server read the model and port saved in `~/.locals/config.json`, but `--local`, `agents` and `tune` use `DEFAULT_MODEL` unless `--model` is given. `menubar` ignores `--port` and uses the saved port.
 - **Incomplete `--no-exec` help.** `locals agents --no-exec` is documented as "disable run_python", but it also disables `run_file`.
 - **`/json` with `/n` in chat.** In `locals chat --local`, a pending `/json` schema is not applied to a `/n` turn and stays pending for the turn after (on the server it applies to the `/n` turn).
-- **Shared server log.** All ports share one `~/.locals/server.log`.
 
 ## Tests
 

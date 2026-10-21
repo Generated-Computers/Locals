@@ -125,7 +125,7 @@ class Stack:
 
     @property
     def log_path(self) -> Path:
-        return self.home / ".locals" / "server.log"
+        return self.home / ".locals" / ("server.log" if self.server_port == 8321 else f"server-{self.server_port}.log")
 
     def locals(self, *args, cwd=None, timeout: float = 900, env=None, check=False) -> subprocess.CompletedProcess:
         return subprocess.run([*LOCALS, *map(str, args)], cwd=cwd or self.home, env=env or self.env, capture_output=True,

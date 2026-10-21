@@ -238,6 +238,13 @@ def _pid_file(port: int) -> Path:
     return LOCALS_DIR / f"server-{port}.pid"
 
 
+def _log_file(port: int) -> Path:
+    """The background server's log: server.log on the default port, server-PORT.log on another. (One file for every
+    port: a start showed another server's lines, and its failure hint could come from them; a rotation left a
+    running server writing into a deleted file.)"""
+    return LOCALS_DIR / ("server.log" if port == 8321 else f"server-{port}.log")
+
+
 def _serve_pid_file(port: int) -> Path:
     """The pid of a server started in the foreground (locals serve): read only to see that one is loading, never
     to stop or restart it (a server started by hand is not locals's to replace)."""
@@ -816,7 +823,7 @@ def _ensure_server(args, wait_s: float) -> None:
     if holder is not None and not _is_locals_server(holder):  # found before loading the model, not after
         sys.exit(f"port {args.port} is in use by another program (pid {holder}); choose another port with --port")
     LOCALS_DIR.mkdir(exist_ok=True)
-    log_path = LOCALS_DIR / "server.log"
+    log_path = _log_file(args.port)
     loading = _starting_pid(args.port)
     if loading is not None:
         # started by an earlier command (one stopped with Ctrl-C while it waited) and still loading the model:
@@ -957,7 +964,7 @@ def cmd_status(args) -> None:
     st = server_alive(args.port)
     if not st:
         loading = _starting_pid(args.port)
-        print(f"the locals server on port {args.port} is starting (pid {loading}); log: {LOCALS_DIR / 'server.log'}"
+        print(f"the locals server on port {args.port} is starting (pid {loading}); log: {_log_file(args.port)}"
               if loading else f"no server on port {args.port}")
         return
     s = get_json(base_url(args.port) + "/stats")

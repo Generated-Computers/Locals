@@ -110,3 +110,10 @@ def test_a_cap_below_one_snapshot_saves_nothing_and_deletes_nothing(tmp_path):
     d = DiskPromptCache(tmp_path / "m", 1000 / (1 << 30))
     d.save([1, 2, 3], _cache())
     assert not list((tmp_path / "m").glob("*.safetensors")) and (other / "a.safetensors").exists()
+
+
+def test_each_port_has_its_own_server_log(tmp_path, monkeypatch):
+    """One log for every port: a start showed another server's lines (and could take its failure hint from them),
+    and a rotation left the other server writing into a deleted file."""
+    monkeypatch.setattr(app, "LOCALS_DIR", tmp_path)
+    assert app._log_file(8321) == tmp_path / "server.log" and app._log_file(8342) == tmp_path / "server-8342.log"
