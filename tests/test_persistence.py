@@ -86,3 +86,27 @@ def test_workspaces_of_an_interrupted_solve_run_are_removed(tmp_path):
     assert not (dead / "a0").exists() and (kept / "a0").exists()  # a finished run (no pid file) keeps its own (--keep)
     listed = subprocess.run(["git", "worktree", "list"], cwd=project, capture_output=True, text=True).stdout
     assert str(dead / "a0") not in listed
+
+
+def test_a_snapshot_folder_deleted_under_a_running_server_is_made_again(tmp_path):
+    """The user cleared ~/.cache/locals, or another model's server pruned the folder away: the next save raised out of
+    the engine, which failed every request in flight and threw out half the prompt cache, at each new system prompt."""
+    import shutil
+
+    d = DiskPromptCache(tmp_path / "m", 1.0)
+    d.save([1, 2, 3], _cache())
+    shutil.rmtree(tmp_path / "m")
+    d.save([4, 5, 6], _cache())  # (raised FileNotFoundError)
+    d.save([1, 2, 3], _cache())  # the index named it, the file was gone: saved again
+    assert len(list((tmp_path / "m").glob("*.safetensors"))) == 2
+
+
+def test_a_cap_below_one_snapshot_saves_nothing_and_deletes_nothing(tmp_path):
+    """LOCALS_DISK_CACHE_GB=0 (or a tiny cap): each save wrote a snapshot, then deleted every model's, its own too."""
+    other = tmp_path / "other-model"
+    other.mkdir()
+    (other / "a.safetensors").write_bytes(b"x" * 10)
+    (other / "a.tokens.json").write_text("[1]")
+    d = DiskPromptCache(tmp_path / "m", 1000 / (1 << 30))
+    d.save([1, 2, 3], _cache())
+    assert not list((tmp_path / "m").glob("*.safetensors")) and (other / "a.safetensors").exists()

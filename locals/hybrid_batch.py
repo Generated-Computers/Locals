@@ -285,21 +285,28 @@ class DiskPromptCache:
         return hashlib.sha1(json.dumps(list(tokens)).encode()).hexdigest()[:20]
 
     def save(self, tokens, cache) -> None:
+        """Never raises: a snapshot that cannot be saved is only a slower restart. (The folder deleted under a running
+        server, by the user or by another server's pruning, raised out of the engine: every request in flight
+        failed, half the prompt cache went, and again at each new system prompt.)"""
         from mlx_lm.models.cache import save_prompt_cache
 
         import os
-
-        name = self._name(tokens)
-        if name in self.index:
-            return
         import shutil
 
-        size = sum(a.nbytes for c in cache for a in (c.state if isinstance(c.state, (list, tuple)) else [c.state])
-                   if isinstance(a, mx.array))
-        if shutil.disk_usage(self.dir).free < 2 * size + (1 << 30):  # a nearly full disk: no snapshot (only slower)
+        name = self._name(tokens)
+        if name in self.index and (self.dir / f"{name}.safetensors").exists():
             return
-        tmps = [self.dir / f".{name}.{os.getpid()}.tmp.safetensors", self.dir / f".{name}.{os.getpid()}.tmp.json"]
-        try:  # written under temporary names, flushed to the disk and renamed: a crash or a power cut leaves no half
+        tmps = []
+        try:
+            size = sum(a.nbytes for c in cache for a in (c.state if isinstance(c.state, (list, tuple)) else [c.state])
+                       if isinstance(a, mx.array))
+            if size > self.max_bytes:  # (it would push out every snapshot, itself too: LOCALS_DISK_CACHE_GB=0 did)
+                return
+            self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if shutil.disk_usage(self.dir).free < 2 * size + (1 << 30):  # a nearly full disk: no snapshot (only slower)
+                return
+            tmps = [self.dir / f".{name}.{os.getpid()}.tmp.safetensors", self.dir / f".{name}.{os.getpid()}.tmp.json"]
+            # written under temporary names, flushed to the disk and renamed: a crash or a power cut leaves no half
             # file under the real name, and a second server sharing the folder none either
             save_prompt_cache(str(tmps[0]), cache)
             _fsync(tmps[0])

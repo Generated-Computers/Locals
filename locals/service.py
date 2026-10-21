@@ -356,7 +356,12 @@ class BatchService:
             eos_ids = ()
 
         eng = HybridBatchEngine(rt.model, rt.tokenizer, n_slots=self.slots)
-        if os.environ.get("LOCALS_DISK_CACHE", "1") != "0":  # system prompts kept across restarts
+        try:
+            disk_gb = float(os.environ.get("LOCALS_DISK_CACHE_GB") or 4)
+        except ValueError:
+            print(f"locals: LOCALS_DISK_CACHE_GB={os.environ['LOCALS_DISK_CACHE_GB']!r} is not a number; 4 GB", file=sys.stderr)
+            disk_gb = 4.0
+        if os.environ.get("LOCALS_DISK_CACHE", "1") != "0" and disk_gb > 0:  # system prompts kept across restarts (0 GB: off)
             from pathlib import Path
 
             from .hybrid_batch import DiskPromptCache
@@ -365,7 +370,7 @@ class BatchService:
                    + "--" + _weights_fingerprint(self.model_id))
             root = Path(os.environ.get("LOCALS_DISK_CACHE_DIR") or Path.home() / ".cache" / "locals" / "prompts")
             try:
-                eng.disk = DiskPromptCache(root / tag, float(os.environ.get("LOCALS_DISK_CACHE_GB", "4")))
+                eng.disk = DiskPromptCache(root / tag, disk_gb)
                 import shutil
 
                 stem = tag.rsplit("--", 1)[0]  # the same model and dtype, other weights or mlx-lm (or no fingerprint)

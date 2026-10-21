@@ -140,7 +140,7 @@ After an engine error such as a Metal out-of-memory error, the service halves th
 |---|---|---|
 | `LOCALS_DISK_CACHE` | `1` | `0` turns the disk cache off. |
 | `LOCALS_DISK_CACHE_DIR` | `~/.cache/locals/prompts` | Root directory. |
-| `LOCALS_DISK_CACHE_GB` | `4` | Size cap. After each save, the files with the oldest mtime are removed until the total is under the cap. |
+| `LOCALS_DISK_CACHE_GB` | `4` | Size cap, shared by every model's folder under the cache directory. After each save, the files with the oldest mtime (of any model) are removed until the total is under the cap. A snapshot larger than the cap is not saved; `0` turns the disk cache off. |
 
 **Directory.** Each model gets one folder under the root. Its name joins three parts with `--`:
 
@@ -150,7 +150,7 @@ After an engine error such as a Metal out-of-memory error, the service halves th
 
 On start, other folders for the same model and dtype are deleted. The reason given in the code: a saved cache of other weights would give wrong output, or fail the batch at its merge. The directory is mode `0700` and the files `0600`, because system prompts and tool definitions belong to this user only.
 
-**Saving.** A snapshot is saved at each `system` checkpoint the engine takes. Each snapshot is two files: `<name>.safetensors`, written by `save_prompt_cache`, and `<name>.tokens.json`. The name is the first 20 hex digits of a SHA-1 of the token list. Both files are written under temporary names and renamed with `os.replace`, so a crash or a second server never leaves half a file.
+**Saving.** A snapshot is saved at each `system` checkpoint the engine takes. Each snapshot is two files: `<name>.safetensors`, written by `save_prompt_cache`, and `<name>.tokens.json`. The name is the first 20 hex digits of a SHA-1 of the token list. Both files are written under temporary names and renamed with `os.replace`, so a crash or a second server never leaves half a file. `save` never raises: it makes the folder again when it is gone (deleted by the user, or emptied and removed by another server's pruning), and any error skips the snapshot with a line in the log. (Before, a missing folder raised out of the engine, which failed every request in flight and halved the prompt cache.)
 
 **Restoring.** Before each new request's lookup, `restore` finds the longest saved token sequence that the prompt starts with and that is shorter than the prompt.
 

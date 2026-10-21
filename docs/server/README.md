@@ -501,7 +501,7 @@ How the worker runs:
   - `longest` is the KV of one conversation of `context_fit()` tokens. A follow-up question on a long document then continues from it; the comment gives 1.5 s instead of 137 s at 60k tokens.
   - The `--cache-gb` help text says 4 GB, but the code subtracts `5 << 30`.
 - **Disk prompt cache.** Unless `LOCALS_DISK_CACHE=0`, system prompts are kept across restarts.
-  - Location: `LOCALS_DISK_CACHE_DIR` (default `~/.cache/locals/prompts`), up to `LOCALS_DISK_CACHE_GB` (default 4).
+  - Location: `LOCALS_DISK_CACHE_DIR` (default `~/.cache/locals/prompts`), up to `LOCALS_DISK_CACHE_GB` (default 4, shared by every model's folder; 0 turns it off). A save never fails a request: a folder deleted under a running server is made again, and a snapshot that cannot be written is skipped with a line in the log.
   - Each folder is named after the model, the dtype, and a fingerprint of the weight files and the mlx-lm version.
   - Folders left from other weights of the same model are removed.
 - **Checkpoints.** `"system"` and `"user"` checkpoints are stored as copies of the cache in prompt-cache entries of their kind. A copy is skipped when `_room_for_copy` says there is no room, and `"system"` copies are also saved to the disk cache. A `"reply"` checkpoint keeps only the layers that cannot be cut back (recurrent state). When the row finishes, these are joined with the row's KV cut to that position and stored as an `"assistant"` entry. Entries are evicted in mlx-lm's balanced order between the kinds (see [Prompt cache](../prompt-cache/README.md)) (`hybrid_batch._copies`, `hybrid_batch.HybridBatchEngine._checkpoint`, `hybrid_batch.HybridBatchEngine.serve.retire`; `service.BatchService.submit`).
