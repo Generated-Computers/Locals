@@ -1747,7 +1747,9 @@ def make_handler(server: Server, ollama_root: bool = False):
                 return self._error(f"Content-Encoding {enc} is not supported (gzip, deflate)", 415)
             try:
                 req = json.loads(body or b"{}")
-            except (ValueError, RecursionError):
+            except RecursionError:  # (Python 3.11's parser stops there; 3.12's goes on, and _clean_text stops it)
+                return self._error("the request is nested too deeply")
+            except ValueError:
                 return self._error("invalid JSON body")
             if not isinstance(req, dict):
                 return self._error("the request body must be a JSON object")
