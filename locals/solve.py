@@ -272,6 +272,25 @@ atexit.register(_kill_live)
 OPENCODE_DIRS = (".local/share/opencode", ".local/state/opencode", ".config/opencode", ".opencode")
 
 
+def abort_after(ocs, sid: str, directory: str, seconds: float):
+    """(timer, fired): a timer that aborts OpenCode session ``sid`` after ``seconds``, and an event set once it fired.
+    (A bare lambda printed "Exception in thread" over the live status line when OpenCode did not answer the abort,
+    and `not timer.is_alive()` missed a timeout whose abort was still being sent.)"""
+    fired = threading.Event()
+
+    def abort():
+        fired.set()
+        try:
+            ocs.call("POST", f"/session/{sid}/abort", None, directory, timeout=10)
+        except Exception:  # noqa: BLE001  # (OpenCode busy or gone)
+            pass
+
+    timer = threading.Timer(seconds, abort)
+    timer.daemon = True
+    timer.start()
+    return timer, fired
+
+
 def write_sandbox(root: Path, *more: Path) -> str:
     """A macOS sandbox profile (sandbox-exec) for an agent's commands: everything allowed but writing
     outside ``root`` (the agent's copy; ``more``: other folders), the temporary folders and the tools' caches. A
@@ -462,9 +481,7 @@ def write_check(ocs, project: Path, task: str, run_dir: Path, agent: str, provid
             kind = make_workspace(project, ws)
             sid = ocs.call("POST", "/session", {"title": "locals solve: the check", "agent": agent,
                                                 "model": {"providerID": provider, "id": model}}, str(ws), timeout=60)["id"]
-            timer = threading.Timer(timeout, lambda: ocs.call("POST", f"/session/{sid}/abort", None, str(ws), timeout=10))
-            timer.daemon = True
-            timer.start()
+            timer, _ = abort_after(ocs, sid, str(ws), timeout)
             try:
                 ocs.call("POST", f"/session/{sid}/message", {"model": {"providerID": provider, "modelID": model}, "agent": agent,
                                                             "parts": [{"type": "text", "text": CHECK_WRITER.format(task=task.strip())}]},

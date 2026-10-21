@@ -541,3 +541,55 @@ def test_swarm_task_lists_are_checked_before_the_server_starts(tmp_path, monkeyp
     args.tasks = str(tmp_path / "t.json")
     with pytest.raises(SystemExit, match='"task"'):
         app.cmd_swarm(args)
+
+
+def test_a_stopped_swarm_keeps_what_the_finished_agents_did(tmp_path, monkeypatch):
+    """Ctrl-C lost every transcript and the summary: they were written after the wait, which Ctrl-C left."""
+    import argparse
+    import json
+    import threading
+    import time
+
+    import pytest
+
+    real_sleep = time.sleep
+
+    class FakeOC:
+        def __init__(self, *a, **k):
+            self.base, self.refuse = "http://oc", None
+
+        def start_approver(self, refuse_all=False):
+            self.refuse = refuse_all
+
+        def run_task(self, task, directory, agent, provider, model, title, timeout):
+            if title.startswith("swarm 1"):
+                real_sleep(30)
+            return {"session": "s0", "wall_s": 1.0, "error": None,
+                    "messages": [{"info": {"role": "assistant"}, "parts": [{"type": "text", "text": "done"}]}]}
+
+        def close(self):
+            pass
+
+    calls = []
+
+    def sleep(s):
+        if threading.current_thread() is threading.main_thread():
+            calls.append(s)
+            if len(calls) >= 3:
+                raise KeyboardInterrupt
+        real_sleep(min(s, 0.05))
+
+    monkeypatch.setattr(app, "opencode_bin", lambda: "oc")
+    monkeypatch.setattr(app, "ensure_server", lambda a: None)
+    monkeypatch.setattr(app, "OpenCodeServer", FakeOC)
+    monkeypatch.setattr(app, "get_json", lambda *a, **k: (_ for _ in ()).throw(OSError()))
+    monkeypatch.setattr(app.time, "sleep", sleep)
+    (tmp_path / "p").mkdir()
+    args = argparse.Namespace(tasks=None, task="t", n=2, dir=str(tmp_path / "p"), workspaces=False, port=8321, model="m/x",
+                              engine="locals", agent="coder", auto=False, timeout=900, out=str(tmp_path / "out"))
+    with pytest.raises(SystemExit, match="stopped; what the agents did so far is in"):
+        app.cmd_swarm(args)
+    run = next((tmp_path / "out").iterdir())
+    summary = json.loads((run / "summary.json").read_text())
+    assert summary["stopped"] and summary["tasks"][0]["answer"] == "done"
+    assert summary["tasks"][1]["error"] == "stopped before it finished" and (run / "task_00.json").exists()

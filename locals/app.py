@@ -1816,10 +1816,11 @@ class OpenCodeServer:
             raw = r.read()
             return json.loads(raw) if raw else None
 
-    def start_approver(self) -> None:
-        """Headless mode: answer permission requests with "once" and reject
+    def start_approver(self, refuse_all: bool = False) -> None:
+        """Headless mode: answer permission requests with "once" (``refuse_all``: "reject") and reject
         questions, from the server's event stream (rules set to deny in the
-        agent config never reach here)."""
+        agent config never reach here). With nothing answering, a request stayed
+        pending and its agent waited until its time ran out."""
 
         def listen():
             while self.proc.poll() is None:
@@ -1838,7 +1839,7 @@ class OpenCodeServer:
                             t, pr = ev.get("type"), ev.get("properties") or {}
                             sid = pr.get("sessionID")
                             # outside the session's own folder, or a loop OpenCode itself flagged: refused, not approved
-                            refuse = any(v in ("external_directory", "doom_loop") for v in pr.values() if isinstance(v, str))
+                            refuse = refuse_all or any(v in ("external_directory", "doom_loop") for v in pr.values() if isinstance(v, str))
                             try:
                                 if t == "permission.asked":
                                     self.call("POST", f"/session/{sid}/permissions/{pr['id']}",
@@ -1863,17 +1864,17 @@ class OpenCodeServer:
         sid = s["id"]
         t0 = time.time()
         error = None
-        timer = threading.Timer(timeout, lambda: self.call("POST", f"/session/{sid}/abort", None, directory, timeout=10))
-        timer.daemon = True
-        timer.start()
+        from .solve import abort_after
+
+        timer, fired = abort_after(self, sid, directory, timeout)
         try:
             self.call("POST", f"/session/{sid}/message", {"model": {"providerID": provider, "modelID": model}, "agent": agent,
                                                           "parts": [{"type": "text", "text": task}]}, directory)
         except Exception as e:  # noqa: BLE001
             error = f"{type(e).__name__}: {e}"
         finally:
-            timed_out = not timer.is_alive()
             timer.cancel()
+            timed_out = fired.is_set()
         if timed_out:
             error = (error or "") + f" aborted after {timeout:.0f}s"
         msgs = self.call("GET", f"/session/{sid}/message", directory=directory, timeout=60) or []
@@ -1943,20 +1944,23 @@ def cmd_swarm(args) -> None:
         print(f"note: {len(tasks)} agents work in the same folder ({base}) at once and may edit the same files; "
               "--workspaces gives each its own subfolder", flush=True)
     ocs = OpenCodeServer(oc, base, run_dir / "opencode-serve.log")
-    if args.auto:
-        ocs.start_approver()
+    ocs.start_approver(refuse_all=not args.auto)
     print(f"{len(tasks)} agents ({args.agent} on {args.engine}/{short}) on one OpenCode server ({ocs.base}); "
           f"model server {base_url(args.port)} (open it in a browser for live batch rows)")
     results: List[Optional[dict]] = [None] * len(tasks)
 
     def work(i):
-        results[i] = ocs.run_task(tasks[i], str(dirs[i]), args.agent, args.engine, f"{args.engine}/{short}", f"swarm {i}: {tasks[i][:40]}", args.timeout)
+        try:
+            results[i] = ocs.run_task(tasks[i], str(dirs[i]), args.agent, args.engine, f"{args.engine}/{short}",
+                                      f"swarm {i}: {tasks[i][:40]}", args.timeout)
+        except Exception as e:  # noqa: BLE001  # (OpenCode gone: a traceback over the status line)
+            results[i] = {"error": f"{type(e).__name__}: {e}", "messages": [], "wall_s": time.time() - t0}
 
     t0 = time.time()
     threads = [threading.Thread(target=work, args=(i,), daemon=True) for i in range(len(tasks))]
     for th in threads:
         th.start()
-    last = ""
+    last, stopped = "", False
     try:
         while any(th.is_alive() for th in threads):
             time.sleep(1)
@@ -1971,20 +1975,25 @@ def cmd_swarm(args) -> None:
                     last = line
             except Exception:
                 pass
+    except KeyboardInterrupt:  # what the finished agents did is still written (it was all lost)
+        stopped = True
     finally:
         print()
         wall = time.time() - t0
         ocs.close()
     summary = []
     for i, (task, d) in enumerate(zip(tasks, dirs)):
-        r = results[i] or {"error": "no result", "messages": [], "wall_s": 0}
+        r = results[i] or {"error": "stopped before it finished" if stopped else "no result", "messages": [], "wall_s": 0}
         sm = _transcript_summary(r["messages"])
         (run_dir / f"task_{i:02d}.json").write_text(json.dumps(r, indent=1))
         summary.append({"task": task, "dir": str(d), "session": r.get("session"), "wall_s": r["wall_s"], "error": r.get("error"),
                         "steps": sm["steps"], "tools": [t["tool"] for t in sm["tool_calls"]], "answer": sm["final"]})
         print(f"\n=== task {i}: {task}\n[{r['wall_s']:.0f}s, {sm['steps']} steps, tools: {', '.join(t['tool'] for t in sm['tool_calls']) or '-'}"
               f"{', error: ' + r['error'] if r.get('error') else ''}]  {d}\n{sm['final'][:800]}")
-    (run_dir / "summary.json").write_text(json.dumps({"model": f"{args.engine}/{short}", "agent": args.agent, "wall_s": wall, "tasks": summary}, indent=1))
+    (run_dir / "summary.json").write_text(json.dumps({"model": f"{args.engine}/{short}", "agent": args.agent, "wall_s": wall,
+                                                      "stopped": stopped, "tasks": summary}, indent=1))
+    if stopped:
+        sys.exit(f"\nstopped; what the agents did so far is in {run_dir}")
     try:
         s = get_json(base_url(args.port) + "/stats", timeout=2)["engines"][args.engine]
         print(f"\n{len(tasks)} agents in {wall:.0f}s wall; engine {args.engine} totals: {s['completion_tokens']} output tokens, "
@@ -2435,7 +2444,8 @@ def _main(argv=None):
     p.add_argument("--agent", default="coder")
     p.add_argument("--engine", choices=list(PROVIDERS), default="locals")
     p.add_argument("--auto", action=argparse.BooleanOptionalAction, default=True,
-                   help="approve the agents' permission requests (headless; default on, --no-auto to refuse them)")
+                   help="approve the agents' permission requests (headless; default on; --no-auto refuses them). "
+                        "Questions are always refused")
     p.add_argument("--timeout", type=float, default=900, help="seconds per task before the agent is aborted")
     p.add_argument("--out", default="swarm_runs")
     add_server_opts(p)

@@ -274,19 +274,19 @@ Without `--run`, it `execve`s `opencode <dir> -m ...` (`--logs` adds `--print-lo
 `OpenCodeServer` starts one `opencode serve --port <free port>` and drives it over HTTP. Every agent is a session inside the one process, because separate `opencode run` processes contend for OpenCode's SQLite database.
 
 - **Startup:** it waits up to 90 s for `/global/health`.
-- **`run_task`:** creates a session, posts the task, and aborts it after `timeout` seconds with a timer. It returns the transcript.
-- **`start_approver`:** headless mode. It listens on `/global/event` and answers `permission.asked` / `permission.v2.asked` with `once`. It answers `reject` when a property value is `external_directory` or `doom_loop`, and rejects all questions.
+- **`run_task`:** creates a session, posts the task, and aborts it after `timeout` seconds with a timer (`solve.abort_after`: an abort OpenCode does not answer is ignored, and whether the timer fired is recorded, so a timeout is always reported as one). It returns the transcript.
+- **`start_approver`:** headless mode. It listens on `/global/event` and answers `permission.asked` / `permission.v2.asked` with `once`. It answers `reject` when a property value is `external_directory` or `doom_loop` (with `refuse_all`, always), and rejects all questions.
 
 `cmd_swarm` takes tasks from `--tasks FILE` (a JSON list of strings or `{"task": ...}` objects, else one task per line with `#` comments skipped) or from `--task TEXT` repeated `--n` times (default 4). Other options:
 
 - `--workspaces`: each task gets `DIR/swarm/task_NN`. Without it, the agents share `DIR` and a note warns that they may edit the same files.
 - `--agent`: default `coder`.
 - `--engine`: default `locals`.
-- `--auto/--no-auto`: default on, starts the approver.
+- `--auto/--no-auto`: default on, approves permission requests; `--no-auto` refuses them. (With nothing answering, a request stayed pending and its agent waited until `--timeout`.)
 - `--timeout`: default 900 s per task.
 - `--out`: default `swarm_runs`.
 
-`swarm` requires OpenCode to be installed already ("run locals setup first"). While it runs, it prints a live line from `/stats`.
+`swarm` requires OpenCode to be installed already ("run locals setup first"). While it runs, it prints a live line from `/stats`. Ctrl-C stops it, and the transcripts of the agents that finished, and the summary (`"stopped": true`), are still written; the command then exits 1 and names the folder.
 
 ## Other agent tools
 

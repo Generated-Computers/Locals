@@ -324,3 +324,30 @@ def test_stale_runs_of_other_projects_are_left_alone(tmp_path):
     assert cleanup_stale_runs(app, root) == 3
     assert not (mine / "a0").exists() and not (old / "a0").exists() and not (mine / "fix1-0").exists()
     assert (v2 / "a0").exists() and (other / "a0").exists()
+
+
+def test_an_abort_that_fails_prints_no_traceback_and_still_counts():
+    """A bare lambda timer printed "Exception in thread" over the live status line when OpenCode did not answer the
+    abort; and `not timer.is_alive()` missed a timeout whose abort was still being sent."""
+    import threading
+    import time
+
+    from locals.solve import abort_after
+
+    errors = []
+    old_hook = threading.excepthook
+    threading.excepthook = lambda a: errors.append(a)
+
+    class Gone:
+        def call(self, *a, **k):
+            time.sleep(0.3)
+            raise ConnectionRefusedError
+
+    try:
+        timer, fired = abort_after(Gone(), "s1", "/tmp", 0.05)
+        time.sleep(0.1)
+        assert fired.is_set() and timer.is_alive()  # (the old test said: not timed out)
+        timer.join(2)
+        assert not errors
+    finally:
+        threading.excepthook = old_hook

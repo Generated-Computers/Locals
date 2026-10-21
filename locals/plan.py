@@ -25,7 +25,7 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from .solve import SKIP_DIRS, make_workspace, read_source, run_check, write_source
+from .solve import SKIP_DIRS, abort_after, make_workspace, read_source, run_check, write_source
 
 # Throwaway copies of the project in use (a candidate's check, a repair agent's copy), removed at exit too: on Ctrl-C
 # the finally of the daemon thread that made one never ran, and the copy stayed in the temporary folder for good.
@@ -507,9 +507,7 @@ class Team:
                                  str(self.ws), timeout=60)["id"]
             except Exception as e:  # noqa: BLE001
                 return {"title": title, "session": None, "wall_s": 0.0, "error": f"no session: {type(e).__name__}: {e}"}
-        timer = threading.Timer(r.timeout, lambda: r.ocs.call("POST", f"/session/{sid}/abort", None, str(self.ws), timeout=10))
-        timer.daemon = True
-        timer.start()
+        timer, _ = abort_after(r.ocs, sid, str(self.ws), r.timeout)
         t0 = time.time()
         try:
             r.ocs.call("POST", f"/session/{sid}/message", {"model": {"providerID": r.provider, "modelID": r.model}, "agent": r.agent,
