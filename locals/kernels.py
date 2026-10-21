@@ -166,17 +166,39 @@ def _read_tune(path):
         return {k: (v if k.startswith("__") else tuple(v)) for k, v in _json.load(f).items()}
 
 
+_PRESET: dict = {}  # the shipped preset as loaded: its entries are not copied into the user's cache (_save_tune)
+
+
+def _beyond_preset(data: dict) -> dict:
+    """``data`` without what the preset says (in a dict-valued key such as ``__times__``, per entry). A copy of the
+    preset in the user's file overrode it for good: a later release's corrected preset never reached anyone who had
+    run Locals once."""
+    out = {}
+    for k, v in data.items():
+        p = _PRESET.get(k)
+        if isinstance(v, dict) and isinstance(p, dict):
+            d = {kk: vv for kk, vv in v.items() if kk not in p or p[kk] != vv}
+            if d:
+                out[k] = d
+        elif k not in _PRESET or p != v:
+            out[k] = v
+    return out
+
+
 def _load_tune():
     """The tuning choices: the shipped preset for this GPU, overridden by the user's own cache. A
     cache file that does not parse (a write cut short) is set aside, not silently replaced."""
-    global _TUNE
+    global _TUNE, _PRESET
     with _TUNE_LOCK:
         if _TUNE is None:
-            tune = {}
+            tune, _PRESET = {}, {}
             preset = _preset_path()
             if preset:
                 try:
-                    tune.update(_read_tune(preset))
+                    import copy
+
+                    _PRESET = _read_tune(preset)
+                    tune.update(copy.deepcopy(_PRESET))  # (shared, what tuning adds to __times__ went into _PRESET too)
                 except Exception:  # noqa: BLE001
                     pass
             user = None
@@ -188,7 +210,8 @@ def _load_tune():
                         _os.replace(_TUNE_PATH, _TUNE_PATH + ".bad")
                     except OSError:
                         pass
-            tune.update(user or {})
+            for k, v in (user or {}).items():  # over the preset; a dict-valued key (__times__) entry by entry
+                tune[k] = {**tune[k], **v} if isinstance(v, dict) and isinstance(tune.get(k), dict) else v
             _TUNE = tune
             crashed = _crashed_shapes(tune)
             _drop_old_temps()
@@ -311,6 +334,7 @@ def _save_tune():
                 theirs = {}
             data = _merge_tune(_TUNE, theirs)
             _TUNE.update({k: v for k, v in data.items() if k not in _TUNE or isinstance(v, (dict, list))})
+            data = _beyond_preset(data)
             fd, tmp = tempfile.mkstemp(dir=d, prefix=".tune-", suffix=".json")
             try:
                 with _os.fdopen(fd, "w") as f:

@@ -9,6 +9,7 @@ from locals import app, kernels
 def test_a_save_keeps_what_another_process_wrote(tmp_path, monkeypatch):
     path = tmp_path / "tune.json"
     monkeypatch.setattr(kernels, "_TUNE_PATH", str(path))
+    monkeypatch.setattr(kernels, "_PRESET", {})
     monkeypatch.setattr(kernels, "_TUNE", {"2560x4096x8": ("frag", 2, 2, 1), "__times__": {"2560x4096x8": {"frag": 10.0}},
                                            "__model_tuned_pipe__x": [2, 3]})
     path.write_text(json.dumps({"9216x2560x8": ["mlx"], "__times__": {"9216x2560x8": {"mlx": 20.0}},
@@ -136,3 +137,25 @@ def test_padding_is_chosen_again_once_more_shapes_are_timed(tmp_path, monkeypatc
     monkeypatch.setattr(kernels, "_time_shape", timed)
     kernels._tune_shape(None, None, 16, 4096, 2560, "float16", "2560x4096x16", tune)
     assert kernels._pad_rows(2560, 4096, 12, "float16") == 16
+
+
+def test_a_corrected_preset_reaches_a_mac_that_ran_the_old_one(tmp_path, monkeypatch):
+    """The preset was written out as the user's cache at the first start, and that copy overrode every later preset:
+    a release that corrected an entry never reached anyone who had run Locals once."""
+    preset = tmp_path / "preset.json"
+    monkeypatch.setattr(kernels, "_TUNE_PATH", str(tmp_path / "tune.json"))
+    monkeypatch.setattr(kernels, "_preset_path", lambda: str(preset))
+    monkeypatch.setattr(kernels, "_PRESET", {})
+    preset.write_text(json.dumps({"2560x4096x8": ["frag", 2, 2, 1], "__times__": {"2560x4096x8": {"frag": 10.0}}}))
+    monkeypatch.setattr(kernels, "_TUNE", None)
+    tune = kernels._load_tune()
+    tune["9216x2560x8"] = ("mlx",)  # measured here
+    tune["__times__"]["9216x2560x8"] = {"mlx": 20.0}
+    kernels._save_tune()
+    saved = json.loads((tmp_path / "tune.json").read_text())
+    assert saved == {"9216x2560x8": ["mlx"], "__times__": {"9216x2560x8": {"mlx": 20.0}}}  # no copy of the preset
+    preset.write_text(json.dumps({"2560x4096x8": ["mlx"], "__times__": {"2560x4096x8": {"mlx": 9.0}}}))  # corrected
+    monkeypatch.setattr(kernels, "_TUNE", None)
+    tune = kernels._load_tune()
+    assert tune["2560x4096x8"] == ("mlx",) and tune["9216x2560x8"] == ("mlx",)
+    assert tune["__times__"] == {"2560x4096x8": {"mlx": 9.0}, "9216x2560x8": {"mlx": 20.0}}
