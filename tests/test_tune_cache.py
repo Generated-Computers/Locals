@@ -153,6 +153,7 @@ def test_a_corrected_preset_reaches_a_mac_that_ran_the_old_one(tmp_path, monkeyp
     tune["__times__"]["9216x2560x8"] = {"mlx": 20.0}
     kernels._save_tune()
     saved = json.loads((tmp_path / "tune.json").read_text())
+    saved.pop("__mlx__")
     assert saved == {"9216x2560x8": ["mlx"], "__times__": {"9216x2560x8": {"mlx": 20.0}}}  # no copy of the preset
     preset.write_text(json.dumps({"2560x4096x8": ["mlx"], "__times__": {"2560x4096x8": {"mlx": 9.0}}}))  # corrected
     monkeypatch.setattr(kernels, "_TUNE", None)

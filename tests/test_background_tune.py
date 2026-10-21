@@ -124,3 +124,43 @@ def test_an_idle_tuner_waits_while_another_server_works(tmp_path, monkeypatch):
     svc._tune_after = 0.0
     svc._tune_while_idle()
     assert tuned == [("layer", 1)] and not svc._tune_work
+
+
+def test_shapes_timed_under_another_mlx_are_timed_again(tmp_path, monkeypatch):
+    """The tune cache was not keyed on MLX's version: choices timed under an older MLX stayed for good after an
+    upgrade. They are stale now: still used, and timed again by the idle tuner (and locals tune)."""
+    import json
+
+    monkeypatch.setattr(kernels, "_TUNE_PATH", str(tmp_path / "tune.json"))
+    monkeypatch.setattr(kernels, "_preset_path", lambda: None)
+    monkeypatch.setattr(kernels, "_TUNE", None)
+    monkeypatch.setattr(kernels, "_CHOICE", {})
+    monkeypatch.setattr(kernels, "_DEFER", True)
+    layer = nn.QuantizedLinear(512, 1024, bits=4, group_size=64)
+    dt = str(layer["scales"].dtype).split(".")[-1]
+    key = "1024x512x1" + ("" if dt == "float16" else f"x{dt}")
+    (tmp_path / "tune.json").write_text(json.dumps({"__mlx__": "0.0.1", key: ["mlx"], "__times__": {key: {"mlx": 1.0}}}))
+    tune = kernels._load_tune()
+    assert tune["__stale__"] == [key] and tune["__mlx__"] == mx.__version__
+    assert json.loads((tmp_path / "tune.json").read_text())["__mlx__"] == mx.__version__
+    x = mx.zeros((1, 512), layer["scales"].dtype)
+    assert kernels._choose(x, layer) == ("mlx",)  # still used, not timed in a request
+    work = kernels.pending_work(nn.Sequential(layer), max_m=1)
+    assert [m for _, m in work] == [1, kernels.PREFILL_TUNE_M]
+    kernels.tune_one(*work[0])
+    assert key not in kernels._load_tune()["__stale__"] and kernels._load_tune()["__times__"][key] != {"mlx": 1.0}
+    assert key not in json.loads((tmp_path / "tune.json").read_text())["__stale__"]
+    assert [m for _, m in kernels.pending_work(nn.Sequential(layer), max_m=1)] == [kernels.PREFILL_TUNE_M]
+
+
+def test_a_cache_from_before_versions_gets_one_and_nothing_is_stale(tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setattr(kernels, "_TUNE_PATH", str(tmp_path / "tune.json"))
+    monkeypatch.setattr(kernels, "_preset_path", lambda: None)
+    monkeypatch.setattr(kernels, "_TUNE", None)
+    (tmp_path / "tune.json").write_text(json.dumps({"1024x512x1": ["mlx"]}))
+    tune = kernels._load_tune()
+    assert not tune.get("__stale__") and json.loads((tmp_path / "tune.json").read_text())["__mlx__"] == mx.__version__
+    # what both processes still call stale stays stale: one that timed a shape again took it off
+    assert kernels._merge_tune({"__stale__": ["a"]}, {"__stale__": ["a", "b"]})["__stale__"] == ["a"]

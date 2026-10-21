@@ -169,6 +169,43 @@ def _read_tune(path):
 _PRESET: dict = {}  # the shipped preset as loaded: its entries are not copied into the user's cache (_save_tune)
 
 
+_SHAPE_KEY = __import__("re").compile(r"\d+x\d+x(\d+|P)(x[a-z0-9]+)?")  # a matmul shape's choice, or how prompts are read
+_RETIME = False  # set while a tuner runs (the idle tuner, locals tune): stale shapes are timed again then
+
+
+def _mark_stale(tune: dict, user: Optional[dict]) -> bool:
+    """After an MLX upgrade (the user's file says another version), the shapes this Mac timed are stale: still used,
+    and timed again by the idle tuner or locals tune (``__stale__``). Choices timed under an older MLX stayed for good.
+    Whether anything changed (the file then gets this version)."""
+    import sys
+
+    now = mx.__version__
+    was = (user or {}).get("__mlx__")
+    tune["__mlx__"] = now
+    if user is None or was == now:
+        return user is not None and was is None  # (a file from before this: it gets the version, nothing stale)
+    if was is None:
+        return True
+    stale = sorted({k for k in user if _SHAPE_KEY.fullmatch(k)} | set(tune.get("__stale__") or []))
+    tune["__stale__"] = stale
+    if stale:
+        print(f"locals: MLX is {now} now ({was} when this Mac's kernels were timed): {len(stale)} kernel shapes are timed "
+              f"again while the server is idle (locals tune does them at once); until then they keep their choice",
+              file=sys.stderr, flush=True)
+    return True
+
+
+def _is_stale(tune: dict, key: str) -> bool:
+    """Whether ``key`` is to be timed again now: stale, and a tuner runs."""
+    return _RETIME and key in (tune.get("__stale__") or ())
+
+
+def _unstale(tune: dict, key: str) -> None:
+    st = tune.get("__stale__")
+    if st and key in st:
+        tune["__stale__"] = [k for k in st if k != key]
+
+
 def _beyond_preset(data: dict) -> dict:
     """``data`` without what the preset says (in a dict-valued key such as ``__times__``, per entry). A copy of the
     preset in the user's file overrode it for good: a later release's corrected preset never reached anyone who had
@@ -212,10 +249,11 @@ def _load_tune():
                         pass
             for k, v in (user or {}).items():  # over the preset; a dict-valued key (__times__) entry by entry
                 tune[k] = {**tune[k], **v} if isinstance(v, dict) and isinstance(tune.get(k), dict) else v
+            upgraded = _mark_stale(tune, user)
             _TUNE = tune
             crashed = _crashed_shapes(tune)
             _drop_old_temps()
-            if (user is None and tune) or crashed:
+            if (user is None and tune) or crashed or upgraded:
                 try:
                     _save_tune()
                 except OSError:
@@ -375,6 +413,8 @@ def _merge_tune(mine: dict, theirs: dict) -> dict:
         w = out.get(k)
         if isinstance(v, dict) and isinstance(w, dict):
             out[k] = {**w, **v}
+        elif k == "__stale__" and isinstance(v, list) and isinstance(w, list):
+            out[k] = [x for x in w if x in v]  # (a union brought back the shapes timed again meanwhile)
         elif k.startswith("__") and isinstance(v, list) and isinstance(w, list):
             out[k] = list(dict.fromkeys([*w, *v]))
         else:
@@ -506,11 +546,13 @@ def _choose(x2, mod):
     N = mod["weight"].shape[0]
     dt = str(x2.dtype).split(".")[-1]
     c = _CHOICE.get((N, K, M, dt))
-    if c is not None:
+    if c is not None and not _RETIME:  # (the path of every call once chosen: no lock, no lookups)
         return c
     key = f"{N}x{K}x{M}" + ("" if dt == "float16" else f"x{dt}")
     tune = _load_tune()
-    if key in tune:
+    if c is not None and not _is_stale(tune, key):
+        return c
+    if key in tune and not _is_stale(tune, key):
         c = tuple(tune[key])
         if dt != "float16" and c[0] == "fragh":  # computes in fp16: never for bf16 activations
             c = ("mlx",)
@@ -520,7 +562,7 @@ def _choose(x2, mod):
         return ("mlx",)
     with _TUNE_LOCK:
         c = _CHOICE.get((N, K, M, dt))
-        return c if c is not None else _tune_shape(x2, mod, M, K, N, dt, key, tune)
+        return c if c is not None and not _is_stale(tune, key) else _tune_shape(x2, mod, M, K, N, dt, key, tune)
 
 
 def _tune_shape(x2, mod, M, K, N, dt, key, tune):
@@ -604,6 +646,7 @@ def _time_shape(x2, mod, M, K, N, dt, key, tune):
     best = (times[choice], choice)
     tune[key] = best[1]
     _CHOICE[(N, K, M, dt)] = best[1]
+    _unstale(tune, key)
     _save_tune()
     return best[1]
 
@@ -745,21 +788,23 @@ def _dense_prefill(mod, dtype) -> bool:
     w = mod["weight"]
     N, K, dt = w.shape[0], w.shape[1] * 8, str(dtype).split(".")[-1]
     hit = _DENSE.get((N, K, dt))
-    if hit is not None:
+    if hit is not None and not _RETIME:
+        return hit
+    key = _prefill_key(N, K, dt)
+    tune = _load_tune()
+    if hit is not None and not _is_stale(tune, key):
         return hit
     force = _os.environ.get("LOCALS_DENSE_PREFILL")
     if force in ("0", "1"):
         _DENSE[(N, K, dt)] = force == "1"
         return _DENSE[(N, K, dt)]
-    key = _prefill_key(N, K, dt)
-    tune = _load_tune()
-    if key in tune:
+    if key in tune and not _is_stale(tune, key):
         _DENSE[(N, K, dt)] = tune[key][0] == "dense"
         return _DENSE[(N, K, dt)]
     if _DEFER and not _TUNING:
         return True  # not timed yet: as before (the server times it while idle)
     with _TUNE_LOCK:
-        if (N, K, dt) not in _DENSE:
+        if (N, K, dt) not in _DENSE or _is_stale(tune, key):
             _tune_prefill(mod, N, K, dtype, key, tune)
         return _DENSE[(N, K, dt)]
 
@@ -879,6 +924,7 @@ def _tune_prefill(mod, N, K, dtype, key, tune) -> None:
     tune[key] = ("dense",) if dense_wins else ("mlx",)
     tune.setdefault("__times__", {})[key] = {"mlx": round(tq, 1), "dense": round(td, 1)}
     _DENSE[(N, K, str(dtype).split(".")[-1])] = dense_wins
+    _unstale(tune, key)
     _save_tune()
 
 
@@ -1185,22 +1231,30 @@ def pretune(model, max_m: int = MAX_M, log=None) -> int:
             seen.add((N, K))
             dt = mod["scales"].dtype
             name = str(dt).split(".")[-1]
+            stale = set(tune.get("__stale__") or ())
             for M in range(MIN_M, max_m + 1):
-                work.append((mod, M, K, dt, f"{N}x{K}x{M}" + ("" if name == "float16" else f"x{name}") not in tune))
+                key = f"{N}x{K}x{M}" + ("" if name == "float16" else f"x{name}")
+                work.append((mod, M, K, dt, key not in tune or key in stale))
             if N * K <= DENSE_MAX:  # how prompts are read through it (_dense_prefill)
-                work.append((mod, PREFILL_TUNE_M, K, dt, _prefill_key(N, K, name) not in tune))
+                key = _prefill_key(N, K, name)
+                work.append((mod, PREFILL_TUNE_M, K, dt, key not in tune or key in stale))
     total, done = sum(w[-1] for w in work), 0
     t0 = last = _time.perf_counter()
-    for mod, M, K, dt, pending in work:
-        if M >= PREFILL_M:
-            _dense_prefill(mod, dt)
-        else:
-            _choose(mx.zeros((M, K), dt), mod)
-        done += pending
-        now = _time.perf_counter()
-        if log and pending and done < total and done * 10 // total > (done - 1) * 10 // total and now - last >= 20:
-            log(f"locals: tuning {done * 100 // total}% ({(now - t0) / 60:.1f} min)")
-            last = now
+    global _RETIME
+    _RETIME = True  # (stale shapes are timed again)
+    try:
+        for mod, M, K, dt, pending in work:
+            if M >= PREFILL_M:
+                _dense_prefill(mod, dt)
+            else:
+                _choose(mx.zeros((M, K), dt), mod)
+            done += pending
+            now = _time.perf_counter()
+            if log and pending and done < total and done * 10 // total > (done - 1) * 10 // total and now - last >= 20:
+                log(f"locals: tuning {done * 100 // total}% ({(now - t0) / 60:.1f} min)")
+                last = now
+    finally:
+        _RETIME = False
     return len(seen)
 
 
@@ -1216,25 +1270,27 @@ def pending_work(model, max_m: int = 16) -> list:
                 continue
             seen.add((N, K))
             name = str(mod["scales"].dtype).split(".")[-1]
+            stale = set(tune.get("__stale__") or ())
             for M in range(MIN_M, max_m + 1):
-                if f"{N}x{K}x{M}" + ("" if name == "float16" else f"x{name}") not in tune:
+                key = f"{N}x{K}x{M}" + ("" if name == "float16" else f"x{name}")
+                if key not in tune or key in stale:
                     work.append((mod, M))
-            if N * K <= DENSE_MAX and _prefill_key(N, K, name) not in tune:
+            if N * K <= DENSE_MAX and (_prefill_key(N, K, name) not in tune or _prefill_key(N, K, name) in stale):
                 work.append((mod, PREFILL_TUNE_M))  # how prompts are read through it, after the batch sizes
     return sorted(work, key=lambda w: w[1])
 
 
 def tune_one(mod, M: int) -> tuple:
-    """Tune one (layer, rows) shape now (the background tuner, in the engine's own thread)."""
-    global _TUNING
-    _TUNING = True
+    """Tune one (layer, rows) shape now (the background tuner, in the engine's own thread); a stale one again."""
+    global _TUNING, _RETIME
+    _TUNING = _RETIME = True
     try:
         if M >= PREFILL_M:
             return ("dense",) if _dense_prefill(mod, mod["scales"].dtype) else ("mlx",)
         K = mod["weight"].shape[1] * 8
         return _choose(mx.zeros((M, K), mod["scales"].dtype), mod)
     finally:
-        _TUNING = False
+        _TUNING = _RETIME = False
 
 
 def tune_pending(model, max_m: int = MAX_M) -> int:
