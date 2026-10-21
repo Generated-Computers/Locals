@@ -548,6 +548,22 @@ def part_verifier(root: Path, check: Optional[str], parts: List[dict], i: int):
 
 # Linked into every copy of the project, not copied (big, and the check may run from them); top level only.
 _LINK_DIRS = (".venv", "venv", "env", "node_modules")
+def _hold_stops(got: List[int]):
+    """Ctrl-C, SIGTERM and SIGHUP held off (recorded in ``got``) while the run's files are renamed into the project:
+    a stop between two renames left some written, and said none was. Returns what lets them in again."""
+    import signal
+
+    if threading.current_thread() is not threading.main_thread():
+        return lambda: None
+    old = {s: signal.signal(s, lambda n, f: got.append(n)) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+
+    def let_in():
+        for s, h in old.items():
+            signal.signal(s, h if h is not None else signal.SIG_DFL)
+
+    return let_in
+
+
 class Run:
     """One locals run: plan, workers in parallel, check, fixers in parallel.
 
@@ -1072,13 +1088,20 @@ class Run:
                 # the project file's own mode, or for a new file the run's (a script it made executable stays so)
                 os.chmod(tmp, (dst if dst.exists() else self.root / f).stat().st_mode & 0o777)
                 tmps.append((tmp, dst))
-            for tmp, dst in tmps:
-                os.replace(tmp, dst)
-            tmps = []
+            stops: List[int] = []
+            let_in = _hold_stops(stops)
+            try:
+                for tmp, dst in tmps:
+                    os.replace(tmp, dst)
+                tmps = []
+            finally:
+                let_in()
         finally:
             for tmp, _ in tmps:
                 tmp.unlink(missing_ok=True)
         self.report["changed"] = [f for f, _ in todo]
+        if stops:  # the stop, now that the project has all of the run's files
+            raise KeyboardInterrupt
 
     def _keep(self, only=None, src: Optional[Path] = None, tag: str = "") -> None:
         """The staging copy's files (those the run wrote, or ``only``; from ``src`` if given) into ``keep_dir``."""
@@ -1180,6 +1203,9 @@ def cmd_run(args) -> None:
     try:
         report = run.go()
     except KeyboardInterrupt:
+        if run.report.get("changed"):
+            sys.exit(f"\n  stopped once the run's files were written ({len(run.report['changed'])} changed): "
+                     + ", ".join(run.report["changed"])[:300])
         kept = run.report.get("kept")
         sys.exit("\n  stopped; the project was not changed" + (f"; the work so far is in {kept}" if kept else ""))
     except Exception as e:  # noqa: BLE001

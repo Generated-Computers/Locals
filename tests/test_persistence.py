@@ -77,7 +77,7 @@ def test_workspaces_of_an_interrupted_solve_run_are_removed(tmp_path):
     subprocess.run(["git", "add", "."], cwd=project, check=True)
     subprocess.run(["git", "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "f"], cwd=project, check=True)
     root = tmp_path / "solve"
-    dead, kept = root / "proj-1", root / "proj-2"
+    dead, kept = root / "proj-20261021-010101", root / "proj-20261021-020202"  # (as solve names them)
     for run in (dead, kept):
         run.mkdir(parents=True)
         solve.make_workspace(project, run / "a0")

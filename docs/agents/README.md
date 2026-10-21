@@ -280,13 +280,13 @@ The project is touched once, by `Run._finish`, at the end of a run that complete
   - All or nothing: when a file changed in the project since the run started (compared with the start `manifest`), or one is a link in the project or the run, nothing is written; they are listed as `skipped` or `links`, the run's files are kept as described below, and `locals run` exits with status 2.
   - With no check at all, the files the run overwrites are first copied, as they were, to `~/.locals/runs/<project>-YYYYmmdd-HHMMSS/before/` (`report["before"]`).
   - Files keep their line endings and bytes that are not UTF-8 (`solve.read_source`, `solve.write_source`).
-  - Files are written under temporary names (`.{name}.locals-{pid}`) and then renamed, so the project gets all of them or none, unless the process crashes between two renames.
+  - Files are written under temporary names (`.{name}.locals-{pid}`) and then renamed, so the project gets all of them or none, unless the process crashes between two renames. Ctrl-C, SIGTERM and SIGHUP are held while the renames run (`_hold_stops`); a stop that came then takes effect after the last one, and `cmd_run` says the files were written and names them.
   - An existing file keeps its permissions, and a new one gets the run's (a script it made executable).
   - A path that resolves outside the project is refused.
 - **Check failed, in a run that started with a check** (given or detected by `cmd_run`). Nothing is written. The files the run changed are copied to `~/.locals/runs/<project>-YYYYmmdd-HHMMSS/` (`_keep`, with `keep_dir=app.LOCALS_DIR / "runs"`).
 - **Stopped with Ctrl-C, a closed terminal (SIGHUP) or a kill (SIGTERM), or crashed.** The work so far goes to the same folder and the project is not changed. On Ctrl-C, `cmd_run` prints "stopped; the project was not changed" and the folder; on a crash, "locals run failed: ..." and "the project was not changed", without the folder (the work is still kept there).
 
-`_finish` has no delete path, so the harness never deletes a file from the project. Only part files and named data files reach the staging copy. Scratch files that an agent's commands made in its copy are discarded with the copy.
+`_finish` has no delete path, so the harness never deletes a file from the project. Only part files and named data files reach the staging copy. Scratch files that an agent's commands made in its copy are discarded with the copy. A part agent's copy is removed as soon as its files are read (`Run._drop`), so a run holds about one copy per agent at work, not one per agent it ever started. `node_modules` and virtualenvs (folders with `pyvenv.cfg`) are links to the project's own in every copy, at the top and further down (a monorepo's `packages/web/node_modules`).
 
 ## Prompts and the shared prefix
 

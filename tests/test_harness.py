@@ -524,6 +524,7 @@ def test_copies_link_nested_environments(tmp_path):
     """A monorepo's packages/web/node_modules was copied for every agent: a link to the project's, as at the top.
     A source package called env (no pyvenv.cfg) is copied."""
     import os
+    import shutil
 
     root = tmp_path / "p"
     (root / "packages" / "web" / "node_modules" / "left-pad").mkdir(parents=True)
@@ -536,8 +537,12 @@ def test_copies_link_nested_environments(tmp_path):
     nm = d / "packages" / "web" / "node_modules"
     assert nm.is_symlink() and os.path.realpath(nm) == os.path.realpath(root / "packages" / "web" / "node_modules")
     assert (d / "packages" / "web" / "index.js").read_text() == "y" and not (d / "packages" / "env").is_symlink()
-    d2 = run._copy("u", d)  # an agent's copy of the staging copy: the link stays a link
-    assert os.path.realpath(d2 / "packages" / "web" / "node_modules") == os.path.realpath(nm)
+    try:
+        d2 = run._copy("u", d)  # an agent's copy of the staging copy: the link stays a link
+        assert os.path.realpath(d2 / "packages" / "web" / "node_modules") == os.path.realpath(nm)
+    finally:
+        for c in run._copies:
+            shutil.rmtree(c, ignore_errors=True)
 
 
 def test_an_agents_copy_goes_once_its_files_are_read(tmp_path, monkeypatch):
@@ -564,3 +569,42 @@ def test_an_agents_copy_goes_once_its_files_are_read(tmp_path, monkeypatch):
     monkeypatch.setattr(run, "_versions", spy)
     assert run.go()["passed"]
     assert left and all(len(x) == 1 for x in left)  # the staging copy only
+
+
+def test_a_stop_while_the_files_are_renamed_waits_for_the_last(tmp_path, monkeypatch):
+    """Ctrl-C between two renames of the final write left one file written and said the project was not changed."""
+    import os
+    import shutil
+    import signal
+
+    import pytest
+
+    from locals.solve import manifest
+
+    root = tmp_path / "p"
+    root.mkdir()
+    (root / "a.py").write_text("A = 0\n")
+    (root / "b.py").write_text("B = 0\n")
+    run = harness.Run("t", root, "http://x", "m", "true", log=lambda m: None)
+    run._start = manifest(root)
+    run.root = run._copy("stage", root)
+    (run.root / "a.py").write_text("A = 1\n")
+    (run.root / "b.py").write_text("B = 1\n")
+    run.touched = {"a.py", "b.py"}
+    real, sent, before = os.replace, [], signal.getsignal(signal.SIGINT)
+
+    def replace(a, b):
+        real(a, b)
+        if not sent:
+            sent.append(1)
+            os.kill(os.getpid(), signal.SIGINT)
+
+    monkeypatch.setattr(os, "replace", replace)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run._finish(True)
+    finally:
+        for c in run._copies:
+            shutil.rmtree(c, ignore_errors=True)
+    assert (root / "a.py").read_text() == "A = 1\n" and (root / "b.py").read_text() == "B = 1\n"
+    assert run.report["changed"] == ["a.py", "b.py"] and signal.getsignal(signal.SIGINT) is before
