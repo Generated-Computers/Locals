@@ -396,6 +396,19 @@ def run(args) -> dict:
     return summary
 
 
+def _without(argv: list, opt: str) -> list:
+    """``argv`` without ``opt VALUE`` and ``opt=VALUE``."""
+    out, skip = [], False
+    for a in argv:
+        if skip:
+            skip = False
+        elif a == opt:
+            skip = True
+        elif not a.startswith(opt + "="):
+            out.append(a)
+    return out
+
+
 def compare(args, argv=None) -> None:
     """Run both engines in fresh processes (one model in memory at a time) and compare."""
     from rich.console import Console
@@ -405,10 +418,9 @@ def compare(args, argv=None) -> None:
     results = {}
     for engine in ("stock", "locals"):
         given = list(sys.argv[1:] if argv is None else argv)  # this command's own arguments (python -m locals.agents ...)
-        drop = {i + 1 for i, a in enumerate(given) if a == "--engine"}
-        cmd = [sys.executable, "-m", "locals.agents", "--engine", engine, "--summary-json", "-"] + [
-            a for i, a in enumerate(given) if i not in drop and a != "--engine" and not a.startswith("--engine=")]
-        cmd = [c for c in cmd if c != "--engine=both"]
+        # (the user's --summary-json came after ours and won: the runs printed nothing, and the comparison crashed)
+        given = _without(_without(given, "--engine"), "--summary-json")
+        cmd = [sys.executable, "-m", "locals.agents", "--engine", engine, "--summary-json", "-"] + given
         p = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
         if p.returncode != 0:
             console.print(f"[red]{engine} run failed[/]")
@@ -435,6 +447,10 @@ def compare(args, argv=None) -> None:
         tab.add_row(*r)
     tab.caption = f"locals: {a['wall_s'] / b['wall_s']:.2f}x less wall time, {b['tok_per_s'] / a['tok_per_s']:.2f}x the throughput"
     console.print(tab)
+    if args.summary_json == "-":
+        print(json.dumps(results))
+    elif args.summary_json:
+        Path(args.summary_json).write_text(json.dumps(results, indent=1))
 
 
 def main(argv=None):

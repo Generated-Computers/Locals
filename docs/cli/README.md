@@ -509,7 +509,7 @@ Before the agents start, the common prefix of all first prompts (when longer tha
 | `--out` | `agent_runs` | |
 | `--no-exec` | off | |
 | `--quiet` | off | Turns off the live `rich` dashboard. |
-| `--summary-json` | none | `-` prints the summary to stdout. |
+| `--summary-json` | none | `-` prints the summary to stdout. With `--engine both`, the file gets both runs' summaries, `{"stock": ..., "locals": ...}`. |
 
 `run_python` and `run_file` execute model-written code as the current user. The module docstring states that this is not a security sandbox.
 

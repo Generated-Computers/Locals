@@ -242,3 +242,27 @@ def test_a_model_named_thinking_is_its_own_name(server, monkeypatch):
     with pytest.raises(ValueError, match="not qwen3.5-4b"):
         server.check_model("locals/qwen3.5-4b")
 
+
+
+def test_comparing_engines_writes_the_summary_where_asked(tmp_path, monkeypatch):
+    """locals agents --engine both --summary-json out.json: the user's option came after ours and won, so each run
+    printed nothing, and the comparison crashed on an empty line."""
+    import argparse
+    import json
+
+    from locals import agents
+
+    cmds = []
+    one = {"wall_s": 2.0, "tokens_out": 10, "tok_per_s": 5.0, "steps": 3, "finished": 1, "agents": 1, "checked": 0,
+           "passed": 0, "cached_tokens": 0, "prompt_tokens": 1, "errors": 0}
+
+    class Done:
+        returncode, stdout = 0, json.dumps(one) + "\n"
+
+    monkeypatch.setattr(agents.subprocess, "run", lambda cmd, **k: cmds.append(cmd) or Done())
+    out = tmp_path / "out.json"
+    argv = ["--engine", "both", "--summary-json", str(out), "--agents", "1"]
+    agents.compare(argparse.Namespace(agents=1, model="m", summary_json=str(out)), argv)
+    assert all(c.count("--summary-json") == 1 and c[c.index("--summary-json") + 1] == "-" for c in cmds)
+    assert all("--agents" in c and "both" not in c for c in cmds)
+    assert set(json.loads(out.read_text())) == {"stock", "locals"}
