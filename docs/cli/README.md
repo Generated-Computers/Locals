@@ -532,6 +532,7 @@ Variables read by the server process must be set in the environment of the comma
 | Variable | Default | Effect | Where |
 |---|---|---|---|
 | `LOCALS_IGNORE_MEMORY` | unset | Skips the check that the weights plus 2 GB fit in GPU memory. | `defaults.too_big` |
+| `LOCALS_NAX` | on where it runs | `0`: the M5's neural-accelerator kernels (`nax`) are no tuning candidate, and cached `nax` choices are read as MLX's kernel (to compare on the same code). | `nax_kernel.available` |
 | `LOCALS_TUNE` | `auto` (`Runtime`, `lm.patch`); `background` (`BatchService`, which both the server and `locals agents` use) | Kernel autotuning mode: `auto`, `background`, `quick`, `full` or `off`. `background` serves at once on MLX's kernels and tunes while idle. | `runtime.Runtime.__init__`, `lm.patch`, `service.BatchService._run_locals`, `kernels.tune_model` |
 | `LOCALS_TUNE_CACHE` | `~/.cache/locals/tune_v6_<arch>.json` | Path of the tuning results file. | `kernels.py` |
 | `LOCALS_NO_PRESET` | unset | Hides the shipped tuning presets, so the first start behaves as on a GPU without them. | `kernels._preset_path` |

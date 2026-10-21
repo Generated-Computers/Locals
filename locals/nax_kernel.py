@@ -445,9 +445,15 @@ def qmm_nax(x: mx.array, w: mx.array, scales: mx.array, biases: mx.array,
 
 
 def available() -> bool:
-    """Whether this GPU compiles and runs the kernel correctly (checked once on a small case)."""
+    """Whether this GPU compiles and runs the kernel correctly (checked once on a small case). ``LOCALS_NAX=0``: no
+    (to compare tuning and decoding without it on the same code)."""
     global _AVAILABLE
     if _AVAILABLE is None:
+        import os
+
+        if os.environ.get("LOCALS_NAX") == "0":
+            _AVAILABLE = False
+            return False
         try:
             w = mx.random.normal((128, 256), key=mx.random.key(1)).astype(mx.bfloat16)
             wq, sc, bi = mx.quantize(w, group_size=64, bits=4)
