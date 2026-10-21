@@ -189,8 +189,8 @@ The first time, Locals downloads a model that suits your Mac (about 3 GB),
 starts it in the background and opens the OpenCode assistant in your project.
 From then on it starts in seconds. Locals also makes itself OpenCode's default
 model, so plain `opencode` uses it too; `locals disconnect opencode` gives
-OpenCode its own settings back. To remove Locals, run `locals stop`,
-`locals disconnect opencode` and `uv tool uninstall locals`. If you already use the uv package manager,
+OpenCode its own settings back. To update Locals, run the install command again. To remove it, run
+`locals stop`, `locals disconnect opencode` and `uv tool uninstall locals`. If you already use the uv package manager,
 you can install with `uv tool install git+https://github.com/Generated-Computers/Locals`
 instead.
 
