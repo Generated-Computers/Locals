@@ -445,7 +445,9 @@ def _tune_shape(x2, mod, M, K, N, dt, key, tune):
         except OSError:
             marker = None
     try:
-        return _time_shape(x2, mod, M, K, N, dt, key, tune)
+        c = _time_shape(x2, mod, M, K, N, dt, key, tune)
+        _PAD.clear()  # (padding chosen before these timings existed stayed "none" for the life of the process)
+        return c
     finally:
         if marker:
             try:
@@ -1256,7 +1258,7 @@ def tune_model(model, mode: str = "auto", log=None) -> dict:
             warmup(model, range(1, 17))  # the shapes tuned already (a shipped preset): compiled now, checked
             pending = len(pending_work(model))
             log(f"locals: no tuned kernels for this model on {mx.device_info()['architecture']} yet: serving now, and tuning "
-                f"{pending} kernel shapes while the server is idle (cached afterwards). locals stop, then locals tune --model <model>, does the "
+                f"{pending} kernel shapes while the server is idle (cached afterwards). locals stop, then locals tune, does the "
                 f"full procedure at once (10-20 minutes, the best batched throughput).")
             return {"mode": "background", "pending": pending}
         else:
@@ -1265,7 +1267,7 @@ def tune_model(model, mode: str = "auto", log=None) -> dict:
         if pending:  # the quick procedure has work to do
             log(f"locals: tuning the matrix kernels for this model on {mx.device_info()['architecture']}: {pending} kernel "
                 f"shapes, once (cached afterwards; on an M2 Pro 2 minutes for Qwen3.5-4B, 7 for Gemma 4 E4B). "
-                f"For the full procedure, 10-20 minutes and the best batched throughput: locals tune --model <model>")
+                f"For the full procedure, 10-20 minutes and the best batched throughput: locals tune")
     if mode == "quick":
         pretune(model, max_m=16, log=log)
         gdn_model_tune(model, log=log)

@@ -2188,13 +2188,14 @@ def cmd_models(args) -> None:
 def cmd_tune(argv: List[str]) -> None:
     ap = argparse.ArgumentParser(prog="locals tune", description="Autotune the small-batch matrix kernels for a model once; "
                                  "results are cached in ~/.cache/locals and used by every later load.")
-    ap.add_argument("--model", default=DEFAULT_MODEL, type=model_id, help=MODEL_HELP)
+    ap.add_argument("--model", default=None, type=model_id, help=MODEL_HELP + " (default: the model used last)")
     ap.add_argument("--mode", choices=["full", "quick"], default="full", help="full: every batch size up to 32 plus whole-step "
                     "timing (10-20 minutes, best throughput); quick: shapes for batch sizes up to 16 (a few minutes)")
     ap.add_argument("--report", action="store_true", help="then print what was measured: MLX's matrix kernels against the "
                     "chosen ones per batch size, and how prompts are read (for a new GPU: tells where Locals gains)")
     ap.add_argument("--force", action="store_true", help="tune even while a locals server runs (its work skews the timings)")
     a = ap.parse_args(argv)
+    a.model = a.model or _load_saved().get("model") or DEFAULT_MODEL  # (it tuned the default, 10-20 minutes for a model not served)
     check_model(a.model)
     running = _locals_server_pids()
     if running and not a.force:  # tuning times kernels: a server on the same GPU (serving, or tuning while idle) skews

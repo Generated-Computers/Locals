@@ -102,3 +102,37 @@ def test_a_save_a_killed_process_left_is_removed(tmp_path, monkeypatch):
     os.utime(old, (time.time() - 3600, time.time() - 3600))
     kernels._load_tune()
     assert not old.exists() and new.exists()
+
+
+def test_tune_takes_the_model_used_last(monkeypatch):
+    """Plain locals tune spent 10-20 minutes on the default model, not the one served (the server's hint says to
+    run locals tune)."""
+    import pytest
+
+    seen = []
+    monkeypatch.setattr(app, "_load_saved", lambda: {"model": "mlx-community/gemma-4-e4b-it-4bit"})
+    monkeypatch.setattr(app, "check_model", seen.append)
+    monkeypatch.setattr(app, "_locals_server_pids", lambda: [4242])
+    with pytest.raises(SystemExit):
+        app.cmd_tune([])
+    assert seen == ["mlx-community/gemma-4-e4b-it-4bit"]
+
+
+def test_padding_is_chosen_again_once_more_shapes_are_timed(tmp_path, monkeypatch):
+    """The rows to pad to were kept from the first batch, before idle tuning had timed 16 rows: on an M5 the padding
+    gain was lost for the server's whole first session."""
+    monkeypatch.setattr(kernels, "_TUNE_PATH", str(tmp_path / "tune.json"))
+    monkeypatch.setattr(kernels, "_preset_path", lambda: None)
+    monkeypatch.setattr(kernels, "_PAD", {})
+    tune = {"2560x4096x12": ("mlx",), "__times__": {"2560x4096x12": {"mlx": 100.0}}}
+    monkeypatch.setattr(kernels, "_TUNE", tune)
+    assert kernels._pad_rows(2560, 4096, 12, "float16") == 12  # nothing timed above 12 rows yet
+
+    def timed(*a):
+        tune["2560x4096x16"] = ("mlx",)
+        tune["__times__"]["2560x4096x16"] = {"mlx": 80.0}
+        return ("mlx",)
+
+    monkeypatch.setattr(kernels, "_time_shape", timed)
+    kernels._tune_shape(None, None, 16, 4096, 2560, "float16", "2560x4096x16", tune)
+    assert kernels._pad_rows(2560, 4096, 12, "float16") == 16
