@@ -44,7 +44,7 @@ from .defaults import DEFAULT_MODEL, MODEL_HELP, model_id
 
 HOME = Path.home()
 LOCALS_DIR = HOME / ".locals"
-OPENCODE_CONFIG = HOME / ".config" / "opencode" / "opencode.json"
+OPENCODE_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "opencode" / "opencode.json"  # (as OpenCode looks)
 OPENCODE_BIN = HOME / ".opencode" / "bin" / "opencode"
 OPENCODE_VERSION = "1.18.32"  # the version this integration was built and tested against
 DEFAULT_PORT = 8321
@@ -471,15 +471,15 @@ def setup_openclaw(args) -> bool:
               f"it, run  locals setup openclaw  again (or: openclaw config patch --file {path} "
               f"--replace-path models.providers.locals.models)")
         return False
-    state = Path(os.environ.get("OPENCLAW_STATE_DIR") or HOME / ".openclaw")
-    cur = _loads_jsonish((state / "openclaw.json").read_text()) if (state / "openclaw.json").is_file() else None
+    conf = _openclaw_config()
+    cur = _loads_jsonish(conf.read_text()) if conf.is_file() else None
     want = patch["models"]["providers"]["locals"]
     provs = ((cur.get("models") or {}).get("providers") or {}) if isinstance(cur, dict) else {}
     if isinstance(cur, dict) and (provs.get("locals") or {}) == want and not any(n in provs for n in LEGACY) \
             and _openclaw_primary(cur) == patch["agents"]["defaults"]["model"]["primary"]:
         print(f"OpenClaw uses {patch['agents']['defaults']['model']['primary']} at {base_url(args.port)}/v1 already.")
         return True  # set up like this already: `openclaw config patch` takes seconds (minutes on its first start)
-    _back_up_once(state / "openclaw.json", "openclaw")
+    _back_up_once(conf, "openclaw")
     print(f"writing the locals provider into OpenClaw's config ({oc} config patch; its first start can take a few minutes) ...",
           flush=True)
     # locals's provider lists the model the server serves: a setup for another model replaces the
@@ -1078,7 +1078,15 @@ TOOL_NAMES = {"opencode": "OpenCode", "openclaw": "OpenClaw", "hermes": "Hermes 
 
 
 def _openclaw_config() -> Path:
-    return Path(os.environ.get("OPENCLAW_STATE_DIR") or HOME / ".openclaw") / "openclaw.json"
+    """OpenClaw's config, found as OpenClaw finds it: OPENCLAW_CONFIG_PATH, else openclaw.json in OPENCLAW_STATE_DIR,
+    else in .openclaw under OPENCLAW_HOME (or the home folder). (With only the state folder read, the check, the
+    backup and disconnect read another file than the one OpenClaw uses.)"""
+    env = lambda k: (os.environ.get(k) or "").strip()  # noqa: E731
+    if env("OPENCLAW_CONFIG_PATH"):
+        return Path(env("OPENCLAW_CONFIG_PATH")).expanduser()
+    if env("OPENCLAW_STATE_DIR"):
+        return Path(env("OPENCLAW_STATE_DIR")).expanduser() / "openclaw.json"
+    return (Path(env("OPENCLAW_HOME")).expanduser() if env("OPENCLAW_HOME") else HOME) / ".openclaw" / "openclaw.json"
 
 
 def _hermes_config() -> Path:
@@ -1153,7 +1161,9 @@ def connection(tool: str, port: int):
     s = _tool_settings(tool)
     fix = "locals code" if tool == "opencode" else f"locals launch {tool}"
     if s is None:
-        return "needs repair", f"its config cannot be read ({_config_path(tool)})"
+        why = " (locals reads it as plain JSON: comments or trailing commas, as in a .jsonc file, are not read)" \
+            if tool == "opencode" else ""
+        return "needs repair", f"its config cannot be read ({_config_path(tool)}){why}"
     if s.get("legacy") and not s.get("url"):
         return "needs repair", f"it uses Locals under its old name, stcon: {fix} updates it"
     if not s.get("url"):

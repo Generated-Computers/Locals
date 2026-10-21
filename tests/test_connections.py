@@ -529,3 +529,23 @@ def test_aider_gets_the_base_url_over_the_users_own(monkeypatch, tmp_path):
     sets = [argv[i + 1] for i, a in enumerate(argv) if a == "--set-env"]
     assert "OPENAI_BASE_URL=http://127.0.0.1:8321/v1" in sets and "OPENAI_API_BASE=http://127.0.0.1:8321/v1" in sets
 
+
+
+def test_openclaws_config_is_found_as_openclaw_finds_it(tmp_path, monkeypatch):
+    for k in ("OPENCLAW_CONFIG_PATH", "OPENCLAW_STATE_DIR", "OPENCLAW_HOME"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(app, "HOME", tmp_path)
+    assert app._openclaw_config() == tmp_path / ".openclaw" / "openclaw.json"
+    monkeypatch.setenv("OPENCLAW_HOME", str(tmp_path / "oh"))
+    assert app._openclaw_config() == tmp_path / "oh" / ".openclaw" / "openclaw.json"
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path / "state"))
+    assert app._openclaw_config() == tmp_path / "state" / "openclaw.json"
+    monkeypatch.setenv("OPENCLAW_CONFIG_PATH", str(tmp_path / "elsewhere.json"))
+    assert app._openclaw_config() == tmp_path / "elsewhere.json"
+
+
+def test_a_jsonc_opencode_config_says_why_it_cannot_be_read(monkeypatch):
+    monkeypatch.setattr(app, "opencode_bin", lambda: "/x/opencode")
+    _opencode('{"model": "x", // a comment\n}')
+    st, why = app.connection("opencode", 8321)
+    assert st == "needs repair" and "comments" in why

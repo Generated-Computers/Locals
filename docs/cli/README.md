@@ -200,7 +200,7 @@ Local paths are used as-is. Hugging Face repositories are fetched with `snapshot
 | `~/.locals/bench.json` | `cmd_bench` | The speeds `locals bench` measured, by model id, with the chip and the date. Read by `locals models`. |
 | `~/.locals/solve/<project>-<stamp>/` | `solve.cmd_solve` | Runs of `locals solve`. |
 | `~/.locals/runs/` | `harness.cmd_run` | `keep_dir` of `locals run`. |
-| `~/.config/opencode/opencode.json` | `write_config`, `cmd_code` | OpenCode's config. A copy from before Locals is kept beside it as `opencode.json.before-locals`, by the same rules as the other backups. |
+| `~/.config/opencode/opencode.json` (`$XDG_CONFIG_HOME/opencode/opencode.json` when that is set, as OpenCode looks) | `write_config`, `cmd_code` | OpenCode's config. A copy from before Locals is kept beside it as `opencode.json.before-locals`, by the same rules as the other backups. |
 | `~/.opencode/bin/opencode` | `install_opencode` | OpenCode, if Locals installed it. |
 | `~/.local/bin/locals` | `cmd_setup` | Symlink created only for a development checkout when `locals` is not on the `PATH`. |
 | `~/.cache/locals/` | engine and server | Kernel tuning (`tune_v6_<arch>.json`; `tune_v6_<arch>.json.tuning-<pid>` names the shape a process is timing, and one left by a process that died counts as a crash of that shape: `kernels._crashed_shapes`), system-prompt disk cache (`prompts/`), request dumps (`requests/`). See the environment variables below. |
@@ -561,7 +561,7 @@ Variables read by the server process must be set in the environment of the comma
 | `LOCALS_PORT` | unset | The port `chat` and `generate` talk to; `locals --port N chat` sets it. | `client.connect` |
 | `LOCALS_NO_SANDBOX` | unset | `solve.run_shell` does not confine commands with `sandbox-exec`. | `solve.run_shell` |
 | `OPENCLAW_BIN`, `HERMES_BIN`, `AIDER_BIN`, `CLINE_BIN`, `KILO_BIN`, `OPENHANDS_BIN` | `PATH` lookup | Path of that tool's command. | `app.py` (`_tool_bin`) |
-| `OPENCLAW_STATE_DIR` | `~/.openclaw` | Where OpenClaw's `openclaw.json` is backed up from. | `app.setup_openclaw` |
+| `OPENCLAW_CONFIG_PATH`, `OPENCLAW_STATE_DIR`, `OPENCLAW_HOME` | `~/.openclaw/openclaw.json` | Where OpenClaw's config is, found as OpenClaw finds it (the file itself, else `openclaw.json` in the state folder, else `.openclaw` under the OpenClaw home): checked, backed up and restored there. | `app.setup_openclaw` |
 | `HERMES_HOME` | `~/.hermes` | Where Hermes's `config.yaml` is backed up from. | `app.setup_hermes` |
 | `LOCALS_SOURCE` | `locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz` | What `install.sh` installs. | `install.sh` |
 
