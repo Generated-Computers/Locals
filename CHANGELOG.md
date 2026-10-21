@@ -158,4 +158,9 @@ First public release.
   longer holds a server thread; a reply cut at `--max-tokens` is said, and
   `locals generate --schema` then exits 1; OpenClaw's and OpenCode's configs
   are found where those tools look; the installer uses Python 3.12, the
-  version Locals is tested on.
+  version Locals is tested on; a request's own `top_p`, `top_k` and `seed`
+  apply to it (they were ignored), so a seeded request alone gives the same
+  reply; a server tuning kernels while idle waits while another Locals
+  server works, instead of keeping timings taken on a busy GPU; after an MLX
+  upgrade, the kernels this Mac timed are timed again; `solve --plan` no
+  longer stops its last version when the others gave nothing.
