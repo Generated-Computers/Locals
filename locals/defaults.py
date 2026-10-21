@@ -11,7 +11,8 @@ MODELS = {
     "lfm2.5-2.6b": "LiquidAI/LFM2.5-2.6B-MLX-4bit",  # 1.6 GB: 8 GB Macs
     "minicpm5-2b": "mlx-community/MiniCPM5-2B-mlx-4Bit",  # 1.4 GB
     # Recursive's 40B mixture of experts (2.5B active), experts at 3 bits: 17.8 GB, a 24 GB Mac with the GPU limit
-    # raised (too_big says how); Recursive's own 4-bit build (RecursiveSI/flint-int4, 22.6 GB) wants 32 GB or more
+    # raised (too_big says how); Recursive's own 4-bit build (RecursiveSI/flint-int4, 22.6 GB) runs on 16 GB Macs too,
+    # its experts read from its files as tokens need them (models/flint_streamed.py)
     "flint": "mlx-community/flint-mixed-3-4bit",
 }
 
@@ -102,16 +103,86 @@ def cached_snapshot(model: str, allow_patterns) -> "Path | None":
             enable_progress_bars()
 
 
+STREAMED = {"flint"}  # model types with a build whose experts stay in its files (locals/models/flint_streamed.py)
+
+
+def streams(config: dict, expert_dtype: "str | None") -> bool:
+    """Whether a model runs with its experts read from its files as tokens need them (locals/models/flint_streamed.py),
+    from its config.json and the dtype of its experts' weights in the files: Flint's 4-bit build as Recursive exports
+    it (RecursiveSI/flint-int4), experts 4-bit affine in groups of 64, the weights stored as bytes ("U8"). Its
+    experts stay in the files on any Mac (locals/models/flint.py, for mlx-community's builds, does not load bytes)."""
+    if not isinstance(config, dict) or config.get("model_type") not in STREAMED or expert_dtype != "U8":
+        return False
+    q = config.get("quantization")
+    if not isinstance(q, dict) or (q.get("bits"), q.get("group_size"), q.get("mode", "affine")) != (4, 64, "affine"):
+        return False
+    return not any(isinstance(v, dict) and ".switch_mlp" in k and (v.get("bits"), v.get("group_size"), v.get("mode", "affine"))
+                   != (4, 64, "affine") for k, v in q.items())
+
+
+def streamed(path: Path) -> bool:
+    """``streams`` for the model in the folder ``path``; False when it cannot be read."""
+    import json
+    import struct
+
+    try:
+        config = json.loads((path / "config.json").read_text())
+        if not isinstance(config, dict) or config.get("model_type") not in STREAMED:
+            return False
+        for f in sorted(path.glob("*.safetensors")):
+            with open(f, "rb") as fh:
+                header = json.loads(fh.read(struct.unpack("<Q", fh.read(8))[0]))
+            dtype = next((t["dtype"] for n, t in header.items() if ".switch_mlp." in n and n.endswith(".weight")), None)
+            if dtype is not None:
+                return streams(config, dtype)
+        return False
+    except (OSError, ValueError, KeyError, TypeError, struct.error):
+        return False
+
+
+def expert_cache_gb() -> float:
+    """GPU memory for the experts of a streamed model that are kept between passes: LOCALS_EXPERT_CACHE_GB, else
+    40% of what the GPU can use (4.3 GB on a 16 GB Mac). On the M2 Pro (16 GB) with Flint, 4 GB kept 46-51% of
+    the experts a token used, 6 GB 57% (3.2 and 3.3 tokens/s), and 7 GB left macOS too little: 1.1 tokens/s."""
+    import os
+
+    if os.environ.get("LOCALS_EXPERT_CACHE_GB"):
+        return float(os.environ["LOCALS_EXPERT_CACHE_GB"])
+    return 0.4 * (gpu_limit_gb() or 10.0)
+
+
+def _resident_gb(path: Path) -> "float | None":
+    """For a model whose experts stay in its files (``streamed``): what stays in GPU memory, its weights without
+    the experts (from the files' headers) and the expert cache. None for any other model."""
+    import json
+    import struct
+
+    try:
+        if not streamed(path):
+            return None
+        total = 0
+        for f in path.glob("*.safetensors"):
+            with open(f, "rb") as fh:
+                header = json.loads(fh.read(struct.unpack("<Q", fh.read(8))[0]))
+            total += sum(t["data_offsets"][1] - t["data_offsets"][0] for n, t in header.items()
+                         if n != "__metadata__" and ".switch_mlp." not in n)
+        return total / 2**30 + expert_cache_gb()
+    except (OSError, ValueError, KeyError, struct.error):
+        return None
+
+
 def weights_gb(model: str, remote: bool = False) -> "float | None":
     """The model's weights in GB: its local files (a folder, or the Hugging Face cache), else, with
-    ``remote``, the sizes Hugging Face lists. None if unknown."""
+    ``remote``, the sizes Hugging Face lists. None if unknown. A model whose experts stay in its files
+    (``streamed``) counts what stays in GPU memory."""
     path = Path(model).expanduser()
     if not path.exists():
         path = cached_snapshot(model, ["*.json", "*.safetensors"])
     if path is not None:
         files = list(path.glob("*.safetensors"))
         if files:
-            return sum(f.stat().st_size for f in files) / 2**30
+            resident = _resident_gb(path)
+            return resident if resident is not None else sum(f.stat().st_size for f in files) / 2**30
     if not remote:
         return None
     try:
@@ -119,6 +190,15 @@ def weights_gb(model: str, remote: bool = False) -> "float | None":
 
         info = HfApi().model_info(model, files_metadata=True, timeout=10)
         n = sum(s.size or 0 for s in info.siblings or [] if s.rfilename.endswith(".safetensors") and "/" not in s.rfilename)
+        listed = getattr(getattr(info, "safetensors", None), "parameters", None) or {}
+        if n and (getattr(info, "config", None) or {}).get("model_type") in STREAMED and "U32" not in listed:
+            import json
+
+            from huggingface_hub import hf_hub_download
+
+            # (no weights listed in MLX's 32-bit words: Recursive's bytes, which Hugging Face does not count)
+            if streams(json.loads(Path(hf_hub_download(model, "config.json")).read_text()), "U8"):
+                return 1.5 + expert_cache_gb()  # (its weights without the experts, about 1.3 GB for Flint at 4 bits)
         return n / 2**30 if n else None
     except Exception:  # noqa: BLE001
         return None

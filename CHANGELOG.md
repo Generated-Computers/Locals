@@ -65,6 +65,12 @@
   tuning entries of their own (`…xbfloat16flint`): every other model's layers, of the same shapes too, keep their
   kernels, timings and choices. Flint: 317 tokens/s at 8 at once instead
   of 302, 352 at 16 instead of 339, 227 at 4 instead of 224; through the server, 305 at 8 clients.
+- Recursive's own 4-bit build of Flint (RecursiveSI/flint-int4, 22.6 GB) runs on a 16 GB Mac: the GPU holds its
+  weights without the experts (1.2 GB) and slots for recently used experts (40% of GPU memory), and the rest are
+  read from the weight files as tokens need them (locals/models/flint_streamed.py, which loads that build on any
+  Mac; mlx-community's builds load whole as before). On the M2 Pro: about 4 tokens per second, a 6,000-token prompt
+  read in 19 s, and OpenCode fixed a bug in a small project with it.
+- A model can set its own prompt passes (HybridBatchEngine.prefill_tokens).
 
 ## 0.2.1 (2026-10-21)
 

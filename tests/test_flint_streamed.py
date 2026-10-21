@@ -1,0 +1,200 @@
+"""Flint (locals/models/flint_streamed.py) on a tiny random model saved as the INT4 build saves it: 4-bit weights as bytes,
+experts stacked per layer. Its experts are read from the files (ExpertStore); these tests check that they give
+what the experts computed in memory give, that decoding with caches gives what one pass over the prompt gives,
+and that the attention sinks are a logit in the softmax's denominator."""
+import json
+
+import mlx.core as mx
+import numpy as np
+import pytest
+
+from locals import models
+
+models.register()
+from locals.models import flint_streamed as flint  # noqa: E402
+
+
+
+def test_only_recursives_4bit_build_loads_with_its_experts_in_its_files():
+    """defaults.streams: Flint's 4-bit build as Recursive exports it (weights as bytes) streams on any Mac; a build
+    in MLX's 32-bit words (mlx-community's, its experts at 3 bits or not) loads whole (locals/models/flint.py)."""
+    from locals.defaults import streams
+
+    mixed = {**CFG, "quantization": {"bits": 4, "group_size": 64, "model.layers.1.mlp.switch_mlp.gate_proj": {"bits": 3, "group_size": 64}}}
+    assert streams(CFG, "U8")
+    assert not streams(CFG, "U32") and not streams(mixed, "U8") and not streams(mixed, "U32")
+    assert not streams({**CFG, "quantization": {"bits": 3, "group_size": 64}}, "U8")
+    assert not streams({**CFG, "model_type": "qwen3_moe"}, "U8")
+
+
+def test_a_flint_folder_loads_the_module_its_build_needs(tmp_path, monkeypatch):
+    """mlx-lm's load_model (locals.models.register) takes flint_streamed for the 4-bit build's bytes, and the memory
+    check counts its weights without the experts; any other Flint folder is mlx-lm's to load (locals/models/flint.py)."""
+    import mlx_lm.utils as mlx_utils
+    from locals.defaults import streamed, weights_gb
+
+    _save(tmp_path)
+    assert streamed(tmp_path)
+    model, _ = mlx_utils.load_model(tmp_path)
+    assert type(model) is flint.Model and model.expert_store is not None
+    monkeypatch.setenv("LOCALS_EXPERT_CACHE_GB", "0")
+    files = sum(f.stat().st_size for f in tmp_path.glob("*.safetensors")) / 2**30
+    assert weights_gb(str(tmp_path)) < files
+    cfg = json.loads((tmp_path / "config.json").read_text())
+    (tmp_path / "config.json").write_text(json.dumps({**cfg, "quantization": {"bits": 3, "group_size": 64}}))
+    assert not streamed(tmp_path) and weights_gb(str(tmp_path)) == files
+
+CFG = {
+    "model_type": "flint", "architectures": ["FlintForCausalLM"], "hidden_size": 128, "num_hidden_layers": 4,
+    "intermediate_size": 128, "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 32,
+    "rms_norm_eps": 1e-6, "vocab_size": 96, "num_experts": 8, "num_experts_per_tok": 2,
+    "moe_intermediate_size": 64, "shared_expert_intermediate_size": 64,
+    "layer_types": ["full_attention", "sliding_attention", "sliding_attention", "full_attention"],
+    "no_rope_layer_indices": [0, 3], "mlp_only_layers": [0], "sliding_window": 5, "rope_theta": 10000.0,
+    "quantization": {"bits": 4, "group_size": 64},
+}
+
+
+def _q(w, bits=4):
+    wq, s, b = mx.quantize(w, group_size=64, bits=bits)
+    return wq.view(mx.uint8), s.astype(mx.bfloat16), b.astype(mx.bfloat16)
+
+
+def _save(folder):
+    """Random weights in the INT4 build's layout; returns the dense expert weights for a reference."""
+    rng = np.random.default_rng(0)
+    r = lambda *s: mx.array(rng.normal(0, 0.08, s).astype(np.float32))  # noqa: E731
+    w, D, H, KV, d = {}, 128, 4, 2, 32
+
+    def lin(name, out, inp, bits=4):
+        w[f"{name}.weight"], w[f"{name}.scales"], w[f"{name}.biases"] = _q(r(out, inp), bits)
+
+    lin("model.embed_tokens", 96, D, bits=8)
+    lin("lm_head", 96, D)
+    w["model.norm.weight"] = mx.ones((D,), dtype=mx.bfloat16)
+    for i in range(4):
+        p = f"model.layers.{i}"
+        for n, o, k in (("q_proj", H * d, D), ("k_proj", KV * d, D), ("v_proj", KV * d, D), ("o_proj", D, H * d)):
+            lin(f"{p}.self_attn.{n}", o, k)
+        w[f"{p}.self_attn.q_norm.weight"] = (1 + r(d)).astype(mx.bfloat16)
+        w[f"{p}.self_attn.k_norm.weight"] = (1 + r(d)).astype(mx.bfloat16)
+        w[f"{p}.self_attn.softmax_offset"] = r(H).astype(mx.bfloat16) * 10
+        w[f"{p}.input_layernorm.weight"] = mx.ones((D,), dtype=mx.bfloat16)
+        w[f"{p}.post_attention_layernorm.weight"] = mx.ones((D,), dtype=mx.bfloat16)
+        if i == 0:
+            lin(f"{p}.mlp.gate_proj", 128, D), lin(f"{p}.mlp.up_proj", 128, D), lin(f"{p}.mlp.down_proj", D, 128)
+            continue
+        w[f"{p}.mlp.gate.weight"] = r(8, D).astype(mx.bfloat16) * 5
+        for n, o, k in (("gate_proj", 64, D), ("up_proj", 64, D), ("down_proj", D, 64)):
+            lin(f"{p}.mlp.shared_expert.{n}", o, k)
+            stack = [_q(r(o, k)) for _ in range(8)]
+            for j, kind in enumerate(("weight", "scales", "biases")):
+                w[f"{p}.mlp.switch_mlp.{n}.{kind}"] = mx.stack([s[j] for s in stack])
+    half = len(w) // 2
+    names = sorted(w)
+    mx.save_safetensors(str(folder / "model-00000.safetensors"), {n: w[n] for n in names[:half]})
+    mx.save_safetensors(str(folder / "model-00001.safetensors"), {n: w[n] for n in names[half:]})
+    (folder / "config.json").write_text(json.dumps(CFG))
+    return w
+
+
+@pytest.fixture(scope="module")
+def tiny(tmp_path_factory):
+    import mlx_lm.utils as mlx_utils
+
+    folder = tmp_path_factory.mktemp("flint")
+    w = _save(folder)
+    model, _ = mlx_utils.load_model(folder)
+    return model, w
+
+
+def _in_memory(model, w):
+    """What the experts give computed in memory from the stacked tensors (mlx-lm's SwitchGLU way)."""
+
+    def call(self, x, inds):
+        p = f"model.layers.{self.layer}.mlp.switch_mlp"
+        t = lambda n, k: w[f"{p}.{n}.{k}"]  # noqa: E731
+        conv = lambda n: (t(n, "weight").view(mx.uint32), t(n, "scales").astype(x.dtype), t(n, "biases").astype(x.dtype))  # noqa: E731
+        xx = mx.expand_dims(x, (-2, -3))
+        qmm = lambda a, n: mx.gather_qmm(a, *conv(n), rhs_indices=inds, transpose=True, group_size=64, bits=4)  # noqa: E731
+        return qmm(flint.swiglu(qmm(xx, "gate_proj"), qmm(xx, "up_proj")), "down_proj").squeeze(-2)
+
+    return call
+
+
+def test_streamed_experts_give_what_the_experts_in_memory_give(tiny, monkeypatch):
+    model, w = tiny
+    tokens = mx.array([[3, 17, 42, 5, 88, 9, 61, 2, 33]])
+    streamed = model(tokens)
+    monkeypatch.setattr(flint.StreamedExperts, "__call__", _in_memory(model, w))
+    full = model(tokens)
+    assert mx.allclose(streamed, full, atol=1e-4).item()
+    store = model.expert_store
+    assert store.misses > 0 and store.bytes > 0  # experts were read from the files and kept
+
+
+def test_decoding_with_caches_gives_what_one_pass_gives(tiny):
+    """Past the sliding window (5): the rotating caches of the sliding layers and the full ones of the others."""
+    model, _ = tiny
+    tokens = mx.array([[3, 17, 42, 5, 88, 9, 61, 2, 33, 70, 11, 4]])
+    one_pass = model(tokens)[0, -1]
+    cache = model.make_cache()
+    model(tokens[:, :6], cache=cache)
+    for t in range(6, 12):
+        last = model(tokens[:, t:t + 1], cache=cache)[0, -1]
+    assert mx.allclose(last, one_pass, atol=2e-3).item()
+
+
+def test_the_sink_is_a_logit_in_the_softmax_denominator(tiny):
+    model, _ = tiny
+    attn = model.model.layers[0].self_attn  # a full-attention layer without RoPE
+    x = mx.random.normal((1, 4, 128), key=mx.random.key(1))
+    got = attn(x, mask="causal")
+    B, L, H, KV, d = 1, 4, 4, 2, 32
+    q = attn.q_norm(attn.q_proj(x).reshape(B, L, H, d)).transpose(0, 2, 1, 3)
+    k = attn.k_norm(attn.k_proj(x).reshape(B, L, KV, d)).transpose(0, 2, 1, 3)
+    v = attn.v_proj(x).reshape(B, L, KV, d).transpose(0, 2, 1, 3)
+    k, v = mx.repeat(k, H // KV, axis=1), mx.repeat(v, H // KV, axis=1)
+    s = (q @ k.transpose(0, 1, 3, 2)) * d ** -0.5
+    s = mx.where(mx.tril(mx.ones((L, L))).astype(mx.bool_), s, -mx.inf)
+    sink = attn.softmax_offset.reshape(1, H, 1, 1).astype(s.dtype)
+    m = mx.maximum(s.max(axis=-1, keepdims=True), sink)
+    e = mx.exp(s - m)
+    p = e / (e.sum(axis=-1, keepdims=True) + mx.exp(sink - m))
+    want = attn.o_proj((p @ v).transpose(0, 2, 1, 3).reshape(B, L, -1))
+    assert mx.allclose(got, want, atol=1e-3).item()
+
+
+def test_few_slots_evict_without_losing_the_experts_a_pass_uses(tiny, monkeypatch):
+    """With 3 slots a layer (a token uses 2 of 8 experts), decoding evicts the least recently used slot a pass
+    does not need; a pass that needs more experts than there are slots stacks them. Both give what the experts
+    in memory give."""
+    model, w = tiny
+    store = model.expert_store
+    monkeypatch.setattr(store, "slots", 3)
+    store.dtype = None  # (start over: the earlier tests made slots of the default size)
+    tokens = mx.array([[3, 17, 42, 5, 88, 9, 61, 2, 33]])
+    cache = model.make_cache()
+    got = [model(tokens[:, i:i + 1], cache=cache)[0, -1] for i in range(9)]
+    misses = store.misses
+    many = model(tokens)  # 9 tokens: up to 8 experts a layer, more than its 3 slots
+    assert all(a.shape[0] == 3 for a in store.arrays[1])
+    assert store.misses > misses
+    monkeypatch.setattr(flint.StreamedExperts, "__call__", _in_memory(model, w))
+    cache = model.make_cache()
+    want = [model(tokens[:, i:i + 1], cache=cache)[0, -1] for i in range(9)]
+    assert all(mx.allclose(a, b, atol=1e-4).item() for a, b in zip(got, want))
+    assert mx.allclose(many, model(tokens), atol=1e-4).item()
+
+
+def test_a_pass_that_needs_most_experts_reads_the_layers_tensors_whole(tiny, monkeypatch):
+    """Reading a prompt routes its tokens to most of a layer's experts: the layer's stacked tensors are read
+    whole (and the next layer's warmed) instead of expert by expert, with the same result."""
+    model, w = tiny
+    tokens = mx.array([[3, 17, 42, 5, 88, 9, 61, 2, 33, 70, 11, 4]])
+    monkeypatch.setattr(flint, "WHOLE", 1)
+    read = []
+    monkeypatch.setattr(flint.ExpertStore, "stacked", lambda *a: read.append(a) or pytest.fail("read expert by expert"))
+    whole = model(tokens)
+    monkeypatch.setattr(flint.StreamedExperts, "__call__", _in_memory(model, w))
+    assert mx.allclose(whole, model(tokens), atol=1e-4).item()

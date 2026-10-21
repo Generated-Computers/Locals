@@ -377,12 +377,14 @@ class DiskPromptCache:
             return 0
 
 
-def prefill_chunk(done: int, rows: int = 1, base: int = 2048, scores: int = PREFILL_SCORES) -> int:
-    """Tokens of the next prefill chunk after ``done`` cached positions."""
+def prefill_chunk(done: int, rows: int = 1, base: int = 2048, scores: Optional[int] = PREFILL_SCORES,
+                  tokens: int = PREFILL_TOKENS) -> int:
+    """Tokens of the next prefill chunk after ``done`` cached positions (``scores`` and ``tokens``: a model's
+    own limits, see HybridBatchEngine.__init__; ``scores`` None: no bound on a chunk's scores)."""
     c = base
-    while c > 128 and rows * c * (done + c) > scores:
+    while scores is not None and c > 128 and rows * c * (done + c) > scores:
         c //= 2
-    while c > 16 and rows * c > PREFILL_TOKENS:
+    while c > 16 and rows * c > tokens:
         c //= 2
     return c
 
@@ -461,6 +463,11 @@ class HybridBatchEngine(BatchEngine):
         self.lm = text_model(model)
         self._prefill_scores = getattr(self.lm, "prefill_scores", PREFILL_SCORES)
         self._prefill_base = getattr(self.lm, "prefill_chunk_tokens", 1024)  # a prompt's chunk where it may be longest
+        # A model may set its own prompt passes: Flint's 4-bit build with its experts in their files reads every expert
+        # of a layer for each pass over a prompt (locals/models/flint_streamed.py), whatever its length, so it takes few
+        # long passes; its attention is fused, with no score matrix for PREFILL_SCORES to bound (None).
+        self.prefill_tokens = getattr(self.lm, "prefill_tokens", None)
+        self._prefill_cap = max(PREFILL_TOKENS, self.prefill_tokens or 0)
         # GPU bytes the engine may use (0: no guard). Before a prefill, prompt-cache
         # entries are dropped if the prefill would not fit next to them.
         self.memory_limit = 0
@@ -766,7 +773,7 @@ class HybridBatchEngine(BatchEngine):
         base = next((c._idx for c in cache if isinstance(c, BatchKVCache)), 0)  # positions already in the batch cache
         i = 0
         while i < L:
-            n = prefill_chunk(done + i, len(prompts), chunk, self._prefill_scores)
+            n = prefill_chunk(done + i, len(prompts), self.prefill_tokens or chunk, self._prefill_scores, self._prefill_cap)
             a0 = mx.get_active_memory()
             _reset_peak()
             self.lm.model(x[:, i : i + n], cache)
@@ -789,7 +796,7 @@ class HybridBatchEngine(BatchEngine):
         False if ``stop()`` (asked between chunks) gave it up."""
         done, i = _cached(cache), 0
         while i < len(toks):
-            n = prefill_chunk(done + i, 1, chunk, self._prefill_scores)
+            n = prefill_chunk(done + i, 1, self.prefill_tokens or chunk, self._prefill_scores, self._prefill_cap)
             a0 = mx.get_active_memory()
             _reset_peak()
             self.lm.model(mx.array([toks[i : i + n]]), cache)
