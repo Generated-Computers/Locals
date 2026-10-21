@@ -32,6 +32,7 @@ class Compiled:
     constraint: object  # CompiledConstraint, or pda.PDAConstraint for a recursive schema
     planner: ForcedPlanner
     recursive: bool = False
+    key: Optional[tuple] = None  # (Runtime.compile's cache key, set by precompile)
 
     def controller(self, use_forced: bool = True, canonical: bool = True):
         if self.recursive:
@@ -39,6 +40,23 @@ class Compiled:
 
             return PDAController(self.constraint, self.planner, use_forced=use_forced, canonical=canonical)
         return LocalsController(self.constraint, self.planner, use_forced=use_forced, canonical=canonical)
+
+
+class Refused:
+    """A grammar that does not compile, as precompile hands it to compile: its error's message only, raised anew
+    each time. (The error itself, kept and raised again, collected the frames of every request that raised it, and
+    with them their prompts and grammars.)"""
+
+    __slots__ = ("message",)
+
+    def __init__(self, message: str):
+        self.message = message
+
+    def raise_(self):
+        raise ValueError(self.message) from None
+
+
+RECURSIVE = "JSON schemas that refer to themselves ($ref on a cycle, as in a tree) are not supported by the server"
 
 
 def _prepare_device_tables(c) -> None:
@@ -265,8 +283,12 @@ class Runtime:
         self.max_compiled = int(os.environ.get("LOCALS_MAX_COMPILED", "16"))
         import threading
 
-        # made by precompile in another thread, for compile to take (or the error it raised)
-        self._precompiled: "OrderedDict[tuple, object]" = OrderedDict()
+        import weakref
+
+        # grammars precompile made and a request still carries (another request for the same one finds it), and the
+        # messages of grammars that did not compile (the same one fails the same way: at once, the next time)
+        self._made: "weakref.WeakValueDictionary[tuple, Compiled]" = weakref.WeakValueDictionary()
+        self._refused: "OrderedDict[tuple, str]" = OrderedDict()
         self._pre_lock = threading.Lock()
         # Radix trie of previously fed token sequences -> KV (mlx-lm's LRU
         # prompt cache). Our KV caches never mutate arrays in place, so a hit
@@ -280,9 +302,17 @@ class Runtime:
         model, tok = mlx_load(model_id(path))  # short names too: "qwen", "gemma"
         return cls(model, tok, **kw)
 
-    def compile(self, schema: Optional[Union[dict, str]] = None, regex: Optional[str] = None, whitespace: str = "") -> Compiled:
-        key = self._key(schema, regex, whitespace)
+    def compile(self, schema: Optional[Union[dict, str]] = None, regex: Optional[str] = None, whitespace: str = "",
+                ready=None, recursive_ok: bool = True) -> Compiled:
+        """The grammar of ``schema`` or ``regex``, with its tables on the GPU. ``ready``: what precompile gave for
+        it (the grammar made, or its refusal). ``recursive_ok=False``: a recursive schema is refused (the batch
+        engine runs none) before anything is compiled."""
+        if isinstance(ready, Refused):
+            ready.raise_()
+        key = ready.key if isinstance(ready, Compiled) and ready.key is not None else self._key(schema, regex, whitespace)
         if key[0] == "pda":
+            if not recursive_ok:
+                raise ValueError(RECURSIVE)
             # Recursive schemas (a $ref on a cycle) get a pushdown automaton
             # (locals/pda.py) instead of a depth-unrolled regex.
             c = self._cget(key)
@@ -296,40 +326,69 @@ class Runtime:
             return c
         c = self._cget(key)
         if c is None:
-            with self._pre_lock:
-                c = self._precompiled.get(key)
-                if isinstance(c, ValueError):
-                    raise c  # (kept: the same grammar fails the same way)
-                self._precompiled.pop(key, None)
+            c = ready if isinstance(ready, Compiled) else self._ready(key, True)
+            if isinstance(c, Refused):
+                c.raise_()
             if c is None:
-                c = self._host_compile(key[1])
+                c = self._made_now(key)
             self._cput(key, c)
             _prepare_device_tables(c)
         return c
 
-    def precompile(self, schema: Optional[Union[dict, str]] = None, regex: Optional[str] = None, whitespace: str = "") -> None:
-        """compile's host work (the automaton, its token table, and the tables decoding derives from them:
-        numpy, seconds for a large grammar) in the caller's thread; compile then only copies the tables to the
-        GPU. The batch engine calls it before a request enters the batch loop, where it stopped every running
-        reply meanwhile. A grammar that does not compile keeps its error, for compile to raise at once."""
+    def ready(self, schema: Optional[Union[dict, str]] = None, regex: Optional[str] = None, whitespace: str = "",
+              recursive_ok: bool = True):
+        """What precompile would give without compiling anything: the grammar if it is made (kept, or made for
+        another request), its refusal (Refused), or None."""
         try:
             key = self._key(schema, regex, whitespace)
-        except Exception:  # noqa: BLE001  # (compile raises it again, at once)
-            return
-        if key[0] != "regex" or key in self._compiled:
-            return
+        except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as e:  # (a schema that cannot be read)
+            return Refused(str(e) or type(e).__name__)
+        return self._ready(key, recursive_ok)
+
+    def precompile(self, schema: Optional[Union[dict, str]] = None, regex: Optional[str] = None, whitespace: str = "",
+                   recursive_ok: bool = True):
+        """compile's host work (the automaton, its token table, and the tables decoding derives from them: numpy,
+        seconds for a large grammar) in the caller's thread. Returns the grammar, for the request to carry to
+        compile (which then only copies its tables to the GPU), or its refusal (Refused); None for a recursive
+        schema, which compile makes itself. The batch engine calls it before a request enters the batch loop, where
+        it stopped every running reply meanwhile."""
+        r = self.ready(schema, regex, whitespace, recursive_ok)
+        if r is not None:
+            return r
+        key = self._key(schema, regex, whitespace)
+        if key[0] != "regex":
+            return None
+        try:
+            c = self._made_now(key)
+        except ValueError as e:
+            return Refused(str(e))
+        _prepare_host_tables(c)
+        return c
+
+    def _ready(self, key: tuple, recursive_ok: bool):
+        if key[0] == "pda" and not recursive_ok:
+            return Refused(RECURSIVE)
+        c = self._compiled.get(key)
+        if c is not None:
+            return c
         with self._pre_lock:
-            if key in self._precompiled:
-                return
+            msg = self._refused.get(key)
+            return Refused(msg) if msg is not None else self._made.get(key)
+
+    def _made_now(self, key: tuple) -> Compiled:
+        """The grammar of a regex key made now; a refusal is remembered (its message) and raised."""
         try:
             c = self._host_compile(key[1])
-            _prepare_host_tables(c)
-        except ValueError as e:  # (an invalid or too large grammar; anything else is left for compile)
-            c = e
+        except ValueError as e:
+            with self._pre_lock:
+                self._refused[key] = str(e)
+                while len(self._refused) > 64:
+                    self._refused.popitem(last=False)
+            raise ValueError(str(e)) from None
+        c.key = key
         with self._pre_lock:
-            self._precompiled[key] = c
-            while len(self._precompiled) > 4:  # (a request cancelled before compile took its grammar)
-                self._precompiled.popitem(last=False)
+            self._made[key] = c
+        return c
 
     def _key(self, schema, regex: Optional[str], whitespace: str = "") -> tuple:
         """compile's cache key: ("regex", the regex), or ("pda", the schema's text) for a recursive schema."""

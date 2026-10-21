@@ -127,10 +127,14 @@ def test_lossless_planner_holds_back_last_block(tok, setup):
 
 
 def test_precompile_does_the_host_work_for_compile(tok, setup, monkeypatch):
-    """The batch engine makes a grammar's host tables outside its loop (Runtime.precompile, in the request's
-    thread); compile then only copies them to the GPU, and a grammar that failed fails at once."""
+    """The batch engine makes a grammar's host tables outside its loop (Runtime.precompile, in a compile thread)
+    and the request carries the result to compile, which then only copies the tables to the GPU: a grammar
+    evicted from the cache meanwhile is not made again in the loop. A refusal is kept as its message only (the
+    error itself, raised again and again, held the frames of every request that raised it)."""
+    import gc
     import threading
     import types
+    import weakref
     from collections import OrderedDict
 
     from locals import runtime
@@ -139,16 +143,38 @@ def test_precompile_does_the_host_work_for_compile(tok, setup, monkeypatch):
     vocab, trie = setup
     rt = runtime.Runtime.__new__(runtime.Runtime)
     rt.vocab, rt.trie, rt.tokenizer = vocab, trie, types.SimpleNamespace(_tokenizer=tok)
-    rt._compiled, rt.max_compiled, rt._precompiled, rt._pre_lock = OrderedDict(), 16, OrderedDict(), threading.Lock()
-    rt.precompile(SCHEMA)
-    rt.precompile(regex="(")
-    (key, pre), (bad_key, bad) = rt._precompiled.items()
-    assert ("T_host", id(pre.constraint)) in _TABLES and isinstance(bad, ValueError)
+    rt._compiled, rt.max_compiled, rt._pre_lock = OrderedDict(), 16, threading.Lock()
+    rt._made, rt._refused = weakref.WeakValueDictionary(), OrderedDict()
+    pre = rt.precompile(SCHEMA)
+    assert isinstance(pre, runtime.Compiled) and ("T_host", id(pre.constraint)) in _TABLES
+    assert rt.ready(SCHEMA) is pre and rt.precompile(SCHEMA) is pre  # (a second request finds it: made once)
     built = []
     monkeypatch.setattr(runtime, "compile_constraint", lambda *a, **k: built.append(a))
-    c = rt.compile(SCHEMA)
+    c = rt.compile(SCHEMA, ready=pre)
     assert c is pre and rt.compile(SCHEMA) is c and not built  # (not made again in the batch loop)
-    assert key not in rt._precompiled and ("T_host", id(c.constraint)) not in _TABLES  # (the GPU's copy is kept)
-    with pytest.raises(ValueError) as e:
-        rt.compile(regex="(")
-    assert e.value is bad and not built
+    assert ("T_host", id(c.constraint)) not in _TABLES  # (the GPU's copy is kept)
+    rt._compiled.clear()  # evicted before the request reached the loop: what it carries is used
+    assert rt.compile(SCHEMA, ready=pre) is pre and not built
+    monkeypatch.undo()
+
+    bad = rt.precompile(regex="(")
+    assert isinstance(bad, runtime.Refused) and list(rt._refused.values()) == [bad.message]
+
+    class Job:  # stands for what the batch loop's frame holds when compile raises
+        pass
+
+    held = []
+    for _ in range(20):
+        job = Job()
+        held.append(weakref.ref(job))
+        try:
+            rt.compile(regex="(", ready=rt.ready(regex="("))
+        except ValueError as e:
+            assert str(e) == bad.message
+        del job
+    gc.collect()
+    assert not any(r() for r in held)  # (no request is kept alive by the refusal)
+    tree = {"type": "object", "properties": {"kids": {"type": "array", "items": {"$ref": "#"}}}}
+    assert isinstance(rt.precompile(tree, recursive_ok=False), runtime.Refused)
+    with pytest.raises(ValueError, match="refer to themselves"):
+        rt.compile(tree, recursive_ok=False)

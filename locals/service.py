@@ -137,6 +137,9 @@ _SERVICES: "weakref.WeakSet" = weakref.WeakSet()  # the engines of this process 
 _POOL_PLANNED = False  # our engine sized MLX's pool of freed buffers (memory_plan): the stock engine keeps it
 
 
+_REQUEST_ERRORS = (ValueError, TypeError, KeyError, AttributeError, RecursionError)  # (a schema or regex that cannot be read)
+
+
 def _reason(e: BaseException) -> str:
     """A request's error as the client reads it: a ValueError's message says what is wrong (the grammar
     compilers' own say which part of the schema); anything else is named."""
@@ -199,14 +202,23 @@ class BatchService:
         return job
 
     def _compile_then_queue(self, rt, job: "Job") -> None:
+        """The job's grammar made (or found made, or refused) for it to carry into the batch loop, then the job
+        queued. Only a grammar not made yet waits for the compile lock (one at a time: each holds its token table
+        while it is made); a cancel meanwhile skips it."""
         try:
-            with self._compile_lock:  # (one at a time: each holds its token table while it is made)
-                if not job.cancelled:
-                    rt.precompile(job.schema, job.regex)
-        except Exception:  # noqa: BLE001  # (compile in the batch loop raises it again: this request's error)
+            ready = rt.ready(job.schema, job.regex, recursive_ok=False)
+            if ready is None and not job.cancelled:
+                with self._compile_lock:
+                    if not job.cancelled:
+                        ready = rt.precompile(job.schema, job.regex, recursive_ok=False)
+            job._ready = ready
+        except Exception:  # noqa: BLE001  # (compile in the batch loop does it again: this request's error)
             pass
         finally:
-            self._q.put(job)
+            if self._closed:  # (the batch loop has stopped: the job would wait forever)
+                self._finish(job, [], "error: the server is shutting down")
+            else:
+                self._q.put(job)
 
     def prime(self, tokens: List[int]) -> None:
         """Prefill ``tokens`` once and store them in the prompt cache (e.g. the
@@ -397,6 +409,9 @@ class BatchService:
                             lru.insert_cache("locals", list(job.prompt), c, cache_type="system")
                         self._finish(job, [], "primed")
                         continue
+                    if job.cancelled and (job.schema is not None or job.regex is not None):
+                        self._finish(job, [], "cancelled")  # (gone while its grammar was made: nothing to compile)
+                        continue
                     if job.schema is not None or job.regex is not None:
                         if self.walk:
                             from .walk import WalkController
@@ -404,14 +419,16 @@ class BatchService:
                             wc, planner = rt.compile_walk(job.schema) if job.regex is None else rt.compile_walk(regex=job.regex)
                             ctl = WalkController(wc, planner, True, True)
                         else:
-                            c = rt.compile(job.schema) if job.regex is None else rt.compile(regex=job.regex)
-                            if getattr(c, "recursive", False):
-                                raise ValueError("recursive JSON schemas ($ref cycles) are not supported by the batch engine")
+                            c = rt.compile(job.schema, regex=job.regex, ready=getattr(job, "_ready", None), recursive_ok=False)
+                            job._ready = None
                             ctl = LocalsController(c.constraint, c.planner, True, True)
                     else:
                         ctl = Endless() if job.ignore_eos else Free()
-                except Exception as e:  # noqa: BLE001
+                except _REQUEST_ERRORS as e:  # the request's grammar: a 400
                     self._finish(job, [], f"invalid: {_reason(e)}")
+                    continue
+                except Exception as e:  # noqa: BLE001  # the engine's (a Metal error making the tables): a 500, retried once
+                    self._finish(job, [], f"error: {e!r}")
                     continue
                 r = Request(job.prompt, ctl, job.max_tokens)
                 r.on_token = job.on_token

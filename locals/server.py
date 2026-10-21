@@ -1434,10 +1434,12 @@ def make_handler(server: Server, ollama_root: bool = False):
             except Exception as e:  # noqa: BLE001  # mid-stream: an error line and a clean end
                 import traceback
 
-                traceback.print_exc()
+                bad = isinstance(e, BadRequest)  # (the request's own fault: its message, no traceback)
+                if not bad:
+                    traceback.print_exc()
                 server.errors += 1
                 try:
-                    write((json.dumps({"error": f"{type(e).__name__}: {e}"}) + "\n").encode())
+                    write((json.dumps({"error": str(e) if bad else f"{type(e).__name__}: {e}"}) + "\n").encode())
                     self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
                 except Exception:  # noqa: BLE001  # the client is gone
@@ -1603,10 +1605,13 @@ def make_handler(server: Server, ollama_root: bool = False):
             except Exception as e:  # noqa: BLE001
                 import traceback
 
-                traceback.print_exc()
+                bad = isinstance(e, BadRequest)  # (the request's own fault: its message, no traceback)
+                if not bad:
+                    traceback.print_exc()
                 server.errors += 1
+                msg = str(e) if bad else f"{type(e).__name__}: {e}"
                 try:
-                    out.feed(f"data: {json.dumps({'error': {'message': f'{type(e).__name__}: {e}'}})}\n\n".encode())
+                    out.feed(f"data: {json.dumps({'error': {'message': msg}})}\n\n".encode())
                     out.close()
                     self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
@@ -1732,8 +1737,9 @@ def make_handler(server: Server, ollama_root: bool = False):
                         self._error(msg, 400 if bad else 500)
                     else:  # mid-stream: an error event and a clean end, not a second HTTP response
                         server.errors += 1
-                        server.log(f"500 POST {path} (after the stream began): {msg[:200]}")
-                        err = json.dumps({"error": {"message": msg, "type": "server_error", "param": None, "code": None}})
+                        server.log(f"{400 if bad else 500} POST {path} (after the stream began): {msg[:200]}")
+                        err = json.dumps({"error": {"message": msg, "type": "invalid_request_error" if bad else "server_error",
+                                                    "param": None, "code": None}})
                         write(f"data: {err}\n\n".encode())
                         write(b"data: [DONE]\n\n")
                         self.wfile.write(b"0\r\n\r\n")
