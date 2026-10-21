@@ -45,6 +45,9 @@ class Job:
     cancelled: bool = False
     checkpoints: List[Tuple[int, str]] = field(default_factory=list)  # (prompt position, LRU cache type) also stored
     temp: Optional[float] = None  # the request's sampling temperature (None: the service's)
+    top_p: Optional[float] = None  # its own top_p, top_k (None: the service's)
+    top_k: Optional[int] = None
+    seed: Optional[int] = None  # its own seed: the same reply for the same request alone (None: unseeded)
     ignore_eos: bool = False  # run to max_tokens: end-of-sequence tokens do not end the reply (a benchmark option)
     _event: threading.Event = field(default_factory=threading.Event)
     _req: object = None
@@ -140,6 +143,24 @@ _POOL_PLANNED = False  # our engine sized MLX's pool of freed buffers (memory_pl
 _REQUEST_ERRORS = (ValueError, TypeError, KeyError, AttributeError, RecursionError)  # (a schema or regex that cannot be read)
 
 
+def _job_sampler(temp: float, top_p: float, top_k: int, seed: Optional[int]):
+    """mlx-lm's sampler for a request with its own settings; with a seed, its draws come from that seed."""
+    from mlx_lm.sample_utils import make_sampler
+
+    if seed is None or not temp:
+        return make_sampler(temp, top_p=top_p, top_k=top_k)
+    from .engine import row_key, sample_logits
+
+    n = [0]
+
+    def sample(logprobs):
+        key = row_key(seed, n[0])
+        n[0] += 1
+        return sample_logits(logprobs, temp, top_p, top_k, key=key)
+
+    return sample
+
+
 def _reason(e: BaseException) -> str:
     """A request's error as the client reads it: a ValueError's message says what is wrong (the grammar
     compilers' own say which part of the schema); anything else is named."""
@@ -178,19 +199,22 @@ class BatchService:
     # -- client API -----------------------------------------------------------------
     def submit(self, prompt: List[int], schema: Optional[dict] = None, max_tokens: int = 512, regex: Optional[str] = None,
                on_token: Optional[Callable[[List[int]], None]] = None, checkpoints: Optional[List[Tuple[int, str]]] = None,
-               temp: Optional[float] = None, ignore_eos: bool = False) -> Job:
+               temp: Optional[float] = None, ignore_eos: bool = False, top_p: Optional[float] = None,
+               top_k: Optional[int] = None, seed: Optional[int] = None) -> Job:
         """Queue a generation; the output matches ``schema`` (JSON Schema) or ``regex`` if given.
         ``on_token`` streams committed tokens (called from the worker thread). For
         each ``(n, kind)`` in ``checkpoints`` the cache of ``prompt[:n]`` is also kept
         in the prompt cache (our engine) as an entry of type ``kind`` ("system"
         entries are evicted last, then "user", then finished replies), for a next
         request that shares only that much. ``temp``: this request's sampling
-        temperature (0: greedy), else the service's. ``ignore_eos``: generate ``max_tokens``
+        temperature (0: greedy), else the service's; ``top_p``, ``top_k`` likewise; ``seed``: its draws come
+        from that seed (our engine: the same reply for the same request alone). ``ignore_eos``: generate ``max_tokens``
         tokens whatever the model ends with (benchmarks' fixed output lengths, as vLLM's option)."""
         if not prompt:
             raise ValueError("empty prompt")
         job = Job(list(prompt), schema, max_tokens, regex, t_submit=time.perf_counter(), on_token=on_token,
-                  checkpoints=list(checkpoints or []), temp=temp, ignore_eos=ignore_eos)
+                  checkpoints=list(checkpoints or []), temp=temp, ignore_eos=ignore_eos, top_p=top_p, top_k=top_k,
+                  seed=seed)
         rt = getattr(self, "_rt", None)
         if rt is not None and not self.walk and (schema is not None or regex is not None):
             # its grammar is made in a thread of its own, and the job queued once it is: made in the batch loop, a
@@ -438,7 +462,7 @@ class BatchService:
                 r = Request(job.prompt, ctl, job.max_tokens)
                 r.on_token = job.on_token
                 r.checkpoints = job.checkpoints
-                r.temp = job.temp
+                r.temp, r.top_p, r.top_k, r.seed = job.temp, job.top_p, job.top_k, job.seed
                 job._req = r  # before reading job.cancelled: a cancel in between sets r.cancel itself
                 r.cancel = job.cancelled
                 owner[id(r)] = (job, r)
@@ -548,7 +572,9 @@ class BatchService:
                     job.cached = len(job.prompt) - len(rest)
                     self.cached_tokens += job.cached
                     self.prompt_tokens += len(job.prompt)
-                    s = sampler if job.temp is None else make_sampler(job.temp, top_p=self.top_p, top_k=self.top_k)
+                    s = sampler if all(v is None for v in (job.temp, job.top_p, job.top_k, job.seed)) else _job_sampler(
+                        self.temp if job.temp is None else job.temp, self.top_p if job.top_p is None else job.top_p,
+                        self.top_k if job.top_k is None else job.top_k, job.seed)
                     try:
                         procs = processors(job.schema, job.regex)
                     except Exception as e:  # noqa: BLE001  # a regex or schema that does not compile: this request's error

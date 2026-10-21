@@ -182,7 +182,7 @@ Each entry carries `context_length` and `max_model_len`, both equal to `context_
 | `n` | must be 1. Otherwise a 400 that says to send the request n times; those requests run together in one batch |
 | `logprobs`, `top_logprobs` | 400 |
 
-The server ignores per-request `top_p`, `top_k` and `seed`. `prepare` passes only the temperature to the engine. The sampling filters are the server-wide `--top-p` and `--top-k`.
+A request's own `top_p` (0 to 1; 0 and 1 mean no filter), `top_k` (a whole number; 0 means no filter) and `seed` (a whole number) apply to it (`_sampling`; another value is a 400); those it leaves out are the server's `--top-p` and `--top-k`, and no seed. With a seed, the same request alone gives the same reply (docs/engine, "Sampling for each row"). (Before, the server ignored all three.)
 
 ### How the constraint is chosen
 
@@ -412,7 +412,7 @@ How requests are translated (`apis.ollama_to_chat`):
 
 - **Model names.** Any other name maps to the server's one model (`Server.chat_model`); our own names for another model (`locals/<short>`, `mlx/<short>`, `stock/<short>`) are refused (`check_model`, a 404 on Ollama's API). `mlx/...` picks the stock engine when it is enabled. A name that contains `think` turns thinking on.
 - **Load and unload.** A chat without messages, or a generate without a prompt, is Ollama's way to load a model. With `keep_alive` 0 it unloads one. Either is answered at once, with `done_reason` `load` or `unload`.
-- **Options.** `options.num_predict` (when > 0) becomes `max_tokens`. `temperature`, `top_p`, `stop` and `seed` are copied, but only `temperature` and `stop` are used downstream.
+- **Options.** `options.num_predict` (when > 0) becomes `max_tokens`. `temperature`, `top_p`, `top_k`, `stop` and `seed` are copied (for `/api/generate` with `raw` too), and all of them apply.
 - **Formats.** `format: "json"` becomes `json_object`. A schema object becomes `json_schema`.
 - **Thinking.** `think: true` or `false` becomes `chat_template_kwargs.enable_thinking`. A level string (`low`, `medium`, `high`) turns thinking on and sets `reasoning_effort`.
 - **Images.** The images are dropped. A message, or a generate prompt, that had any gets one note appended to its text: `IMAGE_NOTE`, "[an image was attached here; this model reads text only]" (`apis.ollama_to_chat`).
@@ -520,7 +520,7 @@ How the worker runs:
   - A schema becomes a regex through `grammar.schema_regex` (outlines-core's, with integer bounds), after `json_safe_schema`.
   - llguidance never matches a special token against regex text. `_llg_grammar` therefore refers to special tokens at the regex's ends by id, in a lark grammar.
   - Grammars are cached per regex.
-- **Sampling.** A request with its own temperature gets a new sampler that keeps the server's `top_p` and `top_k`.
+- **Sampling.** A request with its own temperature, `top_p`, `top_k` or `seed` gets a sampler of its own (`_job_sampler`); the settings it leaves out are the server's.
 - **`ignore_eos`** removes the row's stop tokens only for an unconstrained job (`if job.ignore_eos and not procs`). A constrained job keeps its stop tokens (`service.BatchService._run_stock`).
 - **Cancellation.** Cancelled jobs are removed from the generator.
 - **Not supported:** checkpoints, the disk cache, and a memory guard.

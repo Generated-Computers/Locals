@@ -102,9 +102,9 @@ def ollama_to_chat(req: dict, model: str, generate: bool = False) -> dict:
     out = {"model": model, "messages": msgs, "stream": req.get("stream", True) is not False}
     if opts.get("num_predict") and opts["num_predict"] > 0:
         out["max_tokens"] = opts["num_predict"]
-    for a, b in (("temperature", "temperature"), ("top_p", "top_p"), ("stop", "stop"), ("seed", "seed")):
+    for a in ("temperature", "top_p", "top_k", "stop", "seed"):
         if opts.get(a) is not None:
-            out[b] = opts[a]
+            out[a] = opts[a]
     fmt = req.get("format")
     if fmt == "json":
         out["response_format"] = {"type": "json_object"}
@@ -127,7 +127,7 @@ def ollama_to_text(req: dict, model: str) -> dict:
     out = {"model": model, "prompt": req.get("prompt") or "", "stream": req.get("stream", True) is not False}
     if opts.get("num_predict") and opts["num_predict"] > 0:
         out["max_tokens"] = opts["num_predict"]
-    for a in ("temperature", "stop"):
+    for a in ("temperature", "top_p", "top_k", "stop", "seed"):  # (top_p, top_k and seed were dropped here)
         if opts.get(a) is not None:
             out[a] = opts[a]
     return out

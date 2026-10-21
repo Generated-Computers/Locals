@@ -434,7 +434,7 @@ class Server:
                 "tools": tools, "schema": schema, "regex": regex, "output_regex": output_regex, "max_tokens": max_tokens,
                 "model": model, "fmt": fmt,
                 "tool_choice": req.get("tool_choice", "auto"), "stop": _stops(req), "temp": _temperature(req),
-                "ignore_eos": bool(req.get("ignore_eos")), "include_usage": _include_usage(req)}
+                "sampling": _sampling(req), "ignore_eos": bool(req.get("ignore_eos")), "include_usage": _include_usage(req)}
 
     def prepare_text(self, req: dict) -> dict:
         """A /v1/completions request: a raw prompt (no chat template), as mlx-lm's server encodes it."""
@@ -480,7 +480,8 @@ class Server:
         max_tokens = max(1, min(max_tokens, self.max_tokens, limit - len(ids)))
         return {"engine": engine, "thinking": False, "svc": svc, "prompt": ids, "checkpoints": [], "text": None, "tools": [],
                 "schema": None, "regex": None, "max_tokens": max_tokens, "model": model, "fmt": None, "stop": _stops(req),
-                "temp": _temperature(req), "ignore_eos": bool(req.get("ignore_eos")), "include_usage": _include_usage(req)}
+                "temp": _temperature(req), "sampling": _sampling(req), "ignore_eos": bool(req.get("ignore_eos")),
+                "include_usage": _include_usage(req)}
 
     def text_completion(self, req: dict, p: dict, write=None) -> Optional[dict]:
         """One /v1/completions request, streamed when ``write`` is given."""
@@ -503,7 +504,7 @@ class Server:
         self._active[key] = {"engine": p["engine"], "prompt_tokens": len(p["prompt"]), "tokens": 0, "started": time.time()}
         q: "queue.Queue[List[int]]" = queue.Queue()
         job = p["svc"].submit(p["prompt"], max_tokens=p["max_tokens"], on_token=q.put, temp=p.get("temp"),
-                              ignore_eos=p.get("ignore_eos", False))
+                              ignore_eos=p.get("ignore_eos", False), **p.get("sampling", {}))
         toks: List[int] = []
         sent, stopped, last_emit = 0, None, time.perf_counter()
         last_probe = last_emit
@@ -773,7 +774,7 @@ class Server:
     def _submit(self, p: dict, on_token=None):
         return p["svc"].submit(p["prompt"], schema=p["schema"], max_tokens=p["max_tokens"], regex=p["regex"], on_token=on_token,
                                temp=p.get("temp"), ignore_eos=p.get("ignore_eos", False),
-                               checkpoints=p.get("checkpoints"))
+                               checkpoints=p.get("checkpoints"), **p.get("sampling", {}))
 
     def _account(self, p: dict, job, out_tokens: int, calls: int, t0: float, stopped: Optional[str] = None) -> dict:
         r = getattr(job, "_req", None)
@@ -1051,7 +1052,7 @@ class Server:
         q: "queue.Queue[List[int]]" = queue.Queue()
         job = p["svc"].submit(prompt, schema=p["schema"], max_tokens=p["max_tokens"], regex=p["regex"], on_token=q.put,
                               temp=p.get("temp"), ignore_eos=p.get("ignore_eos", False),
-                              checkpoints=p.get("checkpoints"))
+                              checkpoints=p.get("checkpoints"), **p.get("sampling", {}))
         job.prefix_tokens = len(prompt) - len(p["prompt"])
         toks: List[int] = []
         rs = oai.ReplyStream(p["thinking"] and (not prefix or _in_think(p)), p.get("fmt"),
@@ -1982,6 +1983,37 @@ def _temperature(req: dict) -> Optional[float]:
         return min(2.0, max(0.0, float(t)))
     except (TypeError, ValueError):
         raise ValueError("temperature must be a number")
+
+
+def _sampling(req: dict) -> dict:
+    """The request's own top_p, top_k and seed, checked; those it does not give are the server's (an empty dict)."""
+    import math
+
+    def number(name):
+        v = req.get(name)
+        if v is None:
+            return None
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise ValueError(f"{name} must be a number")
+        return v
+
+    out = {}
+    p = number("top_p")
+    if p is not None:
+        if not 0 <= p <= 1:
+            raise ValueError("top_p must be from 0 to 1 (0 and 1: no filter)")
+        out["top_p"] = float(p)
+    k = number("top_k")
+    if k is not None:
+        if k < 0 or k != int(k):
+            raise ValueError("top_k must be a whole number, 0 or more (0: no filter)")
+        out["top_k"] = int(k)
+    seed = number("seed")
+    if seed is not None:
+        if seed != int(seed):
+            raise ValueError("seed must be a whole number")
+        out["seed"] = int(seed)
+    return out
 
 
 LOOP_GRACE = 1024  # tokens a repetition that may be wanted goes on after it looks like a loop (Server._guard)

@@ -261,6 +261,12 @@ class Request:
     feed: List[int] = field(default_factory=list)
     passes: int = 0
     forced: int = 0
+    # the request's own sampling (None: the engine's): temperature, top_p, top_k, and a seed for its draws
+    temp: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    seed: Optional[int] = None
+    draws: int = 0  # random draws made for it so far (a seeded request's next key)
 
 
 @dataclass

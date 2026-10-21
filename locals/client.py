@@ -68,13 +68,15 @@ def _format(schema: Optional[dict], regex: Optional[str]) -> dict:
 
 
 def several(base: str, body: dict, n: int) -> List[dict]:
-    """n requests at once: they decode together in the server's batch. Ctrl-C closes their connections (the server
-    stops decoding them) and is raised again: it left the command waiting for every reply to finish."""
+    """n requests at once: they decode together in the server's batch (with a seed, request i gets seed + i: the
+    same seed would give n copies of one reply). Ctrl-C closes their connections (the server stops decoding them) and
+    is raised again: it left the command waiting for every reply to finish."""
     import socket
     from urllib.parse import urlparse
 
     u = urlparse(base)
-    data = json.dumps(dict(body, stream=False)).encode()
+    seed = body.get("seed")
+    data = [json.dumps(dict(body, stream=False, **({} if seed is None else {"seed": seed + i}))).encode() for i in range(n)]
     out: List[Optional[dict]] = [None] * n
     errors: List[str] = []
     stopped = threading.Event()
@@ -85,7 +87,7 @@ def several(base: str, body: dict, n: int) -> List[dict]:
         try:
             if stopped.is_set():
                 return
-            c.request("POST", "/v1/chat/completions", data, {"Content-Type": "application/json"})
+            c.request("POST", "/v1/chat/completions", data[i], {"Content-Type": "application/json"})
             r = c.getresponse()
             raw = r.read()
             if r.status != 200:
@@ -125,10 +127,9 @@ def several(base: str, body: dict, n: int) -> List[dict]:
 
 def generate(args, prompt: str, schema: Optional[dict]) -> None:
     base, model = connect(args.model)
-    if args.seed is not None:  # (the server samples every request's rows from one generator: no seed of its own)
-        print("locals generate: --seed applies with --local only; the server's replies are not seeded", file=sys.stderr)
     body = {"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": args.max_tokens,
-            "temperature": args.temp if args.n == 1 else (args.temp or 0.8), **_format(schema, args.regex)}
+            "temperature": args.temp if args.n == 1 else (args.temp or 0.8), **_format(schema, args.regex),
+            **({} if args.seed is None else {"seed": args.seed})}
     t0 = time.time()
     try:
         replies = several(base, body, args.n) if args.n > 1 else [complete(base, body)]
@@ -204,7 +205,7 @@ def chat(args) -> None:
 
         turn = messages + [{"role": "user", "content": msg}]
         body = {"model": model, "messages": turn, "max_tokens": args.max_tokens, "temperature": args.temp,
-                **_format(schema, None)}
+                "top_p": args.top_p, **_format(schema, None)}
         t0 = time.time()
         if n_alt > 1:
             try:

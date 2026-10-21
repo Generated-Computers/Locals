@@ -458,7 +458,7 @@ This command runs on the background server: `client.connect` starts it if it is 
 | `--regex` | none | Regex constraint instead of a schema. |
 | `--max-tokens` | 512 | |
 | `--temp` | 0.0 | |
-| `--seed` | none | With `--local` only (0 there). On the server the replies are not seeded, and a note says so. |
+| `--seed` | none | The same reply for the same prompt. With `--n`, sample i gets seed + i (one seed would give n copies of one reply). With `--local`, 0 when not given. |
 | `--n` | 1 | More than 1 means N samples at once (temperature 0.8 when `--temp` is 0), printed one after another. |
 | `--no-forced` | off | Disables forced-span compression. |
 | `--no-fuse` | off | Keeps separate q/k/v and gate/up matmuls. |
@@ -470,7 +470,7 @@ This command runs on the background server: `client.connect` starts it if it is 
 
 This command runs on the background server (`client.chat`), started if needed, like `locals generate`. Its options are `--model` (default: the model used last), `--system`, `--temp 0.7`, `--max-tokens 1024`, `--think` (the `-thinking` model id; thoughts are printed dimmed), `--no-stats`, and `--local` (or `--dtype`) for the old in-process chat. Replies are streamed; the server's prompt cache keeps the conversation between turns, so a turn reads only what is new. The stats line gives the reply's tokens and speed, the time to the first token, and how much of the context came from the cache.
 
-In-process (`--local`), `Conversation` keeps a ChatML conversation as one token stream whose KV cache persists, warms up with an 8-token generation, and takes `--top-p`.
+In-process (`--local`), `Conversation` keeps a ChatML conversation as one token stream whose KV cache persists, warms up with an 8-token generation, and takes `--top-p`. On the server, `locals chat` sends its `--top-p` with each request.
 
 | In-chat command | Effect |
 |---|---|

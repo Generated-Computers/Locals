@@ -94,7 +94,7 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=None, help="the server's port (default: the last one used, else 8321)")
     ap.add_argument("--system", default=None)
     ap.add_argument("--temp", type=float, default=0.7)
-    ap.add_argument("--top-p", type=float, default=0.9, help="with --local only: the server samples with its own --top-p")
+    ap.add_argument("--top-p", type=float, default=0.9)
     ap.add_argument("--max-tokens", type=int, default=1024)
     ap.add_argument("--think", action="store_true", help="let the model think before answering")
     ap.add_argument("--no-stats", action="store_true")

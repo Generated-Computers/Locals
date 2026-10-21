@@ -609,3 +609,28 @@ def test_without_tools_a_reply_streams_as_it_comes():
         fmt = formats.FORMATS[name]
         assert oai.ReplyStream(False, fmt).feed(head) == []  # with tools: it may be a call
         assert oai.ReplyStream(False, fmt, calls=False).feed(head) == [("content", head)]
+
+
+def test_a_requests_own_top_p_top_k_and_seed():
+    """The server ignored a request's top_p, top_k and seed (one sampler for the batch): each row now samples by its
+    own, and a seeded row's draws come from its seed whatever else is in the batch."""
+    import mlx.core as mx
+    import pytest
+
+    from locals.engine import row_key, sample_each
+    from locals.server import _sampling
+
+    assert _sampling({}) == {} and _sampling({"top_p": 0.9, "top_k": 20, "seed": 3}) == {"top_p": 0.9, "top_k": 20, "seed": 3}
+    assert _sampling({"top_k": 5.0}) == {"top_k": 5}
+    for bad in ({"top_p": 1.5}, {"top_p": "x"}, {"top_k": -1}, {"top_k": 2.5}, {"seed": 1.5}, {"seed": float("inf")},
+                {"top_p": True}):
+        with pytest.raises(ValueError):
+            _sampling(bad)
+    logits = mx.array([[0.0, 5.0, 4.9, 4.8], [0.0, 5.0, 4.9, 4.8]])
+    mx.random.seed(0)
+    drawn = [sample_each(logits, [(2.0, 0.0, 1, None), (2.0, 0.0, 0, None)]).tolist() for _ in range(64)]
+    assert all(d[0] == 1 for d in drawn)  # top_k 1: the most likely token, at any temperature
+    assert len({d[1] for d in drawn}) >= 3  # no filter: it samples
+    seeded = [sample_each(logits, [(2.0, 0.0, 0, row_key(7, n)), (2.0, 0.0, 0, None)]).tolist()[0] for n in range(16)]
+    again = [sample_each(logits[:1], [(2.0, 0.0, 0, row_key(7, n))]).tolist()[0] for n in range(16)]
+    assert seeded == again and len(set(seeded)) >= 2  # the same draws alone or beside another row; draws differ

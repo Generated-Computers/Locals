@@ -64,6 +64,36 @@ def sample_rows(logits: mx.array, temps, top_p: float = 0.0, top_k: int = 0) -> 
     return mx.where(mx.array([x == 0 for x in t]), greedy, drawn)
 
 
+def row_key(seed: int, n: int) -> mx.array:
+    """The PRNG key of draw ``n`` of a request seeded with ``seed``: its draws do not depend on the other requests
+    in the batch, nor on the order they came in."""
+    return mx.random.key((int(seed) * 0x9E3779B97F4A7C15 + n) & 0x7FFFFFFFFFFFFFFF)
+
+
+def sample_each(logits: mx.array, specs) -> mx.array:
+    """One token per row of ``logits`` (B, V), row i by ``specs[i]`` = (temperature, top_p, top_k, key or None),
+    each by mlx-lm's rule (sample_logits). Rows with the same settings and no key are drawn together; a row with a
+    key (a seeded request) is drawn with it."""
+    groups: dict = {}
+    keyed = []
+    for i, (t, p, k, key) in enumerate(specs):
+        if key is not None and t > 0:
+            keyed.append(i)
+        else:
+            groups.setdefault((t, p, k), []).append(i)
+    if len(groups) == 1 and not keyed:
+        ((t, p, k),) = groups
+        return sample_logits(logits, t, p, k)
+    out = mx.zeros((len(specs),), dtype=mx.uint32)
+    for (t, p, k), rows in groups.items():
+        idx = mx.array(rows)
+        out[idx] = sample_logits(logits[idx], t, p, k).astype(mx.uint32)
+    for i in keyed:
+        t, p, k, key = specs[i]
+        out[i] = sample_logits(logits[i: i + 1], t, p, k, key=key)[0].astype(mx.uint32)
+    return out
+
+
 class ConstraintExhausted(RuntimeError):
     """No token is allowed in the current configuration (a pushdown
     constraint at its depth limit): decoding stops with finish="exhausted"."""

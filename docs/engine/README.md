@@ -307,13 +307,15 @@ A Metal out-of-memory error fails every request in flight, while a prompt-cache 
 
 ## Sampling for each row
 
-`BatchService` copies `top_p` and `top_k` onto the engine. The service's `temp` is passed to `serve`, and a request's own `temp` overrides it.
+`BatchService` copies `top_p` and `top_k` onto the engine. The service's `temp` is passed to `serve`. A request's own `temp`, `top_p`, `top_k` and `seed` go onto its row (`Request.temp`, `.top_p`, `.top_k`, `.seed`) and override the engine's.
 
 `_pick` first applies the constraint mask, then calls `_sample`:
 
-- If any row has its own `temp`, the temperature becomes a list and `sample_rows` handles it. When all the values are equal, it reduces to `sample_logits`. Otherwise greedy rows take the argmax, and the other rows take one categorical draw over filtered log-probabilities, each scaled by its row's temperature.
+- If no row has settings of its own, every row is sampled by `sample_logits` with the engine's.
+- Otherwise `_specs` gives each row (temperature, top_p, top_k, key) and `sample_each` samples them: rows with the same settings and no key in one draw, a seeded row on its own with its key. The key is `row_key(seed, n)` for the row's n-th draw (`Request.draws`), so a seeded request's draws do not depend on the other rows or on when it came in. The same request alone gives the same reply; next to other requests, a batch of another size can run other kernels, and a near tie between two tokens can go the other way.
 - `sample_logits` takes the argmax at temperature 0. Otherwise it follows mlx-lm's rule: top-p on the untempered distribution, then top-k, then a categorical draw at `temp`. A sampled run of Locals and one of stock mlx-lm therefore follow the same distribution.
-- `top_p` and `top_k` are the same for every row.
+- The single-row speculative path (`_solo_verify`) uses the row's own top_p, top_k and seed too.
+- The stock engine gives a request with settings of its own a sampler of its own (`service._job_sampler`); with a seed, its draws come from `row_key` as well.
 
 ## Constrained rows in the batch
 

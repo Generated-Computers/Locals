@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache, BatchKVCache, BatchRotatingKVCache, KVCache, make_prompt_cache
 
-from .engine import LocalsController, sample_logits, sample_rows
+from .engine import LocalsController, row_key, sample_each, sample_logits
 from .kernels import head_logits, packed_rows, text_model
 from .packed import NEG_INF, BatchEngine, BatchStats, Request, _common
 
@@ -832,9 +832,9 @@ class HybridBatchEngine(BatchEngine):
         """Sample one token per row under the rows' constraint states ``g``
         (global indices into the combined table, a device array); g=None: unmasked.
         ``budget``: (rows, tokens left per row) for budget-aware masking; a row
-        with its own ``temp`` (a request's temperature) samples at that."""
-        if budget is not None and any(getattr(r, "temp", None) is not None for r in budget[0]):
-            temp = [temp if getattr(r, "temp", None) is None else r.temp for r in budget[0]]
+        with its own sampling (a request's temperature, top_p, top_k or seed) samples by that."""
+        if budget is not None:
+            temp = self._specs(budget[0], temp)
         if getattr(self, "_walk", None) is not None and g is not None:
             table, acc, cover, tlen, eos, offs, packed = self._walk
             rows = self._walk_rows(g)
@@ -858,9 +858,26 @@ class HybridBatchEngine(BatchEngine):
         return self._sample(logits, temp)
 
     def _sample(self, logits: mx.array, temp) -> mx.array:
-        if isinstance(temp, list):
-            return sample_rows(logits, temp, self.top_p, self.top_k)
+        if isinstance(temp, list):  # per row: (temperature, top_p, top_k, key)
+            return sample_each(logits, temp)
         return sample_logits(logits, temp, self.top_p, self.top_k)
+
+    def _specs(self, rows, temp):
+        """Per-row sampling when a row has its own (a request's temperature, top_p, top_k or seed): a list of
+        (temperature, top_p, top_k, key or None); else ``temp`` (the engine's settings for every row). A seeded
+        row's key counts its draws, so its draws do not depend on the batch around it."""
+        if not any(getattr(r, a, None) is not None for r in rows for a in ("temp", "top_p", "top_k", "seed")):
+            return temp
+        out = []
+        for r in rows:
+            t = temp if getattr(r, "temp", None) is None else r.temp
+            key = None
+            if getattr(r, "seed", None) is not None and t > 0:
+                key = row_key(r.seed, r.draws)
+                r.draws += 1
+            out.append((t, self.top_p if getattr(r, "top_p", None) is None else r.top_p,
+                        self.top_k if getattr(r, "top_k", None) is None else r.top_k, key))
+        return out
 
     def _walk_next(self, x: mx.array, g) -> mx.array:
         rows = self._walk_rows(g)
@@ -957,10 +974,11 @@ class HybridBatchEngine(BatchEngine):
             draft = kept if len(kept) >= 2 else []  # one token under a grammar is too often a repeated key's start
         return draft[: max(0, r.max_tokens - len(r.out) - 1)]
 
-    def _solo_verify(self, logits: mx.array, draft: List[int], temp: float) -> List[int]:
+    def _solo_verify(self, logits: mx.array, draft: List[int], temp: float, r=None) -> List[int]:
         """The accepted draft tokens and the token after them. Greedy: draft tokens while each equals the argmax.
         Sampled: draft token d is kept with probability p(d) under the request's distribution, else the token is
-        drawn from p without d (speculative sampling: the tokens follow p exactly)."""
+        drawn from p without d (speculative sampling: the tokens follow p exactly). ``r``: the request, for its own
+        top_p, top_k and seed."""
         if not temp:
             preds = mx.argmax(logits, axis=-1).tolist()
             out = []
@@ -971,17 +989,28 @@ class HybridBatchEngine(BatchEngine):
             return out + [preds[len(draft)]]
         from .engine import _filtered
 
-        lp = _filtered(logits.astype(mx.float32), self.top_p, self.top_k) * (1.0 / temp)
+        top_p = self.top_p if getattr(r, "top_p", None) is None else r.top_p
+        top_k = self.top_k if getattr(r, "top_k", None) is None else r.top_k
+        lp = _filtered(logits.astype(mx.float32), top_p, top_k) * (1.0 / temp)
         p = mx.softmax(lp, axis=-1)
         k = len(draft)
-        keep = (mx.random.uniform(shape=(k,)) < p[mx.arange(k), mx.array(draft)]).tolist()
+        k1 = k2 = None
+        if getattr(r, "seed", None) is not None:
+            k1, k2 = mx.random.split(row_key(r.seed, r.draws))
+            r.draws += 1
+
+        def draw(x):
+            return int((mx.random.categorical(x) if k2 is None else mx.random.categorical(x, key=k2)).item())
+
+        u = mx.random.uniform(shape=(k,)) if k1 is None else mx.random.uniform(shape=(k,), key=k1)
+        keep = (u < p[mx.arange(k), mx.array(draft)]).tolist()
         out = []
         for j, d in enumerate(draft):
             if not keep[j]:
                 rest = mx.where(mx.arange(lp.shape[-1]) == d, NEG_INF, lp[j])
-                return out + [int(mx.random.categorical(rest).item())]
+                return out + [draw(rest)]
             out.append(d)
-        return out + [int(mx.random.categorical(lp[k]).item())]
+        return out + [draw(lp[k])]
 
     def _solo_masked(self, r, logits: mx.array, g, draft: List[int]) -> mx.array:
         """Logits at the sampled position and each draft position under the grammar's state there (as _pick
@@ -1051,7 +1080,7 @@ class HybridBatchEngine(BatchEngine):
                     gs = self._advance([r], mx.array([tok], dtype=mx.int32), gs)
             r.fed.extend(span)
             if draft:
-                picked = self._solo_verify(self._solo_masked(r, logits, gs, draft) if constrained else logits, draft, t_r)
+                picked = self._solo_verify(self._solo_masked(r, logits, gs, draft) if constrained else logits, draft, t_r, r)
                 a = len(picked) - 1
             else:
                 y = self._pick(logits[-1:], gs if constrained else None, t_r, ([r], [r.max_tokens - len(r.out)]))

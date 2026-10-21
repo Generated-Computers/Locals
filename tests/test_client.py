@@ -70,14 +70,42 @@ def test_a_constrained_reply_cut_at_the_limit_is_not_a_success(monkeypatch, caps
     assert "cut at --max-tokens 5" in capsys.readouterr().err
 
 
-def test_seed_on_the_server_says_it_does_nothing(monkeypatch, capsys):
+def test_a_seed_goes_to_the_server_and_each_sample_gets_its_own(monkeypatch):
+    """--seed was not sent (the server ignored seeds then); with --n, the same seed would give n copies of one reply."""
+    import json as _json
+
     whole = {"choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}], "usage": {"completion_tokens": 1}}
+    sent = []
     monkeypatch.setattr(client, "connect", lambda m: ("http://x", "locals/m"))
-    monkeypatch.setattr(client, "complete", lambda base, body: whole)
-    client.generate(_args(seed=1), "p", None)
-    assert "--seed applies with --local only" in capsys.readouterr().err
+    monkeypatch.setattr(client, "complete", lambda base, body: sent.append(body) or whole)
+    client.generate(_args(seed=5), "p", None)
+    assert sent[-1]["seed"] == 5
     client.generate(_args(), "p", None)
-    assert "--seed" not in capsys.readouterr().err
+    assert "seed" not in sent[-1]
+
+    class Conn:
+        def __init__(self, *a, **k):
+            self.sock = None
+
+        def request(self, method, path, data, headers):
+            sent.append(_json.loads(data))
+
+        def getresponse(self):
+            class R:
+                status = 200
+
+                def read(self):
+                    return _json.dumps(whole).encode()
+
+            return R()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(client.http.client, "HTTPConnection", Conn)
+    del sent[:]
+    client.several("http://127.0.0.1:1", {"messages": [], "seed": 10}, 3)
+    assert sorted(b["seed"] for b in sent) == [10, 11, 12]
 
 
 class _Reply:

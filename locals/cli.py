@@ -22,7 +22,8 @@ def main(argv=None):
     ap.add_argument("--regex", default=None, help="regex constraint instead of a schema")
     ap.add_argument("--max-tokens", type=int, default=512)
     ap.add_argument("--temp", type=float, default=0.0)
-    ap.add_argument("--seed", type=int, default=None, help="with --local only (default 0 there)")
+    ap.add_argument("--seed", type=int, default=None, help="the same reply for the same prompt (sample i of --n gets "
+                    "seed + i); with --local, 0 when not given")
     ap.add_argument("--n", type=int, default=1, help="parallel samples sharing the prompt KV")
     ap.add_argument("--no-forced", action="store_true", help="disable forced-span compression")
     ap.add_argument("--no-fuse", action="store_true", help="keep separate q/k/v and gate/up matmuls")
