@@ -6,6 +6,10 @@
 <h1 align="center">Locals</h1>
 
 <p align="center">
+  <b>English</b> · <a href="README.ar.md">العربية</a>
+</p>
+
+<p align="center">
   <b>Run many AI agents at once on your Mac, up to 3x faster.</b><br>
   A local server made for agents rather than plain chat: tool calls, long
   conversations and many agents working at the same time. For OpenCode,
