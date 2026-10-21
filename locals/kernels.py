@@ -191,6 +191,7 @@ def _load_tune():
             tune.update(user or {})
             _TUNE = tune
             crashed = _crashed_shapes(tune)
+            _drop_old_temps()
             if (user is None and tune) or crashed:
                 try:
                     _save_tune()
@@ -203,6 +204,23 @@ def _marker(pid: int) -> str:
     return f"{_TUNE_PATH}.tuning-{pid}"
 
 
+_MARKER_LOCK = _threading.Lock()
+_STOPPING = False
+
+
+def stop_timing() -> None:
+    """This process is being stopped (SIGTERM: locals stop, a model switch, a restart): its marker goes, and no new
+    one is written, so the shape it was timing does not count as one whose kernels crashed (two such stops kept
+    that shape on MLX's kernel for good, with a message about crashes)."""
+    global _STOPPING
+    with _MARKER_LOCK:
+        _STOPPING = True
+        try:
+            _os.unlink(_marker(_os.getpid()))
+        except OSError:
+            pass
+
+
 def _alive(pid: int) -> bool:
     try:
         _os.kill(pid, 0)
@@ -211,6 +229,18 @@ def _alive(pid: int) -> bool:
     except OSError:  # (another user's process)
         return True
     return True
+
+
+def _drop_old_temps() -> None:
+    """Temporary files of saves that a killed process left (each the size of the cache, kept for good)."""
+    import glob
+
+    for t in glob.glob(_os.path.join(glob.escape(_os.path.dirname(_TUNE_PATH)), ".tune-*.json")):
+        try:
+            if _time.time() - _os.path.getmtime(t) > 600:  # (a save takes a second: an old one is no live save)
+                _os.unlink(t)
+        except OSError:
+            pass
 
 
 def _crashed_shapes(tune: dict) -> bool:
@@ -405,12 +435,15 @@ def _choose(x2, mod):
 def _tune_shape(x2, mod, M, K, N, dt, key, tune):
     """_time_shape, with the shape named in this process's marker file while it runs (_crashed_shapes)."""
     marker = _marker(_os.getpid())
-    try:
-        _os.makedirs(_os.path.dirname(marker), exist_ok=True)
-        with open(marker, "w") as f:
-            f.write(key)
-    except OSError:
-        marker = None
+    with _MARKER_LOCK:
+        try:
+            if _STOPPING:
+                raise OSError
+            _os.makedirs(_os.path.dirname(marker), exist_ok=True)
+            with open(marker, "w") as f:
+                f.write(key)
+        except OSError:
+            marker = None
     try:
         return _time_shape(x2, mod, M, K, N, dt, key, tune)
     finally:

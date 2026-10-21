@@ -2140,8 +2140,25 @@ def serve(server: Server, host: str = "127.0.0.1", port: int = 8321, ollama_port
             svc.close()
 
 
+def _on_sigterm() -> None:
+    """SIGTERM (locals stop, a model switch, a restart) still ends the server at once, as it did, but first takes
+    back the kernel-timing marker: a stop while a shape was being timed counted as a crash of its kernels."""
+    import signal
+
+    def term(sig, frame):
+        from . import kernels
+
+        kernels.stop_timing()
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    signal.signal(signal.SIGTERM, term)
+
+
 def main(argv=None):
     import argparse
+
+    _on_sigterm()
 
     ap = argparse.ArgumentParser(prog="locals serve", description="OpenAI-compatible server: our engine and stock mlx-lm side by side.")
     ap.add_argument("--model", default=DEFAULT_MODEL, type=model_id, help=MODEL_HELP)

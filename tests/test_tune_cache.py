@@ -58,3 +58,47 @@ def test_a_shape_that_stops_the_process_twice_keeps_mlx(tmp_path, monkeypatch):
     live = tmp_path / f"tune.json.tuning-{os.getppid()}"  # a process still tuning: left alone
     live.write_text("9216x2560x8")
     assert "9216x2560x8" not in kernels._load_tune() and live.exists()
+
+
+def test_a_stop_while_a_shape_is_timed_is_not_a_crash(tmp_path):
+    """locals stop (SIGTERM) during idle tuning left the marker: two stops there pinned the shape to MLX's kernel
+    for good, with a message about crashes. The server still dies by SIGTERM at once, with its marker gone."""
+    import os
+    import signal
+    import subprocess
+    import sys
+
+    child = (
+        "import threading, time\n"
+        "from locals import kernels, server\n"
+        "server._on_sigterm()\n"
+        "kernels._time_shape = lambda *a: time.sleep(60)\n"
+        "threading.Thread(target=kernels._tune_shape, args=(None, None, 8, 0, 0, 'float16', 'k', {}), daemon=True).start()\n"
+        "time.sleep(0.5)\n"
+        "print('timing', flush=True)\n"
+        "time.sleep(60)\n")
+    env = dict(os.environ, LOCALS_TUNE_CACHE=str(tmp_path / "tune.json"))
+    p = subprocess.Popen([sys.executable, "-c", child], env=env, stdout=subprocess.PIPE, text=True)
+    try:
+        assert p.stdout.readline().strip() == "timing"
+        assert (tmp_path / f"tune.json.tuning-{p.pid}").exists()
+        p.send_signal(signal.SIGTERM)
+        assert p.wait(timeout=20) == -signal.SIGTERM
+        assert not list(tmp_path.glob("*.tuning-*"))
+    finally:
+        p.kill()
+
+
+def test_a_save_a_killed_process_left_is_removed(tmp_path, monkeypatch):
+    import os
+    import time
+
+    monkeypatch.setattr(kernels, "_TUNE_PATH", str(tmp_path / "tune.json"))
+    monkeypatch.setattr(kernels, "_preset_path", lambda: None)
+    monkeypatch.setattr(kernels, "_TUNE", None)
+    old, new = tmp_path / ".tune-old.json", tmp_path / ".tune-new.json"
+    old.write_text("{}")
+    new.write_text("{}")  # (another process saving right now)
+    os.utime(old, (time.time() - 3600, time.time() - 3600))
+    kernels._load_tune()
+    assert not old.exists() and new.exists()
