@@ -134,3 +134,18 @@ def test_head_rows_on_an_mxfp4_head():
         h = mx.random.normal((1, 1, 64))
         ids = mx.array([3, 7, 9])
         assert mx.allclose(head_rows(m, h, ids), m.lm_head(h)[0, -1][ids]), mode
+
+
+def test_a_cached_nax_choice_where_nax_does_not_run_is_mlxs(tmp_path, monkeypatch):
+    """A tune file with NAX choices on a GPU (or an MLX) without them: MLX's kernel, not a compile error in a request."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    from locals import kernels, nax_kernel
+
+    monkeypatch.setattr(nax_kernel, "_AVAILABLE", False)
+    monkeypatch.setattr(kernels, "_CHOICE", {})
+    layer = nn.QuantizedLinear(256, 128, bits=4, group_size=64)
+    dt = str(layer["scales"].dtype).split(".")[-1]
+    monkeypatch.setattr(kernels, "_TUNE", {"128x256x20" + ("" if dt == "float16" else f"x{dt}"): ("nax", "r", 32, 1, 4, 8, 1)})
+    assert kernels._choose(mx.zeros((20, 256), layer["scales"].dtype), layer) == ("mlx",)

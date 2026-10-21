@@ -1,6 +1,6 @@
 """The NAX small-M kernel (locals/nax_kernel.py) gives what MLX's quantized_matmul gives, on Qwen3.5's layer shapes
 (4B, 9B, 27B), for every row count from 1 to 32 a configuration supports, in bfloat16 and float16. Skipped on GPUs
-without NAX (it does not compile there). Copy to tests/test_nax_kernel.py."""
+without NAX (it does not compile there)."""
 
 import mlx.core as mx
 import pytest
@@ -43,3 +43,4 @@ def test_inside_a_batch_of_rows_each_row_is_its_own():
     for i in (0, 5, 11):
         one = mx.quantized_matmul(x[i : i + 1], wq, sc, bi, transpose=True, group_size=64, bits=4).astype(mx.float32)
         assert float(mx.max(mx.abs(full[i : i + 1] - one))) <= 0.05 * (1.0 + float(mx.max(mx.abs(one))))
+

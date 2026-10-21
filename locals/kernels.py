@@ -560,6 +560,11 @@ def _choose(x2, mod):
         c = tuple(tune[key])
         if dt != "float16" and c[0] == "fragh":  # computes in fp16: never for bf16 activations
             c = ("mlx",)
+        if c[0] == "nax":  # (a tune file from an M5 on another Mac, or an MLX without the NAX headers: it failed in
+            from . import nax_kernel  # a request, past the 16 rows warmup compiles)
+
+            if not nax_kernel.available():
+                c = ("mlx",)
         _CHOICE[(N, K, M, dt)] = c
         return c
     if _DEFER and not _TUNING:

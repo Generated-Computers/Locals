@@ -22,6 +22,7 @@ After these steps, `mx.set_wired_limit` is set to the GPU's `max_recommended_wor
 | `qmv_multi.py` | The `multi` and `v3` multi-row matrix-vector kernels |
 | `qmv_frag.py` | The `frag` and `fragh` kernels, which dequantize straight into 8x8 MMA fragments |
 | `mma_kernel.py` | `qmm_mma`: MLX's tiled quantized GEMM rebuilt with 8- or 16-row tiles |
+| `nax_kernel.py` | The `nax` kernels: 4-bit matmuls of 1 to 32 rows on the M5's neural accelerators (Metal 4 tensor operations) |
 | `gdn_kernel.py` | One Metal kernel for a Gated DeltaNet decode step |
 | `norm_kernel.py` | Fused residual add + RMS norm (present, switched off) |
 | `attention.py` | Ragged batch decode attention (present, switched off) |
@@ -166,6 +167,7 @@ The autotuner chooses among these for each (N, K, M, dtype). A choice is a tuple
 | `fragh` | `("fragh", TN, NSG, SPLIT)` | `qmv_frag.py` | `frag` with half-precision fragments. Two nibbles become a `half2` through the exponent of 1024 (`v \| 0x64006400`), and one `half2` fma applies scale and bias. Activations are clamped to +/-65504 (`qmv_frag.py`, `qmv_frag.py`) |
 | `small` | `("small",)` | `kernels.py` (`qmm_small`) | Scalar FMA kernel that reads and dequantizes each weight once for all M rows. Measured on an M2 Pro, it beats MLX for 3 <= M <= 6 on large matrices and loses at M = 8 (`kernels.py`). Launch shape from `small_config(N)` (`kernels.small_config`) |
 | `mma` | `("mma", BM, BN, BK, WM, WN, split)` | `mma_kernel.py` | MLX's `QuantizedBlockLoader` and `steel::BlockMMA` with BM = 8 (or 16) instead of 32. Every weight tile is dequantized once and applied to up to BM rows. MLX's headers are inlined from the installed wheel because custom kernels get no include path (`mma_kernel.py`) |
+| `nax` | `("nax", "r", SN, WN, WK, TK, SPLIT)` or `("nax", BM, BN, BK, WM, WN, SPLIT)` | `nax_kernel.py` | The M5's neural accelerators (`mpp::tensor_ops::matmul2d`, 16 x 32 x 16 products). The register variant (`locals_qmm_naxr`, the one tuning picks): each simdgroup owns 32 or 64 output columns, reads its weights straight into registers (K renumbered so a thread loads 4·TK consecutive 4-bit weights of a row at once) and dequantizes them into the accelerator's operand, whose accumulators stay in their cooperative tensors for the whole K loop; WK simdgroups split K and add up once. The tile variant is MLX's `qmm_t_nax_tgp_impl` with 16-row tiles. Measured on an M5 Pro (macOS 27, MLX 0.32.3): one decode step's 4-bit matmuls 1.6-3.4x MLX's at 6 to 32 rows, timed per shape (whole decode steps not measured yet). Only where `nax_kernel.available()`: it compiles and checks a small case once; elsewhere (no Metal 4 tensor operations, as on macOS 15) it is no candidate, and a cached `nax` choice is read as `mlx` (`kernels._choose`) |
 
 Notes on the families:
 
@@ -195,6 +197,7 @@ Notes on the families:
 | `fragh` | 1 to 32 | as `frag`, fp16 activations only | same as `frag` |
 | `small` | 3 to 6 (`MIN_M_SMALL`, `MAX_M_SMALL`) | N >= 4096 or K >= 4096 | `("small",)` |
 | `mma` | 2 to 32 | `N % BN`, `K % (BK*split)`, `(K/split) % 64` and `BN % (8*WN)` all zero | `_MMA_CANDIDATES[8]` for M <= 8, `[16]` above |
+| `nax` | 2 to 32, where `nax_kernel.available()` | `nax_kernel.supported(M, K, N, cfg)`: the tile variant needs a 32-wide side per simdgroup (`tile_matmad_nax` computes nothing for one 16 x 16 fragment by one); the register variant N % (SN·WN), K % (16·TK·SPLIT), at most 32 KB of threadgroup memory and 1,024 threads | `nax_kernel.CANDIDATES`: 8 tile and 13 register configurations |
 
 At M <= 2, `v3` is not a candidate: it wins in isolation there but loses about 1% inside the model (`kernels._tune_shape`).
 
