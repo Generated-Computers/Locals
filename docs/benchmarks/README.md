@@ -11,10 +11,8 @@ Every table says how it was measured; the scripts and the raw details are in
 
 ## Agent work
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="../assets/charts/agents-dark.svg">
-  <img alt="16 coding agents calling tools: mlx-lm 74.6 s, Locals 29.3 s. 40 LiveCodeBench problems: mlx-lm 19.7 min, Locals 7.93 min. 48 word problems: mlx-lm 183 s, Locals 63 s. Rewriting a 100-line file: mlx-lm 16.1 s, Locals 6.9 s. First request after a restart: mlx-lm 16.3 s, Locals 1.7 s." src="../assets/charts/agents.svg" width="100%">
-</picture>
+<img alt="16 coding agents calling tools: mlx-lm 74.6 s, Locals 29.3 s. 40 LiveCodeBench problems: mlx-lm 19.7 min, Locals 7.93 min. 48 word problems: mlx-lm 183 s, Locals 63 s. Rewriting a 100-line file: mlx-lm 16.1 s, Locals 6.9 s. First request after a restart: mlx-lm 16.3 s, Locals 1.7 s." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/agents.svg#gh-light-mode-only" width="100%">
+<img alt="16 coding agents calling tools: mlx-lm 74.6 s, Locals 29.3 s. 40 LiveCodeBench problems: mlx-lm 19.7 min, Locals 7.93 min. 48 word problems: mlx-lm 183 s, Locals 63 s. Rewriting a 100-line file: mlx-lm 16.1 s, Locals 6.9 s. First request after a restart: mlx-lm 16.3 s, Locals 1.7 s." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/agents-dark.svg#gh-dark-mode-only" width="100%">
 
 ## Every Mac measured so far
 
@@ -71,10 +69,8 @@ give the rest.
 | MiniCPM5-2B | 1.3 GB | 160 | 478 | 3.0x |
 | Gemma 4 E4B | 4.8 GB | 80 | 224 | 2.8x |
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="../assets/charts/models-dark.svg">
-  <img alt="M2 Pro · 16 GB: Qwen3.5-2B 3.1x (188 to 576 tokens/s), MiniCPM5-2B 3.0x (160 to 478 tokens/s), LFM2.5-2.6B 2.8x (144 to 404 tokens/s), Qwen3.5-4B 3.1x (87 to 271 tokens/s), Gemma 4 E4B 2.8x (80 to 224 tokens/s). M2 Max · 96 GB: Qwen3.5-4B 2.66x (152 to 403 tokens/s), Qwen3.5-9B 3.03x (72 to 220 tokens/s), Qwen3.8-27B 3.13x (25 to 78 tokens/s). M5 Pro · 24 GB: Qwen3.5-4B 1.48x (258 to 382 tokens/s), Qwen3.5-9B 1.58x (145 to 229 tokens/s)." src="../assets/charts/models.svg" width="100%">
-</picture>
+<img alt="M2 Pro · 16 GB: Qwen3.5-2B 3.1x (188 to 576 tokens/s), MiniCPM5-2B 3.0x (160 to 478 tokens/s), LFM2.5-2.6B 2.8x (144 to 404 tokens/s), Qwen3.5-4B 3.1x (87 to 271 tokens/s), Gemma 4 E4B 2.8x (80 to 224 tokens/s). M2 Max · 96 GB: Qwen3.5-4B 2.66x (152 to 403 tokens/s), Qwen3.5-9B 3.03x (72 to 220 tokens/s), Qwen3.8-27B 3.13x (25 to 78 tokens/s). M5 Pro · 24 GB: Qwen3.5-4B 1.48x (258 to 382 tokens/s), Qwen3.5-9B 1.58x (145 to 229 tokens/s)." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/models.svg#gh-light-mode-only" width="100%">
+<img alt="M2 Pro · 16 GB: Qwen3.5-2B 3.1x (188 to 576 tokens/s), MiniCPM5-2B 3.0x (160 to 478 tokens/s), LFM2.5-2.6B 2.8x (144 to 404 tokens/s), Qwen3.5-4B 3.1x (87 to 271 tokens/s), Gemma 4 E4B 2.8x (80 to 224 tokens/s). M2 Max · 96 GB: Qwen3.5-4B 2.66x (152 to 403 tokens/s), Qwen3.5-9B 3.03x (72 to 220 tokens/s), Qwen3.8-27B 3.13x (25 to 78 tokens/s). M5 Pro · 24 GB: Qwen3.5-4B 1.48x (258 to 382 tokens/s), Qwen3.5-9B 1.58x (145 to 229 tokens/s)." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/models-dark.svg#gh-dark-mode-only" width="100%">
 
 Dense 4-bit models gain 2.3x to 3.3x at 8 rows. A mixture-of-experts model in the
 mxfp4 format (Mellum) gained nothing (1.0x): the tuned kernels cover 4-bit
@@ -200,10 +196,8 @@ llama.cpp `b11724`: the GGUF files Ollama downloads, Q4_K_M and Q4_0). The
 client is SemiAnalysis's InferenceX benchmark client, chat completions,
 random prompts, temperature 0, thinking off, replies of natural length.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="../assets/charts/servers-dark.svg">
-  <img alt="Qwen3.5-4B, 1,000-token prompts, 8 requests at once on an M2 Pro. Time to the first token: Locals 1.6 s, llama.cpp 2.1 s, Magnitude 16.1 s, Ollama 41.8 s. Tokens per second: Locals 110, llama.cpp 71, Magnitude 42, Ollama 34." src="../assets/charts/servers.svg" width="100%">
-</picture>
+<img alt="Qwen3.5-4B, 1,000-token prompts, 8 requests at once on an M2 Pro. Time to the first token: Locals 1.6 s, llama.cpp 2.1 s, Magnitude 16.1 s, Ollama 41.8 s. Tokens per second: Locals 110, llama.cpp 71, Magnitude 42, Ollama 34." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/servers.svg#gh-light-mode-only" width="100%">
+<img alt="Qwen3.5-4B, 1,000-token prompts, 8 requests at once on an M2 Pro. Time to the first token: Locals 1.6 s, llama.cpp 2.1 s, Magnitude 16.1 s, Ollama 41.8 s. Tokens per second: Locals 110, llama.cpp 71, Magnitude 42, Ollama 34." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/servers-dark.svg#gh-dark-mode-only" width="100%">
 
 ### Ollama and Magnitude
 
@@ -445,10 +439,8 @@ Locals' default rounds less: float16 keeps three more bits than bfloat16.
 Each part of Locals switched off on its own (M2 Pro, in the process, tokens per
 second):
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="../assets/charts/ablation-dark.svg">
-  <img alt="Tokens per second with 8 requests at once, Qwen3.5-4B on an M2 Pro, each part of Locals switched off on its own: Locals 272.7; Locals' model on mlx-lm's scheduler 272.9; without the Gated DeltaNet kernel 267.6; without fused projections 246.8; without pipelining 236.5; without the small-batch kernels 119.2; in bfloat16 instead of float16 97.9; everything above off 79.3; plain mlx-lm 86.2." src="../assets/charts/ablation.svg" width="100%">
-</picture>
+<img alt="Tokens per second with 8 requests at once, Qwen3.5-4B on an M2 Pro, each part of Locals switched off on its own: Locals 272.7; Locals' model on mlx-lm's scheduler 272.9; without the Gated DeltaNet kernel 267.6; without fused projections 246.8; without pipelining 236.5; without the small-batch kernels 119.2; in bfloat16 instead of float16 97.9; everything above off 79.3; plain mlx-lm 86.2." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/ablation.svg#gh-light-mode-only" width="100%">
+<img alt="Tokens per second with 8 requests at once, Qwen3.5-4B on an M2 Pro, each part of Locals switched off on its own: Locals 272.7; Locals' model on mlx-lm's scheduler 272.9; without the Gated DeltaNet kernel 267.6; without fused projections 246.8; without pipelining 236.5; without the small-batch kernels 119.2; in bfloat16 instead of float16 97.9; everything above off 79.3; plain mlx-lm 86.2." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/ablation-dark.svg#gh-dark-mode-only" width="100%">
 
 | Variant | 1 request | 4 | 8 | 16 |
 |---|---|---|---|---|

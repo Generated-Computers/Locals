@@ -101,10 +101,8 @@ times sooner than with mlx-lm and llguidance.
 
 ## Results at a glance
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/requests-narrow-dark.svg">
-  <img align="right" width="48%" alt="Qwen3.5-4B on an M2 Pro with 16 GB. mlx-lm: 61, 82, 87, 87, 157 tokens per second with 1, 2, 4, 8 and 16 requests at once; Locals: 64, 116, 160, 271, 341 (1.0x, 1.4x, 1.8x, 3.1x, 2.2x)." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/requests-narrow.svg">
-</picture>
+<img align="right" width="48%" alt="Qwen3.5-4B on an M2 Pro with 16 GB. mlx-lm: 61, 82, 87, 87, 157 tokens per second with 1, 2, 4, 8 and 16 requests at once; Locals: 64, 116, 160, 271, 341 (1.0x, 1.4x, 1.8x, 3.1x, 2.2x)." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/requests-narrow.svg#gh-light-mode-only">
+<img align="right" width="48%" alt="Qwen3.5-4B on an M2 Pro with 16 GB. mlx-lm: 61, 82, 87, 87, 157 tokens per second with 1, 2, 4, 8 and 16 requests at once; Locals: 64, 116, 160, 271, 341 (1.0x, 1.4x, 1.8x, 3.1x, 2.2x)." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/requests-narrow-dark.svg#gh-dark-mode-only">
 
 mlx-lm, the standard way of running models on a Mac, answers several requests
 together, but it gets no faster from four of them to eight: it writes 87 tokens
@@ -129,10 +127,8 @@ model.
 | 16 coding agents calling tools (Qwen3.5-2B, from the paper) | 75 s (mlx-lm) | 29 s | 2.5x |
 | 40 programming problems from LiveCodeBench, 8 at a time (from the paper) | 20 min (mlx-lm) | 8 min | 2.5x |
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/macs-dark.svg">
-  <img alt="Qwen3.5-4B through the server, 1 to 16 requests at once. M2 Pro · 16 GB: mlx-lm [51, 79, 88, 75, 124], Locals [65, 116, 150, 244, 310]. M2 Max · 96 GB: mlx-lm [91, 121, 142, 152, 267], Locals [104, 177, 244, 403, 530]. M5 Pro · 24 GB: mlx-lm [86, 151, 232, 258, 333], Locals [90, 161, 253, 382, 508]." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/macs.svg" width="100%">
-</picture>
+<img alt="Qwen3.5-4B through the server, 1 to 16 requests at once. M2 Pro · 16 GB: mlx-lm [51, 79, 88, 75, 124], Locals [65, 116, 150, 244, 310]. M2 Max · 96 GB: mlx-lm [91, 121, 142, 152, 267], Locals [104, 177, 244, 403, 530]. M5 Pro · 24 GB: mlx-lm [86, 151, 232, 258, 333], Locals [90, 161, 253, 382, 508]." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/macs.svg#gh-light-mode-only" width="100%">
+<img alt="Qwen3.5-4B through the server, 1 to 16 requests at once. M2 Pro · 16 GB: mlx-lm [51, 79, 88, 75, 124], Locals [65, 116, 150, 244, 310]. M2 Max · 96 GB: mlx-lm [91, 121, 142, 152, 267], Locals [104, 177, 244, 403, 530]. M5 Pro · 24 GB: mlx-lm [86, 151, 232, 258, 333], Locals [90, 161, 253, 382, 508]." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/macs-dark.svg#gh-dark-mode-only" width="100%">
 
 Bigger models gain more on the M2 Max: 3.0x for Qwen3.5-9B and 3.1x for a 27B
 model with eight requests at once. On the M5 Pro the gain is smaller, because
@@ -149,10 +145,8 @@ Every table, and how each was measured, is in
 measured on a MacBook Pro with an M2 Pro (19-core GPU) and 16 GB, with
 Qwen3.5-4B (`mlx-community/Qwen3.5-4B-MLX-4bit`), MLX 0.32 and mlx-lm 0.32.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/models-dark.svg">
-  <img alt="M2 Pro · 16 GB: Qwen3.5-2B 3.1x (188 to 576 tokens/s), MiniCPM5-2B 3.0x (160 to 478 tokens/s), LFM2.5-2.6B 2.8x (144 to 404 tokens/s), Qwen3.5-4B 3.1x (87 to 271 tokens/s), Gemma 4 E4B 2.8x (80 to 224 tokens/s). M2 Max · 96 GB: Qwen3.5-4B 2.66x (152 to 403 tokens/s), Qwen3.5-9B 3.03x (72 to 220 tokens/s), Qwen3.8-27B 3.13x (25 to 78 tokens/s). M5 Pro · 24 GB: Qwen3.5-4B 1.48x (258 to 382 tokens/s), Qwen3.5-9B 1.58x (145 to 229 tokens/s)." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/models.svg" width="100%">
-</picture>
+<img alt="M2 Pro · 16 GB: Qwen3.5-2B 3.1x (188 to 576 tokens/s), MiniCPM5-2B 3.0x (160 to 478 tokens/s), LFM2.5-2.6B 2.8x (144 to 404 tokens/s), Qwen3.5-4B 3.1x (87 to 271 tokens/s), Gemma 4 E4B 2.8x (80 to 224 tokens/s). M2 Max · 96 GB: Qwen3.5-4B 2.66x (152 to 403 tokens/s), Qwen3.5-9B 3.03x (72 to 220 tokens/s), Qwen3.8-27B 3.13x (25 to 78 tokens/s). M5 Pro · 24 GB: Qwen3.5-4B 1.48x (258 to 382 tokens/s), Qwen3.5-9B 1.58x (145 to 229 tokens/s)." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/models.svg#gh-light-mode-only" width="100%">
+<img alt="M2 Pro · 16 GB: Qwen3.5-2B 3.1x (188 to 576 tokens/s), MiniCPM5-2B 3.0x (160 to 478 tokens/s), LFM2.5-2.6B 2.8x (144 to 404 tokens/s), Qwen3.5-4B 3.1x (87 to 271 tokens/s), Gemma 4 E4B 2.8x (80 to 224 tokens/s). M2 Max · 96 GB: Qwen3.5-4B 2.66x (152 to 403 tokens/s), Qwen3.5-9B 3.03x (72 to 220 tokens/s), Qwen3.8-27B 3.13x (25 to 78 tokens/s). M5 Pro · 24 GB: Qwen3.5-4B 1.48x (258 to 382 tokens/s), Qwen3.5-9B 1.58x (145 to 229 tokens/s)." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/models-dark.svg#gh-dark-mode-only" width="100%">
 
 Models quantized to 4 bits in the usual way (in groups of 64) gain 2.3x to 3.3x
 with 8 requests at once; other formats run at mlx-lm's speed
@@ -160,10 +154,8 @@ with 8 requests at once; other formats run at mlx-lm's speed
 
 ### Against other servers
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/servers-dark.svg">
-  <img alt="Qwen3.5-4B, 1,000-token prompts, 8 requests at once on an M2 Pro. Time to the first token: Locals 1.6 s, llama.cpp 2.1 s, Magnitude 16.1 s, Ollama 41.8 s. Tokens per second: Locals 110, llama.cpp 71, Magnitude 42, Ollama 34." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/servers.svg" width="100%">
-</picture>
+<img alt="Qwen3.5-4B, 1,000-token prompts, 8 requests at once on an M2 Pro. Time to the first token: Locals 1.6 s, llama.cpp 2.1 s, Magnitude 16.1 s, Ollama 41.8 s. Tokens per second: Locals 110, llama.cpp 71, Magnitude 42, Ollama 34." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/servers.svg#gh-light-mode-only" width="100%">
+<img alt="Qwen3.5-4B, 1,000-token prompts, 8 requests at once on an M2 Pro. Time to the first token: Locals 1.6 s, llama.cpp 2.1 s, Magnitude 16.1 s, Ollama 41.8 s. Tokens per second: Locals 110, llama.cpp 71, Magnitude 42, Ollama 34." src="https://raw.githubusercontent.com/Generated-Computers/Locals/main/docs/assets/charts/servers-dark.svg#gh-dark-mode-only" width="100%">
 
 Ollama 0.40.5, Magnitude 0.2.9 and llama.cpp `b11724`, one at a time on the GPU,
 each with its own 4-bit build of the model, measured with SemiAnalysis's
