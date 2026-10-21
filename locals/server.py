@@ -1402,6 +1402,35 @@ def make_handler(server: Server, ollama_root: bool = False):
             self.end_headers()
             self.wfile.write(body)
 
+        def _chunked(self) -> bool:
+            """Whether a stream goes in chunks: an HTTP/1.0 client has no chunked encoding (it saw the chunk sizes in
+            the body), and its stream ends when the connection closes."""
+            return self.request_version != "HTTP/1.0"
+
+        def _stream_start(self, content_type: str) -> None:
+            self.send_response(200)
+            self._cors()
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-cache")
+            if self._chunked():
+                self.send_header("Transfer-Encoding", "chunked")
+            else:
+                self.close_connection = True
+                self.send_header("Connection", "close")
+            self.end_headers()
+
+        def _part(self, b: bytes) -> None:
+            """One piece of a stream (an empty one is not sent: as a chunk, it ended the stream)."""
+            if not b:
+                return
+            self.wfile.write(f"{len(b):x}\r\n".encode() + b + b"\r\n" if self._chunked() else b)
+            self.wfile.flush()
+
+        def _stream_end(self) -> None:
+            if self._chunked():
+                self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+
         def do_HEAD(self):
             self.send_response(200)
             self._cors()
@@ -1471,23 +1500,15 @@ def make_handler(server: Server, ollama_root: bool = False):
                     return fail(f"{type(e).__name__}: {e}", 500)
                 return None if resp is None else self._json(apis.text_to_ollama(resp, shown, t0))
 
-            def write(b: bytes):
-                self.wfile.write(f"{len(b):x}\r\n".encode() + b + b"\r\n")
-                self.wfile.flush()
+            write = self._part
 
             out = apis.OllamaStream(write, shown, t0, generate=True)
-            self.send_response(200)
-            self._cors()
-            self.send_header("Content-Type", "application/x-ndjson")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
+            self._stream_start("application/x-ndjson")
             p["alive"] = self._alive
             try:
                 server.text_completion(text_req, p, out.feed)
                 out.close()
-                self.wfile.write(b"0\r\n\r\n")
-                self.wfile.flush()
+                self._stream_end()
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:  # noqa: BLE001  # mid-stream: an error line and a clean end
@@ -1499,8 +1520,7 @@ def make_handler(server: Server, ollama_root: bool = False):
                 server.errors += 1
                 try:
                     write((json.dumps({"error": str(e) if bad else f"{type(e).__name__}: {e}"}) + "\n").encode())
-                    self.wfile.write(b"0\r\n\r\n")
-                    self.wfile.flush()
+                    self._stream_end()
                 except Exception:  # noqa: BLE001  # the client is gone
                     pass
 
@@ -1546,23 +1566,15 @@ def make_handler(server: Server, ollama_root: bool = False):
                     return fail(f"{type(e).__name__}: {e}", 500, "api_error")
                 return None if resp is None else self._json(apis.chat_to_anthropic(resp, shown))
 
-            def write(b: bytes):
-                self.wfile.write(f"{len(b):x}\r\n".encode() + b + b"\r\n")
-                self.wfile.flush()
+            write = self._part
 
             out = apis.AnthropicStream(write, shown, len(p["prompt"]))
-            self.send_response(200)
-            self._cors()
-            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
+            self._stream_start("text/event-stream; charset=utf-8")
             try:
                 out.start()  # at once: the client knows the request is in, before a long prompt is read
                 server.stream(chat, out.feed, p)
                 out.close()
-                self.wfile.write(b"0\r\n\r\n")
-                self.wfile.flush()
+                self._stream_end()
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:  # noqa: BLE001  # mid-stream: an error event and a clean end
@@ -1574,8 +1586,7 @@ def make_handler(server: Server, ollama_root: bool = False):
                 server.errors += 1
                 try:
                     out.error(str(e) if bad else f"{type(e).__name__}: {e}", "invalid_request_error" if bad else "api_error")
-                    self.wfile.write(b"0\r\n\r\n")
-                    self.wfile.flush()
+                    self._stream_end()
                 except Exception:  # noqa: BLE001  # the client is gone
                     pass
 
@@ -1644,23 +1655,15 @@ def make_handler(server: Server, ollama_root: bool = False):
                 traceback.print_exc()
                 return fail(f"{type(e).__name__}: {e}", 500)
 
-            def write(b: bytes):
-                self.wfile.write(f"{len(b):x}\r\n".encode() + b + b"\r\n")
-                self.wfile.flush()
+            write = self._part
 
             out = apis.OllamaStream(write, shown, t0, generate=path == "/api/generate")
             p["alive"] = self._alive  # a client that left is found by the probe, within a second
-            self.send_response(200)
-            self._cors()
-            self.send_header("Content-Type", "application/x-ndjson")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
+            self._stream_start("application/x-ndjson")
             try:
                 server.stream(chat, out.feed, p)
                 out.close()
-                self.wfile.write(b"0\r\n\r\n")
-                self.wfile.flush()
+                self._stream_end()
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:  # noqa: BLE001
@@ -1674,8 +1677,7 @@ def make_handler(server: Server, ollama_root: bool = False):
                 try:
                     out.feed(f"data: {json.dumps({'error': {'message': msg}})}\n\n".encode())
                     out.close()
-                    self.wfile.write(b"0\r\n\r\n")
-                    self.wfile.flush()
+                    self._stream_end()
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -1779,9 +1781,7 @@ def make_handler(server: Server, ollama_root: bool = False):
                 return self._error(f"{type(e).__name__}: {e}", 500)
             started = False
 
-            def write(b: bytes):
-                self.wfile.write(f"{len(b):x}\r\n".encode() + b + b"\r\n")
-                self.wfile.flush()
+            write = self._part
 
             try:
                 if not req.get("stream"):
@@ -1791,19 +1791,13 @@ def make_handler(server: Server, ollama_root: bool = False):
                         return
                     return self._json(resp)
                 p["alive"] = self._alive  # a client that hangs up (Esc in the agent) stops its reply within a second
-                self.send_response(200)
-                self._cors()
-                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Transfer-Encoding", "chunked")
-                self.end_headers()
+                self._stream_start("text/event-stream; charset=utf-8")
                 started = True
                 if text_api:
                     server.text_completion(req, p, write)
                 else:
                     server.stream(req, write, p)
-                self.wfile.write(b"0\r\n\r\n")
-                self.wfile.flush()
+                self._stream_end()
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:  # noqa: BLE001
@@ -1823,8 +1817,7 @@ def make_handler(server: Server, ollama_root: bool = False):
                                                     "param": None, "code": None}})
                         write(f"data: {err}\n\n".encode())
                         write(b"data: [DONE]\n\n")
-                        self.wfile.write(b"0\r\n\r\n")
-                        self.wfile.flush()
+                        self._stream_end()
                 except Exception:  # noqa: BLE001  # the client is gone
                     pass
 

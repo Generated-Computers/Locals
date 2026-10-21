@@ -238,7 +238,7 @@ Replies have `object: "text_completion"` and `choices[0].text`. Their `usage` ha
 
 ## Streaming
 
-Streams are `text/event-stream` with `Transfer-Encoding: chunked`; the handler speaks HTTP/1.1. Each event is `data: {chunk}\n\n`, and the last one is `data: [DONE]`.
+Streams are `text/event-stream` with `Transfer-Encoding: chunked`; the handler speaks HTTP/1.1. An HTTP/1.0 client, which has no chunked encoding, gets the stream as it is and `Connection: close`: the stream ends when the connection closes (`Handler._chunked`, `_stream_start`, `_part`, `_stream_end`). Each event is `data: {chunk}\n\n`, and the last one is `data: [DONE]`.
 
 - **Role.** `"role": "assistant"` goes with the first delta, after the prefill, as vLLM and SGLang do. When the role was sent before the prefill, clients that time the first chunk measured no time to first token at all.
 - **Reasoning.** With thinking on, `oai.ReplyStream` starts in reasoning mode. It sends `delta.reasoning_content` until the think close tag, then `delta.content`.

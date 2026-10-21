@@ -227,3 +227,33 @@ def test_bad_inputs_get_an_answer(http_server):
         with pytest.raises(ValueError, match="whole number"):
             srv._whole(bad, "max_tokens")
     assert srv._printable("/x\x1b[31m") == "/x\\x1b[31m"
+
+
+def test_a_stream_to_an_http_1_0_client_is_not_chunked():
+    """HTTP/1.0 has no chunked encoding: such a client saw the chunk sizes in its stream. And an empty piece is
+    not sent (as a chunk it ended the stream)."""
+    class Stub:
+        requests = errors = 0
+
+        def log(self, s):
+            pass
+
+        def prepare(self, req):
+            return {}
+
+        def stream(self, req, write, p):
+            write(b"data: one\n\n")
+            write(b"")
+            write(b"data: [DONE]\n\n")
+
+    httpd = srv._HTTPServer(("127.0.0.1", 0), srv.make_handler(Stub()))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        body = json.dumps({"messages": [{"role": "user", "content": "hi"}], "stream": True}).encode()
+        ask = b"POST /v1/chat/completions HTTP/%s\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: %d\r\n\r\n"
+        head, _, rest = _raw(httpd.server_address[1], ask % (b"1.0", len(body)) + body).partition(b"\r\n\r\n")
+        assert b"chunked" not in head and b"Connection: close" in head and rest == b"data: one\n\ndata: [DONE]\n\n"
+        head, _, rest = _raw(httpd.server_address[1], ask % (b"1.1", len(body)) + body).partition(b"\r\n\r\n")
+        assert b"Transfer-Encoding: chunked" in head and rest == b"b\r\ndata: one\n\n\r\ne\r\ndata: [DONE]\n\n\r\n0\r\n\r\n"
+    finally:
+        httpd.shutdown()
