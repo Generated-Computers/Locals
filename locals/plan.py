@@ -25,7 +25,7 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from .solve import SKIP_DIRS, make_workspace, run_check
+from .solve import SKIP_DIRS, make_workspace, read_source, run_check, write_source
 
 VERSION = "2026-10-09.12"  # recorded in plan.json: which way the parts and repairs were written
 
@@ -536,7 +536,7 @@ def _put(dst: Path, files: Dict[str, str]) -> None:
         if top not in p.parents:
             raise ValueError(f"refusing to write {f}: it is outside {dst}")
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(c if c.endswith("\n") else c + "\n")
+        write_source(p, c if c.endswith("\n") else c + "\n")
 
 
 class _Checks:
@@ -689,7 +689,7 @@ def _write_samples(team, base_url: str, task: str, parts: List[dict], digest: st
             def one(i):
                 team.states[f"p{i}" + (f".{s}" if samples > 1 else "")] = "writing"
                 seen = {f: c for f, c in written.items() if any(f in parts[j]["files"] for j in parts[i]["needs"])}
-                own = {f: (team.ws / f).read_text(errors="replace") for f in parts[i]["files"] if (team.ws / f).is_file()}
+                own = {f: read_source((team.ws / f)) for f in parts[i]["files"] if (team.ws / f).is_file()}
                 res[i] = _gen(team, base_url, direct_prompt(task, parts, i, digest, seen, own), parts[i]["files"], _TEMPS[s % len(_TEMPS)],
                               stop)
                 team.states[f"p{i}" + (f".{s}" if samples > 1 else "")] = "written" if res[i]["files"] else "failed"
@@ -963,7 +963,7 @@ def _agent_repair(team, task: str, parts: List[dict], cur: List[Dict[str, str]],
         r.timeout = limit
 
     def read(ws, files):
-        return {f: (ws / f).read_text(errors="replace") for f in files if (ws / f).is_file()}
+        return {f: read_source((ws / f)) for f in files if (ws / f).is_file()}
 
     options: List[List[Dict[str, str]]] = [[cur[i]] for i in range(n)]
     results: List[tuple] = []
@@ -1023,7 +1023,7 @@ def solve_with_plan(race, project: Path, task: str, base_url: str, max_parts: in
     a.t_run = a.t0 = t0
     race.attempts.append(a)
     team = Team(race, ws)
-    team.original = {f: (project / f).read_text(errors="replace") for p in parts for f in p["files"]
+    team.original = {f: read_source((project / f)) for p in parts for f in p["files"]
                      if (project / f).is_file() and (project / f).stat().st_size <= 12000}
     if direct:
         t1 = time.time()

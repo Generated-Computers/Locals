@@ -433,3 +433,88 @@ def test_a_stopped_agents_request_is_closed_not_waited_for():
         assert time.time() - t < 2
     finally:
         httpd.shutdown()
+
+
+def test_files_changed_together_are_written_together_or_not_at_all(tmp_path, monkeypatch):
+    """One of two files the run changed was edited in the project meanwhile: the other used to be written alone,
+    a project nobody checked (it failed), and the run said it passed."""
+    root = tmp_path / "p"
+    root.mkdir()
+    (root / "a.py").write_text("A = 0\n")
+    (root / "b.py").write_text("B = 0\n")
+
+    def agent(body, k):
+        if k == 1:
+            (root / "b.py").write_text("B = 0  # the user's edit, meanwhile\n")
+        steps = [_reply("write_file", path="a.py", content="A = 1"), _reply("write_file", path="b.py", content="B = 1"),
+                 _reply("finish", summary="done")]
+        return steps[min(k, 3) - 1]
+
+    _script(monkeypatch, agent)
+    run = harness.Run("Set A and B to 1 in a.py and b.py.", root, "http://x", "m", None, log=lambda m: None,
+                      keep_dir=tmp_path / "kept")
+    run.solos = 0
+    report = run.go()
+    assert report["changed"] == [] and report["skipped"] == ["b.py"]
+    assert (root / "a.py").read_text() == "A = 0\n"  # (not written alone)
+    assert (Path(report["kept"]) / "a.py").read_text() == "A = 1\n"
+
+
+def test_a_run_without_a_check_keeps_what_it_overwrites(tmp_path, monkeypatch):
+    root = tmp_path / "p"
+    root.mkdir()
+    (root / "a.py").write_text("A = 0  # the user's\n")
+
+    def agent(body, k):
+        return [_reply("write_file", path="a.py", content="A = 1"), _reply("finish", summary="done")][min(k, 2) - 1]
+
+    _script(monkeypatch, agent)
+    run = harness.Run("Set A to 1 in a.py.", root, "http://x", "m", None, log=lambda m: None, keep_dir=tmp_path / "kept")
+    run.solos = 0
+    report = run.go()
+    assert report["changed"] == ["a.py"] and (root / "a.py").read_text() == "A = 1\n"
+    assert (Path(report["before"]) / "a.py").read_text() == "A = 0  # the user's\n"  # (nothing checked the run)
+
+
+def test_an_edit_keeps_the_files_line_endings_and_bytes(tmp_path):
+    """A one-line edit made a Windows file's every line \\n, and a Latin-1 é U+FFFD."""
+    from locals.solve import read_source, write_source
+
+    p = tmp_path / "menu.py"
+    p.write_bytes(b"# -*- coding: latin-1 -*-\r\n# caf\xe9 menu\r\ndef f():\r\n    return 1\r\n")
+    text = read_source(p)
+    assert "\r" not in text  # (the model sees \n, and its edits match)
+    write_source(p, text.replace("return 1", "return 2"))
+    assert p.read_bytes() == b"# -*- coding: latin-1 -*-\r\n# caf\xe9 menu\r\ndef f():\r\n    return 2\r\n"
+    q = tmp_path / "new.py"
+    write_source(q, "x = 1\n")
+    assert q.read_bytes() == b"x = 1\n"
+
+
+def test_a_closed_terminal_ends_a_run_as_ctrl_c_does(tmp_path, monkeypatch):
+    """SIGTERM and SIGHUP ran no cleanup: copies stayed, the work was not kept, agents' commands ran on."""
+    import argparse
+    import os
+    import signal
+
+    import pytest
+
+    from locals import app
+
+    root = tmp_path / "p"
+    root.mkdir()
+    monkeypatch.setattr(app, "fetch_model", lambda m: None)
+    monkeypatch.setattr(app, "ensure_server", lambda a: None)
+
+    class Stopped(harness.Run):
+        def go(self):
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(1)
+            raise AssertionError("SIGTERM did not stop the run")
+
+    monkeypatch.setattr(harness, "Run", Stopped)
+    with pytest.raises(SystemExit, match="stopped; the project was not changed"):
+        harness.cmd_run(argparse.Namespace(task="t", dir=str(root), check=None, model="m", port=8321, parts=2,
+                                           workers=2, rounds=0, steps=5, versions=1, report=None))
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, signal.SIG_DFL)

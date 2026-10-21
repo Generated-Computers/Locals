@@ -35,7 +35,7 @@ from typing import Dict, List, Optional
 
 from .plan import (_COPY_SKIP, _DEF, asks_test_changes, _best, _blame, _check_all, _Checks, _is_test, _key, _merge, _names, _put, _score,
                    _search, make_plan, project_digest, tests_after_code)
-from .solve import SKIP_DIRS, run_check, run_shell
+from .solve import SKIP_DIRS, read_source, run_check, run_shell, write_source
 
 _TEMPS = (None, 0.7, 0.9, 0.5, 1.0, 0.6, 0.8, 0.4)  # version v's temperature (None: the server's, 0.2): the versions differ
 
@@ -182,7 +182,7 @@ class Agent:
             p = self._path(args.get("path", ""))
             if p is None or not p.is_file():
                 return f"no such file: {args.get('path')}"
-            text = p.read_text(errors="replace")
+            text = read_source(p)
             return text if len(text) <= 6000 else text[:6000] + f"\n... ({len(text) - 6000} more characters)"
         if name == "write_file":
             rel = self._relpath(args.get("path") or "")
@@ -199,7 +199,7 @@ class Agent:
                 return f"not written: {rel} is a folder"
             p.parent.mkdir(parents=True, exist_ok=True)
             content = args.get("content") or ""
-            p.write_text(content if content.endswith("\n") else content + "\n")
+            write_source(p, content if content.endswith("\n") else content + "\n")
             if rel not in self.wrote:
                 self.wrote.append(rel)
             return f"wrote {rel} ({len(content)} characters)"
@@ -214,7 +214,7 @@ class Agent:
             p = self._path(rel)
             if p is None or not p.is_file():
                 return f"not changed: no such file {rel} (write it with write_file)"
-            text, old = p.read_text(errors="replace"), args.get("old") or ""
+            text, old = read_source(p), args.get("old") or ""
             n = text.count(old) if old else 0
             new_text = text.replace(old, args.get("new") or "", 1) if n == 1 else (_loose_replace(text, old, args.get("new") or "") if n == 0 else None)
             if new_text is None and n > 1:
@@ -223,7 +223,7 @@ class Agent:
             if new_text is None:
                 return (f"not changed: the old text is not in {rel}. The lines of {rel} most like it are:\n"
                         f"{_closest(text, old)}\nCopy the old text exactly from these lines and edit again.")
-            p.write_text(new_text)
+            write_source(p, new_text)
             if rel not in self.wrote:
                 self.wrote.append(rel)
             return f"changed {rel}"
@@ -340,8 +340,8 @@ def _outputs(task: str, copy: Path, base: Path) -> Dict[str, str]:
         p = copy / rel if rel else None
         if p is None or not p.is_file() or p.stat().st_size > 1 << 20:
             continue
-        text = p.read_text(errors="replace")
-        if (base / rel).is_file() and (base / rel).read_text(errors="replace") == text:
+        text = read_source(p)
+        if (base / rel).is_file() and read_source((base / rel)) == text:
             continue
         out[rel] = text
     return out
@@ -420,7 +420,7 @@ def _texts(root: Path, files: List[str], limit: int = 9000) -> str:
         p = root / f
         if not p.is_file():
             continue
-        t = p.read_text(errors="replace")
+        t = read_source(p)
         if used + len(t) > limit:
             out.append(f"--- {f}: {len(t)} characters, read it with read_file")
             continue
@@ -507,7 +507,7 @@ def fixer_prompt(task: str, parts: List[dict], i: int, digest: str, check: str, 
     if shown:  # every fixer of this round reads the same project: a shared prefix
         text.append("The project's files now:\n" + shown)
     text.append(f"Your part: part {i}, {me['title']}. Your files: {', '.join(me['files'])}.")
-    mine = _mine(out, me, {f: (root / f).read_text(errors="replace") for f in me["files"] if (root / f).is_file()} if root else {})
+    mine = _mine(out, me, {f: read_source((root / f)) for f in me["files"] if (root / f).is_file()} if root else {})
     if mine:  # the failures other parts' fixers work on are not this one's
         text.append(f"What fails in your files (from the output above):\n{mine}")
     if users:  # a part repaired because the failing part, repaired alone, did not get better
@@ -540,7 +540,7 @@ def part_verifier(root: Path, check: Optional[str], parts: List[dict], i: int):
         ok, out, _ = run_check(check, root, keep=6000)
         if ok:
             return None
-        cur = [{f: (root / f).read_text(errors="replace") for f in p["files"] if (root / f).is_file()} for p in parts]
+        cur = [{f: read_source((root / f)) for f in p["files"] if (root / f).is_file()} for p in parts]
         return out[-2000:] if i in _blame(out, parts, cur) else None
 
     return verify
@@ -671,7 +671,7 @@ class Run:
                 a.verified = True
                 self.solved.set()
                 return "The project's check passes now. Call finish."
-            cur = [{f: (a.root / f).read_text(errors="replace") for f in p["files"] if (a.root / f).is_file()} for p in parts]
+            cur = [{f: read_source((a.root / f)) for f in p["files"] if (a.root / f).is_file()} for p in parts]
             if i in _blame(out, parts, cur):
                 return "The project's check after this write still fails in your part:\n" + out[-1500:]
             return "The project's check after this write: nothing it reports is in your files."
@@ -709,7 +709,7 @@ class Run:
         if ok:
             if a.won_files is None:  # its files as they passed (the agent may go on and change them)
                 names = sorted({f for p in self._parts for f in p["files"]} | set(a.wrote))
-                a.won_files = {f: (a.root / f).read_text(errors="replace") for f in names if (a.root / f).is_file()}
+                a.won_files = {f: read_source((a.root / f)) for f in names if (a.root / f).is_file()}
                 a.won_files.update(_outputs(self.task, a.root, self.root))
             a.verified = True
             self.won.set()
@@ -723,7 +723,7 @@ class Run:
         for a in self.solo:
             if a.won_files is None:
                 continue
-            before = {f: ((self.root / f).read_text(errors="replace") if (self.root / f).is_file() else None) for f in a.won_files}
+            before = {f: (read_source((self.root / f)) if (self.root / f).is_file() else None) for f in a.won_files}
             self._stage(a.won_files)
             ok, out, _ = run_check(self.check, self.root, keep=8000)
             if ok:
@@ -755,6 +755,9 @@ class Run:
 
         def ignore(d, names):
             skip = {n for n in names if n in _COPY_SKIP}
+            # sockets and pipes (a dev server's socket in the project): nothing to copy, and copytree failed on them
+            skip |= {n for n in names if not os.path.islink(os.path.join(d, n)) and not os.path.isdir(os.path.join(d, n))
+                     and not os.path.isfile(os.path.join(d, n))}
             if Path(d).resolve() == src:
                 skip |= {n for n in names if n in self._links}
             return skip
@@ -782,7 +785,7 @@ class Run:
         for f, c in files.items():
             p = self.root / f
             try:
-                same = p.is_file() and p.read_text(errors="replace") == c
+                same = p.is_file() and read_source(p) == c
             except OSError:
                 same = False
             if not same:
@@ -791,7 +794,7 @@ class Run:
         self.touched.update(changed)
 
     def _current(self, parts: List[dict]) -> List[Dict[str, str]]:
-        return [{f: (self.root / f).read_text(errors="replace") for f in p["files"] if (self.root / f).is_file()} for p in parts]
+        return [{f: read_source((self.root / f)) for f in p["files"] if (self.root / f).is_file()} for p in parts]
 
     def _versions(self, parts: List[dict], todo: List[int], k: int, prompt, tag: str) -> Dict[int, List[Dict[str, str]]]:
         """``k`` agents for each part in ``todo`` (fewer when that is more than ``self.at_once`` agents),
@@ -819,7 +822,7 @@ class Run:
         self._run_agents([a for _, a in jobs], groups)
         out: Dict[int, List[Dict[str, str]]] = {i: [] for i in todo}
         for i, a in jobs:
-            files = {f: (a.root / f).read_text(errors="replace") for f in (parts[i]["files"] or a.wrote) if (a.root / f).is_file()}
+            files = {f: read_source((a.root / f)) for f in (parts[i]["files"] or a.wrote) if (a.root / f).is_file()}
             if files:
                 files.update(_outputs(self.task, a.root, self.root))
             if files and a.wrote and files not in out[i]:
@@ -1005,14 +1008,17 @@ class Run:
         import hashlib
         import os
 
-        if not (ok or not self.given_check):
+        if self.check and not ok:  # (a check found during the run counts too: its tests failed, and the run wrote anyway)
             self.report["changed"] = []
             self._keep()
             return
-        todo, skipped = [], []
+        todo, skipped, links = [], [], []
         for f in sorted(self.touched):
             src, dst = self.root / f, self.project / f
             if not src.is_file():
+                continue
+            if dst.is_symlink() or src.is_symlink():  # (its bytes are another file's: not the run's to write)
+                links.append(f)
                 continue
             data = src.read_bytes()
             now = hashlib.sha1(dst.read_bytes()).hexdigest() if dst.is_file() else None
@@ -1022,6 +1028,15 @@ class Run:
                 skipped.append(f)
                 continue
             todo.append((f, data))
+        if skipped or links:
+            # all or nothing: the files that could be written, without the others, were a project nobody checked
+            # (a run that wrote one of two files it changed together left the project failing, and said it passed)
+            self.report["changed"] = []
+            self.report["skipped"], self.report["links"] = skipped, links
+            self._keep()
+            return
+        if not self.check and todo:  # nothing checked the run: what it overwrites is kept first
+            self._keep([f for f, _ in todo if (self.project / f).is_file()], src=self.project, tag="before")
         top = self.project.resolve()
         tmps = []
         try:
@@ -1032,8 +1047,8 @@ class Run:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 tmp = dst.with_name(f".{dst.name}.locals-{os.getpid()}")
                 tmp.write_bytes(data)
-                if dst.exists():
-                    os.chmod(tmp, dst.stat().st_mode & 0o777)
+                # the project file's own mode, or for a new file the run's (a script it made executable stays so)
+                os.chmod(tmp, (dst if dst.exists() else self.root / f).stat().st_mode & 0o777)
                 tmps.append((tmp, dst))
             for tmp, dst in tmps:
                 os.replace(tmp, dst)
@@ -1042,23 +1057,21 @@ class Run:
             for tmp, _ in tmps:
                 tmp.unlink(missing_ok=True)
         self.report["changed"] = [f for f, _ in todo]
-        if skipped:
-            self.report["skipped"] = skipped
-            self._keep(skipped)
 
-    def _keep(self, only=None) -> None:
-        """The staging copy's files (those the run wrote, or ``only``) into ``keep_dir``."""
+    def _keep(self, only=None, src: Optional[Path] = None, tag: str = "") -> None:
+        """The staging copy's files (those the run wrote, or ``only``; from ``src`` if given) into ``keep_dir``."""
         import shutil
 
         names = sorted(only if only is not None else self.touched)
         if self.keep_dir is None or not names:
             return
-        dst = Path(self.keep_dir) / time.strftime(f"{self.project.name}-%Y%m%d-%H%M%S")
+        src = src or self.root
+        dst = Path(self.keep_dir) / time.strftime(f"{self.project.name}-%Y%m%d-%H%M%S") / tag
         for f in names:
-            if (self.root / f).is_file():
+            if (src / f).is_file():
                 (dst / f).parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(self.root / f, dst / f)
-        self.report["kept"] = str(dst)
+                shutil.copy2(src / f, dst / f)
+        self.report["before" if tag == "before" else "kept"] = str(dst)
 
 
 class _AnyFile(list):
@@ -1135,6 +1148,13 @@ def cmd_run(args) -> None:
               rounds=args.rounds, max_steps=args.steps, log=lambda m: print("\n  " + m, flush=True), status=status,
               versions=args.versions, race=getattr(args, "race", 2), head=getattr(args, "head", 0),
               keep_dir=app.LOCALS_DIR / "runs")
+    import signal
+
+    def _ended(sig, frame):  # a closed terminal or a kill: the same cleanup as Ctrl-C (copies removed, work kept)
+        raise KeyboardInterrupt
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _ended)
     try:
         report = run.go()
     except KeyboardInterrupt:
@@ -1154,9 +1174,13 @@ def cmd_run(args) -> None:
         print(f"  the whole-task agent {report['won_by']} passed the check before the parts did")
     if report.get("changed"):
         print(f"  written into the project: {', '.join(report['changed'])}")
-    if report.get("skipped"):
-        print(f"  not written, changed in the project during the run: {', '.join(report['skipped'])} (the run's versions are in "
-              f"{report.get('kept')})")
+        if report.get("before"):
+            print(f"  nothing checked this run: the files it overwrote are kept as they were in {report['before']}")
+    if report.get("skipped") or report.get("links"):
+        why = (f"changed in the project during the run: {', '.join(report['skipped'])}" if report.get("skipped") else
+               f"links in the project or the run: {', '.join(report['links'])}")
+        print(f"  nothing was written (the run writes all of its files or none): {why}; the run's files are in "
+              f"{report.get('kept')}")
     elif report.get("kept") and not report.get("changed"):
         print(f"  the project was not changed; the best attempt's files are in {report['kept']}")
     said = next((a for a in report["agents"] if a["summary"].strip() and (a["files"] == ["*"] or not a["files"])), None)
@@ -1164,4 +1188,4 @@ def cmd_run(args) -> None:
         print(f"\n  {said['name']} said:\n    " + said["summary"].strip()[:1500].replace("\n", "\n    "))
     if args.report:
         Path(args.report).write_text(json.dumps(report, indent=1))
-    sys.exit(0 if report["passed"] in (True, None) else 1)
+    sys.exit(1 if report["passed"] is False else 2 if report.get("skipped") or report.get("links") else 0)

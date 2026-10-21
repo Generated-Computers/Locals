@@ -1781,13 +1781,19 @@ class OpenCodeServer:
     (separate ``opencode run`` processes contend for OpenCode's SQLite
     database)."""
 
-    def __init__(self, oc: str, cwd: Path, log_path: Path):
+    def __init__(self, oc: str, cwd: Path, log_path: Path, confine: Optional[List[Path]] = None):
+        """``confine``: the folders OpenCode (and the commands its agents run) may write in, besides the temporary
+        folders and caches (macOS's sandbox-exec; LOCALS_NO_SANDBOX=1: not confined)."""
         self.port = _free_port()
         self.base = f"http://127.0.0.1:{self.port}"
         env = dict(os.environ, OPENCODE_DISABLE_AUTOUPDATE="1", PWD=str(cwd))  # OpenCode reads its directory from $PWD
         _space_opencode_starts()
-        self.proc = subprocess.Popen([oc, "serve", "--port", str(self.port)], stdout=open(log_path, "wb"), stderr=subprocess.STDOUT,
-                                     env=env, cwd=str(cwd))
+        argv = [oc, "serve", "--port", str(self.port)]
+        if confine and not os.environ.get("LOCALS_NO_SANDBOX") and shutil.which("sandbox-exec"):
+            from .solve import write_sandbox
+
+            argv = ["sandbox-exec", "-p", write_sandbox(*confine)] + argv
+        self.proc = subprocess.Popen(argv, stdout=open(log_path, "wb"), stderr=subprocess.STDOUT, env=env, cwd=str(cwd))
         t0 = time.time()
         while time.time() - t0 < 90:
             if self.proc.poll() is not None:

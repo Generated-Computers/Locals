@@ -3,7 +3,7 @@
     locals solve "make the failing tests pass" --check "python3 -m pytest -q"
 
 Every attempt is an OpenCode session (one ``opencode serve``, many sessions) in a
-workspace of its own: a git worktree with the project's uncommitted changes, or a
+workspace of its own: a repository of its own (git clone --shared) with the project's uncommitted changes, or a
 copy. The sessions decode together in one batch of the locals server, and their
 common prompt (the agent's instructions and the task) is computed once. When an
 agent stops, the check runs in its workspace; if it fails, the agent sees the
@@ -80,13 +80,35 @@ def manifest(root: Path) -> Dict[str, str]:
             if f in SKIP_DIRS:
                 continue
             p = Path(dirpath) / f
-            if p.is_symlink() or not p.is_file():
-                continue
-            try:
-                out[str(p.relative_to(root))] = hashlib.sha1(p.read_bytes()).hexdigest()
-            except OSError:
-                pass
+            h = manifest_one(root, str(p.relative_to(root)))
+            if h is not None:
+                out[str(p.relative_to(root))] = h
     return out
+
+
+def read_source(p: Path) -> str:
+    """A project file's text for an agent: its lines with \n (as the model writes them), and bytes that are not
+    UTF-8 kept as they are (surrogates), so writing it back changes nothing the agent did not change."""
+    return p.read_text(encoding="utf-8", errors="surrogateescape")
+
+
+def write_source(p: Path, text: str) -> None:
+    """``text`` into ``p`` with the file's own line endings (CRLF stays CRLF) and its bytes that were not UTF-8 as
+    they were. (One edit of a Windows file made every line \n, and a Latin-1 é became U+FFFD.)"""
+    crlf = False
+    try:
+        with open(p, "rb") as f:
+            head = f.read(65536)
+        crlf = head.count(b"\r\n") * 2 > head.count(b"\n")
+    except OSError:
+        pass
+    with open(p, "w", encoding="utf-8", errors="surrogateescape", newline="\r\n" if crlf else "\n") as f:
+        f.write(text)
+
+
+def _plain(entry: Optional[str]) -> bool:
+    """A manifest entry of a plain readable file (or none: a file that is not there)."""
+    return entry is None or not (entry.startswith("link:") or entry == "unreadable")
 
 
 def changes(base: Dict[str, str], now: Dict[str, str]) -> Tuple[List[str], List[str], List[str]]:
@@ -110,10 +132,17 @@ def git_root(project: Path) -> Optional[Path]:
 
 
 def make_workspace(project: Path, dest: Path) -> str:
-    """A copy of the project as it is now (uncommitted changes included) at ``dest``:
-    a detached git worktree when the project is a git repository's root, else a copy."""
+    """A copy of the project as it is now (uncommitted changes included) at ``dest``: a repository of its own when
+    the project is a git repository's root (``git clone --shared``: the project's objects, read-only, but its own
+    refs, stash, config and hooks), else a copy. (A worktree shared the user's stash, config and branches: an
+    agent's `git stash pop` took the user's newest stash into an attempt that was then deleted.)"""
     if git_root(project) == project and _git(project, "rev-parse", "--verify", "HEAD", check=False).returncode == 0:
-        _git(project, "worktree", "add", "--detach", "--quiet", str(dest), "HEAD")
+        head = _git(project, "rev-parse", "HEAD").stdout.strip()
+        quiet = ["-c", "core.hooksPath=/dev/null", "-c", "advice.detachedHead=false"]  # (no hook of the user's runs)
+        subprocess.run(["git", *quiet, "clone", "--shared", "--no-checkout", "--quiet", str(project), str(dest)],
+                       capture_output=True, text=True, check=True)
+        subprocess.run(["git", "-C", str(dest), *quiet, "checkout", "--quiet", "--detach", head],
+                       capture_output=True, text=True, check=True)
         # the working tree as the user has it: modified, deleted and untracked files
         st = _git(project, "status", "--porcelain", "-z", "--untracked-files=all").stdout.split("\0")
         i = 0
@@ -133,7 +162,7 @@ def make_workspace(project: Path, dest: Path) -> str:
                 shutil.copy2(src, dst)
             elif not src.exists():
                 dst.unlink(missing_ok=True)
-        return "worktree"
+        return "clone"
     shutil.copytree(project, dest, symlinks=True,
                     ignore=lambda d, names: {n for n in names if (Path(d) / n).is_dir() and _skip_dir(Path(d), n, project)}
                     | {n for n in names if n == ".DS_Store"})
@@ -153,7 +182,7 @@ def cleanup_stale_runs(project: Path, root: Path) -> int:
             if not (run / "pid").exists():
                 continue
         for ws in [d for d in run.iterdir() if d.is_dir() and d.name[:1] in ("a", "c", "p")]:  # aN, checkN, probeN
-            remove_workspace(project, ws, "worktree" if (ws / ".git").is_file() else "copy")
+            remove_workspace(project, ws, "worktree" if (ws / ".git").is_file() else "copy")  # (a worktree: older runs)
             removed += 1
         (run / "pid").unlink(missing_ok=True)
     return removed
@@ -231,18 +260,26 @@ import atexit  # noqa: E402
 atexit.register(_kill_live)
 
 
-def write_sandbox(root: Path) -> str:
+# where OpenCode keeps its own state (sessions, logs, config): written by an `opencode serve` run under the sandbox
+OPENCODE_DIRS = (".local/share/opencode", ".local/state/opencode", ".config/opencode", ".opencode")
+
+
+def write_sandbox(root: Path, *more: Path) -> str:
     """A macOS sandbox profile (sandbox-exec) for an agent's commands: everything allowed but writing
-    outside ``root`` (the agent's copy), the temporary folders and the tools' caches. A command that
-    an agent ran with the absolute path the check named wrote into the folder of the check's script."""
+    outside ``root`` (the agent's copy; ``more``: other folders), the temporary folders and the tools' caches. A
+    command that an agent ran with the absolute path the check named wrote into the folder of the check's script."""
     import tempfile
 
     def q(path) -> str:
         return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
     home = Path.home()
-    places = {os.path.realpath(root), os.path.realpath(tempfile.gettempdir()), "/private/tmp", "/private/var/tmp",
+    places = {os.path.realpath(r) for r in (root, *more)}
+    places |= {os.path.realpath(tempfile.gettempdir()), "/private/tmp", "/private/var/tmp",
               os.path.realpath(home / "Library" / "Caches"), os.path.realpath(home / ".cache")}
+    # package managers' own stores (a check's `cargo test` or `npm test` fetches into them)
+    places |= {os.path.realpath(home / d) for d in (".cargo", ".npm", ".pnpm-store", ".yarn", ".bun", ".gradle", ".m2",
+                                                    "go/pkg", "Library/pnpm")}
     allow = " ".join(f"(subpath {q(x)})" for x in sorted(places))
     return ('(version 1)(allow default)(deny file-write* (subpath "/"))'
             f'(allow file-write* {allow} (literal "/dev/null") (literal "/dev/tty") (literal "/dev/zero") (regex #"^/dev/fd/"))')
@@ -337,9 +374,12 @@ def check_cannot_run(cmd: str, cwd: Path) -> Optional[str]:
 
 def run_check(cmd: str, cwd: Path, timeout: float = 300, keep: int = 2000) -> Tuple[bool, str, float]:
     """(passed, the end of the output, seconds). A run that ran no tests is a failure: unittest's
-    discovery that finds nothing exits 0 ("Ran 0 tests ... OK"), and would pass every attempt."""
+    discovery that finds nothing exits 0 ("Ran 0 tests ... OK"), and would pass every attempt. The check writes
+    only in ``cwd`` (an attempt's copy), the temporary folders and the tools' caches, as the agents' commands do:
+    through a link out of the project, or the project's own .venv, a failed run's check had changed files
+    outside the copy, while it said the project was not changed."""
     t0 = time.time()
-    code, out = run_shell(cmd, cwd, timeout)
+    code, out = run_shell(cmd, cwd, timeout, confine=cwd)
     if code is None:
         ok, out = False, f"(the check ran over {timeout:.0f} s)\n" + out
     else:
@@ -409,7 +449,7 @@ def write_check(ocs, project: Path, task: str, run_dir: Path, agent: str, provid
     dst = run_dir / "locals_check.py"
     for k in range(tries):
         ws = run_dir / f"check{k}"
-        kind = "worktree" if git_root(project) == project else "copy"  # removed in the finally even if making it fails
+        kind = "copy"  # removed in the finally even if making it fails
         try:
             kind = make_workspace(project, ws)
             sid = ocs.call("POST", "/session", {"title": "locals solve: the check", "agent": agent,
@@ -435,7 +475,7 @@ def write_check(ocs, project: Path, task: str, run_dir: Path, agent: str, provid
                 log(f"  the check ({k + 1}/{tries}) does not compile: {out[-200:]}")
                 continue
             probe = run_dir / f"probe{k}"
-            pkind = "worktree" if git_root(project) == project else "copy"
+            pkind = "copy"
             try:
                 pkind = make_workspace(project, probe)
                 cmd = check_command(dst)
@@ -555,6 +595,7 @@ class Race:
                         a.state = "outrun"
                         return
                     a.state = "checking"
+                    a.files = manifest(a.ws)  # (before the check: what it writes, target/ or htmlcov/, is not the attempt's work)
                     with self.check_slots:
                         ok, out, secs = run_check(self.check, a.ws)
                     a.check_out, a.check_s = out, a.check_s + secs
@@ -668,7 +709,10 @@ def cmd_solve(args) -> None:
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, _stop)
     base_project = manifest(project)
-    ocs = app.OpenCodeServer(oc, project, run_dir / "opencode-serve.log")
+    # OpenCode under the same sandbox as the checks: its agents' shell wrote through a link out of the project
+    # (data -> ~/datasets) into the user's files, from an attempt that was then thrown away
+    ocs = app.OpenCodeServer(oc, project, run_dir / "opencode-serve.log",
+                             confine=[run_dir, *(Path.home() / d for d in OPENCODE_DIRS)])
     ocs.start_approver()
     if not check:
         print("no tests in the project: an agent writes a check for the task first ...", flush=True)
@@ -679,7 +723,7 @@ def cmd_solve(args) -> None:
             sys.exit("no usable check came out (it must compile and fail on the untouched project); give one with --check")
         print(f"  the check: {run_dir / 'locals_check.py'}", flush=True)
     pre = run_dir / "precheck"  # the check on the project as it is, in a copy: a check an agent wrote runs its programs
-    pkind = "worktree" if git_root(project) == project else "copy"
+    pkind = "copy"
     try:
         pkind = make_workspace(project, pre)
         ok0, out0, _ = run_check(check, pre)
@@ -749,12 +793,16 @@ def cmd_solve(args) -> None:
               "attempts": [a.summary() for a in race.attempts]}
     for a in race.attempts:  # every attempt's changes as a diff against the project as it was (before anything is applied)
         if a.ws.exists():
-            ch, ad, de = changes(race.base, manifest(a.ws))
+            ch, ad, de = changes(race.base, getattr(a, "files", None) or manifest(a.ws))
             if ch or ad or de:
                 (run_dir / f"{a.name}.diff").write_text(unified_diff(project, a.ws, ch + ad, de))
     if w is not None:
-        changed, added, deleted = changes(race.base, manifest(w.ws))
+        files = getattr(w, "files", None) or manifest(w.ws)
+        changed, added, deleted = changes(race.base, files)
         report["changes"] = {"changed": changed, "added": added, "deleted": deleted}
+        # a link or an unreadable file, in the winner or where it writes: its bytes are not what was checked, and
+        # a file that became a link was deleted from the project (the link never made)
+        odd = [f for f in changed + added + deleted if not _plain(files.get(f)) or not _plain(race.base.get(f))]
         diff_path = run_dir / f"{w.name}.diff"
         # changed in the project during the run, or "added" over a file the project has (a gitignored .env or
         # database the worktree did not have): nothing is applied over those
@@ -767,10 +815,11 @@ def cmd_solve(args) -> None:
         outside = [f for f in changed + added + deleted if top not in (project / f).resolve().parents]
         if args.no_apply:
             print(f"{w.name} passed the check after {w.t1 - w.t0:.0f}s; not applied (--no-apply): {diff_path}")
-        elif drift or tests or outside:
+        elif drift or tests or outside or odd:
             why = (f"these files changed in the project during the run (or exist there already): {', '.join(drift[:5])}" if drift else
                    f"it changed the tests the check runs ({', '.join(tests[:5])}), which the task does not ask for" if tests else
-                   f"these paths lead outside the project: {', '.join(outside[:5])}")
+                   f"these paths lead outside the project: {', '.join(outside[:5])}" if outside else
+                   f"these are links or unreadable files, here or in the winner: {', '.join(odd[:5])}")
             print(f"{w.name} passed, but nothing was applied: {why}. The winning changes: {diff_path}")
         else:
             _apply(project, w.ws, changed + added, deleted)
@@ -802,6 +851,8 @@ def _apply(project: Path, ws: Path, write: List[str], delete: List[str]) -> None
             dst.parent.mkdir(parents=True, exist_ok=True)
             tmp = dst.with_name(f".{dst.name}.locals-{os.getpid()}")
             shutil.copy2(ws / rel, tmp)
+            if dst.exists():  # (the user's own mode: copy2 gave the workspace's checkout's, 0644 for a 0600 file)
+                os.chmod(tmp, dst.stat().st_mode & 0o7777)
             tmps.append((tmp, dst))
         for tmp, dst in tmps:
             os.replace(tmp, dst)
@@ -814,8 +865,17 @@ def _apply(project: Path, ws: Path, write: List[str], delete: List[str]) -> None
 
 
 def manifest_one(root: Path, rel: str) -> Optional[str]:
+    """A file's entry in a manifest: the sha1 of its bytes; "link:<target>" for a symbolic link (its target is not
+    read: it may be outside the project); "unreadable" for a file that cannot be read; None for anything else."""
     p = root / rel
-    try:
-        return hashlib.sha1(p.read_bytes()).hexdigest() if p.is_file() else None
-    except OSError:
+    if p.is_symlink():
+        try:
+            return "link:" + os.readlink(p)
+        except OSError:
+            return "unreadable"
+    if not p.is_file():
         return None
+    try:
+        return hashlib.sha1(p.read_bytes()).hexdigest()
+    except OSError:
+        return "unreadable"

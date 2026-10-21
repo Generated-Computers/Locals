@@ -142,16 +142,23 @@ def test_ctrl_c_on_a_writing_agent(stack, report):
     env = dict(stack.env, PWD=str(d))
     mark, off = stack.proxy.mark("ctrl-c"), stack.log_offset()
     task = "Write a file essay.md with a 3000-word essay on the history of computing, in one go."
-    p = subprocess.Popen([*LOCALS, "code", str(d), "--run", task, "--port", str(stack.port)], cwd=d, env=env,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True)
+    out = d / "locals-code.log"  # (what it printed, and on a hang where each thread was: faulthandler on SIGABRT)
+    p = subprocess.Popen([*LOCALS, "code", str(d), "--run", task, "--port", str(stack.port)], cwd=d,
+                         env=dict(env, PYTHONFAULTHANDLER="1"), stdout=open(out, "w"), stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
     writing = _wait(lambda: any((r.get("token_events") or 0) > 20 and r.get("total") is None for r in stack.proxy.since(mark)), 300)
     assert writing is not None, "the agent never started writing"
     os.killpg(p.pid, signal.SIGINT)  # Ctrl-C in the terminal: the whole foreground group
     try:
         p.wait(timeout=30)
     except subprocess.TimeoutExpired:
+        os.kill(p.pid, signal.SIGABRT)  # (its threads' stacks into the log, then it ends)
+        try:
+            p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
         os.killpg(p.pid, signal.SIGKILL)
-        raise AssertionError("locals code did not stop on Ctrl-C within 30 s")
+        raise AssertionError("locals code did not stop on Ctrl-C within 30 s; it printed:\n" + out.read_text()[-4000:])
     gone = _wait(lambda: _idle(stack), 15)
     log = stack.log_since(off)
     report.note(f"Ctrl-C on a writing agent: requests gone after {gone and round(gone, 1)} s; "

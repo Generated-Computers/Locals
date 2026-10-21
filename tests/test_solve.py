@@ -33,9 +33,9 @@ def repo(tmp_path):
     return d
 
 
-def test_worktree_holds_the_working_tree(repo, tmp_path):
+def test_workspace_holds_the_working_tree(repo, tmp_path):
     ws = tmp_path / "ws"
-    assert solve.make_workspace(repo, ws) == "worktree"
+    assert solve.make_workspace(repo, ws) == "clone"
     assert (ws / "keep.txt").read_text() == "keep, edited\n"
     assert not (ws / "gone.txt").exists() and (ws / "notes.md").read_text() == "untracked\n"
     assert solve.manifest(ws) == solve.manifest(repo)  # the same files, .git left out
@@ -47,10 +47,24 @@ def test_worktree_holds_the_working_tree(repo, tmp_path):
     assert (changed, added, deleted) == (["pkg/calc.py"], ["pkg/extra.py"], ["notes.md"])
     diff = solve.unified_diff(repo, ws, changed + added, deleted)
     assert "-    return a - b" in diff and "+    return a + b" in diff and "+X = 1" in diff and "-untracked" in diff
-    solve.remove_workspace(repo, ws, "worktree")
+    solve.remove_workspace(repo, ws, "clone")
     assert not ws.exists()
     assert "ws" not in subprocess.run(["git", "-C", str(repo), "worktree", "list"], capture_output=True, text=True).stdout
     assert (repo / "pkg" / "calc.py").read_text().endswith("a - b\n")  # the project itself is untouched
+
+
+def test_an_attempts_git_never_reaches_the_users_repository(repo, tmp_path):
+    """A worktree shared the user's stash, config and branches: an agent's `git stash pop` took the user's newest
+    stash into an attempt that was then deleted. A workspace is a repository of its own."""
+    _git(repo, "stash", "-q", "-u")  # the user's work, stashed
+    ws = tmp_path / "ws"
+    solve.make_workspace(repo, ws)
+    for cmd in (["stash", "list"], ["config", "user.name", "Agent"], ["branch", "-f", "main", "HEAD"]):
+        subprocess.run(["git", "-C", str(ws), *cmd], capture_output=True)
+    assert subprocess.run(["git", "-C", str(ws), "stash", "list"], capture_output=True, text=True).stdout == ""
+    assert "WIP" in subprocess.run(["git", "-C", str(repo), "stash", "list"], capture_output=True, text=True).stdout
+    assert subprocess.run(["git", "-C", str(repo), "config", "user.name"], capture_output=True, text=True).stdout.strip() != "Agent"
+    solve.remove_workspace(repo, ws, "clone")
 
 
 def test_copy_workspace_without_git(tmp_path):
@@ -236,3 +250,54 @@ def test_a_check_that_cannot_run_is_named_before_any_agent_starts(tmp_path, monk
     assert "not installed" in check_cannot_run("no-such-program-xyz --all", tmp_path)
     for fine in (f"{py} -m wordcount", "./run_tests.sh", f"PYTHONPATH=. {py} -c pass", "true && make test"):
         assert check_cannot_run(fine, tmp_path) is None, fine
+
+
+def test_links_and_unreadable_files_are_in_the_manifest(tmp_path):
+    """They were left out: a winner whose file had become a link counted it as deleted, and the project lost it."""
+    import os
+
+    d = tmp_path / "p"
+    d.mkdir()
+    (d / "real.py").write_text("x = 1\n")
+    os.symlink("real.py", d / "util.py")
+    (d / "secret.txt").write_text("s")
+    (d / "secret.txt").chmod(0)
+    try:
+        m = solve.manifest(d)
+        assert m["util.py"] == "link:real.py" and m["secret.txt"] == "unreadable" and len(m["real.py"]) == 40
+        assert not solve._plain(m["util.py"]) and solve._plain(m["real.py"]) and solve._plain(None)
+    finally:
+        (d / "secret.txt").chmod(0o600)
+
+
+def test_the_winners_files_keep_the_projects_modes(tmp_path):
+    d, ws = tmp_path / "p", tmp_path / "ws"
+    d.mkdir()
+    ws.mkdir()
+    (d / "secrets.py").write_text("TOKEN = 1\n")
+    (d / "secrets.py").chmod(0o600)
+    (ws / "secrets.py").write_text("TOKEN = 2\n")
+    (ws / "secrets.py").chmod(0o644)
+    solve._apply(d, ws, ["secrets.py"], [])
+    assert (d / "secrets.py").read_text() == "TOKEN = 2\n" and (d / "secrets.py").stat().st_mode & 0o777 == 0o600
+
+
+def test_a_check_writes_only_in_its_copy(tmp_path, monkeypatch):
+    """Through a link out of the project, a failed run's check had written into the user's files."""
+    import os
+    import shutil
+    import tempfile
+
+    import pytest
+
+    if not shutil.which("sandbox-exec") or os.environ.get("LOCALS_NO_SANDBOX"):
+        pytest.skip("no sandbox-exec")
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))  # (else all of this test's folder may be written)
+    (tmp_path / "tmp").mkdir()
+    outside, ws = tmp_path / "outside", tmp_path / "ws"
+    outside.mkdir()
+    ws.mkdir()
+    (outside / "data.csv").write_text("id,value\n")
+    os.symlink(outside, ws / "data")
+    ok, out, _ = solve.run_check("echo overwritten > data/data.csv; echo inside > here.txt; true", ws)
+    assert (outside / "data.csv").read_text() == "id,value\n" and (ws / "here.txt").read_text() == "inside\n"

@@ -276,13 +276,15 @@ Process groups still running when locals exits are killed by an `atexit` hook.
 
 The project is touched once, by `Run._finish`, at the end of a run that completed:
 
-- **Check passed, or the run started without a check** (`given_check` is None: no `--check`, and `cmd_run`'s `detect_check` found none in the project). In that case the files are written even when a check detected later from the tests the parts wrote (step 6) fails. Every file the run changed in the staging copy (`Run.touched`) is written into the project, with these safeguards:
-  - A file that changed in the project since the run started (compared with the start `manifest`) is not overwritten. It is listed as `skipped`, and the run's version is kept as described below.
+- **Check passed, or the run had no check at all** (none given, none in the project, and none found in the tests the parts wrote: a check found during the run must pass too, or nothing is written). Every file the run changed in the staging copy (`Run.touched`) is written into the project, with these safeguards:
+  - All or nothing: when a file changed in the project since the run started (compared with the start `manifest`), or one is a link in the project or the run, nothing is written; they are listed as `skipped` or `links`, the run's files are kept as described below, and `locals run` exits with status 2.
+  - With no check at all, the files the run overwrites are first copied, as they were, to `~/.locals/runs/<project>-YYYYmmdd-HHMMSS/before/` (`report["before"]`).
+  - Files keep their line endings and bytes that are not UTF-8 (`solve.read_source`, `solve.write_source`).
   - Files are written under temporary names (`.{name}.locals-{pid}`) and then renamed, so the project gets all of them or none, unless the process crashes between two renames.
-  - An existing file keeps its permissions.
+  - An existing file keeps its permissions, and a new one gets the run's (a script it made executable).
   - A path that resolves outside the project is refused.
 - **Check failed, in a run that started with a check** (given or detected by `cmd_run`). Nothing is written. The files the run changed are copied to `~/.locals/runs/<project>-YYYYmmdd-HHMMSS/` (`_keep`, with `keep_dir=app.LOCALS_DIR / "runs"`).
-- **Stopped with Ctrl-C, or crashed.** The work so far goes to the same folder and the project is not changed. On Ctrl-C, `cmd_run` prints "stopped; the project was not changed" and the folder; on a crash, "locals run failed: ..." and "the project was not changed", without the folder (the work is still kept there).
+- **Stopped with Ctrl-C, a closed terminal (SIGHUP) or a kill (SIGTERM), or crashed.** The work so far goes to the same folder and the project is not changed. On Ctrl-C, `cmd_run` prints "stopped; the project was not changed" and the folder; on a crash, "locals run failed: ..." and "the project was not changed", without the folder (the work is still kept there).
 
 `_finish` has no delete path, so the harness never deletes a file from the project. Only part files and named data files reach the staging copy. Scratch files that an agent's commands made in its copy are discarded with the copy.
 
@@ -341,4 +343,4 @@ The exit status is 0 when the check passed or there was none, and 1 otherwise.
 
 ## Related: `locals solve`
 
-`plan.py` and `solve.py` also hold `locals solve`, which works differently. Its `Race` runs OpenCode sessions in git worktrees or copies, and the first to pass the check wins. Its `--plan` mode writes each part in a single generation, in a `FILE` format constrained by a regular expression. `locals run` uses only the planning, picking, shell and check helpers listed in the table at the top.
+`plan.py` and `solve.py` also hold `locals solve`, which works differently. Its `Race` runs OpenCode sessions in repositories of their own (`git clone --shared`: a worktree shared the user's stash, config and branches) or copies, with `opencode serve` and every check confined to them by the write sandbox, and the first to pass the check wins. Its apply refuses a winner with links or unreadable files where it writes, takes the attempt's files as they were before its check ran (build output is not its work), and keeps the project's file modes. Its `--plan` mode writes each part in a single generation, in a `FILE` format constrained by a regular expression. `locals run` uses only the planning, picking, shell and check helpers listed in the table at the top.
