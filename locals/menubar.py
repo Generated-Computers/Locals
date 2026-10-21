@@ -1,7 +1,7 @@
 """locals in the macOS menu bar: the server's state at a glance, start and stop, and the
 tools opened on it, without a terminal.
 
-    locals menubar          (needs rumps: uv tool install --python 3.12 --force --with rumps 'locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz')
+    locals menubar          (needs rumps: uv tool install --python 3.12 --force 'locals[menubar]')
 
 The icon shows whether the server runs (●), is starting (◐) or is stopped (○); the menu
 shows the model and the requests running, and opens OpenCode or the status page.
@@ -34,7 +34,7 @@ def main(argv=None) -> None:
         import rumps
     except ImportError:
         sys.exit("the menu-bar app needs rumps; add it to the locals install with:\n"
-                 "  uv tool install --python 3.12 --force --with rumps 'locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz'")
+                 "  uv tool install --python 3.12 --force 'locals[menubar]'")
     from .app import DEFAULT_PORT, _load_saved, base_url, get_json, server_alive
 
     saved = _load_saved()

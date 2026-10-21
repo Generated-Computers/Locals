@@ -244,12 +244,11 @@ After the first start, which downloads the model, Locals starts in seconds.
 - **OpenCode** uses Locals as its default model from then on, so plain
   `opencode` uses it too; `locals disconnect opencode` gives OpenCode its own
   settings back.
-- **To update** Locals, run the install command again.
+- **To update** Locals, run the install command again, or `uv tool upgrade locals`.
 - **To remove** it, run `locals stop`, `locals disconnect opencode` and
   `uv tool uninstall locals`.
-- **With the uv package manager**, you can install with
-  `uv tool install --python 3.12 git+https://github.com/Generated-Computers/Locals`
-  instead.
+- **With the uv package manager**, you can install from PyPI with
+  `uv tool install --python 3.12 locals` instead.
 
 ### Coming from Ollama, LM Studio, mlx-lm or llama.cpp
 

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 (unreleased)
+
+- The installer installs the release from PyPI; `LOCALS_SOURCE` set to GitHub's archive installs the main branch.
+- `locals menubar` asks for `uv tool install 'locals[menubar]'` when rumps is missing.
+
 ## 0.2.0 (2026-10-21)
 
 First public release.

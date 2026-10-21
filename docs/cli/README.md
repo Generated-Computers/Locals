@@ -35,7 +35,7 @@ Runtime dependencies are `mlx>=0.32,<0.34`, `mlx-lm>=0.32,<0.33`, `numpy>=1.26`,
 
 1. It refuses anything other than Darwin on `arm64` with macOS 14 or newer.
 2. It uses `uv` from the `PATH` or from `~/.local/bin/uv`. If neither exists, it installs uv with `https://astral.sh/uv/install.sh`.
-3. It runs `uv tool install --python 3.12 --force "$SOURCE"` (run again, this updates: uv asks for the archive with its `ETag`, and a new `main` is downloaded and installed although its version number is the same; an unchanged one gets a 304 and stays, checked with uv 0.12 against a server that answers as GitHub's codeload does): Python 3.12, which Locals is tested on (without it, uv gave a new user the oldest Python the package allows, 3.11). `SOURCE` is `$LOCALS_SOURCE` when set, else `locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz`, GitHub's archive of the main branch: unlike `git+https://...` it needs no git, which a Mac without the Command Line Tools lacks. `LOCALS_SOURCE` is anything `uv tool install` accepts. The script's header shows a wheel path; a local folder also works.
+3. It runs `uv tool install --python 3.12 --force "$SOURCE"`: Python 3.12, which Locals is tested on (without it, uv gave a new user the oldest Python the package allows, 3.11). `SOURCE` is `$LOCALS_SOURCE` when set, else `locals`, the release on PyPI. Run again, this updates: with `--force`, uv resolves the package again and installs PyPI's newest version (checked with uv 0.12); `uv tool upgrade locals` does the same. `LOCALS_SOURCE='locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz'` installs the main branch from GitHub's archive, which, unlike `git+https://...`, needs no git (a Mac without the Command Line Tools lacks it). `LOCALS_SOURCE` is anything `uv tool install` accepts: a package name, a wheel path or a local folder.
 4. If uv's bin directory was not on the original `PATH`, it runs `uv tool update-shell` and prints the `export PATH=...` line; it says that uv added the folder to the shell's startup file only when `update-shell` succeeded.
 5. It prints `locals --version` and the next commands to run.
 
@@ -515,7 +515,7 @@ Before the agents start, the common prefix of all first prompts (when longer tha
 
 ## `locals menubar` (`menubar.py`)
 
-This command needs `rumps` (`uv tool install --python 3.12 --force --with rumps 'locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz'`, the command it prints when `rumps` is missing). It reads the port from `~/.locals/config.json` and polls `/health` and `/stats` every 2 s. The title shows `locals ○` (stopped), `locals ◐` (starting or stopping) or `locals ●` (running), and the menu shows the model and the number of running requests.
+This command needs `rumps` (`uv tool install --python 3.12 --force 'locals[menubar]'`, the command it prints when `rumps` is missing). It reads the port from `~/.locals/config.json` and polls `/health` and `/stats` every 2 s. The title shows `locals ○` (stopped), `locals ◐` (starting or stopping) or `locals ●` (running), and the menu shows the model and the number of running requests.
 
 The menu has three actions:
 
@@ -564,7 +564,7 @@ Variables read by the server process must be set in the environment of the comma
 | `OPENCLAW_BIN`, `HERMES_BIN`, `AIDER_BIN`, `CLINE_BIN`, `KILO_BIN`, `OPENHANDS_BIN` | `PATH` lookup | Path of that tool's command. | `app.py` (`_tool_bin`) |
 | `OPENCLAW_CONFIG_PATH`, `OPENCLAW_STATE_DIR`, `OPENCLAW_HOME` | `~/.openclaw/openclaw.json` | Where OpenClaw's config is, found as OpenClaw finds it (the file itself, else `openclaw.json` in the state folder, else `.openclaw` under the OpenClaw home): checked, backed up and restored there. | `app.setup_openclaw` |
 | `HERMES_HOME` | `~/.hermes` | Where Hermes's `config.yaml` is backed up from. | `app.setup_hermes` |
-| `LOCALS_SOURCE` | `locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz` | What `install.sh` installs. | `install.sh` |
+| `LOCALS_SOURCE` | `locals` (the release on PyPI) | What `install.sh` installs. | `install.sh` |
 
 ### Set by Locals for the programs it starts
 
