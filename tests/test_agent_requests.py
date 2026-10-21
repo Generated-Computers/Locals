@@ -226,7 +226,7 @@ def test_a_request_for_another_model_by_our_names_is_refused(server):
     for bad in (f"locals/{other}", f"locals/locals/{other}"):
         with pytest.raises(ValueError, match=f"runs {server.short}, not {other}"):
             server.prepare(dict(base, model=bad))
-        with pytest.raises(ValueError, match="another locals command switched"):
+        with pytest.raises(ValueError, match="or just \"locals\""):
             server.chat_model(bad)
     assert server.chat_model("llama3.2:latest").endswith(server.short)  # (Ollama's names: the model loaded)
 

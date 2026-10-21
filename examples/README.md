@@ -135,6 +135,9 @@ locals generate --prompt "Ana Silva, 29, ana@example.com, application approved, 
 Start Locals with `locals start`; it answers at `http://127.0.0.1:8321` in the same
 language as the OpenAI and Ollama services. These snippets use the official
 `openai` Python package; any language with an OpenAI library works the same way.
+The model name `locals` means the model the server runs. A full name such as
+`locals/qwen3.5-4b` names one model, and the server refuses it with a message if
+it runs another.
 
 **A simple question.**
 
@@ -143,7 +146,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8321/v1", api_key="local")
 reply = client.chat.completions.create(
-    model="locals/qwen3.5-4b",
+    model="locals",
     messages=[{"role": "user", "content": "Write a haiku about the sea."}],
 )
 print(reply.choices[0].message.content)
@@ -153,7 +156,7 @@ print(reply.choices[0].message.content)
 
 ```python
 stream = client.chat.completions.create(
-    model="locals/qwen3.5-4b",
+    model="locals",
     messages=[{"role": "user", "content": "Explain what a Python list is in two sentences."}],
     stream=True,
 )
@@ -172,7 +175,7 @@ schema = {
     "required": ["name", "age", "city"],
 }
 reply = client.chat.completions.create(
-    model="locals/qwen3.5-4b",
+    model="locals",
     messages=[{"role": "user", "content": "Maria Gonzalez is 34 and lives in Madrid."}],
     response_format={"type": "json_schema", "json_schema": {"name": "person", "schema": schema}},
 )
@@ -193,7 +196,7 @@ tools = [{
     },
 }]
 reply = client.chat.completions.create(
-    model="locals/qwen3.5-4b",
+    model="locals",
     messages=[{"role": "user", "content": "Do I need an umbrella in Paris today?"}],
     tools=tools,
 )
@@ -210,7 +213,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 def ask(question):
     reply = client.chat.completions.create(
-        model="locals/qwen3.5-4b",
+        model="locals",
         messages=[{"role": "user", "content": question}],
     )
     return reply.choices[0].message.content
@@ -235,7 +238,7 @@ print(reply["message"]["content"])
 
 ```bash
 curl http://127.0.0.1:8321/v1/chat/completions -H "Content-Type: application/json" \
-  -d '{"model": "locals/qwen3.5-4b", "messages": [{"role": "user", "content": "Hello!"}]}'
+  -d '{"model": "locals", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
 Libraries built on OpenAI's interface, such as LangChain, LlamaIndex, pydantic-ai

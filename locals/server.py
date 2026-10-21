@@ -207,9 +207,10 @@ class Server:
                 return
         except Exception:  # noqa: BLE001
             pass
-        raise ValueError(f"this server runs {self.short}, not {want} (another locals command switched its model). "
-                         f"Start the agent again through locals (locals code, locals launch ...) to use {self.short}, "
-                         f"or serve {want} on another port: locals start --model {want} --port <another port>")
+        raise ValueError(f"this server runs {self.short}, not {want}. Ask for locals/{self.short}, or just \"locals\" "
+                         f"(the model the server runs); an agent set up for {want} before another locals command switched "
+                         f"the model is set up again by its locals command (locals code, locals launch ...); or serve "
+                         f"{want} on another port: locals start --model {want} --port <another port>")
 
     def chat_model(self, name: str) -> str:
         """The model id for a name an Ollama client sends: the server has one model, so any name is it

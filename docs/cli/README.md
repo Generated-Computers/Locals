@@ -44,7 +44,7 @@ Runtime dependencies are `mlx>=0.32,<0.34`, `mlx-lm>=0.32,<0.33`, `numpy>=1.26`,
 `main(argv)` in `app.py` works in four steps:
 
 1. **Platform check.** Unless the first argument is `--version`, `-h` or `--help`, `_platform_ok()` exits on anything that is not `darwin`/`arm64`.
-2. **Delegated commands.** `generate`, `chat`, `agents` and `tune` have their own `argparse` parsers. `menubar` has none: `menubar.main(argv=None)` takes no options. `_delegate` maps the five names to their entry points. `main` skips any leading `--model`/`--port` options (both `--model X` and `--model=X` forms) and looks at the next word. If that word is a delegated command, `main` calls its `main` with the leading `--model` (never `--port`) followed by the command's own arguments, so the command's own options win. `menubar` gets the arguments that follow its name, without the leading `--model`. `menubar.main` ignores them.
+2. **Delegated commands.** `generate`, `chat`, `agents` and `tune` have their own `argparse` parsers. `menubar` has none: `menubar.main(argv=None)` takes no options. `_delegate` maps the five names to their entry points. `main` skips any leading `--model`/`--port` options (both `--model X` and `--model=X` forms) and looks at the next word. If that word is a delegated command, `main` calls its `main` with the leading `--model` followed by the command's own arguments, so the command's own options win. A leading `--port N` is not passed on but exported as `LOCALS_PORT`, which `chat` and `generate` use (`client.connect`); both also take `--port` themselves. `menubar` gets the arguments that follow its name, without the leading `--model`. `menubar.main` ignores them.
 3. **Saved defaults.** For every other command, `--model` and `--port` default to the values in `~/.locals/config.json` (`_load_saved`), and otherwise to `DEFAULT_MODEL` and `DEFAULT_PORT = 8321`. Commands save them with `remember(**kw)`, which merges non-`None` keys (`model`, `port`, and `opencode` from setup) and ignores I/O and JSON errors.
 4. **Options before or after the subcommand.** `add_common` gives each subparser `--model`/`--port` with `default=argparse.SUPPRESS`. A value given before the subcommand is kept unless it is repeated after it.
 
@@ -73,7 +73,7 @@ The `type=model_id` converter in `locals/defaults.py` resolves names as follows:
 `short_name(model)` is the model's name in the API. It is the last path component, lower-cased, with a trailing `-4bit` or `-mlx-4bit` removed. The server routes on the model id of a request:
 
 - `locals/<short>` goes to Locals's engine.
-- An id that starts with `mlx/`, `stock/` or `stock-` (any case) goes to stock mlx-lm. Every other id goes to Locals's engine, including `locals/<short>` and a plain Hugging Face id.
+- An id that starts with `mlx/`, `stock/` or `stock-` (any case) goes to stock mlx-lm. Every other id goes to Locals's engine, including `locals/<short>` and a plain Hugging Face id. An id `locals/<short>`, `mlx/<short>` or `stock/<short>` that names another model than the one loaded (an alias of it passes) gets a 400, a 404 on Ollama's API, saying which model runs (`server.Server.check_model`); the plain `locals` is always the model loaded.
 - An id containing `think` (any case) turns on the think block, and `--thinking` sets the default. A request's `chat_template_kwargs.enable_thinking` overrides both, and `reasoning_effort: "none"` turns thinking off.
 
 OpenCode references these ids as `<provider>/<engine>/<short>` (`oc_model`), because OpenCode does not send the provider prefix to the server.
@@ -87,7 +87,7 @@ OpenCode references these ids as `<provider>/<engine>/<short>` (`oc_model`), bec
 | `locals disconnect TOOL` | `cmd_disconnect` | Takes Locals out of OpenCode's, OpenClaw's or Hermes's own config (see "Connections" below). |
 | `locals models` | `cmd_models` | The tested models: download size, memory needed, whether they fit this Mac, speed with 8 requests at once (measured here by `locals bench`, else on an M2 Pro), and which to use for coding agents (`defaults.AGENT_TASKS`: the tasks each finished in the end-to-end suite). `locals code` and `locals launch` print a note for a model that finished fewer than half (`defaults.agent_note`: Gemma 4 E4B). |
 | `locals setup [opencode\|openclaw\|hermes]` | `cmd_setup` | Writes the tool's config. For `openclaw`/`hermes`, also downloads the model and starts the background server unless `--no-start` is given. |
-| `locals serve` | `cmd_serve` | `os.execv` into `python -m locals.server` in the foreground. The server downloads the model itself. |
+| `locals serve` | `cmd_serve` | Holds the port's start lock, checks and downloads the model (`fetch_model`), remembers it, then `os.execv`s into `python -m locals.server` in the foreground. |
 | `locals start` | `cmd_start` | Downloads the model, then starts the server in the background (`ensure_server`). |
 | `locals stop` | `cmd_stop` | Stops the Locals server on `--port`, and only a Locals server. |
 | `locals status` | `cmd_status` | Prints `/stats` as a table. |
@@ -98,7 +98,7 @@ OpenCode references these ids as `<provider>/<engine>/<short>` (`oc_model`), bec
 | `locals generate` | `cli.main` | One generation on the background server. |
 | `locals chat` | `chat.main` | Interactive chat on the background server. |
 | `locals agents` | `agents.main` | In-process agent suite (no HTTP server). |
-| `locals tune` | `cmd_tune` | The full one-time kernel autotuning: `Runtime.load(model, tune=mode)`. `--mode full` (default) or `quick`. `--report` then prints what tuning measured (`kernels.tune_report`): per batch size, one decode step's 4-bit matmuls with MLX's kernels against the chosen ones and the fastest of Locals' own, and per layer shape how prompts are read, and for Qwen3.5 the whole model reading prompts with mlx-lm's recurrent kernel against MLX's op. On a new GPU it shows where Locals gains. |
+| `locals tune` | `cmd_tune` | The full one-time kernel autotuning: `Runtime.load(model, tune=mode)`. `--mode full` (default) or `quick`. `--report` then prints what tuning measured (`kernels.tune_report`): per batch size, one decode step's 4-bit matmuls with MLX's kernels against the chosen ones and the fastest of Locals' own, and per layer shape how prompts are read, and for Qwen3.5 the whole model reading prompts with mlx-lm's recurrent kernel against MLX's op. On a new GPU it shows where Locals gains. It runs `check_model` first, and refuses while a locals server runs (its work would skew the timings) unless given `--force`. |
 | `locals menubar` | `menubar.main` | The menu-bar app. |
 
 The description in `--help` is the module docstring of `app.py`. argparse adds the usage line and the list of subcommands with their `help=` strings, and that list includes `run`, `launch` and `menubar`.
@@ -130,14 +130,14 @@ The description in `--help` is the module docstring of `app.py`. argparse adds t
 
 ### Starting it: `ensure_server` and `_ensure_server`
 
-`ensure_server(args, wait_s=3600)` takes an exclusive `fcntl.flock` on `~/.locals/server-<port>.lock`. If another `locals` command (a second terminal, the menu bar) is already starting the server, this command prints that it is waiting, blocks, and then finds the server already running. Only one `ensure_server` caller at a time starts a model on a given port. `locals serve` (`os.execv`, no lock) and `python -m locals.server` do not take the lock. They rely on the server's own `_port_taken` check, which runs before loading. It then calls `_ensure_server`:
+`ensure_server(args, wait_s=3600)` takes an exclusive `fcntl.flock` on `~/.locals/server-<port>.lock`. If another `locals` command (a second terminal, the menu bar) is already starting the server, this command prints that it is waiting, blocks, and then finds the server already running. Only one `ensure_server` caller at a time starts a model on a given port. `locals serve` takes the same lock (non-blocking: it exits with "another locals command is starting the server on port N" while another command holds it) from its check until it `os.execv`s the server, so a command meanwhile waits for it. Only `python -m locals.server` takes no lock and relies on the server's own `_port_taken` check, which runs before loading. It then calls `_ensure_server`:
 
 1. If `--engine mlx` is set and `--engines` is not, `args.engines` becomes `locals,mlx`, because a comparison needs both engines loaded.
 2. **If something answers `/health` on the port**, it reads `/stats` (the running `model`) and `/health` (`build`, `engines`):
    - `stale` is true when the server reports a `build` different from `defaults.build_id()`. `build_id` is a SHA-1 over the names, sizes and modification times of `locals/*.py`, except `plan.py` and `solve.py`, which only the client runs. **Editing any other module in a checkout therefore makes a running background server stale.**
-   - `same` is true when `/stats` reports no model, when the running model equals the requested one, or when it has the same short name.
+   - `same` is true when `/stats` reports no model, or when the running model's full id equals the requested one (a fine-tune or another publisher's conversion with the same short name is another model).
    - If `same` and not `stale`, the server is reused. `_SERVER_OPTS` is `engines`, `slots`, `temp`, `top_p`, `top_k`, `max_tokens`, `cache_gb`, `max_calls`, `max_context`. If any of these other than `engines` was given, a note says they only apply on the next start. When a server is reused, `--preload`, `--thinking`, `--walk`, `--typed-tools` and `--ollama` are dropped without a note. If `mlx` was requested but the running server lacks it, the command exits and asks you to stop the server first.
-   - Otherwise the command restarts the server only when it is ours and idle. `_background_pid` returns the pid saved in the pid file only if that pid is the one listening (`lsof`), and the server must have no `active` rows. A server that is not ours or is busy is used as-is when `same` (with a note that it runs older code). Otherwise the command exits and names `locals stop` or `--port`. A restart sends `SIGTERM` and waits up to 60 s (120 polls of 0.5 s) for the port to free.
+   - Otherwise the command restarts the server only when it is ours and idle. `_background_pid` returns the pid saved in the pid file only if that pid is the one listening (`lsof`), and the server must have no `active` rows. A server that is not ours or is busy is used as-is when `same` (with a note that it runs older code). Otherwise the command exits and names `locals stop` or `--port`. A restart sends `SIGTERM` and waits up to 60 s (120 polls of 0.5 s) for the port to free. The new server gets the options the old one was started with (`_KEPT`, saved in `~/.locals/server-<port>.json`: `--ollama-port`, `--max-context` and the others except `engines` and `preload`) where this command leaves them unset.
 3. If some other process holds the port (`_listener_pid` finds a process whose command line lacks `locals.server`), the command exits before loading anything.
    If a server this tool started is still loading (`_starting_pid`: the saved pid is a running `locals.server` that does not listen yet, for example after a command was stopped with Ctrl-C while it waited), the command waits for it and follows its log instead of starting a second copy of the model, then applies the checks above. `locals serve` refuses to start next to it, and `locals status` reports it as starting. Ctrl-C while waiting stops the waiting, not the server.
 4. If `~/.locals/server.log` is larger than 50 MiB (`50 << 20`), it is moved to `server.log.1`.
@@ -168,12 +168,13 @@ The server also serves a status page at `GET /` (`STATUS_HTML` in `server.py`) t
 
 ### Model download: `fetch_model`
 
-`fetch_model(model)` runs before the background start in `start`, `code`, `launch`, `setup openclaw|hermes`, `run`, `solve` and `bench`, so there a download shows progress in the terminal instead of in the server log. `swarm` calls `ensure_server` without it. Its first download happens inside the server, and its progress goes to `server.log`. Ctrl-C during a download ends with a line saying that the next run goes on where it stopped.
+`fetch_model(model)` runs before the background start in `start`, `code`, `launch`, `setup openclaw|hermes`, `run`, `solve` and `bench`, and before `serve` becomes the server, so there a download shows progress in the terminal instead of in the server log. `swarm` calls `ensure_server` without it. Its first download happens inside the server, and its progress goes to `server.log`. Ctrl-C during a download ends with a line saying that the next run goes on where it stopped.
 
 `check_model(model)` comes first (`fetch_model` calls it, and `locals setup` calls it alone, before any config names the model). It downloads nothing and refuses:
 
 - GGUF models (`defaults.gguf_hint` names MLX versions instead: the same model and size first, then `mlx-community`'s, then 4-bit ones).
-- Ollama names it does not know, such as `llama3.2:3b` (`defaults.ollama_hint` names MLX versions on Hugging Face, the tag's size first). Without it, the download failed with "Repo id must use alphanumeric chars".
+- Ollama names it does not know, such as `llama3.2:3b` (`defaults.ollama_hint` names MLX versions of that size on Hugging Face, `mlx-community`'s and 4-bit ones first). Without it, the download failed with "Repo id must use alphanumeric chars".
+- Gated models whose license is not accepted ("is gated on Hugging Face: accept its license at ..., then sign in with `hf auth login` or set HF_TOKEN").
 - Models whose weights plus `HEADROOM_GB = 2.0` exceed the GPU's recommended working set (`defaults.too_big`, skipped with `LOCALS_IGNORE_MEMORY=1`). The message suggests a smaller model for this Mac.
 - A name that is neither a folder nor a model on Hugging Face (a typo), with the nearest short name (`did you mean --model gemma?`). Offline, a model not downloaded yet passes, and its download says what is wrong.
 
@@ -187,7 +188,10 @@ Local paths are used as-is. Hugging Face repositories are fetched with `snapshot
 |---|---|---|
 | `~/.locals/config.json` | `remember` | Last `model`, `port`, `opencode` binary. These are the defaults of later commands. |
 | `~/.locals/server-<port>.pid` | `_ensure_server` | Pid of the background server. `server.pid` is the older single-file name, still read. |
-| `~/.locals/server-<port>.lock` | `ensure_server` | `flock` that serializes server starts per port. |
+| `~/.locals/server-<port>.lock` | `ensure_server`, `cmd_serve` | `flock` that serializes server starts per port. |
+| `~/.locals/serve-<port>.pid` | `cmd_serve` | Pid of a `locals serve` server, written before it loads the model, so another command waits for it. |
+| `~/.locals/server-<port>.json` | `_ensure_server` | The options a background server was started with, kept for a restart. |
+| `~/.locals/config.json.bad` | `_load_saved` | A `config.json` that did not parse, set aside with a note; the defaults are used. |
 | `~/.locals/server.log`, `server.log.1` | `_ensure_server` | Output of background servers. One file for all ports. Rotated once past 50 MiB. |
 | `~/.locals/backups/<tool>-<file>.before-locals` | `_back_up_once` | OpenClaw's `openclaw.json` / Hermes's `config.yaml` as it was before Locals changed it (`{}` when the tool had none). Taken once, never of a config that already holds Locals's settings, and removed by `locals disconnect`, so a later connect keeps the config as it is then. The undo command is printed. |
 | `~/.locals/openclaw-locals.json5` | `setup_openclaw` | The config fragment patched into OpenClaw. |
@@ -199,11 +203,11 @@ Local paths are used as-is. Hugging Face repositories are fetched with `snapshot
 | `~/.config/opencode/opencode.json` | `write_config`, `cmd_code` | OpenCode's config. A copy from before Locals is kept beside it as `opencode.json.before-locals`, by the same rules as the other backups. |
 | `~/.opencode/bin/opencode` | `install_opencode` | OpenCode, if Locals installed it. |
 | `~/.local/bin/locals` | `cmd_setup` | Symlink created only for a development checkout when `locals` is not on the `PATH`. |
-| `~/.cache/locals/` | engine and server | Kernel tuning (`tune_v6_<arch>.json`), system-prompt disk cache (`prompts/`), request dumps (`requests/`). See the environment variables below. |
+| `~/.cache/locals/` | engine and server | Kernel tuning (`tune_v6_<arch>.json`; `tune_v6_<arch>.json.tuning-<pid>` names the shape a process is timing, and one left by a process that died counts as a crash of that shape: `kernels._crashed_shapes`), system-prompt disk cache (`prompts/`), request dumps (`requests/`). See the environment variables below. |
 | `./swarm_runs/<stamp>/` | `cmd_swarm` | `task_NN.json`, `summary.json`, `opencode-serve.log`. Location set with `--out`. |
 | `./agent_runs/<stamp>-<engine>/` | `agents.run` | Agent sandboxes `agent_NN/`, `summary.json`, `transcripts.json`. Location set with `--out`. |
 
-Writes to OpenCode's `opencode.json` (`write_config`, `cmd_code`) go through `_write_atomic`, which writes a temporary file in the same folder and then `os.replace`s it. OpenClaw's and Hermes's configs are changed by their own CLIs (`openclaw config patch`, `hermes config set`). Locals's own files (`config.json`, `kilo.json`, `openclaw-locals.json5`) are written with plain `write_text`. It follows a symlinked config to its target and keeps the file mode, so a crash never leaves half a config file.
+Writes to OpenCode's `opencode.json` (`write_config`, `cmd_code`) go through `_write_atomic`, which writes a temporary file in the same folder and then `os.replace`s it. OpenClaw's and Hermes's configs are changed by their own CLIs (`openclaw config patch`, `hermes config set`). Locals's own `config.json` and `bench.json` go through `_write_atomic` too (flushed to disk before the rename); `kilo.json` and `openclaw-locals.json5` are written with plain `write_text`. It follows a symlinked config to its target and keeps the file mode, so a crash never leaves half a config file.
 
 ## OpenCode
 
@@ -223,7 +227,7 @@ Writes to OpenCode's `opencode.json` (`write_config`, `cmd_code`) go through `_w
 `opencode_config` produces the following:
 
 - `provider.locals` is always written. `provider.mlx` is written only when the engine is `mlx`, because the comment says the stock engine is for comparisons and confuses everyday use. Each provider uses `npm: "@ai-sdk/openai-compatible"`, `baseURL: http://127.0.0.1:<port>/v1` and `apiKey: "local"`. Each lists `<engine>/<short>` and, with thinking, `<engine>/<short>-thinking`, with `tool_call: true`, `reasoning` set on the thinking variant, and `limit: {context, output}` (output default 4096).
-- `model` and `small_model` are `<engine>/<engine>/<short>`, so Locals becomes OpenCode's default model.
+- `model` and `small_model` are `locals/locals/<short>`, so Locals becomes OpenCode's default model.
 - `default_agent` is the chosen agent, and `subagent_depth` is `1`.
 - `agent` holds the team below, plus `build` and `plan` with `steps: AGENT_STEPS`.
 
@@ -235,7 +239,7 @@ Writes to OpenCode's `opencode.json` (`write_config`, `cmd_code`) go through `_w
 
 It refuses a file that is not plain JSON (comments or trailing commas, which OpenCode's JSONC allows) or that is not a JSON object, because rewriting it would lose them.
 
-`_opencode_ready(model, port)` decides whether `locals code` and `locals solve` need to run setup. It checks that OpenCode is installed, that the config's `model` ends with `/<short>`, and that `provider.locals.options.baseURL` matches the port.
+`_opencode_ready(model, port)` decides whether `locals code` and `locals solve` need to run setup. It checks that OpenCode is installed, that the config's `model` is `locals/locals/<short>`, and that `provider.locals.options.baseURL` matches the port.
 
 ### The agent team (`AGENTS`)
 
@@ -255,7 +259,7 @@ Every agent, plus `build` and `plan`, gets `steps = AGENT_STEPS = 40`. The comme
 
 `cmd_code` runs these steps in order:
 
-1. Checks that `DIR` exists, and refuses the home folder, `/` and the folders above the home folder: the agent edits files and runs commands in its folder without asking.
+1. If `DIR` is missing, asks to create it (at a terminal; otherwise exits with the `mkdir -p` command), and refuses the home folder, `/` and the folders above the home folder (`project_folder`): the agent edits files and runs commands in its folder without asking. `run`, `solve` and `swarm` refuse the same folders.
 2. Installs OpenCode if it is missing (`install_opencode` asks first), before the model's download rather than after it.
 3. Calls `fetch_model`, so a model that cannot run (a typo, a GGUF, too big) is refused before OpenCode's config names it.
 4. Runs setup if `_opencode_ready` is false (OpenCode's default model is not `locals/locals/<short>`, or the provider points at another port), or if `--engine mlx` is given and the config has no `mlx` provider. OpenCode's default `model` and `small_model` are always on the Locals engine: `--engine mlx` adds the `mlx` provider and chooses it for that launch only, with `-m`.
@@ -376,7 +380,7 @@ Both tools speak OpenAI chat completions to a custom base URL. The config is wri
 
   It warns when the context is under 64000.
 
-If the tool is not installed, both functions print how to finish by hand and return `False`, and `cmd_setup` then starts nothing. Otherwise `cmd_setup` remembers the model and port. Unless `--no-start` is given, it downloads the model and starts the background server.
+If the tool is not installed, both functions print how to finish by hand and return `False`, and `cmd_setup` then starts nothing and exits with status 1. Otherwise `cmd_setup` remembers the model and port. Unless `--no-start` is given, it downloads the model and starts the background server.
 
 `locals setup` with no target (OpenCode) also creates the `~/.local/bin/locals` symlink for a development checkout, as listed in the files table.
 
@@ -512,12 +516,12 @@ Before the agents start, the common prefix of all first prompts (when longer tha
 
 ## `locals menubar` (`menubar.py`)
 
-This command needs `rumps` (`uv tool install 'locals[menubar]'`). It reads the port from `~/.locals/config.json` and polls `/health` and `/stats` every 2 s. The title shows `locals ○` (stopped), `locals ◐` (starting or stopping) or `locals ●` (running), and the menu shows the model and the number of running requests.
+This command needs `rumps` (`uv tool install --force --with rumps 'locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz'`, the command it prints when `rumps` is missing). It reads the port from `~/.locals/config.json` and polls `/health` and `/stats` every 2 s. The title shows `locals ○` (stopped), `locals ◐` (starting or stopping) or `locals ●` (running), and the menu shows the model and the number of running requests.
 
 The menu has three actions:
 
 - **Start or stop the server:** runs `python -m locals.app start|stop` in a thread, the same commands as the terminal. Failures appear in an alert on the next refresh, because AppKit is not thread-safe.
-- **Open OpenCode on a folder:** an AppleScript folder picker, then Terminal with `cd <folder> && locals code .`.
+- **Open OpenCode on a folder:** an AppleScript folder picker, then Terminal with `cd <folder> && <python> -m locals.app code .`.
 - **Status page:** opens the server's status page in the browser.
 
 ## Environment variables
@@ -553,6 +557,9 @@ Variables read by the server process must be set in the environment of the comma
 | `LOCALS_HOSTS` | empty | Extra `Host` header names accepted, against DNS rebinding (comma-separated, `*`). | `server._host_ok` |
 | `LOCALS_DEBUG` | unset | Saves every request as received. | `server.Server.prepare`, `server.Server.prepare_text`, `server.make_handler.Handler._other_api` |
 | `LOCALS_DEBUG_DIR` | `~/.cache/locals/requests` | Where those dumps go. The folder is mode 0700 and the files 0600. | `server._dump_request` |
+| `LOCALS_SOLO` | `1` | `0`: a request running alone decodes one token a step, as with many requests (no forced spans in one pass, no prompt-lookup drafts). | `hybrid_batch.py` |
+| `LOCALS_KEEP_THINK` | `1` | `0`: the chat template's own handling of past replies' empty think blocks (it drops them, so each new message re-read the previous turn). | `server.py` |
+| `LOCALS_PORT` | unset | The port `chat` and `generate` talk to; `locals --port N chat` sets it. | `client.connect` |
 | `LOCALS_NO_SANDBOX` | unset | `solve.run_shell` does not confine commands with `sandbox-exec`. | `solve.run_shell` |
 | `OPENCLAW_BIN`, `HERMES_BIN`, `AIDER_BIN`, `CLINE_BIN`, `KILO_BIN`, `OPENHANDS_BIN` | `PATH` lookup | Path of that tool's command. | `app.py` (`_tool_bin`) |
 | `OPENCLAW_STATE_DIR` | `~/.openclaw` | Where OpenClaw's `openclaw.json` is backed up from. | `app.setup_openclaw` |
@@ -573,10 +580,9 @@ Variables read by the server process must be set in the environment of the comma
 
 - **Stale check in the agent suite.** The `reverse` task in `agents.SUITE` asks for `'locals agents'` reversed (`stnega slacol`) but checks for `"stnega nocts"`, left over from the rename. That task's check always fails.
 - **Misleading status-page label.** The status page labels its last column "tok/s (decode)", but `decode_s` accumulates `t_done - t_submit` per request, which is wall time including queueing and prefill. `locals status` labels the same number correctly.
-- **Delegated commands ignore saved defaults.** `generate`, `chat`, `agents` and `tune` do not read `~/.locals/config.json`. They use `DEFAULT_MODEL` unless `--model` is given. `menubar` ignores `--port` and uses the saved port.
+- **Some delegated commands ignore saved defaults.** `generate` and `chat` on the server read the model and port saved in `~/.locals/config.json`, but `--local`, `agents` and `tune` use `DEFAULT_MODEL` unless `--model` is given. `menubar` ignores `--port` and uses the saved port.
 - **Incomplete `--no-exec` help.** `locals agents --no-exec` is documented as "disable run_python", but it also disables `run_file`.
-- **`/json` with `/n` in chat.** In `locals chat`, a pending `/json` schema is not applied to a `/n` turn and stays pending for the turn after.
-- **Outdated `--help` text.** The `app.py` docstring at the top of `locals --help` does not describe `run`, `launch` or `menubar`. They appear only in argparse's generated list of subcommands. It also calls Qwen3.5-4B "the default", although below 12 GB of memory the default is Qwen3.5-2B.
+- **`/json` with `/n` in chat.** In `locals chat --local`, a pending `/json` schema is not applied to a `/n` turn and stays pending for the turn after (on the server it applies to the `/n` turn).
 - **Shared server log.** All ports share one `~/.locals/server.log`.
 
 ## Tests

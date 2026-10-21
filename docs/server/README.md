@@ -65,19 +65,20 @@ Handler.do_POST
    - `n` other than 1;
    - a truthy `logprobs` or `top_logprobs`. `logprobs: false` and `top_logprobs: 0` pass (`server._unsupported`).
 3. It picks the engine with `oai.engine_of(model)` and thinking with `oai.thinking_of(model, --thinking)`.
-   - A request for another model by the server's own names (`locals/<name>`, `mlx/<name>`) is a 400 that says which model runs (`check_model`): another locals command had switched the model under a connected agent, and the agent's requests were answered by the new model without a word. Any other name (`gpt-4o` in an app, Ollama's names) is the model loaded.
+   - A request for another model by the server's own names (`locals/<name>`, `mlx/<name>`, `stock/<name>`; an alias of the loaded model passes) is a 400 that says which model runs (`check_model`), and that the plain `locals` is always the model loaded: another locals command had switched the model under a connected agent, and the agent's requests were answered by the new model without a word. Any other name (`gpt-4o` in an app, Ollama's names) is the model loaded.
    - A bool in `chat_template_kwargs.enable_thinking` (the switch vLLM and SGLang use) overrides thinking.
    - `reasoning_effort: "none"`, or `reasoning.effort` in the Responses API shape, turns thinking off.
 4. `Server.service(engine)` loads the engine on first use. Each engine has its own lock, so the other engine keeps serving during a load. After a failed load, the engine is not loaded again for 60 s. Requests in that window get a 500 that repeats the error.
 5. `_cap_context()` fixes the context limit once (see Context limits).
 6. `format_of(engine)` reads two things from the chat template, once per engine: the tool-call format (`formats.detect`) and the thinking style (`formats.thinking_style`).
-7. Thinking is forced off in three cases:
+7. Thinking is forced off in four cases:
    - The style is `"none"` (no switch) or `"switch"` (thoughts marked in a way the parser does not know).
    - The output is constrained (a `response_format` of type `json_object`, `json_schema` or `regex`, or `guided_regex`). The grammar writes the JSON from the first token, and an open think block would hold it.
    - `formats.offers_thinking` says the model has no thinking mode. Such a model never closes a think block.
+   - An Anthropic request ends with an assistant prefill (`_prefill`): the reply goes on from it.
 8. `oai.convert_messages` flattens the messages:
    - `system` and `developer` messages are merged into one at the front;
-   - content parts are joined with newlines, with images as `[image omitted]` and files as `[file omitted]`;
+   - content parts are joined with newlines, with an image as "[an image was attached here; this model reads text only]" and a file as "[a file was attached here; this model reads only the text of the conversation]" (`oai.IMAGE_NOTE`, `oai.FILE_NOTE`);
    - tool-call arguments become dicts;
    - an empty user message is added when there is none, because templates require one.
 
@@ -110,7 +111,7 @@ Paths are matched with any trailing slash removed.
 | OPTIONS | any | 204 with CORS headers, after `_allowed()` |
 | HEAD | any | 200 with an empty body. No host or origin check |
 
-Any other path gets a 404.
+`GET /v1/models/<id>` (and `/models/<id>`) answers the loaded model's entry. `POST /v1/messages` and `/v1/messages/count_tokens` are the Anthropic API (below). Any other path gets a 404.
 
 `BUILD_ID` comes from `defaults.build_id()`. It is a fingerprint of the names, sizes and modification times (`st_mtime_ns`) of the installed `locals/*.py` files, except `plan.py` and `solve.py`, which are the client side of `locals solve` (`defaults.build_id`). The CLI compares it with its own, so it can restart a background server that still runs older code.
 
@@ -140,10 +141,10 @@ Two engines can serve the same model, and each request's model id picks one. `EN
 | `locals/<short>` | ours | `<short>` is `defaults.short_name(model)`: the repository or folder name in lower case, without `-mlx-4bit` or `-4bit` |
 | `mlx/<short>` | stock mlx-lm | as are ids that start with `stock/` or `stock-` |
 | contains `think` (as in `...-thinking`) | either | turns thinking on |
-| anything else | ours | including a Hugging Face id such as `mlx-community/Qwen3.5-4B-MLX-4bit`. The server has one model, so the rest of the id is not checked |
+| anything else | ours | including a Hugging Face id such as `mlx-community/Qwen3.5-4B-MLX-4bit`. The server has one model; an id naming another model in our own namespace (`locals/<short>` of another model) is refused (`check_model`) |
 
 - A request without `model` is served as `locals/<short>`.
-- Asking for an engine that is not in `--engines` is a 400: `engine 'mlx' is not enabled on this server`.
+- Asking for an engine that is not in `--engines` is a 400: `engine 'mlx' is not enabled on this server (enabled: locals)`.
 
 `/v1/models` lists two ids for each enabled engine:
 
@@ -162,7 +163,7 @@ Each entry carries `context_length` and `max_model_len`, both equal to `context_
 | `model` | picks the engine and thinking (see above) |
 | `messages` | required, a non-empty list |
 | `tools` | OpenAI function tools. A bare `{name, description, parameters}` also works |
-| `tool_choice` | `auto` (the default), `required`, `none`, or `{"type": "function", "function": {"name": ...}}` (`{"name": ...}` also works). On our engine, when tools are offered and no `response_format` or `guided_regex` constraint applies, `_check_tool_choice` turns any other value, or a name that is not one of the tools, into a 400. The stock engine does not check it (`server.Server.prepare`, `server._check_tool_choice`). |
+| `tool_choice` | `auto` (the default), `required`, `none`, or `{"type": "function", "function": {"name": ...}}` (`{"name": ...}` also works). On our engine, whenever tools are offered (with or without a `response_format`), `_check_tool_choice` turns any other value, or a name that is not one of the tools, into a 400. The stock engine does not check it (`server.Server.prepare`, `server._check_tool_choice`). |
 | `parallel_tool_calls` | `false`: at most one call per reply (our engine's grammar) |
 | `response_format` | type `text`, `json_object`, `json_schema` (schema in `json_schema.schema`) or `regex` (in `regex` or `pattern`). Any other type is a 400, so a reply is never unconstrained by mistake |
 | `guided_regex` | vLLM's name for a regex constraint |
@@ -246,7 +247,7 @@ Streams are `text/event-stream` with `Transfer-Encoding: chunked`; the handler s
   - If the client has left, the write fails and the job is cancelled.
 - **Finish chunk.** An empty delta with `finish_reason`:
   - `tool_calls`;
-  - `length`, when the engine's finish was `length` or `exhausted`;
+  - `length`, when the engine's finish was `length` or `exhausted`, or when the loop guard cut a call (`loop_in_call`) or a reply without tools;
   - `stop` otherwise.
 
   Without `include_usage`, this chunk also carries `usage`. With it, usage goes in a separate last chunk with `choices: []`, which is where clients such as vLLM's and InferenceX's benchmarks read it.
@@ -270,8 +271,8 @@ The model can repeat itself forever, and the grammar cannot see it. `_looping(to
 
 - A block shorter than 8 tokens must repeat over `short_span` tokens, because data repeats short runs on purpose.
 - The thresholds rise where repetition can be legitimate:
-  - inside a call's arguments, such as a file of identical lines: `reps=8, min_span=128, short_span=256`;
-  - in a reply without tools, such as "write it ten times": `reps=12, min_span=96, short_span=256`.
+  - inside a call's arguments, such as a file of identical lines: `reps=16, min_span=256, short_span=256`, and the reply is cut only after `LOOP_GRACE` (1024) more tokens of it (`_past_grace`): the reason is `loop_in_call`, the call is dropped and the finish is `length`;
+  - in a reply without tools, such as "write it ten times": `reps=12, min_span=96, short_span=256`, with the same 1024-token grace, and the finish is `length`.
 - With tools, the call checks and `_line_looping` see only the text after the reasoning, so drafts in thoughts are not counted as calls. The token-loop check `_looping` still runs on every token, reasoning included (`server.Server._guard`, `server.Server._decode`).
 
 **Repeated calls across turns.** `_previous_calls` walks back from the end over tool results to the last assistant turn and collects its calls with their results. If a user message comes first, it returns nothing and steering does not apply (`server.py`). If the new reply repeats one of them (same name and arguments), `_run` decodes the turn again:
@@ -282,7 +283,7 @@ The model can repeat itself forever, and the grammar cannot see it. `_looping(to
 
 Steering is skipped for `llama3_json`, `mistral` and `mistral_legacy`, whose calls are the whole reply and cannot be preceded by text. For these formats the first repeat already ends the turn with the "I am stuck" message and returns no calls, unless `tool_choice` is `required` or a named function (`server.Server._run`).
 
-If the second attempt still repeats, the turn ends with a message that asks the user how to proceed, and no calls are returned. The exception is a `tool_choice` of `required` or a named function: then the repeated call is returned as asked.
+If the steered reply repeats too, it is decoded up to twice more without the tools whose call repeated (for this reply only), unless `tool_choice` names a function. When no other tool is left, or the attempts run out, the turn ends with a message that asks the user how to proceed, and no calls are returned. The exception is a `tool_choice` of `required` or a named function: then the repeated call is returned as asked. With tools and a response format (`tool_choice` `auto`), a reply that repeats a call is decoded once more as the format's output instead (`p["output_regex"]`).
 
 Two smaller rules:
 
@@ -306,9 +307,9 @@ On the next turn, the client sends the conversation back and the chat template r
 - Only formats with `replay_raw = True` use `_raw`. That is the `ToolFormat` default. Mistral v3 and v11 and Gemma 4 set it to `False`.
 - What is stored is the reply as the client received it: cut after `max_calls`, without duplicate calls.
 
-**Cache checkpoints.** Some models have a cache that cannot be cut back to a shorter prefix, such as Qwen3.5's recurrent layers or Gemma's sliding windows. `_needs_checkpoints` detects them by checking for any cache layer that is not a plain `KVCache`. For these models, our engine also stores the prompt's cache at up to three positions computed by `_checkpoints`:
+**Cache checkpoints.** Some models have a cache that cannot be cut back to a shorter prefix, such as Qwen3.5's recurrent layers or Gemma's sliding windows. `_needs_checkpoints` detects them by checking for any cache layer that is not a plain `KVCache`. For these models, our engine also stores the prompt's cache at up to four positions computed by `_checkpoints`:
 
-- `"system"`: the end of the system message and tools;
+- `"system"`: where this session's own part of the system message starts (`_session_start`: what it shares with recent sessions' system messages comes before), and its end too when that is more than 4096 characters further;
 - `"user"`: the start of the last message;
 - `"reply"`: where this reply starts once the next request renders it. Set `LOCALS_REPLY_CHECKPOINT=0` to turn it off.
 
@@ -332,7 +333,7 @@ Each request has a limit on prompt plus reply tokens, `context_for(engine)`.
 
 `BatchService.context_fit()` computes how much KV cache fits under the engine's memory limit, next to the weights and a prefill's activations: `(memory_limit - weights_bytes - (3 << 29)) // kv_bytes_per_token`, rounded down to a multiple of 1024. `3 << 29` is 1.5 GB.
 
-`memory_limit` is Metal's `max_recommended_working_set_size` minus `5 << 29` (2.5 GB). MLX keeps up to 1 GB of freed buffers, and 1.5 GB more covers what the admission estimate misses.
+`memory_limit` is Metal's `max_recommended_working_set_size` minus a margin (`service.memory_plan`): MLX's pool of freed buffers (1 GiB, or an eighth of the room a model leaves under 8 GiB, at least 256 MiB) and 0.5 GiB for what the admission estimate misses, 1.5 GiB for a 4B on 16 GB; `LOCALS_MEMORY_MARGIN_GB` sets it.
 
 Until our engine loads (for example with `--preload none`), the limit is 65536, or the model's own context if that is smaller. `_cap_context` runs on every request and fixes the final value after the first load.
 
@@ -405,7 +406,7 @@ Requests are translated to Chat Completions and go through the same `prepare`, b
 
 How requests are translated (`apis.ollama_to_chat`):
 
-- **Model names.** Any name maps to the server's one model (`Server.chat_model`). `mlx/...` picks the stock engine when it is enabled. A name that contains `think` turns thinking on.
+- **Model names.** Any other name maps to the server's one model (`Server.chat_model`); our own names for another model (`locals/<short>`, `mlx/<short>`, `stock/<short>`) are refused (`check_model`, a 404 on Ollama's API). `mlx/...` picks the stock engine when it is enabled. A name that contains `think` turns thinking on.
 - **Load and unload.** A chat without messages, or a generate without a prompt, is Ollama's way to load a model. With `keep_alive` 0 it unloads one. Either is answered at once, with `done_reason` `load` or `unload`.
 - **Options.** `options.num_predict` (when > 0) becomes `max_tokens`. `temperature`, `top_p`, `stop` and `seed` are copied, but only `temperature` and `stop` are used downstream.
 - **Formats.** `format: "json"` becomes `json_object`. A schema object becomes `json_schema`.
@@ -490,7 +491,7 @@ How the worker runs:
   - A compile error ends only that job, with `invalid:`; the batch goes on.
   - Unconstrained jobs stop at the model's EOS ids. With `ignore_eos` they have no stop ids.
 - **Memory.**
-  - `memory_limit` is the recommended working set minus `5 << 29` (2.5 GB).
+  - `memory_limit` is the recommended working set minus `memory_plan`'s margin (1.5 GiB for a 4B on 16 GB, see above).
   - The prompt cache (`chain_cache`, at most 256 entries) gets `cache_gb` when it is given. Otherwise it gets `min(max(free, longest, 1.5 GB), 16 << 30)`.
   - `free` is the working set minus the active memory after loading and `5 << 30` (5 GB) for running rows and prefill.
   - `longest` is the KV of one conversation of `context_fit()` tokens. A follow-up question on a long document then continues from it; the comment gives 1.5 s instead of 137 s at 60k tokens.
@@ -499,7 +500,7 @@ How the worker runs:
   - Location: `LOCALS_DISK_CACHE_DIR` (default `~/.cache/locals/prompts`), up to `LOCALS_DISK_CACHE_GB` (default 4).
   - Each folder is named after the model, the dtype, and a fingerprint of the weight files and the mlx-lm version.
   - Folders left from other weights of the same model are removed.
-- **Checkpoints.** `"system"` and `"user"` checkpoints are stored as copies of the cache in prompt-cache entries of their kind. A copy is skipped when `_room_for_copy` says there is no room, and `"system"` copies are also saved to the disk cache. A `"reply"` checkpoint keeps only the layers that cannot be cut back (recurrent state). When the row finishes, these are joined with the row's KV cut to that position and stored as an `"assistant"` entry. Eviction order: `"assistant"` first, then `"user"`, then `"system"` (`hybrid_batch._copies`, `hybrid_batch.HybridBatchEngine._checkpoint`, `hybrid_batch.HybridBatchEngine.serve.retire`; `service.BatchService.submit`).
+- **Checkpoints.** `"system"` and `"user"` checkpoints are stored as copies of the cache in prompt-cache entries of their kind. A copy is skipped when `_room_for_copy` says there is no room, and `"system"` copies are also saved to the disk cache. A `"reply"` checkpoint keeps only the layers that cannot be cut back (recurrent state). When the row finishes, these are joined with the row's KV cut to that position and stored as an `"assistant"` entry. Entries are evicted in mlx-lm's balanced order between the kinds (see [Prompt cache](../prompt-cache/README.md)) (`hybrid_batch._copies`, `hybrid_batch.HybridBatchEngine._checkpoint`, `hybrid_batch.HybridBatchEngine.serve.retire`; `service.BatchService.submit`).
 - **Errors.** When the engine loop raises, for example on Metal out of memory, the worker:
   - fails the jobs in flight;
   - halves the prompt cache;

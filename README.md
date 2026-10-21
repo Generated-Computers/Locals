@@ -351,7 +351,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8321/v1", api_key="local")
 reply = client.chat.completions.create(
-    model="locals/qwen3.5-4b",
+    model="locals",  # the model the server runs
     messages=[{"role": "user", "content": "Write a haiku about the sea."}],
 )
 print(reply.choices[0].message.content)
