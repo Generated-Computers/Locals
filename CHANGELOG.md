@@ -143,3 +143,19 @@ First public release.
   without a regex (Pydantic's `Path`, `SecretStr`) is no longer a 400; LFM2
   calls to tools named like `resolve-library-id` (Context7) are read as calls
   instead of coming back as text.
+- **Fixed, safety and steadiness:** `locals run` writes the files it changed
+  together or none of them, keeps their line endings, bytes and permissions,
+  and a stop during that write lets it finish and says which files changed;
+  each `locals solve` attempt works in a clone of its own (an agent's
+  `git stash pop` no longer reached your stash), and OpenCode and the checks
+  there can write only inside the attempt's copy, also through a link out of
+  the project; copies of the project go as soon as they are read, and a
+  stopped `solve --plan`, `swarm` or `/n` turn leaves none behind and keeps
+  what finished; a system-prompt snapshot whose folder was deleted under a
+  running server no longer fails every request in flight; `locals stop`
+  during kernel tuning no longer counts as a crash of that kernel; every
+  malformed request gets a 4xx answer, and a client that stops reading no
+  longer holds a server thread; a reply cut at `--max-tokens` is said, and
+  `locals generate --schema` then exits 1; OpenClaw's and OpenCode's configs
+  are found where those tools look; the installer uses Python 3.12, the
+  version Locals is tested on.
