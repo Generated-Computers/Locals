@@ -189,9 +189,9 @@ def _mark_stale(tune: dict, user: Optional[dict]) -> bool:
     stale = sorted({k for k in user if _SHAPE_KEY.fullmatch(k)} | set(tune.get("__stale__") or []))
     tune["__stale__"] = stale
     if stale:
-        print(f"locals: MLX is {now} now ({was} when this Mac's kernels were timed): {len(stale)} kernel shapes are timed "
-              f"again while the server is idle (locals tune does them at once); until then they keep their choice",
-              file=sys.stderr, flush=True)
+        print(f"locals: MLX is {now} now ({was} when this Mac's kernels were timed): the {len(stale)} kernel shapes timed "
+              f"here keep their choice until they are timed again, the served model's while the server is idle, or all "
+              f"of a model's at once with locals tune", file=sys.stderr, flush=True)
     return True
 
 
