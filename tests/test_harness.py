@@ -518,3 +518,49 @@ def test_a_closed_terminal_ends_a_run_as_ctrl_c_does(tmp_path, monkeypatch):
                                            workers=2, rounds=0, steps=5, versions=1, report=None))
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, signal.SIG_DFL)
+
+
+def test_copies_link_nested_environments(tmp_path):
+    """A monorepo's packages/web/node_modules was copied for every agent: a link to the project's, as at the top.
+    A source package called env (no pyvenv.cfg) is copied."""
+    import os
+
+    root = tmp_path / "p"
+    (root / "packages" / "web" / "node_modules" / "left-pad").mkdir(parents=True)
+    (root / "packages" / "web" / "node_modules" / "left-pad" / "index.js").write_text("x")
+    (root / "packages" / "web" / "index.js").write_text("y")
+    (root / "packages" / "env").mkdir()
+    (root / "packages" / "env" / "m.py").write_text("")
+    run = harness.Run("t", root, "http://x", "m", None, log=lambda m: None)
+    d = run._copy("t", root)
+    nm = d / "packages" / "web" / "node_modules"
+    assert nm.is_symlink() and os.path.realpath(nm) == os.path.realpath(root / "packages" / "web" / "node_modules")
+    assert (d / "packages" / "web" / "index.js").read_text() == "y" and not (d / "packages" / "env").is_symlink()
+    d2 = run._copy("u", d)  # an agent's copy of the staging copy: the link stays a link
+    assert os.path.realpath(d2 / "packages" / "web" / "node_modules") == os.path.realpath(nm)
+
+
+def test_an_agents_copy_goes_once_its_files_are_read(tmp_path, monkeypatch):
+    """Every agent's copy stayed until the run ended (19 copies of the project for 18 agents)."""
+    root = tmp_path / "p"
+    root.mkdir()
+
+    def agent(body, k):
+        mine = "a.py" if "Your files: a.py" in body["messages"][1]["content"] else "b.py"
+        return [_reply("write_file", path=mine, content="A = 1" if mine == "a.py" else "B = 2"), _reply("finish", summary="ok")][min(k, 2) - 1]
+
+    _script(monkeypatch, agent)
+    run = harness.Run("Write a.py (A = 1) and b.py (B = 2).", root, "http://x", "m",
+                      "python3 -c 'import a, b; assert a.A == 1 and b.B == 2'", log=lambda m: None)
+    run.k, run.solos = 2, 0
+    left = []
+    versions = run._versions
+
+    def spy(*a, **k):
+        out = versions(*a, **k)
+        left.append([d for d in run._copies if d.exists()])
+        return out
+
+    monkeypatch.setattr(run, "_versions", spy)
+    assert run.go()["passed"]
+    assert left and all(len(x) == 1 for x in left)  # the staging copy only

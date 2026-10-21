@@ -301,3 +301,25 @@ def test_a_check_writes_only_in_its_copy(tmp_path, monkeypatch):
     os.symlink(outside, ws / "data")
     ok, out, _ = solve.run_check("echo overwritten > data/data.csv; echo inside > here.txt; true", ws)
     assert (outside / "data.csv").read_text() == "id,value\n" and (ws / "here.txt").read_text() == "inside\n"
+
+
+def test_stale_runs_of_other_projects_are_left_alone(tmp_path):
+    """Project app's run removed the workspaces of app-v2's runs, and of another folder's app."""
+    from locals.solve import cleanup_stale_runs
+
+    root, app = tmp_path / "solve", tmp_path / "app"
+    app.mkdir()
+
+    def run(name, project=None):
+        d = root / name
+        (d / "a0").mkdir(parents=True)
+        (d / "pid").write_text("999999")  # no such process: the run died
+        if project is not None:
+            (d / "project").write_text(str(project))
+        return d
+
+    mine, old = run("app-20261021-010101", app), run("app-20261020-010101")
+    v2, other = run("app-v2-20261021-010101"), run("app-20261021-020202", tmp_path / "elsewhere" / "app")
+    assert cleanup_stale_runs(app, root) == 2
+    assert not (mine / "a0").exists() and not (old / "a0").exists()
+    assert (v2 / "a0").exists() and (other / "a0").exists()

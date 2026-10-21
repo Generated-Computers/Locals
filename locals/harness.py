@@ -744,7 +744,8 @@ class Run:
     # -- copies ------------------------------------------------------------------------------------
     def _copy(self, tag: str, src: Optional[Path] = None) -> Path:
         """A copy of the staging copy (or ``src``) as it is now, for one agent: its own files to write, its own
-        check. Caches and .git are left out; .venv and node_modules are links to the project's own."""
+        check. Caches and .git are left out; .venv and node_modules are links to the project's own, at the top and
+        further down (a monorepo's packages/web/node_modules was copied for every agent)."""
         import os
         import shutil
         import tempfile
@@ -753,8 +754,17 @@ class Run:
         base = Path(tempfile.mkdtemp(prefix=f"locals-run-{tag}-"))
         self._copies.append(base)  # before the copy: a copy that fails half-way is removed too
 
+        nested: List[Path] = []
+
         def ignore(d, names):
             skip = {n for n in names if n in _COPY_SKIP}
+            if Path(d).resolve() != src:
+                for n in names:
+                    p = os.path.join(d, n)
+                    if (os.path.isdir(p) and not os.path.islink(p)
+                            and (n == "node_modules" or (n in _LINK_DIRS and os.path.isfile(os.path.join(p, "pyvenv.cfg"))))):
+                        skip.add(n)
+                        nested.append(Path(d).resolve().relative_to(src) / n)
             # sockets and pipes (a dev server's socket in the project): nothing to copy, and copytree failed on them
             skip |= {n for n in names if not os.path.islink(os.path.join(d, n)) and not os.path.isdir(os.path.join(d, n))
                      and not os.path.isfile(os.path.join(d, n))}
@@ -776,7 +786,18 @@ class Run:
         for name in self._links:
             if not (d / name).exists():
                 os.symlink(self.project / name, d / name)
+        for rel in nested:
+            os.symlink(src / rel, d / rel)
         return d
+
+    def _drop(self, a: "Agent") -> None:
+        """An agent's copy, once its files are read (the copies of a long run took the disk: one per agent)."""
+        import shutil
+
+        base = a.root.parent.resolve()  # (the agent's is resolved: /private/var/..., the list's /var/...)
+        for d in [d for d in self._copies if d.resolve() == base]:
+            self._copies.remove(d)
+            shutil.rmtree(d, ignore_errors=True)
 
     def _stage(self, files: Dict[str, str]) -> None:
         """Files into the staging copy (the project is written at the end, from there); a file whose
@@ -827,6 +848,7 @@ class Run:
                 files.update(_outputs(self.task, a.root, self.root))
             if files and a.wrote and files not in out[i]:
                 out[i].append(files)
+            self._drop(a)
         return out
 
     def _pick(self, parts: List[dict], options: List[List[Dict[str, str]]], current_out: Optional[str]) -> tuple:

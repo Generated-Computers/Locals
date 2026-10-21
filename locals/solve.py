@@ -174,7 +174,14 @@ def cleanup_stale_runs(project: Path, root: Path) -> int:
     runs then): git worktrees still registered in the project (git worktree list), and copies of it. Their
     transcripts and diffs stay. A run counts as dead when the pid it wrote is no running process. How many."""
     removed = 0
+    mine = re.compile(re.escape(project.name) + r"-\d{8}-\d{6}")  # (not app-v2's runs for project app)
     for run in root.glob(f"{project.name}-*"):
+        owner = run / "project"  # (two projects of the same name in different folders)
+        try:
+            if not mine.fullmatch(run.name) or (owner.exists() and owner.read_text() != str(project)):
+                continue
+        except OSError:
+            continue
         try:
             os.kill(int((run / "pid").read_text()), 0)  # (only asks whether it still runs)
             continue
@@ -701,6 +708,7 @@ def cmd_solve(args) -> None:
     run_dir = app.LOCALS_DIR / "solve" / f"{project.name}-{stamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "pid").write_text(str(os.getpid()))
+    (run_dir / "project").write_text(str(project))
     import signal
 
     def _stop(sig, frame):  # a closed terminal (SIGHUP) or kill (SIGTERM): the cleanup below runs, as for Ctrl-C
