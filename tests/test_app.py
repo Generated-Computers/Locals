@@ -593,3 +593,25 @@ def test_a_stopped_swarm_keeps_what_the_finished_agents_did(tmp_path, monkeypatc
     summary = json.loads((run / "summary.json").read_text())
     assert summary["stopped"] and summary["tasks"][0]["answer"] == "done"
     assert summary["tasks"][1]["error"] == "stopped before it finished" and (run / "task_00.json").exists()
+
+
+def test_a_tools_help_needs_no_model_and_no_server(monkeypatch):
+    """locals launch aider --help downloaded the model (3 GB on a first run) and started the server, then showed
+    aider's help; locals menubar --help started the menu-bar app."""
+    import argparse
+
+    import pytest
+
+    from locals import menubar
+
+    ran = []
+    monkeypatch.setattr(app, "_installed", lambda tool, env: "/usr/local/bin/aider")
+    monkeypatch.setattr(app, "fetch_model", lambda m: ran.append("fetch"))
+    monkeypatch.setattr(app, "ensure_server", lambda a: ran.append("server"))
+    monkeypatch.setattr(app.os, "execvp", lambda exe, argv: (_ for _ in ()).throw(SystemExit(f"exec {argv}")))
+    with pytest.raises(SystemExit, match=r"exec \['/usr/local/bin/aider', '--help'\]"):
+        app.cmd_launch(argparse.Namespace(tool="aider", rest=["--help"], model="m/x", port=8321))
+    assert ran == []
+    with pytest.raises(SystemExit) as e:
+        menubar.main(["--help"])
+    assert e.value.code == 0

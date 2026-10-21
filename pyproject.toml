@@ -53,10 +53,11 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["locals"]
+packages = ["locals", "locals.presets"]
 
 [tool.setuptools.package-data]
 locals = ["presets/*.json"]
+"locals.presets" = ["*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

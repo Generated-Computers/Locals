@@ -1,7 +1,7 @@
 """locals in the macOS menu bar: the server's state at a glance, start and stop, and the
 tools opened on it, without a terminal.
 
-    locals menubar          (needs rumps: uv tool install --force --with rumps 'locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz')
+    locals menubar          (needs rumps: uv tool install --python 3.12 --force --with rumps 'locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz')
 
 The icon shows whether the server runs (●), is starting (◐) or is stopped (○); the menu
 shows the model and the requests running, and opens OpenCode or the status page.
@@ -25,11 +25,16 @@ def _osascript_terminal(command: str) -> None:
 
 
 def main(argv=None) -> None:
+    import argparse
+
+    argparse.ArgumentParser(prog="locals menubar", description="A menu-bar item for the locals server: its status, "
+                            "start and stop, the status page and the coding tools. It runs until you quit it from its "
+                            "menu.").parse_args(sys.argv[2:] if argv is None else argv)  # (--help started the app)
     try:
         import rumps
     except ImportError:
         sys.exit("the menu-bar app needs rumps; add it to the locals install with:\n"
-                 "  uv tool install --force --with rumps 'locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz'")
+                 "  uv tool install --python 3.12 --force --with rumps 'locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz'")
     from .app import DEFAULT_PORT, _load_saved, base_url, get_json, server_alive
 
     saved = _load_saved()

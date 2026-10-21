@@ -41,17 +41,21 @@ command -v uv >/dev/null 2>&1 || fail "uv is not on PATH after installing it; op
 SOURCE="${LOCALS_SOURCE:-locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz}"
 say "installing locals from $SOURCE ..."
 BIN="$(uv tool dir --bin 2>/dev/null || printf '%s' "$HOME/.local/bin")"
-# with its folder on PATH, uv does not warn that it is not; the PATH is explained once, below
-PATH="$BIN:$PATH" uv tool install --force "$SOURCE" \
-  || fail "uv tool install $SOURCE failed; its message is above (check the network, or report it on GitHub)."
+# with its folder on PATH, uv does not warn that it is not; the PATH is explained once, below. Python 3.12, the one
+# locals is tested on (uv took the oldest the package allows, 3.11, for a new user)
+PATH="$BIN:$PATH" uv tool install --python 3.12 --force "$SOURCE" \
+  || fail "uv tool install $SOURCE failed; its message is above (check the network; with an old uv, run  uv self update  first)."
 
 case ":$ORIG_PATH:" in
   *":$BIN:"*) ;;
   *)
-    uv tool update-shell >/dev/null 2>&1 || true
     say ""
-    say "locals is installed in $BIN; uv added it to your shell's PATH (in your shell's startup file),"
-    say "which this terminal does not search yet:"
+    if uv tool update-shell >/dev/null 2>&1; then  # (it said so even when this failed)
+      say "locals is installed in $BIN; uv added it to your shell's PATH (in your shell's startup file),"
+      say "which this terminal does not search yet:"
+    else
+      say "locals is installed in $BIN, which is not on your shell's PATH:"
+    fi
     say "open a new terminal, or run:  export PATH=\"$BIN:\$PATH\""
     ;;
 esac

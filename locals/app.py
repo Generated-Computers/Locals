@@ -1489,6 +1489,8 @@ def cmd_launch(args) -> None:
         exe = _tool_bin(tool, tool.upper() + "_BIN")
         if not exe:
             sys.exit(f"{tool} is not installed; see {TOOL_SITES[tool]}")
+    if exe and rest in (["--help"], ["-h"]):  # the tool's own help: no model download and no server start for it
+        os.execvp(exe, [exe, *rest])
     import contextlib
 
     with contextlib.redirect_stdout(sys.stderr):  # the tool's own output (aider --message, ...) stays clean
@@ -2352,7 +2354,7 @@ def _main(argv=None):
     p.add_argument("target", nargs="?", choices=["opencode", "openclaw", "hermes"], default="opencode",
                    help="opencode: install it if needed and write its config; openclaw / hermes: write their config")
     add_common(p)
-    p.add_argument("--engine", choices=list(PROVIDERS), default="locals", help="default provider in OpenCode")
+    p.add_argument("--engine", choices=list(PROVIDERS), default="locals", help="also set up the stock mlx-lm engine as a provider (mlx); OpenCode's default model stays locals's")
     p.add_argument("--agent", default=None, help="default agent in OpenCode (orchestrator, coder, build, plan; "
                    "default: orchestrator for Qwen3.5, coder for other models)")
     p.add_argument("--context", type=int, default=None, help="context window declared to the tool "
@@ -2391,8 +2393,8 @@ def _main(argv=None):
 
     p.set_defaults(fn=_run)
 
-    p = sub.add_parser("launch", help="open a tool on the local model: opencode, openhands, cline, kilo, openclaw, hermes, "
-                       "aider, ollama, editor (locals launch list)")
+    p = sub.add_parser("launch", help="open a tool on the local model: opencode, claude, openhands, cline, kilo, openclaw, "
+                       "hermes, aider, ollama, editor (locals launch list)")
     p.add_argument("tool", nargs="?", default="list", choices=["list", *LAUNCH_TOOLS], help="the tool to open (none: the list)")
     p.add_argument("rest", nargs=argparse.REMAINDER, help="arguments for the tool (locals's own options, such as --model, "
                    "go before the tool's name: locals launch --model gemma aider)")
@@ -2401,7 +2403,7 @@ def _main(argv=None):
 
     p = sub.add_parser("code", help="open OpenCode on a project (starts the server if needed)")
     p.add_argument("dir", nargs="?", default=".", help="the project directory (default: this one)")
-    p.add_argument("--engine", choices=list(PROVIDERS), default=None, help="OpenCode's default provider (kept for later launches)")
+    p.add_argument("--engine", choices=list(PROVIDERS), default=None, help="the engine for this launch (mlx: stock mlx-lm, to compare); OpenCode's default model stays locals's")
     p.add_argument("--agent", default=None, help="OpenCode's default agent (kept for later launches)")
     p.add_argument("--logs", action="store_true", help="print OpenCode logs")
     p.add_argument("--run", default=None, metavar="TASK", help="run this task to the end without the interface, print the answer")

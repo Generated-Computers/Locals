@@ -18,6 +18,11 @@
 
 ```bash
 curl -LsSf https://raw.githubusercontent.com/Generated-Computers/Locals/main/install.sh | sh
+```
+
+Then, in a new Terminal window:
+
+```bash
 locals code ~/my-project
 ```
 
@@ -172,7 +177,9 @@ Open the Terminal app and run:
 curl -LsSf https://raw.githubusercontent.com/Generated-Computers/Locals/main/install.sh | sh
 ```
 
-Then start a coding assistant on one of your projects:
+Then open a new Terminal window (the installer adds Locals to your shell's
+PATH, which only new windows read) and start a coding assistant on one of your
+projects:
 
 ```bash
 locals code ~/my-project
@@ -180,7 +187,10 @@ locals code ~/my-project
 
 The first time, Locals downloads a model that suits your Mac (about 3 GB),
 starts it in the background and opens the OpenCode assistant in your project.
-From then on it starts in seconds. If you already use the uv package manager,
+From then on it starts in seconds. Locals also makes itself OpenCode's default
+model, so plain `opencode` uses it too; `locals disconnect opencode` gives
+OpenCode its own settings back. To remove Locals, run `locals stop`,
+`locals disconnect opencode` and `uv tool uninstall locals`. If you already use the uv package manager,
 you can install with `uv tool install git+https://github.com/Generated-Computers/Locals`
 instead.
 
@@ -330,6 +340,9 @@ columns are speeds in tokens per second (tps) with 8 requests at once.
 | LFM2.5-2.6B | `--model lfm` | `locals/lfm2.5-2.6b` | 1.6 GB | 144 tps | 404 tps |
 | MiniCPM5-2B | `--model minicpm` | `locals/minicpm5-2b` | 1.4 GB | 160 tps | 478 tps |
 | Gemma 4 E4B | `--model gemma` | `locals/gemma-4-e4b-it` | 4.8 GB | 80 tps | 224 tps |
+
+On a Mac with less than 12 GB of memory, the default is Qwen3.5-2B instead
+(`--model qwen3.5-2b`; `locals/qwen3.5-2b` in your editor).
 
 Each model also has a thinking mode, in which it reasons before it answers: add
 `-thinking` to the name, for example `locals/lfm2.5-2.6b-thinking`. The smaller

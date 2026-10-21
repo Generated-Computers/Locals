@@ -35,8 +35,8 @@ Runtime dependencies are `mlx>=0.32,<0.34`, `mlx-lm>=0.32,<0.33`, `numpy>=1.26`,
 
 1. It refuses anything other than Darwin on `arm64` with macOS 14 or newer.
 2. It uses `uv` from the `PATH` or from `~/.local/bin/uv`. If neither exists, it installs uv with `https://astral.sh/uv/install.sh`.
-3. It runs `uv tool install --force "$SOURCE"`. `SOURCE` is `$LOCALS_SOURCE` when set, else `locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz`, GitHub's archive of the main branch: unlike `git+https://...` it needs no git, which a Mac without the Command Line Tools lacks. `LOCALS_SOURCE` is anything `uv tool install` accepts. The script's header shows a package name (`LOCALS_SOURCE=locals`, for PyPI) or a wheel path, and a local folder also works.
-4. If uv's bin directory was not on the original `PATH`, it runs `uv tool update-shell` and prints the `export PATH=...` line.
+3. It runs `uv tool install --python 3.12 --force "$SOURCE"`: Python 3.12, which Locals is tested on (without it, uv gave a new user the oldest Python the package allows, 3.11). `SOURCE` is `$LOCALS_SOURCE` when set, else `locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz`, GitHub's archive of the main branch: unlike `git+https://...` it needs no git, which a Mac without the Command Line Tools lacks. `LOCALS_SOURCE` is anything `uv tool install` accepts. The script's header shows a package name (`LOCALS_SOURCE=locals`, for PyPI) or a wheel path, and a local folder also works.
+4. If uv's bin directory was not on the original `PATH`, it runs `uv tool update-shell` and prints the `export PATH=...` line; it says that uv added the folder to the shell's startup file only when `update-shell` succeeded.
 5. It prints `locals --version` and the next commands to run.
 
 ## How `locals` parses a command
@@ -292,7 +292,7 @@ Without `--run`, it `execve`s `opencode <dir> -m ...` (`--logs` adds `--print-lo
 
 ### Launch targets
 
-`locals launch` first makes sure the tool exists. The tools in `INSTALLERS` are offered an install, and the ones in `TOOL_SITES` must already be installed. It then runs `fetch_model` and `ensure_server` with stdout redirected to stderr, so the tool's own output stays clean. Locals's own options go before the tool name. Everything after the name is passed to the tool (`argparse.REMAINDER`).
+`locals launch` first makes sure the tool exists. The tools in `INSTALLERS` are offered an install, and the ones in `TOOL_SITES` must already be installed. It then runs `fetch_model` and `ensure_server` with stdout redirected to stderr, so the tool's own output stays clean. Locals's own options go before the tool name. Everything after the name is passed to the tool (`argparse.REMAINDER`). When that is only `--help` (or `-h`), the tool is run with it at once, with no model download and no server start.
 
 | Target | What Locals does |
 |---|---|
@@ -515,7 +515,7 @@ Before the agents start, the common prefix of all first prompts (when longer tha
 
 ## `locals menubar` (`menubar.py`)
 
-This command needs `rumps` (`uv tool install --force --with rumps 'locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz'`, the command it prints when `rumps` is missing). It reads the port from `~/.locals/config.json` and polls `/health` and `/stats` every 2 s. The title shows `locals ○` (stopped), `locals ◐` (starting or stopping) or `locals ●` (running), and the menu shows the model and the number of running requests.
+This command needs `rumps` (`uv tool install --python 3.12 --force --with rumps 'locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz'`, the command it prints when `rumps` is missing). It reads the port from `~/.locals/config.json` and polls `/health` and `/stats` every 2 s. The title shows `locals ○` (stopped), `locals ◐` (starting or stopping) or `locals ●` (running), and the menu shows the model and the number of running requests.
 
 The menu has three actions:
 
