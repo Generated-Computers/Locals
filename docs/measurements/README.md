@@ -314,6 +314,55 @@ generation thread stopped with Metal's "Insufficient Memory" on the follow-up
 the conversation and answered. The edit row is the second of three rounds (the
 rounds differed by less than 1%); the others ran once.
 
+## An independent check of the speed
+
+The numbers above are checked here in a way that trusts nothing Locals reports, with the scripts in
+[audit/](audit/). The table at the top was measured inside the process, with the end-of-text token ignored;
+these go through each server's own HTTP API, as an app sees them:
+
+- **Baseline:** mlx-lm's own server (`python -m mlx_lm server`, mlx-lm 0.32.2, its defaults: up to 32 requests
+  decoded together), not the stock engine inside Locals.
+- **Counting:** the client counts the tokens itself (the streamed text tokenized again with the model's
+  tokenizer) and times them on its own clock, from sending the requests to the last byte. Each server's own
+  count was recorded too, and matched the client's on both.
+- **No cache:** every request starts with a nonce no other request had, so no prompt cache can help.
+- **Same work:** temperature 0, 256 tokens a reply, essay prompts; every reply on both servers ran to 256.
+
+Qwen3.5-4B on the M2 Pro (16 GB), one server at a time, Locals at commit `42b4f94` with the kernel choices it
+ships (a new user's), 21 October 2026. Tokens per second, end to end:
+
+| Requests at once | mlx-lm's server | Locals | Ratio | Locals with mlx-lm's arithmetic |
+|---|---|---|---|---|
+| 1 | 51 | 65 | 1.27x | 61 |
+| 2 | 79 | 116 | 1.47x | 92 |
+| 4 | 88 | 150 | 1.70x | 98 |
+| 8 | 75 | 244 | 3.24x | 85 |
+| 16 | 124 | 310 | 2.49x | 148 |
+
+The last column is Locals with `LOCALS_DTYPE=bfloat16 LOCALS_FUSE=0 LOCALS_KERNELS=0`: MLX's own matmul
+kernels, no fused layers, bfloat16. Its batch engine alone gives 10 to 20%, and it slows down from 4 to 8
+requests as mlx-lm does; the kernels written for a few rows at a time give the rest.
+
+**Are the replies the same?** Both servers build the same prompts (the same token counts) and write coherent
+text with no repeated runs. Of the 31 replies, 3 are the same token for token; the others agree for a median of
+50 tokens, then part at a near-tie ("facilitating" against "accelerating"). One at a time, with no batching, 2
+of 8 are the same over 128 tokens. To see which is nearer the exact computation, every reply was scored by the
+same model computed in float32 (`reference.py`, teacher forcing):
+
+| Replies written by | The float32 model's own top choice | Mean log-probability |
+|---|---|---|
+| mlx-lm's server (bfloat16) | 98.79% of the tokens | -0.3792 |
+| Locals (float16, its kernels) | 99.79% | -0.3707 |
+| Locals with mlx-lm's arithmetic | 98.80% | -0.3794 |
+
+The replies differ by rounding, and Locals' default rounds less: float16 keeps three more bits than bfloat16.
+With mlx-lm's arithmetic, Locals scores what mlx-lm scores.
+
+**Answers that can be checked** (`quality_audit.py`): 48 word problems with computed answers, eight at a
+time, 400 tokens each. Both servers got the same 36 right, and missed the same 12 (all one kind of problem,
+where the model was still checking its work when the 400 tokens ran out); 28 of the 48 replies are the same
+text. mlx-lm took 183 s, Locals 63 s.
+
 ## Where the time goes
 
 **Decode steps.** One decode step at about 1,000 tokens of context took 25.7 ms

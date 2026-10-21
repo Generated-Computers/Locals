@@ -90,6 +90,10 @@ each number was measured:
 [llama.cpp](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md#against-llamacpp),
 [mlx-lm's own server](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md#against-mlx-lms-own-server),
 [the M2 Max](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/m2-max.md).
+[An independent check](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md#an-independent-check-of-the-speed)
+counts the tokens on the client, through each server's own API with no prompt cache to help: 3.2x mlx-lm's
+server with eight requests at once, the same answers to checked problems, and replies nearer a float32
+computation of the model than mlx-lm's.
 
 - **Many agents in the time of a few.** Eight agents working at once finish in
   about the time two would need one after the other, and the answers are the
