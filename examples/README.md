@@ -128,7 +128,7 @@ locals generate --prompt "Ana Silva, 29, ana@example.com, application approved, 
 | `--regex` | none | Constrain to a regular expression instead of a schema |
 | `--max-tokens` | `512` | Token limit |
 | `--temp` | `0.0` | Sampling temperature |
-| `--model` | the default model | Which model to load |
+| `--model` | the model used last, else this Mac's default | Which model to use (without `--local`, the background server is started or switched to it) |
 
 ## The server from your own code
 

@@ -2,7 +2,7 @@
 
 Part of the [technical documentation](../README.md) of Locals. File and function names refer to the `locals` package.
 
-`HybridBatchEngine.serve` in `locals/hybrid_batch.py` is the loop behind the `locals` engine. It uses continuous batching: requests join and leave a running batch between steps. A single background thread in `BatchService` (`locals/service.py`) owns the model and calls `serve`. HTTP handlers only queue jobs. This section covers what that loop does on each step:
+`HybridBatchEngine.serve` in `locals/hybrid_batch.py` is the loop behind the `locals` engine. It uses continuous batching: requests join and leave a running batch between steps. A single background thread in `BatchService` (`locals/service.py`) owns the model and calls `serve`. HTTP handlers queue jobs; a job with a schema or regex (except with `--walk`) is queued by a `locals-compile` thread once `Runtime.precompile` has made its grammar's host tables, one grammar at a time, so the loop only copies them to the GPU (see [Server](../server/README.md)). This section covers what that loop does on each step:
 
 - when rows join and leave the batch
 - how prompts are prefilled
@@ -131,7 +131,7 @@ Checkpoints are only requested for models whose cache cannot be cut back to a sh
 
 ## Prefill
 
-### `_prefill_batch(prompts, others, chunk=1024, starts=None)`
+### `_prefill_batch(prompts, others, chunk=1024, starts=None, stop=None)`
 
 This prefills several prompts in one right-padded batch and returns a batch cache. `starts[i]` is a `(cache, remaining tokens)` pair, typically from the prompt cache. Without one, `_prefill_start` provides the start.
 
@@ -148,7 +148,7 @@ This prefills several prompts in one right-padded batch and returns a batch cach
 
 Only `max_snapshots` snapshots are kept (`LOCALS_MAX_SNAPSHOTS`, default 4, at least 1). The least recently used is dropped first, because a snapshot that is reused is moved to the end of the `OrderedDict`. The comment explains the limit: keeping them all "grew by gigabytes over a night of agents". `_trim_for` clears all snapshots when memory is short.
 
-### `_run(cache, toks, chunk=2048)`
+### `_run(cache, toks, chunk=2048, stop=None)`
 
 This prefills a single sequence through the body only. It is used for checkpoints in a prefill at once, for a filling entry's remaining checkpoints (`_fill_checkpoints`, when no rows are left), for shared-prefix snapshots in `_prefill_start`, and for primes. The rest of a filling entry after its last checkpoint goes through `_prefill_batch`, not `_run`. It reserves the KV buffers after the first chunk.
 
@@ -178,7 +178,7 @@ Two more helpers follow the same one-layer-at-a-time pattern:
 
 Prefilling a new prompt on its own stops every running row for the whole prefill. On a 4B model on an M2 Pro, a prefill takes 1.5 s for 1k tokens and 12 s for 8k (the module docstring of mixed.py; the figure 1.47 does not appear anywhere in the repo).
 
-Running the prefill on a second MLX stream does not help: the GPU does not run a second stream's work alongside the first (measured: two streams take as long as one after the other). The code gives no ratio; docs/README.md:110 gives "0.98x to 0.99x". Instead, `mixed.forward` computes the running rows' next tokens in the same forward pass as a chunk of the new prompt. The rows keep decoding while the prompt is prefilled, for little more than the prefill's own cost.
+Running the prefill on a second MLX stream does not help: the GPU does not run a second stream's work alongside the first (measured: two streams take as long as one after the other). The code gives no ratio; [Measurements](../measurements/README.md) gives "0.98x to 0.99x". Instead, `mixed.forward` computes the running rows' next tokens in the same forward pass as a chunk of the new prompt. The rows keep decoding while the prompt is prefilled, for little more than the prefill's own cost.
 
 ### `forward(body, xd, cache_d, xp, cache_p)`
 
@@ -207,7 +207,7 @@ Each prompt being prefilled this way is a dict in `filling`:
 
 ### `_launch`
 
-`_launch` picks the first entry with `pos < end`. If there is none, it runs a plain decode step (`_launch1`). Only one prompt advances per step, in arrival order.
+`_launch` picks the entry with the fewest tokens left among those with `pos < end`. If there is none, it runs a plain decode step (`_launch1`). Only one prompt advances per step.
 
 Otherwise it does the following:
 
@@ -226,7 +226,7 @@ If the chunk reaches a checkpoint, the step is evaluated synchronously and `_che
 
 ### Joining and leaving
 
-- **Joining.** When `filling[0]` reaches `end`, the next boundary pops every complete entry at the head of the list. It passes them through `_prefill_batch(..., starts=[(cache, [])])`, which only merges them (a single entry is wrapped without copying), and calls `attach(..., count=False)`. Mixed passes already counted their tokens in `prefill_tokens`.
+- **Joining.** Any complete entry forces a boundary, and every complete entry joins there, wherever it sits in the list. It passes them through `_prefill_batch(..., starts=[(cache, [])])`, which only merges them (a single entry is wrapped without copying), and calls `attach(..., count=False)`. Mixed passes already counted their tokens in `prefill_tokens`.
 - **No rows left.** If every row finishes while prompts are still in `filling`, the rest is prefilled at once: `_fill_checkpoints`, then `_prefill_batch` with each entry's remaining tokens.
 - **Cancellation.** A `filling` entry whose request is cancelled forces a boundary. There the entry is removed and finished as `"cancelled"`, and `_fill_eval` is cleared.
 
@@ -297,9 +297,9 @@ A Metal out-of-memory error fails every request in flight, while a prompt-cache 
 | `memory_limit` | GPU bytes the engine may use. The engine default is 0 (no guard). `BatchService` sets it to `max_recommended_working_set_size` minus a margin (`service.memory_plan`, or `LOCALS_MEMORY_MARGIN_GB`): MLX's pool of freed buffers (`mx.set_cache_limit`: 1 GiB, or an eighth of what the weights leave when that is under 8 GiB, at least 256 MiB: 0.43 GiB for a 27B on 24 GB) and 0.5 GiB for what the admission estimate misses. A 4B on 16 GB keeps 1.5 GiB. It was 2.5 GiB while the estimate left out each request's fixed state and kept 1.5 GiB for reads that take up to 2.1 GB; with those counted, 2.5 made room by emptying the prompt cache (four agents at once: 71-88% of prompts from it against 87-95%). With 1.5 GiB on a 16 GB Mac, 16 x 2k, 8 x 8k and 4 x 30k-token prompts at once all finished, at most 9.06 of 11.45 GB in use. |
 | `_kv_bytes_per_token()` | KV bytes one token adds: the number of layers whose `make_prompt_cache` entry is a `KVCache` × the keys-plus-values width × 2 bytes. Sliding-window `RotatingKVCache` layers are not `KVCache` instances, so they are not counted. The width is the larger of `2 * kv_heads * head_dim` from the config and the widest `k_proj` + `v_proj`; the comment cites Gemma 4, where the config's figure was half the real width. Recurrent state is fixed in size and not counted. |
 | `_trim_for(lru, need)` | Makes `need` more bytes fit under the limit, in this order: `gc.collect()` and `mx.clear_cache()`; then clear the shared-prefix snapshots; then `lru.trim_to(n_bytes=max(0, lru.nbytes - over))`, only if the prompt cache is not empty. mlx-lm's `CacheOrder.pop` evicts the oldest entry of the first kind, in the order `"assistant"`, `"user"`, `"system"`, that has at least as many entries as the next kind. This is a preference balanced by entry counts, not a strict order. With 1 reply and 3 "user" entries, a "user" entry goes first. With no replies, 1 "user" and 2 "system" entries, a "system" entry goes first. Increments the counter `cache_trims`. |
-| `_make_room(lru, tokens, copies, held)` | Calls `_trim_for` for `(tokens * (1 + copies) + held) * kv + 1.5 GiB` before an admission. The 1.5 GiB is the prefill transient, which `PREFILL_SCORES` bounds. |
+| `_make_room(lru, tokens, copies, held, rows=1)` | Calls `_trim_for` for `(tokens * (1 + copies) + held) * kv + _admit_bytes(rows, tokens)` before an admission: each new row's fixed state and 256 positions of KV, and the room a read of that size took, plus a sixth (1.5 GiB, `PREFILL_RESERVE`, until one has been recorded). |
 | `_fits` | The admission check described under "Admission". |
-| `_room_for_copy(lru, positions)` | Before a checkpoint copy: trims, then skips the copy if `positions * kv + 1.5 GiB` still does not fit. The copy shares the request's KV buffers, so the request's next write duplicates them. |
+| `_room_for_copy(lru, positions)` | Before a checkpoint copy: trims, then skips the copy if `positions * kv + _admit_bytes(0, PREFILL_TOKENS)` still does not fit. The copy shares the request's KV buffers, so the request's next write duplicates them. |
 | Growth trim | Every 32 steps (`_growth_trim`: boundary steps, chained steps and a lone row's passes, which count 64 positions), calls `_trim_for(lru, len(rows) * 32 * kv)`. The rows' KV grows past what admission counted, so room for the next 32 steps comes out of the prompt cache in advance. `LOCALS_GROWTH_TRIM=0` turns this off (default `"1"`). |
 | Retire trim | See "Retiring rows". |
 

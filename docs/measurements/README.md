@@ -411,7 +411,8 @@ of one row measured at each length:
 Qwen3.5-4B keeps 32 KB of attention cache per token (8 of its 32 layers use full
 attention; the other 24 keep a fixed recurrent state), so memory grows by about
 1 GB per 32,000 tokens. The server's automatic limit for this model on 16 GB is
-145,408 tokens (`service.context_fit`).
+178,176 tokens (`service.context_fit`); it was 145,408 when these runs were made,
+with a 2.5 GiB margin.
 
 Through the server, a fact placed in the middle of a document made of the
 repository's own source files was found at every length tried:
@@ -424,7 +425,8 @@ repository's own source files was found at every length tried:
 | 128,761 | 446 s | yes |
 | 139,387 | 501 s | yes |
 
-A request of 158,012 tokens was refused with `context_length_exceeded`.
+A request of 158,012 tokens was refused with `context_length_exceeded` (by that
+limit of then).
 
 **Follow-up questions.** The second turn of a conversation used to read the whole
 conversation again, because the chat template writes the earlier reply

@@ -33,7 +33,7 @@ All 4-bit, from `mlx-community`:
 Two measurements per model, both through the HTTP server (`locals serve`, port 8321, both engines loaded in one
 process):
 
-1. **`locals bench`**: the repo's own tool: `--n` concurrent tool-calling chat requests, 2 rounds, median tokens/s per
+1. **`locals bench --agents`** (plain `locals bench` at the time): the repo's own tool: `--n` concurrent tool-calling chat requests, 2 rounds, median tokens/s per
    engine. Output lengths are whatever the model produces, so they differ a little between engines and rounds.
 2. **Fixed-length decode sweep**: the method described in [Measurements](README.md): `n` concurrent `/v1/completions`
    requests, 256 tokens each, `ignore_eos: true`, `temperature: 0`, one warm-up request per engine, 2 rounds per
@@ -62,7 +62,7 @@ Decode sweep (256 tokens per request, eos ignored):
 | 8 | 152 | 403 | 2.66x |
 | 16 | 267 | 530 | 1.99x |
 
-`locals bench` (tool-calling chat, median of 2 rounds):
+`locals bench --agents` (tool-calling chat, median of 2 rounds):
 
 | `--n` | mlx-lm tok/s | Locals tok/s | Ratio |
 |---|---|---|---|
@@ -90,7 +90,7 @@ Decode sweep:
 | 8 | 72 | 220 | 3.03x |
 | 16 | 138 | 300 | 2.18x |
 
-`locals bench`:
+`locals bench --agents`:
 
 | `--n` | mlx-lm tok/s | Locals tok/s | Ratio |
 |---|---|---|---|
@@ -111,7 +111,7 @@ Decode sweep:
 | 8 | 25 | 78 | 3.13x |
 | 16 | 47 | 106 | 2.25x |
 
-`locals bench`:
+`locals bench --agents`:
 
 | `--n` | mlx-lm tok/s | Locals tok/s | Ratio |
 |---|---|---|---|

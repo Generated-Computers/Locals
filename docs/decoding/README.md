@@ -244,7 +244,7 @@ The device configuration is an int32 vector `[q, ptr, stack[0..63], S]` (`STACK_
 - **Depth limit.** Pushes past `STACK_DEPTH` are masked. If no token is allowed at all, `accept` raises `ConstraintExhausted`. The engines stop with `finish="exhausted"`, and the server reports `finish_reason` `"length"`.
 - **`q`** is `(state, tuple(stack))`, hashable, used as the key for caches and statistics.
 
-**Where recursive schemas run.** They work through `Runtime.compile` / `Runtime.generate` and through `GrammarCompiler.compile_json_schema`. Without `--walk`, the server's batch engine refuses them: the request ends with `"recursive JSON schemas ($ref cycles) are not supported by the batch engine"`. With `--walk`, the schema goes to `Runtime.compile_walk`, which does not check for recursion and passes it to outlines-core's `build_regex_from_schema`. The batch engine itself also raises `NotImplementedError` for a `PDAController`.
+**Where recursive schemas run.** They work through `Runtime.compile` / `Runtime.generate` and through `GrammarCompiler.compile_json_schema`. Without `--walk`, the server's batch engine refuses them: the request ends with `"JSON schemas that refer to themselves ($ref on a cycle, as in a tree) are not supported by the server"`, before anything is compiled. With `--walk`, the schema goes to `Runtime.compile_walk`, which does not check for recursion and passes it to outlines-core's `build_regex_from_schema`. The batch engine itself also raises `NotImplementedError` for a `PDAController`.
 
 ## Forced spans
 
@@ -369,7 +369,7 @@ fallback     the hermes form; the tools are described in the system prompt
 | `gemma4` | Gemma 4 | yes | Keys `[A-Za-z_][A-Za-z0-9_.\-]*`; values `<\|"\|>`-quoted strings, numbers, booleans, `null`, nested objects and lists three levels deep | no |
 | `fallback` | Templates without tools (Gemma 3, ...) | no: a model without tool training chains dependent calls blindly | `json_args_regex()` | yes |
 
-`json_args_regex(space=r"[ ]?")` accepts any JSON object nested four levels deep (objects of lists of objects of lists, as Hermes Agent's clarify tool needs). It allows JSON string escapes including `\uXXXX`, JSON numbers, and an optional single space between JSON tokens, because templates write `", "` and `": "`. Its docstring puts it at about 700 automaton states. Arguments nested deeper cannot be written in these formats: Claude Code's `AskUserQuestion` puts its option objects at level five, so a model in one of them writes the options as strings. Five levels would take 1420 states, a 2.5 GB token table per tool set; Qwen's XML, MiniCPM's and LFM2's values have no such limit, and `--walk` needs no table.
+`json_args_regex(space=r"[ ]?")` accepts any JSON object nested four levels deep (objects of lists of objects of lists, as Hermes Agent's clarify tool needs). It allows JSON string escapes including `\uXXXX`, JSON numbers, and an optional single space between JSON tokens, because templates write `", "` and `": "`. Its docstring puts it at about 700 automaton states. Arguments nested deeper cannot be written in these formats: Claude Code's `AskUserQuestion` puts its option objects at level five, so a model in one of them writes the options as strings. Five levels would take 1420 states, a 2.5 GB token table per tool set; Qwen's XML and MiniCPM's values have no such limit; an LFM2 value nests four levels, one more than these formats' arguments, which is enough for `AskUserQuestion`; and `--walk` needs no table.
 
 In every format, tool names are restricted to the offered names by `_alts(names)`, with `[A-Za-z0-9_.\-]+` when no names are given.
 
@@ -384,7 +384,7 @@ In every format, tool names are restricted to the offered names by `_alts(names)
 | `"required"` | (Free text if `preamble`), then one or more calls |
 | `{"function": {"name": N}}` | (Free text if `preamble`), then exactly one call to N. If N is not offered, any offered name is allowed. |
 
-The server always passes `preamble=False`, because a small model given room to talk first can talk until the token limit. It passes `parallel=False` when the request sets `parallel_tool_calls: false`, which allows at most one call. The server builds a reply grammar only for the `locals` engine, and only when the request has tools and no `response_format` of type `json_object`, `json_schema` or `regex` (nor `guided_regex`). It also skips the grammar when `ignore_eos` is set, unless `tool_choice` is `"required"` or a named function.
+The server always passes `preamble=False`, because a small model given room to talk first can talk until the token limit. It passes `parallel=False` when the request sets `parallel_tool_calls: false`, which allows at most one call. The server builds a reply grammar only for the `locals` engine, and only when the request has tools. With tools and a `response_format` (or `guided_regex`) at once, the grammar is the calls or the output: `(reply_regex(tools, "required", ...)|format regex)` for `auto`, the calls only for `required` or a named function, the output only for `none`; a reply that repeats the previous call is decoded again as the output. It also skips the grammar when `ignore_eos` is set, unless `tool_choice` is `"required"` or a named function.
 
 How free text excludes a call. `not_containing(*lits)` is an exact regex for strings that contain none of the given literals, all of which must start with the same character and not contain it again. The string is split at every occurrence of that lead character, and each segment must not begin with the rest of any literal. The free text of each format:
 
@@ -400,10 +400,11 @@ How free text excludes a call. `not_containing(*lits)` is an exact regex for str
 
 **Typed Qwen calls.** `--typed-tools` switches Qwen's XML calls to `typed_call_regex`. Every parameter name is then fixed in schema order, required parameters are mandatory, and values are typed by `_value_regex`:
 
-- `enum`: alternation of the values;
+- `enum`: alternation of the values, a member that is not a string as JSON writes it (`null`, `true`);
 - `integer`: `-?[0-9]+`;
 - `number`: a decimal with optional exponent;
 - `boolean`: `true|false`;
+- an integer, number or boolean whose `type` list includes `"null"` also allows `null`;
 - anything else: free text.
 
 These automata have thousands of states, so the comment pairs the flag with the walk kernel. Other formats ignore `typed`.
@@ -423,6 +424,7 @@ These automata have thousands of states, so the comment pairs the flag with the 
 
 `coerce(value, schema)` follows these rules:
 
+- An enum member that is not a string (`null`, `true`, `3`) is returned when the text is its JSON form and not itself a member.
 - If the schema allows a string, or declares no type, the text is kept as is ("1.0", or a file that happens to be JSON, stays text).
 - `null` becomes `None` when null is allowed.
 - Integers and numbers are parsed; NaN and infinity are rejected.
@@ -435,7 +437,7 @@ Format-specific parsing details:
 - **qwen_xml.** `qwen_calls` reads each value up to its own `</parameter>`, which the grammar keeps out of values. A value may therefore contain `</function>` or a whole example call. A call cut before `</function>` is not a call. A missing `</tool_call>` at the very end is tolerated.
 - **llama3_json.** A preamble sentence before `{"name"` is accepted when the call parses, has a dict under `parameters` (or `arguments`) and ends the reply. A code-fence opener (for example ```json) at the end of the preamble is removed from the content, and backticks after the call are ignored.
 - **gemma4.** A reply that starts with `call:` without its opener is accepted. Arguments are converted by `_gemma_to_json`.
-- **lfm2_python.** Calls are parsed with `ast`; complete calls are found by bracket matching outside quoted strings.
+- **lfm2_python.** Complete calls are found by bracket matching outside quoted strings; each call's name and keyword arguments are split at brackets and quotes (`_py_args`), so names the grammar allows but Python does not (`resolve-library-id`, `-n`) parse, and each value is read with `ast`.
 - **fallback** (`loose_calls`). Two more shapes count as a call when they name an offered tool:
   - a fenced JSON block at the end of the reply;
   - a reply that is one JSON object.

@@ -2,7 +2,7 @@
 
 Part of the [technical documentation](../README.md) of Locals. File and function names refer to the `locals` package.
 
-This part of the package turns a stock mlx-lm model into the model Locals decodes with. It changes how the model computes, not what it computes (`locals/`lm.py`). Loading runs four steps, in the same order in `Runtime.__init__` (`runtime.py`) and in `locals.lm.patch` (`lm.patch`):
+This part of the package turns a stock mlx-lm model into the model Locals decodes with. It changes how the model computes, not what it computes (`locals/`lm.py`). Loading runs four steps, in the same order in `Runtime.__init__` (`runtime.py`), which also runs `guard_attention` after the first (passes of a query length MLX's attention kernel cannot run on this GPU are split in two), and in `locals.lm.patch` (`lm.patch`):
 
 1. `set_compute_dtype`: with the default `dtype="auto"`, on M1 and M2 GPUs, cast the bf16 arrays (weights, quantization scales and biases) to fp16, unless the model's source is fp16-special, a value exceeds 6.0e4, or the probe check fails; in those cases it stays in bf16.
 2. `fuse_model`: concatenate projections that read the same input, and swap in fused layer classes.
@@ -66,7 +66,7 @@ Apple GPUs before the M3 generation emulate bf16 arithmetic. On those GPUs (arch
 Safety checks under `"auto"`:
 
 1. **Range.** If any bf16 array holds a value with magnitude above `6.0e4`, the model stays in bf16. 65504 is fp16's largest finite value, so larger values would become inf (`runtime.set_compute_dtype`; the code comment there claims the cast is exactly reversible below that limit). It is not exact for very small values: fp16 has fewer exponent bits than bf16. That is why a failed probe restores the saved bf16 arrays instead of casting back (`runtime.set_compute_dtype`, `runtime.set_compute_dtype`).
-2. **Probe.** A fixed 12-token probe runs before and after the cast. fp16 is kept only if the new last-position logits are finite, have the same argmax, and differ by at most `0.05 * max|ref| + 0.5` (`runtime.set_compute_dtype`). On failure, the saved bf16 arrays themselves are put back, because casting fp16 back to bf16 loses small values (`runtime.set_compute_dtype`).
+2. **Probe.** A fixed 12-token probe runs before and after the cast. fp16 is kept if the new last-position logits are finite, have the same argmax, and differ by at most `0.05 * max|ref| + 0.5`; failing that, it is kept if a float32 run of the probe (built from the saved bf16 arrays) has fp16's argmax and fp16's largest error against it is no larger than bf16's, the Gemma 4 E4B case (`runtime.set_compute_dtype`). On failure, the saved bf16 arrays themselves are put back, because casting fp16 back to bf16 loses small values (`runtime.set_compute_dtype`).
 
 `_fp16_special` keeps a model in bf16 when the source of its text model's module contains the substring `float16`. The heuristic is meant to catch models that treat fp16 specially. The test also matches `bfloat16`, so any module that mentions bf16 stays in bf16 as well. In the installed mlx-lm 0.32.0 that includes deepseek_v3, deepseek_v32, minimax, mimo_v2_flash and mistral4. Gemma 3 clips every residual add through fp32 in fp16. In bf16 it runs its plain path, which is also faster: 68 against 53 tok/s for Gemma 3 4B on an M2 (`runtime.py`).
 
@@ -175,7 +175,7 @@ Notes on the families:
 
 ## Autotuning
 
-### Per-shape tuning (`_choose`, `_tune_shape`)
+### Per-shape tuning (`_choose`, `_tune_shape`, `_time_shape`)
 
 `_choose(x2, mod)` looks up the choice in this order (`kernels._choose`):
 
@@ -184,7 +184,7 @@ Notes on the families:
 3. If the background tuner is deferring work (`_DEFER` set, `_TUNING` not set), it returns `("mlx",)` without remembering it, so a later lookup can find the tuned result.
 4. Otherwise it tunes the shape now, under `_TUNE_LOCK`.
 
-`_tune_shape` builds the candidate list from these rules (`kernels.py`):
+`_time_shape` builds the candidate list from these rules (`kernels.py`; `_tune_shape` only names the shape in its crash marker and calls it):
 
 | Family | Row counts M | Other conditions | Candidates |
 |---|---|---|---|
@@ -219,8 +219,8 @@ Timing is pipelined, as the engines decode: step s+1 is built and queued while s
 |---|---|---|
 | `auto` | If the cache or preset covers every shape for 1 to 16 rows (`tune_pending(max_m=16) == 0`), only `warmup`. Otherwise the `quick` procedure | `Runtime`, `locals.lm` |
 | `background` | Serve at once. Untuned shapes run on MLX's kernel, and the server tunes them while idle. Shapes tuned already (for example from a preset) are compiled at load | The server engine (`service.BatchService._run_locals`) |
-| `quick` | `pretune(max_m=16)`: every shape for 1 to 16 rows, then `warmup` | `locals tune --mode quick` |
-| `full` | `pretune()` up to 32 rows, then `model_tune`, then `warmup` | `locals tune` (`app.cmd_tune`) |
+| `quick` | `pretune(max_m=16)`: every shape for 1 to 16 rows, then `gdn_model_tune`, then `warmup` | `locals tune --mode quick` |
+| `full` | `pretune()` up to 32 rows, then `gdn_model_tune`, then `model_tune`, then `warmup` | `locals tune` (`app.cmd_tune`) |
 | `off` | Nothing ahead of time. Untuned shapes are tuned on first use | none |
 
 Sources: `kernels.tune_model`. Any other value raises `ValueError`. The log line at `kernels.tune_model` gives quick tuning on an M2 Pro as 2 minutes for Qwen3.5-4B and 7 for Gemma 4 E4B. The full procedure takes 10-20 minutes and gives the best batched throughput (`runtime.Runtime`).
@@ -234,7 +234,7 @@ Two consequences for row counts above 16:
 
 ### Background tuning while idle
 
-When `tune_model` returns with `_DEFER` set, the service builds `kernels.pending_work(rt.model)`: the untuned (layer, rows) pairs, smallest batches first (`service.BatchService._run_locals`, `kernels.pending_work`). When the request queue is empty, `_take` calls `_tune_while_idle`, which tunes one pair with `tune_one` in the engine's own thread, so the GPU is not shared. A request that arrives meanwhile waits for at most that one shape (`service.BatchService`). `tune_one` sets `_TUNING` so that `_choose` really tunes instead of deferring (`kernels.py`). From then on the shape runs on its tuned kernel. When the list is empty, the server logs that tuning is finished. While a shape is timed (`_tune_shape`), a marker file next to the cache names it (`<cache>.tuning-<pid>`). A Metal error MLX raises in a command buffer's completion handler aborts the process, which no `except` catches, so the shape would be tuned again, and abort the server again, at every start. `_load_tune` reads markers left by dead processes (`_crashed_shapes`): each counts in `__crashed__`, and a shape that stopped a process twice keeps MLX's kernel. One death (a kill, a power cut) only tunes the shape again.
+When `tune_model` returns with `_DEFER` set, the service builds `kernels.pending_work(rt.model)`: the untuned (layer, rows) pairs, smallest batches first (`service.BatchService._run_locals`, `kernels.pending_work`). When the request queue is empty (and the other engine, if loaded, has nothing in flight or queued), `_take` calls `_tune_while_idle`, which tunes one pair with `tune_one` in the engine's own thread, so the GPU is not shared. A request that arrives meanwhile waits for at most that one shape (`service.BatchService`). `tune_one` sets `_TUNING` so that `_choose` really tunes instead of deferring (`kernels.py`). From then on the shape runs on its tuned kernel. When the list is empty, the server logs that tuning is finished. While a shape is timed (`_tune_shape`), a marker file next to the cache names it (`<cache>.tuning-<pid>`). A Metal error MLX raises in a command buffer's completion handler aborts the process, which no `except` catches, so the shape would be tuned again, and abort the server again, at every start. `_load_tune` reads markers left by dead processes (`_crashed_shapes`): each counts in `__crashed__`, and a shape that stopped a process twice keeps MLX's kernel. One death (a kill, a power cut) only tunes the shape again.
 
 ### Cache file and presets
 
@@ -245,7 +245,7 @@ When `tune_model` returns with `_DEFER` set, the service builds `kernels.pending
   2. The user's cache is loaded on top and overrides it.
   3. A user cache that does not parse is renamed to `.bad`, not silently replaced.
   4. If there is no readable user cache (none, or one just renamed to `.bad`) and the preset is non-empty, the preset is written out as the user cache. Later writes also save the merged preset + user dictionary.
-- **Writes** (`_save_tune`) replace the whole file atomically, via a temporary file and `os.replace`. Writes and tuning both take `_TUNE_LOCK`, an `RLock`, because the server runs two engines (`kernels.py`, `kernels.py`).
+- **Writes** (`_save_tune`) merge with the file as it is on disk, under an `fcntl` lock on `<cache>.lock` (another process's results are kept), then replace the whole file atomically, via a temporary file flushed to disk and `os.replace`. Writes and tuning both take `_TUNE_LOCK`, an `RLock`, because the server runs two engines (`kernels.py`, `kernels.py`).
 - **Format:** a JSON object. Shape keys (`"2560x10240x4"`, `"…x4xbfloat16"`) map to choice lists such as `["frag", 2, 2, 1]`. `"…xP"` keys hold the prompt-reading choice (`["dense"]` or `["mlx"]`). `"__times__"` holds what tuning measured, per shape key and family in microseconds, which `locals tune --report` (`tune_report`) sums per batch size. `"…|family"` keys hold per-family winners. `"__model_tuned_pipe__…"` keys hold lists of finished row counts. Keys that start with `__` are kept as they are, and all others are read as tuples (`kernels._read_tune`).
 - **Presets:** `locals/presets/tune_v6_applegpu_g14s.json` (M2 Pro and M2 Max) and `tune_v6_applegpu_g17s.json` (M5 Pro: so far only how prompts are read, measured on one for Qwen3.5-4B and 9B) are shipped. It is packaged through `[tool.setuptools.package-data]` (`pyproject.toml:58-59`). Setting `LOCALS_NO_PRESET=1` hides presets, so a start behaves as on a GPU without one (`kernels._preset_path`).
 
@@ -278,7 +278,7 @@ To re-tune from scratch, delete the cache file (or point `LOCALS_TUNE_CACHE` at 
 
 - **`default_model()`** reads the Mac's memory with `sysctl -n hw.memsize`. It picks `qwen3.5-2b` when memory is known and below 12 GB, and `qwen3.5-4b` otherwise, including when memory is unknown (`defaults.memory_gb`, `defaults.default_model`). The 4B (3 GB of weights, 64k context) and its prompt cache do not fit next to macOS in 8 GB. `DEFAULT_MODEL` is computed once, at import (`defaults.py`).
 - **`model_id(name)`** resolves a `--model` value; every command uses it as the argparse `type` (for example `server.main`). Resolution order (`defaults.model_id`):
-  1. A short name or alias, matched case-insensitively, becomes its repository. A short name wins over a folder of the same name in the current directory.
+  1. A short name or alias, matched case-insensitively, becomes its repository; so does an Ollama name of one (`qwen3.5:4b`, `gemma4:e4b`: `:` becomes `-`, and `:latest` is dropped). A short name wins over a folder of the same name in the current directory.
   2. An existing path becomes its absolute path, because the background server runs elsewhere and later commands may run from other folders. Symlinks are kept.
   3. Anything else is returned unchanged.
 - **`short_name(model)`** gives the model's name in the API (`locals/<short name>`). It takes the last path component, strips a trailing `-4bit` or `-mlx-4bit` in any capitalization, and lowercases the rest: `MiniCPM5-2B-mlx-4Bit` becomes `minicpm5-2b` (`defaults.short_name`). It is used by the server (`server.Server.__init__`).
@@ -291,7 +291,7 @@ To re-tune from scratch, delete the cache file (or point `LOCALS_TUNE_CACHE` at 
   - A repo already in the cache with safetensors is accepted without contacting Hugging Face, so startup works offline.
   - For a hint, it strips `gguf` and quantization suffixes (`Q4_K_M`, `IQ…`, `F16`, `BF16`, `F32`) from the name. It searches Hugging Face for MLX builds (`filter="mlx"`, sorted by downloads, at most 3) under that name, and under the part after the first `_` (bartowski's `Qwen_Qwen3.5-0.8B` naming).
   - If nothing is found, it suggests mlx-community or `mlx_lm.convert --hf-path ORIGINAL -q`.
-- **Where the checks run:** `locals serve` and the app's model fetch both call `gguf_hint(...) or too_big(..., remote=True)` before downloading anything, and exit with the message if either returns one (`server.main`, `app.fetch_model`).
+- **Where the checks run:** `locals serve` (in `server.main`) calls `gguf_hint(...) or too_big(..., remote=True)` before downloading anything; the app's `check_model` (through `fetch_model`) calls `gguf_hint(...) or ollama_hint(...) or too_big(..., remote=True)` and also refuses a name that is neither a folder nor a Hugging Face repository, a gated repository and a typo; and exit with the message if either returns one (`server.main`, `app.fetch_model`).
 - **`build_id()`** fingerprints the installed code: a SHA-1 of the names, sizes and modification times of `locals/*.py`, except the client-only `plan.py` and `solve.py`, truncated to 12 hex digits (`defaults.build_id`). The app compares it with a running server's to detect a server started before an upgrade (`app._ensure_server`).
 
 ## Environment variables
@@ -330,4 +330,4 @@ To re-tune from scratch, delete the cache file (or point `LOCALS_TUNE_CACHE` at 
 - Never draw from MLX's global random state during load or tuning. Seeded sampling must match mlx-lm's. That is why `_concat_quantized` avoids the constructor, and why the probes use fixed keys (`fuse.py`, `fuse._swiglu_mlp`, `kernels._tune_shape`).
 - `enable_small_m` matches exact types only. A subclass of `QuantizedLinear` may compute differently and is left alone (`kernels.py`).
 - Tuning keys carry the activation dtype. Different GPU architectures already use separate cache files (`kernels.py`). The dtype in the key separates a bf16 model from an fp16 model on the same GPU, for example Gemma 3 (kept in bf16) next to Qwen3.5 (fp16) on an M2. `fragh` must never run on bf16 activations. (`kernels._choose`, `kernels._choose`).
-- A new kernel family needs four things: a branch in `_launcher`, candidate rules in `_tune_shape`, an entry in `model_tune`'s `families` if it should compete there, and correctness under the tolerance check. A new choice can also break a cached file on another mlx version; `warmup` falls back to MLX in that case.
+- A new kernel family needs four things: a branch in `_launcher`, candidate rules in `_time_shape`, an entry in `model_tune`'s `families` if it should compete there, and correctness under the tolerance check. A new choice can also break a cached file on another mlx version; `warmup` falls back to MLX in that case.

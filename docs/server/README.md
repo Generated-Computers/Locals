@@ -513,7 +513,7 @@ How the worker runs:
 - **Prompt cache.** `LRUPromptCache(max_size=256, max_bytes=cache_gb or 1.5 GB)`. Each job fetches its longest cached prefix and prefills only the rest.
   - Recurrent-layer cache rows are copied before they are stored. mlx-lm returns them as views of the whole batch buffer, so each cached conversation would hold every row's state (about 0.3 GB at 16 rows on Qwen3.5-2B).
 - **Constraints.** llguidance logits processors (`LLGProcessor`).
-  - A schema becomes a regex through outlines-core, after `json_safe_schema`.
+  - A schema becomes a regex through `grammar.schema_regex` (outlines-core's, with integer bounds), after `json_safe_schema`.
   - llguidance never matches a special token against regex text. `_llg_grammar` therefore refers to special tokens at the regex's ends by id, in a lark grammar.
   - Grammars are cached per regex.
 - **Sampling.** A request with its own temperature gets a new sampler that keeps the server's `top_p` and `top_k`.

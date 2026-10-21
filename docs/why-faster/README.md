@@ -82,8 +82,9 @@ The MLX checkpoints of Qwen3.5 keep their quantization scales and activations in
 bfloat16, which the M1 and M2 GPUs (`applegpu_g13`, `applegpu_g14`) emulate rather
 than compute natively. On those GPUs Locals casts them to float16
 (`runtime.set_compute_dtype`) when every value fits float16's range and a probe
-input gives the same next token and nearly the same logits as before; otherwise
-the model stays in bfloat16, as do models whose own code treats float16
+input gives the same next token and nearly the same logits as before, or when
+float16 is at least as close as bfloat16 to a float32 run of the probe (Gemma 4
+E4B); otherwise the model stays in bfloat16, as do models whose own code treats float16
 specially (Gemma 3). In bfloat16, the same Locals runs at 93 and 98 tokens/s with 4 and 8
 requests instead of 161 and 273: the small-batch kernels gain little without it.
 On GPUs with native bfloat16 (M3 and later) Locals keeps bfloat16; we have not

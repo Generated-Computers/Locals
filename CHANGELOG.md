@@ -41,7 +41,7 @@ First public release.
   memory next to the model, instead of a fixed 64k tokens: about 178,000 tokens
   for Qwen3.5-4B on a 16 GB Mac (`--max-context` still sets it). The next turn
   continues from where the previous reply began, so a follow-up question about
-  a 139,000-token document starts in 2.4 seconds; it used to read the whole
+  a 138,000-token document starts in 2.4 seconds; it used to read the whole
   conversation again (eight minutes), and agents re-read their last tool result
   on every turn. Four multi-turn conversations at once now take 83% of their
   prompts from memory instead of 28%, and finish 36 turns in four minutes

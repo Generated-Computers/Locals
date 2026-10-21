@@ -88,7 +88,7 @@ Four functions then make the plan safe to use:
 - `cover` gives its own part to any named code file the plan left out.
 - `protect_tests` removes existing test files from the parts (see the next paragraph).
 
-If neither attempt gives a usable plan, `make_plan` falls back to the task's file names. That is always empty here, because a task with usable file names never reaches the model, so it returns no parts. `Run.plan` then makes a single part, "the whole task", with no files. It does the same whenever `_owned` leaves no parts. Its agent may write any file (`_AnyFile`).
+If neither attempt gives a usable plan, `make_plan` falls back to the task's file names. That is usually empty, because a task with usable file names never reaches the model; when the task names a file that several project files share, the shortcut is skipped, and the fallback returns the task's other named files. `Run.plan` then makes a single part, "the whole task", with no files. It does the same whenever `_owned` leaves no parts. Its agent may write any file (`_AnyFile`).
 
 **Existing tests are the check.** By default, test files that already exist are removed from the parts (`protect_tests`, `_owned`). When there is a check, they also go into `Run.readonly`, and `write_file` and `edit_file` refuse them for every agent, even one that owns every file. A `run` command can still change them in the agent's own copy, and that can make the after-write check pass there and set `Run.solved`. Such a change never reaches the staging copy, because a version carries only part files, files written with the tools and named data files. The docstring gives the reason: an agent that rewrote the tests could make the check pass.
 
@@ -147,7 +147,7 @@ An agent ends when it calls `finish`, after `max_steps` steps, or when its `stop
 `Agent.run` also ends an agent on these guards:
 
 - the conversation grows past 90,000 characters;
-- a reply comes back with no tool call. (The harness comment gives the server's loop guard as the cause, but the harness always sends `tool_choice="required"`. For such a request the server steers once and then returns the repeated call instead of ending the turn, so a reply without a call has some other cause, for example a reply cut short before its call is complete.) The first time, the agent gets the `NUDGE` message; the second time, it ends.
+- a reply comes back with no tool call. (The harness comment gives the server's loop guard as the cause, but the harness always sends `tool_choice="required"`. For such a request the server steers once, decodes up to twice more without the tools whose call repeated, and then returns the repeated call instead of ending the turn, so a reply without a call has some other cause, for example a reply cut short before its call is complete.) The first time, the agent gets the `NUDGE` message; the second time, it ends.
 - the same two calls alternate three times.
 
 Softer guards only add a note to the tool result: the same call three times, two calls repeating, and four tool calls in a row other than `write_file`/`edit_file`. A refused write or edit also resets the count, and an agent that may write any file (`_AnyFile`, an empty list) never gets this note.
@@ -282,7 +282,7 @@ The project is touched once, by `Run._finish`, at the end of a run that complete
   - An existing file keeps its permissions.
   - A path that resolves outside the project is refused.
 - **Check failed, in a run that started with a check** (given or detected by `cmd_run`). Nothing is written. The files the run changed are copied to `~/.locals/runs/<project>-YYYYmmdd-HHMMSS/` (`_keep`, with `keep_dir=app.LOCALS_DIR / "runs"`).
-- **Stopped with Ctrl-C, or crashed.** The work so far goes to the same folder and the project is not changed. `cmd_run` prints "stopped; the project was not changed" and the folder.
+- **Stopped with Ctrl-C, or crashed.** The work so far goes to the same folder and the project is not changed. On Ctrl-C, `cmd_run` prints "stopped; the project was not changed" and the folder; on a crash, "locals run failed: ..." and "the project was not changed", without the folder (the work is still kept there).
 
 `_finish` has no delete path, so the harness never deletes a file from the project. Only part files and named data files reach the staging copy. Scratch files that an agent's commands made in its copy are discarded with the copy.
 
