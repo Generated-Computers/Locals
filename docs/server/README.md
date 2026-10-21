@@ -38,7 +38,7 @@ Handler.do_POST
    - bodies larger than `MAX_BODY` (`64 << 20` bytes): 413;
    - bodies that are not a JSON object: 400;
    - chat requests whose `messages` is not a non-empty list: 400.
-2. **Preparation.** `Server.prepare` (chat) or `Server.prepare_text` (text completions) runs the request checks that can be made before decoding, all before any byte of the response is sent. A regex or schema that does not compile is found only later, in the worker (`invalid: ...`; see How the constraint is chosen) (service.py:347-362; server.py:884-885, 1283-1297). The handler maps exceptions to statuses:
+2. **Preparation.** `Server.prepare` (chat) or `Server.prepare_text` (text completions) runs the request checks that can be made before decoding, all before any byte of the response is sent. A regex or schema that does not compile is found only later, in the worker (`invalid: ...`; see How the constraint is chosen) (`service.BatchService._run_locals.source`; `server.Server._decode`, `server.make_handler.Handler.do_POST`). The handler maps exceptions to statuses:
    - `ContextTooLong`: 400 with code `context_length_exceeded`;
    - `ValueError`, `TypeError`, `KeyError`, `AttributeError`: 400;
    - anything else: 500, with the traceback in the log.
@@ -63,7 +63,7 @@ Handler.do_POST
 1. With `LOCALS_DEBUG` set, it saves the request (see Security).
 2. `_unsupported` refuses with a 400 the options the server would otherwise ignore while the client relied on them:
    - `n` other than 1;
-   - a truthy `logprobs` or `top_logprobs`. `logprobs: false` and `top_logprobs: 0` pass (server.py:1321-1322).
+   - a truthy `logprobs` or `top_logprobs`. `logprobs: false` and `top_logprobs: 0` pass (`server._unsupported`).
 3. It picks the engine with `oai.engine_of(model)` and thinking with `oai.thinking_of(model, --thinking)`.
    - A request for another model by the server's own names (`locals/<name>`, `mlx/<name>`) is a 400 that says which model runs (`check_model`): another locals command had switched the model under a connected agent, and the agent's requests were answered by the new model without a word. Any other name (`gpt-4o` in an app, Ollama's names) is the model loaded.
    - A bool in `chat_template_kwargs.enable_thinking` (the switch vLLM and SGLang use) overrides thinking.
@@ -82,7 +82,7 @@ Handler.do_POST
    - an empty user message is added when there is none, because templates require one.
 
    Tool-call turns the server wrote itself are replayed verbatim (see Exact token streams).
-9. `oai.tool_specs` normalises `tools`. When tools are offered and the first message is a system message, `_cwd_hint` reads the path from its `Working directory: <path>` line and appends a new last paragraph: "The working directory is <cwd>. Every file path you pass to a tool must start with <cwd>/ (for example <cwd>/main.py); run commands there with: cd <cwd> && <command>." It adds nothing if the prompt already contains that sentence (server.py:950-963). Small models invent absolute paths, and the end of the system prompt is where they pay attention.
+9. `oai.tool_specs` normalises `tools`. When tools are offered and the first message is a system message, `_cwd_hint` reads the path from its `Working directory: <path>` line and appends a new last paragraph: "The working directory is <cwd>. Every file path you pass to a tool must start with <cwd>/ (for example <cwd>/main.py); run commands there with: cd <cwd> && <command>." It adds nothing if the prompt already contains that sentence (`server.py`). Small models invent absolute paths, and the end of the system prompt is where they pay attention.
 10. `fmt.prepare(msgs, tools)` lets the tool-call format adapt the messages to its template. The base `ToolFormat` returns them unchanged.
 11. It builds the template kwargs:
     - `enable_thinking`, unless the style is `"none"`;
@@ -112,7 +112,7 @@ Paths are matched with any trailing slash removed.
 
 Any other path gets a 404.
 
-`BUILD_ID` comes from `defaults.build_id()`. It is a fingerprint of the names, sizes and modification times (`st_mtime_ns`) of the installed `locals/*.py` files, except `plan.py` and `solve.py`, which are the client side of `locals solve` (defaults.py:169-181). The CLI compares it with its own, so it can restart a background server that still runs older code.
+`BUILD_ID` comes from `defaults.build_id()`. It is a fingerprint of the names, sizes and modification times (`st_mtime_ns`) of the installed `locals/*.py` files, except `plan.py` and `solve.py`, which are the client side of `locals solve` (`defaults.build_id`). The CLI compares it with its own, so it can restart a background server that still runs older code.
 
 `/stats` returns:
 
@@ -150,7 +150,7 @@ Two engines can serve the same model, and each request's model id picks one. `EN
 - `<engine>/<short>`;
 - `<engine>/<short>-thinking`, when the model can think or before any engine has loaded.
 
-Each entry carries `context_length` and `max_model_len`, both equal to `context_for(engine)`. Once `format_of` has run for the engine (at preload, or on its first chat request; an engine loaded only by a `/v1/completions` request has no format yet), each entry also carries (server.py:177-180, 269-271, 312, 376-387):
+Each entry carries `context_length` and `max_model_len`, both equal to `context_for(engine)`. Once `format_of` has run for the engine (at preload, or on its first chat request; an engine loaded only by a `/v1/completions` request has no format yet), each entry also carries (`server.Server.__init__`, `server.Server.models`, `server.Server.prepare`, `server.Server.prepare_text`):
 
 - `tool_call_format`: the format's name, such as `qwen_xml`;
 - `parallel_tool_calls`: whether the format writes several calls in one reply.
@@ -162,14 +162,14 @@ Each entry carries `context_length` and `max_model_len`, both equal to `context_
 | `model` | picks the engine and thinking (see above) |
 | `messages` | required, a non-empty list |
 | `tools` | OpenAI function tools. A bare `{name, description, parameters}` also works |
-| `tool_choice` | `auto` (the default), `required`, `none`, or `{"type": "function", "function": {"name": ...}}` (`{"name": ...}` also works). On our engine, when tools are offered and no `response_format` or `guided_regex` constraint applies, `_check_tool_choice` turns any other value, or a name that is not one of the tools, into a 400. The stock engine does not check it (server.py:357-369, 1304-1313). |
+| `tool_choice` | `auto` (the default), `required`, `none`, or `{"type": "function", "function": {"name": ...}}` (`{"name": ...}` also works). On our engine, when tools are offered and no `response_format` or `guided_regex` constraint applies, `_check_tool_choice` turns any other value, or a name that is not one of the tools, into a 400. The stock engine does not check it (`server.Server.prepare`, `server._check_tool_choice`). |
 | `parallel_tool_calls` | `false`: at most one call per reply (our engine's grammar) |
 | `response_format` | type `text`, `json_object`, `json_schema` (schema in `json_schema.schema`) or `regex` (in `regex` or `pattern`). Any other type is a 400, so a reply is never unconstrained by mistake |
 | `guided_regex` | vLLM's name for a regex constraint |
-| `reasoning_effort`, `reasoning.effort` | `none` turns thinking off. Other values reach the template as `reasoning_effort` only when thinking is on, unless the client sets that key in `chat_template_kwargs`. When the template lists the values it accepts, the nearest one is used (server.py:327-333) |
+| `reasoning_effort`, `reasoning.effort` | `none` turns thinking off. Other values reach the template as `reasoning_effort` only when thinking is on, unless the client sets that key in `chat_template_kwargs`. When the template lists the values it accepts, the nearest one is used (`server.Server.prepare`) |
 | `chat_template_kwargs` | `enable_thinking` (a bool) switches thinking. Other keys reach the template if allowed (see Security) |
 | `stop` | a string or a list. At most 16 non-empty strings, applied only when the request offers no tools |
-| `temperature` | clamped to 0 to 2. If absent, null or a bool, the server's `--temp` applies. Anything `float()` cannot convert is a 400; a numeric string such as "0.7" is accepted (server.py:1383-1391) |
+| `temperature` | clamped to 0 to 2. If absent, null or a bool, the server's `--temp` applies. Anything `float()` cannot convert is a 400; a numeric string such as "0.7" is accepted (`server._temperature`) |
 | `max_completion_tokens`, else `max_tokens` | Zero or negative (such as `-1`) means the server's `--max-tokens`. Always capped by `--max-tokens` and by the room left in the context |
 | `ignore_eos` | runs to `max_tokens` whatever the model ends with, as vLLM's option does for benchmarks' fixed output lengths. It also turns off the reply guards, and the tool grammar unless a call is required |
 | `stream` | server-sent events |
@@ -211,7 +211,7 @@ Properties of the grammar:
 - With thinking on, the grammar starts inside the open `<think>` block.
 - Formats other than `qwen_xml` build their own grammar with `fmt.reply_regex`.
 
-By default, parameter names and values are free, and values are converted to the schema's types after parsing (`oai.coerce`). This keeps the automaton at a few hundred states. `--typed-tools` instead fixes parameter names, their order and simple value types (`typed_call_regex`). Required parameters are mandatory and the others optional. It applies only to the `qwen_xml` format; other formats build their grammar with `fmt.reply_regex` and ignore it (oai.py:216-230, 253-257). Use it with `--walk`, which handles grammars of any size.
+By default, parameter names and values are free, and values are converted to the schema's types after parsing (`oai.coerce`). This keeps the automaton at a few hundred states. `--typed-tools` instead fixes parameter names, their order and simple value types (`typed_call_regex`). Required parameters are mandatory and the others optional. It applies only to the `qwen_xml` format; other formats build their grammar with `fmt.reply_regex` and ignore it (`oai.typed_call_regex`, `oai.reply_regex`). Use it with `--walk`, which handles grammars of any size.
 
 ## Text completions
 
@@ -263,7 +263,7 @@ Streams are `text/event-stream` with `Transfer-Encoding: chunked`; the handler s
 |---|---|---|
 | `max_calls` | the reply holds `--max-calls` complete calls (default 6) | the reply is cut after that many (`fmt.cut_after`) |
 | `duplicate_call` | two calls in the reply have the same name and arguments | duplicates are dropped, and the text is cut to match |
-| `loop` | the token stream ends in a repeated block (`_looping`). With tools offered and no call opener in the reply yet, also when the last 30 lines of at least 12 characters say at most 6 different things (`_line_looping`). Once an opener has appeared, the raised in-call thresholds apply for the rest of the reply (server.py:686-708, 1420-1427) | the reply ends there |
+| `loop` | the token stream ends in a repeated block (`_looping`). With tools offered and no call opener in the reply yet, also when the last 30 lines of at least 12 characters say at most 6 different things (`_line_looping`). Once an opener has appeared, the raised in-call thresholds apply for the rest of the reply (`server.Server._guard`, `server._line_looping`) | the reply ends there |
 | `stop` | a stop sequence appeared | the text is cut at it |
 
 The model can repeat itself forever, and the grammar cannot see it. `_looping(toks, reps=3, max_period=256, min_span=24, short_span=128)` looks for one block of up to 256 tokens repeated `reps` times at the end, over at least `min_span` tokens.
@@ -272,15 +272,15 @@ The model can repeat itself forever, and the grammar cannot see it. `_looping(to
 - The thresholds rise where repetition can be legitimate:
   - inside a call's arguments, such as a file of identical lines: `reps=8, min_span=128, short_span=256`;
   - in a reply without tools, such as "write it ten times": `reps=12, min_span=96, short_span=256`.
-- With tools, the call checks and `_line_looping` see only the text after the reasoning, so drafts in thoughts are not counted as calls. The token-loop check `_looping` still runs on every token, reasoning included (server.py:704-709, 855-857).
+- With tools, the call checks and `_line_looping` see only the text after the reasoning, so drafts in thoughts are not counted as calls. The token-loop check `_looping` still runs on every token, reasoning included (`server.Server._guard`, `server.Server._decode`).
 
-**Repeated calls across turns.** `_previous_calls` walks back from the end over tool results to the last assistant turn and collects its calls with their results. If a user message comes first, it returns nothing and steering does not apply (server.py:905-922). If the new reply repeats one of them (same name and arguments), `_run` decodes the turn again:
+**Repeated calls across turns.** `_previous_calls` walks back from the end over tool results to the last assistant turn and collects its calls with their results. If a user message comes first, it returns nothing and steering does not apply (`server.py`). If the new reply repeats one of them (same name and arguments), `_run` decodes the turn again:
 
-- It adds a steering prefix written for the model: "The X call above was already made and returned: ... Repeating it would give the same result, so I will do something different now: ", with the result shortened to 160 characters. The client receives it as `reasoning_content` when the prompt opened a think block (`_in_think`), otherwise as `content` (server.py:741-742, 925-932).
+- It adds a steering prefix written for the model: "The X call above was already made and returned: ... Repeating it would give the same result, so I will do something different now: ", with the result shortened to 160 characters. The client receives it as `reasoning_content` when the prompt opened a think block (`_in_think`), otherwise as `content` (`server.Server._run`, `server.Server._steer_text`).
 - It caps `max_tokens` at `STEERED_MAX_TOKENS` (2048). Gemma 4 wrote 4,096 tokens of prose after the steering text.
 - It removes a leading thought block from the grammar (Gemma 4's `thought_regex`).
 
-Steering is skipped for `llama3_json`, `mistral` and `mistral_legacy`, whose calls are the whole reply and cannot be preceded by text. For these formats the first repeat already ends the turn with the "I am stuck" message and returns no calls, unless `tool_choice` is `required` or a named function (server.py:767-793).
+Steering is skipped for `llama3_json`, `mistral` and `mistral_legacy`, whose calls are the whole reply and cannot be preceded by text. For these formats the first repeat already ends the turn with the "I am stuck" message and returns no calls, unless `tool_choice` is `required` or a named function (`server.Server._run`).
 
 If the second attempt still repeats, the turn ends with a message that asks the user how to proceed, and no calls are returned. The exception is a `tool_choice` of `required` or a named function: then the repeated call is returned as asked.
 
@@ -312,7 +312,7 @@ On the next turn, the client sends the conversation back and the chat template r
 - `"user"`: the start of the last message;
 - `"reply"`: where this reply starts once the next request renders it. Set `LOCALS_REPLY_CHECKPOINT=0` to turn it off.
 
-Each position is found with the model's own template. `"system"` is where two renderings part: the system message followed by two different dummy user messages (this needs at least two messages, the first a system one). `"user"` is the rendering of every message but the last. `"reply"` is where two renderings part: the whole conversation followed by two different dummy assistant replies and a follow-up user message (server.py:581-611). A position is used only if its text is a prefix of the prompt text, at least 2048 characters long, and matches at least 1024 of the prompt's tokens.
+Each position is found with the model's own template. `"system"` is where two renderings part: the system message followed by two different dummy user messages (this needs at least two messages, the first a system one). `"user"` is the rendering of every message but the last. `"reply"` is where two renderings part: the whole conversation followed by two different dummy assistant replies and a follow-up user message (`server.Server._checkpoints`). A position is used only if its text is a prefix of the prompt text, at least 2048 characters long, and matches at least 1024 of the prompt's tokens.
 
 A plain KV cache does not need checkpoints. The prompt cache cuts it back to any shared prefix, so snapshots would only store the prompt's KV twice more.
 
@@ -410,7 +410,7 @@ How requests are translated (`apis.ollama_to_chat`):
 - **Options.** `options.num_predict` (when > 0) becomes `max_tokens`. `temperature`, `top_p`, `stop` and `seed` are copied, but only `temperature` and `stop` are used downstream.
 - **Formats.** `format: "json"` becomes `json_object`. A schema object becomes `json_schema`.
 - **Thinking.** `think: true` or `false` becomes `chat_template_kwargs.enable_thinking`. A level string (`low`, `medium`, `high`) turns thinking on and sets `reasoning_effort`.
-- **Images.** The images are dropped. A message, or a generate prompt, that had any gets one note appended to its text: `IMAGE_NOTE`, "[an image was attached here; this model reads text only]" (apis.py:19, 66, 71-72).
+- **Images.** The images are dropped. A message, or a generate prompt, that had any gets one note appended to its text: `IMAGE_NOTE`, "[an image was attached here; this model reads text only]" (`apis.ollama_to_chat`).
 - **Tool call ids.** Ollama's tool calls have no ids, so they get stable ones (`call_<message>_<index>`), the same on every request. Random ids changed the history the template writes, so the prompt cache missed. Tool results without a `tool_call_id` are paired with the last assistant turn's calls by position.
 
 Replies have:
@@ -433,9 +433,9 @@ The server has no authentication. It is meant to listen on loopback, which is th
   - any loopback or private IP address;
   - entries of `LOCALS_HOSTS` (comma-separated; `*` allows any).
 
-  Anything else gets 403 `this server answers to localhost only`. A request without a `Host` header passes. When the server is bound to any address other than `localhost`, `127.0.0.1` or `::1`, this check is off (server.py:104-105).
+  Anything else gets 403 `this server answers to localhost only`. A request without a `Host` header passes. When the server is bound to any address other than `localhost`, `127.0.0.1` or `::1`, this check is off (`server._host_ok`).
 - **Origin check** (`_origin_ok`). A request that carries an `Origin` header must come from one of these:
-  - a page served from this machine: `http` or `https` with host `localhost`, `127.0.0.1` or `::1` (`_LOOPBACK`), or a name ending in `.localhost`, on any port. Other loopback or private addresses are not accepted as origins (server.py:63, 94-95);
+  - a page served from this machine: `http` or `https` with host `localhost`, `127.0.0.1` or `::1` (`_LOOPBACK`), or a name ending in `.localhost`, on any port. Other loopback or private addresses are not accepted as origins (`server._origin_ok`);
   - a desktop app or extension scheme: `app`, `file`, `tauri`, `vscode-webview`, `vscode-file`, `chrome-extension`, `moz-extension`, `safari-web-extension`;
   - an origin listed in `LOCALS_ORIGINS` (comma-separated; `*` allows any).
 
@@ -499,7 +499,7 @@ How the worker runs:
   - Location: `LOCALS_DISK_CACHE_DIR` (default `~/.cache/locals/prompts`), up to `LOCALS_DISK_CACHE_GB` (default 4).
   - Each folder is named after the model, the dtype, and a fingerprint of the weight files and the mlx-lm version.
   - Folders left from other weights of the same model are removed.
-- **Checkpoints.** `"system"` and `"user"` checkpoints are stored as copies of the cache in prompt-cache entries of their kind. A copy is skipped when `_room_for_copy` says there is no room, and `"system"` copies are also saved to the disk cache. A `"reply"` checkpoint keeps only the layers that cannot be cut back (recurrent state). When the row finishes, these are joined with the row's KV cut to that position and stored as an `"assistant"` entry. Eviction order: `"assistant"` first, then `"user"`, then `"system"` (hybrid_batch.py:97-119, 789-802, 1002; service.py:153-155).
+- **Checkpoints.** `"system"` and `"user"` checkpoints are stored as copies of the cache in prompt-cache entries of their kind. A copy is skipped when `_room_for_copy` says there is no room, and `"system"` copies are also saved to the disk cache. A `"reply"` checkpoint keeps only the layers that cannot be cut back (recurrent state). When the row finishes, these are joined with the row's KV cut to that position and stored as an `"assistant"` entry. Eviction order: `"assistant"` first, then `"user"`, then `"system"` (`hybrid_batch._copies`, `hybrid_batch.HybridBatchEngine._checkpoint`, `hybrid_batch.HybridBatchEngine.serve.retire`; `service.BatchService.submit`).
 - **Errors.** When the engine loop raises, for example on Metal out of memory, the worker:
   - fails the jobs in flight;
   - halves the prompt cache;
@@ -516,13 +516,13 @@ How the worker runs:
   - llguidance never matches a special token against regex text. `_llg_grammar` therefore refers to special tokens at the regex's ends by id, in a lark grammar.
   - Grammars are cached per regex.
 - **Sampling.** A request with its own temperature gets a new sampler that keeps the server's `top_p` and `top_k`.
-- **`ignore_eos`** removes the row's stop tokens only for an unconstrained job (`if job.ignore_eos and not procs`). A constrained job keeps its stop tokens (service.py:480-483).
+- **`ignore_eos`** removes the row's stop tokens only for an unconstrained job (`if job.ignore_eos and not procs`). A constrained job keeps its stop tokens (`service.BatchService._run_stock`).
 - **Cancellation.** Cancelled jobs are removed from the generator.
 - **Not supported:** checkpoints, the disk cache, and a memory guard.
 
 ## Command-line flags
 
-`main()` is the entry point of `python -m locals.server`. `locals serve` (`app.cmd_serve`) remembers the model and port, then `os.execv`s `python -m locals.server` with the flags `app.server_cmd` builds. It accepts only a subset: `--model`, `--port`, `--engines`, `--preload`, `--slots`, `--temp`, `--top-p`, `--top-k`, `--max-tokens`, `--cache-gb`, `--max-context`, `--thinking`, `--max-calls`, `--walk`, `--typed-tools` and `--ollama`. `--host`, `--seed` and `--ollama-port` exist only on `python -m locals.server` (app.py:493-503, 518-520, 1332-1357). It also remembers the model and port for later commands, and adds `--ollama` as a shortcut for `--ollama-port 11434`.
+`main()` is the entry point of `python -m locals.server`. `locals serve` (`app.cmd_serve`) remembers the model and port, then `os.execv`s `python -m locals.server` with the flags `app.server_cmd` builds. It accepts only a subset: `--model`, `--port`, `--engines`, `--preload`, `--slots`, `--temp`, `--top-p`, `--top-k`, `--max-tokens`, `--cache-gb`, `--max-context`, `--thinking`, `--max-calls`, `--walk`, `--typed-tools` and `--ollama`. `--host`, `--seed` and `--ollama-port` exist only on `python -m locals.server` (`app.server_cmd`, and the parsers in `app._main`). It also remembers the model and port for later commands, and adds `--ollama` as a shortcut for `--ollama-port 11434`.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -537,7 +537,7 @@ How the worker runs:
 | `--top-p` | `0.0` (off) | nucleus sampling when the temperature is above 0 (Qwen3.5 thinking: 0.95) |
 | `--top-k` | `0` (off) | top-k sampling when the temperature is above 0 (Qwen3.5 thinking: 20) |
 | `--max-tokens` | `4096` | cap on completion tokens per request |
-| `--cache-gb` | unset | prompt-cache size in GB, used by both engines. When unset, our engine sizes it from free GPU memory and the stock engine uses 1.5 GB (`max_bytes=self.cache_bytes or int(1.5 * (1 << 30))`) (service.py:130, 320-326, 450) |
+| `--cache-gb` | unset | prompt-cache size in GB, used by both engines. When unset, our engine sizes it from free GPU memory and the stock engine uses 1.5 GB (`max_bytes=self.cache_bytes or int(1.5 * (1 << 30))`) (`service.BatchService.__init__`, `service.BatchService._run_locals`, `service.BatchService._run_stock`) |
 | `--max-context` | unset | prompt plus reply tokens per request (see Context limits) |
 | `--thinking` | off | think before every reply |
 | `--seed` | `0` | |

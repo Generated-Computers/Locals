@@ -528,36 +528,36 @@ Variables read by the server process must be set in the environment of the comma
 
 | Variable | Default | Effect | Where |
 |---|---|---|---|
-| `LOCALS_IGNORE_MEMORY` | unset | Skips the check that the weights plus 2 GB fit in GPU memory. | `defaults.py:74` |
-| `LOCALS_TUNE` | `auto` (`Runtime`, `lm.patch`); `background` (`BatchService`, which both the server and `locals agents` use) | Kernel autotuning mode: `auto`, `background`, `quick`, `full` or `off`. `background` serves at once on MLX's kernels and tunes while idle. | `runtime.py:144`, `lm.py:64`, `service.py:280`, `kernels.py:848-861` |
-| `LOCALS_TUNE_CACHE` | `~/.cache/locals/tune_v6_<arch>.json` | Path of the tuning results file. | `kernels.py:134` |
-| `LOCALS_NO_PRESET` | unset | Hides the shipped tuning presets, so the first start behaves as on a GPU without them. | `kernels.py:148` |
+| `LOCALS_IGNORE_MEMORY` | unset | Skips the check that the weights plus 2 GB fit in GPU memory. | `defaults.too_big` |
+| `LOCALS_TUNE` | `auto` (`Runtime`, `lm.patch`); `background` (`BatchService`, which both the server and `locals agents` use) | Kernel autotuning mode: `auto`, `background`, `quick`, `full` or `off`. `background` serves at once on MLX's kernels and tunes while idle. | `runtime.Runtime.__init__`, `lm.patch`, `service.BatchService._run_locals`, `kernels.tune_model` |
+| `LOCALS_TUNE_CACHE` | `~/.cache/locals/tune_v6_<arch>.json` | Path of the tuning results file. | `kernels.py` |
+| `LOCALS_NO_PRESET` | unset | Hides the shipped tuning presets, so the first start behaves as on a GPU without them. | `kernels._preset_path` |
 | `LOCALS_DTYPE`, `LOCALS_FUSE`, `LOCALS_KERNELS`, `LOCALS_GDN_KERNEL`, `LOCALS_GDN_FAST`, `LOCALS_DENSE_PREFILL`, `LOCALS_PAD_ROWS` | `auto`, `1`, `1`, `1`, timed, timed, `1` | Switches for measuring what each part of the engine gives on a new GPU (see [Runtime](../runtime/README.md)). | `runtime.py`, `fuse.py`, `kernels.py` |
 | `LOCALS_PREFILL_RESERVE_GB` | learned | Room an admission keeps for a prompt being read, fixed. By default the engine keeps what its own reads of that size needed (1.5 GB until it has seen one); see [Batch engine](../engine/README.md). | `hybrid_batch.py` |
 | `LOCALS_MEMORY_MARGIN_GB` | `1.5`, less for a model that leaves under 8 GB | Margin below the GPU limit the memory guard keeps: MLX's pool of freed buffers (1 GB, or an eighth of the room a large model leaves, at least 256 MB) and 0.5 GB for what the admission estimate misses (`memory_plan`). | `service.py` |
-| `LOCALS_MAX_TABLE_GB` | `3` | Largest token table a grammar may need. Above it, the request fails and the error suggests `--walk`. | `constraint.py:127` |
-| `LOCALS_TABLE_CACHE_GB` | `0.5` | LRU limit on per-state constraint tables. | `engine.py:345` |
-| `LOCALS_MAX_COMPILED` | `16` | Compiled constraints kept, least recently used first. | `runtime.py:162` |
-| `LOCALS_COMPILED_GB` | `1.5` | Limit, in units of 1e9 bytes, on the tables of kept compiled constraints. | `runtime.py:245` |
-| `LOCALS_MIX_CHUNK` | `1024` | Prompt tokens per mixed prefill and decode pass. `0` prefills a new prompt while the other rows wait. | `hybrid_batch.py:333` |
-| `LOCALS_MAX_SNAPSHOTS` | `4` | Shared-prefix snapshots kept (at least 1). | `hybrid_batch.py:347` |
-| `LOCALS_GROWTH_TRIM` | `1` | `0` turns off making room in the prompt cache every 32 decode steps for the rows' KV growth. | `hybrid_batch.py:181,1220` |
-| `LOCALS_MEMLOG` | unset | Prints GPU memory around each admission. | `hybrid_batch.py:34` |
-| `LOCALS_MIXLOG` | unset | Prints each mixed pass. | `hybrid_batch.py:35` |
-| `LOCALS_PREFILL_LOG` | unset | Prints prefill and checkpoint lines. | `hybrid_batch.py:567,803,1176` |
-| `LOCALS_REPLY_CHECKPOINT` | `1` | `0` turns off the "reply" prompt-cache checkpoint for follow-up turns. | `server.py:603` |
-| `LOCALS_DISK_CACHE` | `1` | `0` turns off the system-prompt snapshots on disk, which survive server restarts. | `service.py:296` |
-| `LOCALS_DISK_CACHE_DIR` | `~/.cache/locals/prompts` | Where those snapshots go. | `service.py:303` |
-| `LOCALS_DISK_CACHE_GB` | `4` | Their size limit. | `service.py:305` |
-| `LOCALS_ORIGINS` | empty | Extra browser origins allowed to call the server (comma-separated, `*` for any). | `server.py:86` |
-| `LOCALS_HOSTS` | empty | Extra `Host` header names accepted, against DNS rebinding (comma-separated, `*`). | `server.py:110` |
-| `LOCALS_DEBUG` | unset | Saves every request as received. | `server.py:295,378,1132` |
-| `LOCALS_DEBUG_DIR` | `~/.cache/locals/requests` | Where those dumps go. The folder is mode 0700 and the files 0600. | `server.py:129` |
-| `LOCALS_NO_SANDBOX` | unset | `solve.run_shell` does not confine commands with `sandbox-exec`. | `solve.py:242` |
-| `OPENCLAW_BIN`, `HERMES_BIN`, `AIDER_BIN`, `CLINE_BIN`, `KILO_BIN`, `OPENHANDS_BIN` | `PATH` lookup | Path of that tool's command. | `app.py:330-331` (`_tool_bin`) |
-| `OPENCLAW_STATE_DIR` | `~/.openclaw` | Where OpenClaw's `openclaw.json` is backed up from. | `app.py:354` |
-| `HERMES_HOME` | `~/.hermes` | Where Hermes's `config.yaml` is backed up from. | `app.py:383` |
-| `LOCALS_SOURCE` | `locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz` | What `install.sh` installs. | `install.sh:37` |
+| `LOCALS_MAX_TABLE_GB` | `3` | Largest token table a grammar may need. Above it, the request fails and the error suggests `--walk`. | `constraint.compile_constraint` |
+| `LOCALS_TABLE_CACHE_GB` | `0.5` | LRU limit on per-state constraint tables. | `engine._TableCache.__init__` |
+| `LOCALS_MAX_COMPILED` | `16` | Compiled constraints kept, least recently used first. | `runtime.Runtime.__init__` |
+| `LOCALS_COMPILED_GB` | `1.5` | Limit, in units of 1e9 bytes, on the tables of kept compiled constraints. | `runtime.Runtime._cput` |
+| `LOCALS_MIX_CHUNK` | `1024` | Prompt tokens per mixed prefill and decode pass. `0` prefills a new prompt while the other rows wait. | `hybrid_batch.HybridBatchEngine.__init__` |
+| `LOCALS_MAX_SNAPSHOTS` | `4` | Shared-prefix snapshots kept (at least 1). | `hybrid_batch.HybridBatchEngine.__init__` |
+| `LOCALS_GROWTH_TRIM` | `1` | `0` turns off making room in the prompt cache every 32 decode steps for the rows' KV growth. | `hybrid_batch.py` |
+| `LOCALS_MEMLOG` | unset | Prints GPU memory around each admission. | `hybrid_batch.py` |
+| `LOCALS_MIXLOG` | unset | Prints each mixed pass. | `hybrid_batch.py` |
+| `LOCALS_PREFILL_LOG` | unset | Prints prefill and checkpoint lines. | `hybrid_batch.HybridBatchEngine._prefill_batch`, `hybrid_batch.HybridBatchEngine._checkpoint`, `hybrid_batch.HybridBatchEngine.serve` |
+| `LOCALS_REPLY_CHECKPOINT` | `1` | `0` turns off the "reply" prompt-cache checkpoint for follow-up turns. | `server.Server._checkpoints` |
+| `LOCALS_DISK_CACHE` | `1` | `0` turns off the system-prompt snapshots on disk, which survive server restarts. | `service.BatchService._run_locals` |
+| `LOCALS_DISK_CACHE_DIR` | `~/.cache/locals/prompts` | Where those snapshots go. | `service.BatchService._run_locals` |
+| `LOCALS_DISK_CACHE_GB` | `4` | Their size limit. | `service.BatchService._run_locals` |
+| `LOCALS_ORIGINS` | empty | Extra browser origins allowed to call the server (comma-separated, `*` for any). | `server._origin_ok` |
+| `LOCALS_HOSTS` | empty | Extra `Host` header names accepted, against DNS rebinding (comma-separated, `*`). | `server._host_ok` |
+| `LOCALS_DEBUG` | unset | Saves every request as received. | `server.Server.prepare`, `server.Server.prepare_text`, `server.make_handler.Handler._other_api` |
+| `LOCALS_DEBUG_DIR` | `~/.cache/locals/requests` | Where those dumps go. The folder is mode 0700 and the files 0600. | `server._dump_request` |
+| `LOCALS_NO_SANDBOX` | unset | `solve.run_shell` does not confine commands with `sandbox-exec`. | `solve.run_shell` |
+| `OPENCLAW_BIN`, `HERMES_BIN`, `AIDER_BIN`, `CLINE_BIN`, `KILO_BIN`, `OPENHANDS_BIN` | `PATH` lookup | Path of that tool's command. | `app.py` (`_tool_bin`) |
+| `OPENCLAW_STATE_DIR` | `~/.openclaw` | Where OpenClaw's `openclaw.json` is backed up from. | `app.setup_openclaw` |
+| `HERMES_HOME` | `~/.hermes` | Where Hermes's `config.yaml` is backed up from. | `app.setup_hermes` |
+| `LOCALS_SOURCE` | `locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz` | What `install.sh` installs. | `install.sh` |
 
 ### Set by Locals for the programs it starts
 

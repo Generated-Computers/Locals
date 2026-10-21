@@ -87,7 +87,7 @@ When a prompt is prefilled in mixed passes next to decoding rows (`mix_chunk`, `
 - **The entry replaces the row.** `retire` inserts the reply entry under `prompt[:n]` as `assistant`. The comment gives two reasons: the row is no prefix of the next request, and the views would count twice in the prompt cache's bytes next to the row. Without a reply entry, the whole row is inserted as usual.
 - **Regenerated replies.** If the cached prefix found for a request ends exactly at its `reply` position, the state is taken straight from that cached prefix.
 
-**Measured effect** (the 60k numbers are from the comments in service.py:322 and server.py:601; the others are from the message of commit 76f5502; none of these sources names the model):
+**Measured effect** (the 60k numbers are from the comments in `service.BatchService._run_locals` and `server.Server._checkpoints`; the others are from the message of commit 76f5502; none of these sources names the model):
 
 | Case | Without | With |
 |---|---|---|
