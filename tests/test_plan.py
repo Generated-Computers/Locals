@@ -529,3 +529,18 @@ def test_a_candidates_copy_is_removed_when_the_run_is_stopped(tmp_path):
                        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     copy = p.stdout.strip()
     assert "locals-cand-" in copy and not os.path.exists(copy)
+
+
+def test_the_last_version_is_not_cut_while_the_others_gave_nothing(monkeypatch):
+    """The cut that stops a version running away came once most versions were done, whatever they gave: when the
+    done ones had all failed, it stopped the only one that could still give a version."""
+    monkeypatch.setattr(plan, "_TAIL_MIN", 0.2)
+    for useful, cut in ((False, False), (True, True)):
+        late = threading.Event()
+        fast = [threading.Thread(target=lambda: None) for _ in range(2)]
+        slow = threading.Thread(target=lambda: late.wait(3.0))  # ends at the cut, or after 3 s
+        for th in fast + [slow]:
+            th.start()
+        t0 = time.time()
+        plan._wait(fast + [slow], late, lambda s: None, {}, useful=lambda: useful)
+        assert late.is_set() == cut and (time.time() - t0 < 2.0) == cut

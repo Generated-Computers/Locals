@@ -674,15 +674,19 @@ class _Any:
         return any(e.is_set() for e in self.events)
 
 
-def _wait(threads: List[threading.Thread], late: threading.Event, status, states) -> None:
-    """Wait for the threads; when all but a few are done, the rest get a little longer (half the
-    time so far, 15 s at least), then ``late`` stops them: a version that runs away (4,096 tokens
-    of a loop the guard did not see) held a repair round for two minutes."""
+_TAIL_MIN = 15.0  # seconds the last versions get, at least, once the others are done (_wait)
+
+
+def _wait(threads: List[threading.Thread], late: threading.Event, status, states, useful=lambda: True) -> None:
+    """Wait for the threads; when all but a few are done, and the done ones gave something to go on (``useful``),
+    the rest get a little longer (half the time so far, 15 s at least), then ``late`` stops them: a version that
+    runs away (4,096 tokens of a loop the guard did not see) held a repair round for two minutes. (When the done ones
+    all failed, the cut stopped the only version that could still give one.)"""
     t0, cut = time.time(), None
     while any(th.is_alive() for th in threads):
         alive = sum(th.is_alive() for th in threads)
-        if cut is None and alive < len(threads) and alive <= max(1, len(threads) // 5):  # not before one is done
-            cut = time.time() + max(15.0, 0.5 * (time.time() - t0))
+        if cut is None and alive < len(threads) and alive <= max(1, len(threads) // 5) and useful():  # not before one is done
+            cut = time.time() + max(_TAIL_MIN, 0.5 * (time.time() - t0))
         if cut is not None and time.time() > cut:
             late.set()
         status(states)
@@ -764,7 +768,8 @@ def _write_samples(team, base_url: str, task: str, parts: List[dict], digest: st
     threads = [threading.Thread(target=sample, args=(s,), daemon=True) for s in range(samples)]
     for th in threads:
         th.start()
-    _wait(threads, late, status, team.states)
+    # (cut the last versions only once one is whole: the parts of it are then there to combine)
+    _wait(threads, late, status, team.states, useful=lambda: any(all(options[i][s] for i in range(n)) for s in range(samples)))
     return {"options": options, "runs": sorted(runs, key=lambda r: (r["sample"], r["part"])), "results": results}
 
 
@@ -957,7 +962,7 @@ def _repair(team, base_url: str, task: str, parts: List[dict], cur: List[Dict[st
     threads = [threading.Thread(target=one, args=(i, c), daemon=True) for i in todo for c in range(k)]
     for th in threads:
         th.start()
-    _wait(threads, late, status, team.states)
+    _wait(threads, late, status, team.states, useful=lambda: any(len(options[i]) > 1 for i in todo))  # (a new version)
     if not found.is_set() and len(todo) > 1:  # new versions of two parts may only pass together
         results += _search(options, checks, tried, [((0,) * n, False, out)] + results)
     return {"todo": todo, "gens": sorted(gens, key=lambda g: (g["part"], g["candidate"])), "options": options, "results": results}
