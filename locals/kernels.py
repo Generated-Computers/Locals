@@ -535,6 +535,7 @@ def _tune_shape(x2, mod, M, K, N, dt, key, tune):
                 f.write(key)
         except OSError:
             marker = None
+    mark_busy()  # (locals tune, or a shape tuned on first use: another server's idle tuner waits too)
     try:
         c = _time_shape(x2, mod, M, K, N, dt, key, tune)
         _PAD.clear()  # (padding chosen before these timings existed stayed "none" for the life of the process)
