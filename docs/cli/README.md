@@ -220,7 +220,7 @@ Writes to OpenCode's `opencode.json` (`write_config`, `cmd_code`) go through `_w
 `setup_opencode` chooses four values and calls `write_config(opencode_config(...))`:
 
 - **Default agent:** `--agent`, else `default_agent(model)`. That function returns `orchestrator` when the chat format is `qwen_xml` (Qwen3.5) and `coder` otherwise. It also returns `orchestrator` when the tokenizer cannot be loaded or its format detected. The docstring gives the reason: Qwen3.5 delegated sensibly (11 of 13 real tasks), while the other models tested called the subagent tool over and over with junk arguments.
-- **Context declared:** `--context`, else `min(32768, agent_context(model))`.
+- **Context declared:** `--context`, else `min(32768, agent_context(model, args))`.
 - **Engine:** `--engine` (`locals` or `mlx`), default `locals`.
 - **Thinking variants:** `model_thinks(model)` is true when the chat template offers thinking (Qwen3, Qwen3.5, Gemma 4). It is also true when the tokenizer cannot be loaded, because the check falls back to `True`.
 
@@ -298,13 +298,13 @@ Without `--run`, it `execve`s `opencode <dir> -m ...` (`--logs` adds `--print-lo
 |---|---|
 | `list` (default) | `print_connections`: each tool, its connection state, and what to run (see "Connections" below). |
 | `opencode` | Same as `locals code [DIR]`. `DIR` is the first argument after the name. |
-| `aider` | `exec aider --model openai/locals/<short> --no-show-model-warnings --edit-format diff ...` with `OPENAI_API_BASE=<base>/v1`, `OPENAI_API_KEY=locals`. Search/replace edits: in the whole-file format Aider picks for a model it does not know, code the model quotes after a sentence became a file named after the sentence. A user's own `--edit-format` comes later and wins. |
-| `cline` | `cline auth --config ~/.locals/cline -p openai -k locals -m locals/<short> -b <base>/v1`, then `exec cline --config ~/.locals/cline ...`. |
+| `aider` | `exec aider --model openai/locals/<short> --no-show-model-warnings --edit-format diff ...` with `OPENAI_BASE_URL` and `OPENAI_API_BASE` set to `<base>/v1` and `OPENAI_API_KEY=locals`, in the environment and again as `--set-env` options, which Aider applies after it reads `~/.env` and the project's `.env` (a base URL of the user's there, or an `OPENAI_BASE_URL` that litellm reads first, won before). Search/replace edits: in the whole-file format Aider picks for a model it does not know, code the model quotes after a sentence became a file named after the sentence. A user's own `--edit-format` comes later and wins. |
+| `cline` | `cline auth --config ~/.locals/cline -p openai -k locals -m locals/<short> -b <base>/v1`, then `exec cline --config ~/.locals/cline ...`; if `cline auth` fails, the command exits with its output instead of opening an unconfigured Cline. |
 | `kilo` | Writes `~/.locals/kilo.json` (provider `locals`, model `locals/locals/<short>`, context `agent_context(model)`, output 4096), then `exec`s Kilo with `KILO_CONFIG` pointing to it. |
 | `openhands` | `exec openhands --override-with-envs ...` with `LLM_MODEL=openai/locals/<short>`, `LLM_BASE_URL=<base>/v1`, `LLM_API_KEY=locals`, `OPENHANDS_SUPPRESS_BANNER=1`. |
-| `claude` | `exec claude ...` with, for that launch only, `ANTHROPIC_BASE_URL=<base>` (the server's Messages API), `ANTHROPIC_AUTH_TOKEN=locals`, `ANTHROPIC_MODEL` and the default Haiku, Sonnet and Opus models set to `locals/<short>`, `CLAUDE_CODE_MAX_CONTEXT_TOKENS` set to the server's context (Claude Code assumes 200k tokens for a model it does not know, and would compact too late), `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and `API_TIMEOUT_MS=3600000` (a long first prompt is read for minutes). An `ANTHROPIC_API_KEY` in the environment is left out. Claude Code's own settings are not touched. |
+| `claude` | `exec claude ...` with, for that launch only, `ANTHROPIC_BASE_URL=<base>` (the server's Messages API), `ANTHROPIC_AUTH_TOKEN=locals`, `ANTHROPIC_MODEL` and the default Haiku, Sonnet and Opus models set to `locals/<short>`, `CLAUDE_CODE_MAX_CONTEXT_TOKENS` set to the server's context (Claude Code assumes 200k tokens for a model it does not know, and would compact too late), `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and `API_TIMEOUT_MS=3600000` (a long first prompt is read for minutes). An `ANTHROPIC_API_KEY` in the environment is left out, and so are `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` and `CLAUDE_CODE_USE_FOUNDRY`, which would send the session to that cloud. Claude Code's own settings are not touched. |
 | `openclaw`, `hermes` | Runs `setup_openclaw` / `setup_hermes` (below), then `exec`s the tool. |
-| `ollama` | Makes the server also answer on port 11434. It exits if that port is held by something that is not Locals (Ollama itself, for example). It restarts an idle running server that lacks the Ollama port, and refuses while that server has active requests. It then prints the address and the model name `<short>:latest`. |
+| `ollama` | Makes the server also answer on port 11434. It exits if that port is held by something that is not Locals (Ollama itself, for example). It restarts an idle running server that lacks the Ollama port, with the options it was started with (`_keep_options`: `--max-context`, `--slots` and the others), and refuses while that server has active requests, or when it was started by hand (`locals serve`). It then prints the address and the model name `<short>:latest`. |
 | `editor` | Prints the settings for an OpenAI-compatible provider: base URL, model `locals/<short>`, any API key, and the context window. The context comes from the running server's `/v1/models` (`context_length`), falling back to 65536. It also prints snippets for Continue, Cline/Roo/Kilo Code, Zed and JetBrains AI Assistant. |
 
 For Aider, OpenHands, Cline and Kilo Code, Locals configures the launch only, through environment variables or a config file of its own. OpenCode, OpenClaw and Hermes get Locals written into their own config.
@@ -320,7 +320,7 @@ server's address:
 | `ready` | Aider, OpenHands, Cline and Kilo Code: Locals gives them its settings each time `locals launch` opens them, so there is nothing to keep connected. |
 | `not connected` | OpenCode, OpenClaw or Hermes without a Locals provider in its config. |
 | `connected` | The config's Locals provider points at this server's `<base>/v1`. The detail names the default model, or says when the tool's default is another model. |
-| `needs repair` | The provider points at another address (another port), the config cannot be read (OpenCode's JSONC, a broken YAML), or the tool still uses Locals under its old name `stcon` (`LEGACY`). The detail names the command that fixes it (`locals code`, `locals launch <tool>`). |
+| `needs repair` | The provider points at another address (another port), the config cannot be read (OpenCode's JSONC, a broken YAML), or its default model is `locals/<another model>` than the one the server runs (or, with no server, the one Locals remembers): the server refuses those requests (`check_model`); or the tool still uses Locals under its old name `stcon` (`LEGACY`). The detail names the command that fixes it (`locals code`, `locals launch <tool>`). |
 
 `_tool_settings` reads each config directly: `opencode.json` (`provider.locals.options.baseURL`, `model`),
 `$OPENCLAW_STATE_DIR/openclaw.json` (JSON5, read by `_loads_jsonish`: `models.providers.locals.baseUrl`,
@@ -362,10 +362,9 @@ Without a TTY, or without uv or npm, it prints what to run and exits.
 
 Both tools speak OpenAI chat completions to a custom base URL. The config is written through the tool's own CLI when the tool is installed, so the format and its validation stay the tool's business. Otherwise the snippet is saved or printed.
 
-`AGENT_CONTEXT = 65536` is the context declared to these tools. The comment says Hermes refuses models under 64,000 tokens, and 65536 is also the server's default minimum `--max-context`. `agent_context(model)` lowers it to the model's own `max_position_embeddings` when that is smaller.
+`AGENT_CONTEXT = 65536` is the context declared to these tools. The comment says Hermes refuses models under 64,000 tokens, and 65536 is also the server's default minimum `--max-context`. `agent_context(model, args)` lowers it to the model's own `max_position_embeddings` when that is smaller, and to the server's own limit: `--max-context` when given, else the `context_length` the server on the port answers for this model (a tool told more than the server takes had its long requests refused).
 
 - **OpenClaw** (`openclaw_patch`, `setup_openclaw`): writes `~/.locals/openclaw-locals.json5` containing:
-  - `models.mode: "merge"`;
   - a `locals` provider with `baseUrl <base>/v1`, `apiKey "locals-local"`, `api "openai-completions"`, `timeoutSeconds 900`;
   - one model `locals/<short>` with zero cost, `contextWindow` and `maxTokens`;
   - `agents.defaults.model.primary: "locals/locals/<short>"`.

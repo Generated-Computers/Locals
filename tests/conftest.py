@@ -38,6 +38,30 @@ def _no_real_user_files(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(app, "LOCALS_DIR", home / ".locals")
     monkeypatch.setattr(app, "OPENCODE_CONFIG", home / ".config" / "opencode" / "opencode.json")
     monkeypatch.setattr(app, "OPENCODE_BIN", home / ".opencode" / "bin" / "opencode")
+    # what a server on the default port runs (the user's own may be up): none, unless a test says so
+    monkeypatch.setattr(app, "_serving_short", lambda port: None, raising=False)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _tuning_cache_copy(tmp_path_factory):
+    """Kernel tuning reads and writes a copy of the user's cache: its timings (a model test tunes nothing it
+    has), but what a test tunes, under a loaded machine, never reaches ~/.cache/locals (a run once rewrote it)."""
+    import os
+    import shutil
+
+    try:
+        from locals import kernels
+    except Exception:  # noqa: BLE001
+        yield
+        return
+    copy = tmp_path_factory.mktemp("tune") / os.path.basename(kernels._TUNE_PATH)
+    if os.path.exists(kernels._TUNE_PATH):
+        shutil.copy(kernels._TUNE_PATH, copy)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(kernels, "_TUNE_PATH", str(copy))
+        mp.setattr(kernels, "_TUNE", None)
+        mp.setenv("LOCALS_TUNE_CACHE", str(copy))  # (servers and tools a test starts)
+        yield
 
 
 def pytest_collection_modifyitems(config, items):

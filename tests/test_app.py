@@ -144,7 +144,7 @@ def test_agent_setup_without_the_agent_installed(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(app, "LOCALS_DIR", tmp_path)
     monkeypatch.setattr(app, "_tool_bin", lambda name, env: None)
-    monkeypatch.setattr(app, "agent_context", lambda model: 65536)
+    monkeypatch.setattr(app, "agent_context", lambda model, args=None: 65536)
 
     def boom(*a, **k):
         raise AssertionError("must not start anything")
@@ -178,7 +178,7 @@ def test_code_run_end_to_end_with_stand_ins(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(app, "opencode_bin", lambda: "/bin/echo")
     monkeypatch.setattr(app, "default_agent", lambda model: "coder")
     monkeypatch.setattr(app, "model_thinks", lambda model: True)
-    monkeypatch.setattr(app, "agent_context", lambda model: 65536)
+    monkeypatch.setattr(app, "agent_context", lambda model, args=None: 65536)
     calls = []
     monkeypatch.setattr(app, "fetch_model", lambda model: calls.append(("fetch", model)))
     monkeypatch.setattr(app, "ensure_server", lambda args: calls.append(("server", args.model)))
@@ -237,7 +237,7 @@ def test_openclaw_setup_replaces_localss_model_list(tmp_path, monkeypatch, capsy
     import subprocess
 
     monkeypatch.setattr(app, "_tool_bin", lambda name, env: "/opt/openclaw")
-    monkeypatch.setattr(app, "agent_context", lambda model: 65536)
+    monkeypatch.setattr(app, "agent_context", lambda model, args=None: 65536)
     seen = []
     monkeypatch.setattr(app.subprocess, "run", lambda cmd, **kw: seen.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))
     assert app.setup_openclaw(argparse.Namespace(model="mlx-community/gemma-4-e4b-it-4bit", port=8321, context=None, output=4096))

@@ -197,8 +197,9 @@ class Server:
         parts = name.strip().lower().split("/")
         if len(parts) < 2 or parts[0] not in ("locals", "mlx", "stock"):
             return
-        want = parts[-1].removesuffix(":latest").removesuffix("-thinking")
-        if want in ("", self.short):
+        raw = parts[-1].removesuffix(":latest")
+        want = raw.removesuffix("-thinking")  # (the thinking variant /v1/models lists; a model may be named so too)
+        if raw in ("", self.short) or want == self.short:
             return
         from .defaults import model_id, short_name
 

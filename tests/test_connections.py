@@ -341,7 +341,7 @@ def test_a_launch_that_finds_the_tool_set_up_runs_none_of_its_commands(tmp_path,
     (tmp_path / "openclaw").mkdir()
     monkeypatch.setattr(app, "_tool_bin", lambda name, env: f"/opt/{name}")
     args = argparse.Namespace(model=QWEN, port=8321, context=None, output=None)
-    monkeypatch.setattr(app, "agent_context", lambda model: 65536)
+    monkeypatch.setattr(app, "agent_context", lambda model, args=None: 65536)
     ours = {k.split(".", 1)[1]: v for k, v in app.hermes_settings(QWEN, 8321).items()}
     (tmp_path / "hermes" / "config.yaml").write_text(yaml.safe_dump({"model": {**ours, "context_length": 65536}}))
     patch = app.openclaw_patch(QWEN, 8321)
@@ -385,7 +385,7 @@ def test_launch_aider_uses_search_replace_edits(monkeypatch):
                                           model="mlx-community/Qwen3.5-4B-MLX-4bit", ollama_port=None))
     argv = seen["argv"]
     assert argv[:5] == ["/opt/aider", "--model", "openai/locals/qwen3.5-4b", "--no-show-model-warnings", "--edit-format"]
-    assert argv[5] == "diff" and argv[6:] == ["--edit-format", "whole", "a.py"]
+    assert argv[5] == "diff" and argv[-3:] == ["--edit-format", "whole", "a.py"]  # (the user's own come last, and win)
     assert seen["env"]["OPENAI_API_BASE"] == "http://127.0.0.1:8321/v1"
 
 
@@ -437,3 +437,95 @@ def test_json5_strings_are_left_as_they_are(text, want):
     """OpenClaw's JSON5: commas, colons and braces inside strings are text (a regular expression over the whole file
     once broke "Hello, world: hi"; then the config could not be read, and a disconnect refused)."""
     assert app._loads_jsonish(text) == want
+
+
+def test_openclaw_with_a_model_written_as_a_string(tmp_path, monkeypatch):
+    """OpenClaw's agents.defaults.model may be the reference itself, a string: `locals launch`, setup and
+    disconnect ended with an AttributeError on it."""
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path))
+    (tmp_path / "openclaw.json").write_text(json.dumps({"agents": {"defaults": {"model": "anthropic/claude-x"}}}))
+    monkeypatch.setattr(app, "_tool_bin", lambda name, env: "/opt/openclaw")
+    monkeypatch.setattr(app, "_installed", lambda name, env: "/opt/openclaw")
+    assert app.connection("openclaw", 8321)[0] == "not connected"
+    assert app._openclaw_primary({"agents": {"defaults": {"model": "a/b"}}}) == "a/b"
+    assert app._openclaw_primary({"agents": {"defaults": {"model": {"primary": "c/d"}}}}) == "c/d"
+    assert app._openclaw_primary({}) == "" and app._openclaw_primary({"agents": {"defaults": {"model": 3}}}) == ""
+    assert "mode" not in app.openclaw_patch(QWEN, 8321)["models"]  # (a user's "replace" stays theirs)
+
+
+def test_disconnect_hermes_puts_back_a_model_written_as_a_string(tmp_path, monkeypatch):
+    yaml = pytest.importorskip("yaml")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ours = {k.split(".", 1)[1]: v for k, v in app.hermes_settings(QWEN, 8321).items()}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"model": ours}))
+    keep = app.LOCALS_DIR / "backups" / "hermes-config.yaml.before-locals"
+    keep.parent.mkdir(parents=True)
+    keep.write_text(yaml.safe_dump({"model": "anthropic/claude-sonnet-4"}))  # (Hermes's shorthand)
+    monkeypatch.setattr(app, "_tool_bin", lambda name, env: "/opt/hermes")
+    monkeypatch.setattr(app, "_installed", lambda name, env: "/opt/hermes")
+    seen = _record_runs(monkeypatch)
+    app.disconnect_hermes()
+    assert ["/opt/hermes", "config", "set", "model.default", "anthropic/claude-sonnet-4"] in seen  # (it was unset: no model)
+
+
+def test_a_tool_set_up_for_another_model_needs_repair(monkeypatch):
+    """Since the server refuses our names for another model, a tool still set up for the old one would get a 400
+    on every request: it is shown as needing repair, not as connected."""
+    monkeypatch.setattr(app, "opencode_bin", lambda: "/x/opencode")
+    app.write_config(app.opencode_config(QWEN, 8321))
+    monkeypatch.setattr(app, "_serving_short", lambda port: "gemma-4-e4b")
+    st, why = app.connection("opencode", 8321)
+    assert st == "needs repair" and "gemma-4-e4b" in why and "locals code" in why
+    monkeypatch.setattr(app, "_serving_short", lambda port: "qwen3.5-4b")
+    assert app.connection("opencode", 8321)[0] == "connected"
+
+
+def test_opencode_config_keeps_the_users_own_text(monkeypatch):
+    _opencode({"agent": {"ревьюер": {"description": "Мой ревьюер 🔍", "mode": "subagent"}}})
+    app.write_config(app.opencode_config(QWEN, 8321))
+    text = app.OPENCODE_CONFIG.read_text()
+    assert "Мой ревьюер 🔍" in text and "\\u" not in text
+
+
+def test_a_config_link_into_a_read_only_folder_is_a_sentence(tmp_path):
+    store = tmp_path / "store"
+    store.mkdir()
+    (store / "opencode.json").write_text("{}")
+    store.chmod(0o555)
+    link = tmp_path / "opencode.json"
+    link.symlink_to(store / "opencode.json")
+    try:
+        with pytest.raises(SystemExit, match="cannot write .*store.*where .* points"):
+            app._write_atomic(link, "{}")
+    finally:
+        store.chmod(0o755)
+
+
+def test_the_context_told_to_tools_is_the_servers_limit_at_most(monkeypatch):
+    monkeypatch.setattr(app, "get_json", lambda url, timeout=5: (_ for _ in ()).throw(OSError("no server")))
+    assert app.agent_context(QWEN) == 65536
+    assert app.agent_context(QWEN, argparse.Namespace(max_context=16384, port=8321)) == 16384
+    monkeypatch.setattr(app, "get_json", lambda url, timeout=5: {"data": [{"id": "locals/qwen3.5-4b", "context_length": 20480}]})
+    assert app.agent_context(QWEN, argparse.Namespace(max_context=None, port=8321)) == 20480
+    # a server running another model (about to be switched) says nothing about this one
+    monkeypatch.setattr(app, "get_json", lambda url, timeout=5: {"data": [{"id": "locals/gemma-4-e4b", "context_length": 8192}]})
+    assert app.agent_context(QWEN, argparse.Namespace(max_context=None, port=8321)) == 65536
+
+
+def test_aider_gets_the_base_url_over_the_users_own(monkeypatch, tmp_path):
+    """Aider reads ~/.env and the project's .env over the environment, and litellm reads OPENAI_BASE_URL first: a
+    base URL of the user's won, and the request for locals/<short> went there."""
+    calls = []
+    monkeypatch.setattr(app.os, "execve", lambda exe, argv, env: calls.append((argv, env)) or (_ for _ in ()).throw(SystemExit(0)))
+    monkeypatch.setattr(app, "fetch_model", lambda m: None)
+    monkeypatch.setattr(app, "ensure_server", lambda a: None)
+    monkeypatch.setattr(app, "_installed", lambda name, env: "/opt/aider")
+    monkeypatch.setattr(app, "_tool_bin", lambda name, env: "/opt/aider")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+    with pytest.raises(SystemExit):
+        app.main(["launch", "--model", QWEN, "aider"])
+    argv, env = calls[0]
+    assert env["OPENAI_BASE_URL"] == env["OPENAI_API_BASE"] == "http://127.0.0.1:8321/v1"
+    sets = [argv[i + 1] for i, a in enumerate(argv) if a == "--set-env"]
+    assert "OPENAI_BASE_URL=http://127.0.0.1:8321/v1" in sets and "OPENAI_API_BASE=http://127.0.0.1:8321/v1" in sets
+

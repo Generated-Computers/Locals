@@ -180,9 +180,13 @@ def _write_atomic(path: Path, text: str) -> None:
     """``text`` into ``path`` whole: a crash or a full disk never leaves half a config file."""
     import tempfile
 
-    path = path.resolve()  # a config kept as a link (dotfile managers): the file it points at is written
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".")
+    link, path = path, path.resolve()  # a config kept as a link (dotfile managers): the file it points at is written
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".")
+    except OSError as e:  # (a link into a read-only folder: Nix home-manager's store)
+        sys.exit(f"locals cannot write {path}" + (f" (where {link} points)" if link != path else "") +
+                 f": {e.strerror or e}. Make it writable, or add the settings yourself")
     try:
         with os.fdopen(fd, "w") as f:
             f.write(text)
@@ -354,7 +358,7 @@ def write_config(cfg: dict, path: Optional[Path] = None) -> None:
               f"the same name{'s' if len(users) > 1 else ''}; yours {'are' if len(users) > 1 else 'is'} used)")
     for name in LEGACY:  # locals's provider under its old name: the server no longer answers to it
         (merged.get("provider") or {}).pop(name, None)
-    _write_atomic(path, json.dumps(merged, indent=2) + "\n")
+    _write_atomic(path, json.dumps(merged, indent=2, ensure_ascii=False) + "\n")
 
 
 def _locals_providers(provs) -> set:
@@ -406,12 +410,19 @@ def _users_agents(old: dict, path: Path) -> List[str]:
 AGENT_CONTEXT = 65536  # Hermes refuses models under 64,000 tokens; the server's default --max-context
 
 
+def _openclaw_primary(cfg: dict) -> str:
+    """OpenClaw's default model in ``cfg``: ``agents.defaults.model`` is an object with ``primary``, or the reference
+    itself as a string (its schema allows both; a string ended locals's commands with an AttributeError)."""
+    m = ((cfg.get("agents") or {}).get("defaults") or {}).get("model") if isinstance(cfg, dict) else None
+    return str(m.get("primary") or "") if isinstance(m, dict) else (m if isinstance(m, str) else "")
+
+
 def openclaw_patch(model: str, port: int, context: int = AGENT_CONTEXT, output: int = 4096) -> dict:
     """OpenClaw config fragment: a ``locals`` provider and the default agent model.
     The model id carries the engine (``locals/<short>``) because only the id is
     sent to the server; OpenClaw's reference is then ``locals/locals/<short>``."""
     mid = f"locals/{model_short(model)}"
-    return {"models": {"mode": "merge", "providers": {"locals": {
+    return {"models": {"providers": {"locals": {
                 "baseUrl": base_url(port) + "/v1", "apiKey": "locals-local", "api": "openai-completions", "timeoutSeconds": 900,
                 "models": [{"id": mid, "name": f"{model_short(model)} (locals, local)", "reasoning": False, "input": ["text"],
                             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
@@ -429,17 +440,28 @@ def _tool_bin(name: str, env: str) -> Optional[str]:
     return os.environ.get(env) or shutil.which(name)
 
 
-def agent_context(model: str) -> int:
-    """The context declared to agent tools: 64k, or the model's own if smaller."""
+def agent_context(model: str, args=None) -> int:
+    """The context declared to agent tools: 64k, or the model's own if smaller, and no more than the server's own
+    limit: ``--max-context``, else what the server on the port answers for this model (Kilo, OpenClaw and Hermes
+    were told 64k by a server started with --max-context 16384, and their long requests were refused)."""
     from .server import native_context
 
     n = native_context(model)
-    return min(AGENT_CONTEXT, n) if n else AGENT_CONTEXT
+    ctx = min(AGENT_CONTEXT, n) if n else AGENT_CONTEXT
+    cap = getattr(args, "max_context", None)
+    if not cap and args is not None:
+        try:
+            m = get_json(base_url(args.port) + "/v1/models", timeout=3)["data"][0]
+            if m.get("id", "").rsplit("/", 1)[-1] == model_short(model):
+                cap = int(m["context_length"])
+        except Exception:  # noqa: BLE001  # (no server yet: it starts with this model's own limit)
+            cap = None
+    return min(ctx, cap) if cap else ctx
 
 
 def setup_openclaw(args) -> bool:
     """Write the locals provider into OpenClaw's config; False if OpenClaw is not installed."""
-    patch = openclaw_patch(args.model, args.port, args.context or agent_context(args.model), args.output or 4096)
+    patch = openclaw_patch(args.model, args.port, args.context or agent_context(args.model, args), args.output or 4096)
     LOCALS_DIR.mkdir(exist_ok=True)
     path = LOCALS_DIR / "openclaw-locals.json5"
     path.write_text(json.dumps(patch, indent=2) + "\n")
@@ -454,8 +476,7 @@ def setup_openclaw(args) -> bool:
     want = patch["models"]["providers"]["locals"]
     provs = ((cur.get("models") or {}).get("providers") or {}) if isinstance(cur, dict) else {}
     if isinstance(cur, dict) and (provs.get("locals") or {}) == want and not any(n in provs for n in LEGACY) \
-            and (((cur.get("agents") or {}).get("defaults") or {}).get("model") or {}).get("primary") == \
-            patch["agents"]["defaults"]["model"]["primary"]:
+            and _openclaw_primary(cur) == patch["agents"]["defaults"]["model"]["primary"]:
         print(f"OpenClaw uses {patch['agents']['defaults']['model']['primary']} at {base_url(args.port)}/v1 already.")
         return True  # set up like this already: `openclaw config patch` takes seconds (minutes on its first start)
     _back_up_once(state / "openclaw.json", "openclaw")
@@ -477,7 +498,7 @@ def setup_openclaw(args) -> bool:
 
 def setup_hermes(args) -> bool:
     """Point Hermes Agent at the server; False if Hermes is not installed."""
-    ctx = args.context or agent_context(args.model)
+    ctx = args.context or agent_context(args.model, args)
     if ctx < 64000:
         print(f"warning: {args.model} has a {ctx}-token context; Hermes Agent requires at least 64,000 and will refuse it. "
               "Pick a model with a longer context (Qwen3.5, Llama 3.1+, Gemma 3+).")
@@ -539,7 +560,7 @@ def setup_opencode(args) -> str:
     ver = subprocess.run([oc, "--version"], capture_output=True, text=True).stdout.strip()
     print(f"opencode {ver} at {oc}")
     agent = getattr(args, "agent", None) or default_agent(args.model)
-    context = getattr(args, "context", None) or min(32768, agent_context(args.model))
+    context = getattr(args, "context", None) or min(32768, agent_context(args.model, args))
     engine = getattr(args, "engine", None) or "locals"
     write_config(opencode_config(args.model, args.port, engine, agent, context,
                                  getattr(args, "output", None) or 4096, thinking=model_thinks(args.model)))
@@ -731,6 +752,18 @@ def ensure_server(args, wait_s: float = 3600) -> None:
         _ensure_server(args, wait_s)
 
 
+def _keep_options(args) -> None:
+    """The options the server on ``args.port`` was started with (--ollama-port, --max-context, --slots, ...), where
+    this command leaves them unset, for the server that replaces it."""
+    try:
+        kept = json.loads(_opts_file(args.port).read_text())
+    except (OSError, ValueError):
+        kept = {}
+    for k in _KEPT:
+        if kept.get(k) not in (None, False) and getattr(args, k, None) in (None, False):
+            setattr(args, k, kept[k])
+
+
 _SERVER_OPTS = ("engines", "slots", "temp", "top_p", "top_k", "max_tokens", "cache_gb", "max_calls", "max_context")
 
 
@@ -771,13 +804,7 @@ def _ensure_server(args, wait_s: float) -> None:
                      f"stop it with  locals stop  (or use another --port) to use {args.model}")
         print(f"restarting the background server: it runs older locals code ..." if same else
               f"switching the background server from {running} to {args.model} ...", flush=True)
-        try:  # the options it was started with (--ollama-port, --max-context, --slots, ...) that this command leaves unset
-            kept = json.loads(_opts_file(args.port).read_text())
-        except (OSError, ValueError):
-            kept = {}
-        for k in _KEPT:
-            if kept.get(k) not in (None, False) and getattr(args, k, None) in (None, False):
-                setattr(args, k, kept[k])
+        _keep_options(args)
         os.kill(pid, signal.SIGTERM)
         for _ in range(120):
             if _listener_pid(args.port) is None:
@@ -1095,7 +1122,7 @@ def _tool_settings(tool: str) -> Optional[dict]:
             return None
         provs = (cfg.get("models") or {}).get("providers") or {}
         prov = provs.get("locals")
-        model = str((((cfg.get("agents") or {}).get("defaults") or {}).get("model") or {}).get("primary") or "")
+        model = _openclaw_primary(cfg)
         return {"url": prov.get("baseUrl") if isinstance(prov, dict) else None, "model": model,
                 "ours": model.startswith("locals/"), "legacy": any(n in provs for n in LEGACY)}
     if tool == "hermes":
@@ -1136,7 +1163,20 @@ def connection(tool: str, port: int):
         return "needs repair", f"it points at {s['url']}, the server is at {want}: {fix} fixes it"
     if not s["ours"]:
         return "connected", f"but its default model is {s['model'] or 'not set'}; choose locals/... in it"
+    running = _serving_short(port)
+    if running and s["model"].rsplit("/", 1)[-1] != running:
+        return "needs repair", f"its default model is {s['model']}, but the server runs {running}: {fix} updates it"
     return "connected", f"default model {s['model']}"
+
+
+def _serving_short(port: int) -> Optional[str]:
+    """The short name of the model the server on ``port`` runs, else of the model locals remembers; None if neither."""
+    try:
+        running = get_json(base_url(port) + "/stats", timeout=3).get("model")
+    except Exception:  # noqa: BLE001
+        running = None
+    running = running or _load_saved().get("model")
+    return model_short(running) if running else None
 
 
 def _config_path(tool: str) -> Path:
@@ -1298,7 +1338,7 @@ def disconnect_opencode() -> List[str]:
     if "agent" in cfg and not agents and "agent" not in before:
         del cfg["agent"]
     if changed:
-        _write_atomic(path, json.dumps(cfg, indent=2) + "\n")
+        _write_atomic(path, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
     _backup_path("opencode").unlink(missing_ok=True)  # a later connect keeps the config as it is then
     return changed
 
@@ -1320,7 +1360,7 @@ def disconnect_openclaw() -> List[str]:
             _run_tool([oc, "config", "unset", f"models.providers.{name}"], "openclaw")
             changed.append(f"the {name} provider")
     if s.get("ours") or s["model"].split("/")[0] in LEGACY:
-        old = str((((_before_locals("openclaw").get("agents") or {}).get("defaults") or {}).get("model") or {}).get("primary") or "")
+        old = _openclaw_primary(_before_locals("openclaw"))
         if old and old.split("/")[0] not in ("locals", *LEGACY):
             _run_tool([oc, "config", "set", "agents.defaults.model.primary", old], "openclaw")
             changed.append(f"the default model, back to {old}")
@@ -1340,7 +1380,7 @@ def disconnect_hermes() -> List[str]:
     if hm is None:
         sys.exit(f"hermes is not on the PATH; edit the model section of {_hermes_config()} by hand")
     old = _before_locals("hermes").get("model")
-    old = old if isinstance(old, dict) else {}
+    old = old if isinstance(old, dict) else ({"default": old} if isinstance(old, str) and old else {})  # (the shorthand)
     changed = []
     for key in hermes_settings("x", DEFAULT_PORT):  # the keys locals sets
         field = key.split(".", 1)[1]
@@ -1414,7 +1454,11 @@ def cmd_launch(args) -> None:
             if busy:
                 sys.exit(f"the locals server on port {args.port} is answering {busy} request(s); run this again when it is idle "
                          f"(it restarts to answer on Ollama's port too)")
+            if _background_pid(args.port) is None:  # (started by hand, with locals serve: not locals's to restart)
+                sys.exit(f"the locals server on port {args.port} was started by hand; stop it and run this again, or "
+                         f"start it with --ollama to answer on Ollama's port as well")
             print("restarting the locals server to answer on Ollama's port as well ...", flush=True)
+            _keep_options(args)  # (its --max-context, --slots, ...: they were lost)
             cmd_stop(args)
     exe = None
     from .defaults import agent_note
@@ -1440,12 +1484,19 @@ def cmd_launch(args) -> None:
         # search/replace edits: in the whole-file format (Aider's choice for a model it does not know) code quoted
         # after a sentence became a new file named after the sentence (5 of 7 bug fixes with Qwen3.5-4B, none of 7
         # with diff); the user's own --edit-format comes later and wins
+        # --set-env: applied after Aider reads ~/.env and the project's .env (which override the environment), and
+        # OPENAI_BASE_URL too (litellm reads it first): a base URL of the user's (OpenRouter, LM Studio) won, and
+        # the request for locals/<short> went there
+        setenv = [a for k, v in (("OPENAI_BASE_URL", f"{base}/v1"), ("OPENAI_API_BASE", f"{base}/v1"),
+                                 ("OPENAI_API_KEY", "locals")) for a in ("--set-env", f"{k}={v}")]
         os.execve(exe, [exe, "--model", f"openai/locals/{short}", "--no-show-model-warnings", "--edit-format", "diff",
-                        *rest], env)
+                        *setenv, *rest], dict(env, OPENAI_BASE_URL=f"{base}/v1"))
     if tool == "cline":
         cfg = LOCALS_DIR / "cline"  # a config folder of locals's: the user's own ~/.cline is left alone
-        subprocess.run([exe, "auth", "--config", str(cfg), "-p", "openai", "-k", "locals", "-m", f"locals/{short}",
-                        "-b", f"{base}/v1"], capture_output=True)
+        r = subprocess.run([exe, "auth", "--config", str(cfg), "-p", "openai", "-k", "locals", "-m", f"locals/{short}",
+                            "-b", f"{base}/v1"], capture_output=True, text=True)
+        if r.returncode != 0:  # (Cline then opened unconfigured, with no word why)
+            sys.exit(f"cline auth failed, so Cline is not set up for locals:\n{(r.stdout + r.stderr)[-800:]}")
         os.execv(exe, [exe, "--config", str(cfg), *rest])
     if tool == "kilo":
         cfg = LOCALS_DIR / "kilo.json"  # read through KILO_CONFIG: the user's own config is left alone
@@ -1455,7 +1506,7 @@ def cmd_launch(args) -> None:
             "provider": {"locals": {"npm": "@ai-sdk/openai-compatible", "name": "locals (local)",
                                    "options": {"baseURL": f"{base}/v1", "apiKey": "locals"},
                                    "models": {f"locals/{short}": {"name": f"{short} (locals)", "tool_call": True,
-                                                                 "limit": {"context": agent_context(args.model), "output": 4096}}}}},
+                                                                 "limit": {"context": agent_context(args.model, args), "output": 4096}}}}},
             "model": f"locals/locals/{short}"}, indent=2) + "\n")
         os.execve(exe, [exe, *rest], dict(os.environ, KILO_CONFIG=str(cfg)))
     if tool == "claude":
@@ -1464,8 +1515,9 @@ def cmd_launch(args) -> None:
         except Exception:  # noqa: BLE001
             ctx = AGENT_CONTEXT
         ref = f"locals/{short}"
-        env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}  # a key for
-        # Anthropic's own API stays out of a session that talks to this Mac
+        env = {k: v for k, v in os.environ.items() if k not in (  # a key for Anthropic's own API stays out of a
+            "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",  # session that talks to this Mac, and a cloud provider the
+            "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")}  # user uses would win over it
         env.update(ANTHROPIC_BASE_URL=base, ANTHROPIC_AUTH_TOKEN="locals", ANTHROPIC_MODEL=ref, ANTHROPIC_SMALL_FAST_MODEL=ref,
                    ANTHROPIC_DEFAULT_HAIKU_MODEL=ref, ANTHROPIC_DEFAULT_SONNET_MODEL=ref, ANTHROPIC_DEFAULT_OPUS_MODEL=ref,
                    CLAUDE_CODE_MAX_CONTEXT_TOKENS=str(ctx), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
@@ -1582,7 +1634,7 @@ def cmd_code(args) -> None:
     short = model_short(args.model)
     if args.agent and cfg.get("default_agent") != args.agent:  # OpenCode's default agent, kept for later launches
         cfg["default_agent"] = args.agent
-        _write_atomic(OPENCODE_CONFIG, json.dumps(cfg, indent=2) + "\n")
+        _write_atomic(OPENCODE_CONFIG, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
     # The model is given on OpenCode's command line on every launch: a model set by a project's own opencode.json
     # (or a global .jsonc) would otherwise win over ours, and could send the project to a cloud model. An engine
     # asked for here (--engine mlx) is for this launch only: later servers start without the stock engine.

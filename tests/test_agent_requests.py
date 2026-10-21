@@ -230,3 +230,15 @@ def test_a_request_for_another_model_by_our_names_is_refused(server):
             server.chat_model(bad)
     assert server.chat_model("llama3.2:latest").endswith(server.short)  # (Ollama's names: the model loaded)
 
+
+def test_a_model_named_thinking_is_its_own_name(server, monkeypatch):
+    """`check_model` dropped a "-thinking" suffix before comparing: a model whose own name ends so
+    (qwen3-next-80b-a3b-thinking) was refused its own name."""
+    monkeypatch.setattr(server, "short", "qwen3-next-80b-a3b-thinking")
+    for name in ("locals/qwen3-next-80b-a3b-thinking", "locals/locals/qwen3-next-80b-a3b-thinking", "locals"):
+        server.check_model(name)
+    import pytest
+
+    with pytest.raises(ValueError, match="not qwen3.5-4b"):
+        server.check_model("locals/qwen3.5-4b")
+
