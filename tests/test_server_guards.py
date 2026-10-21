@@ -157,3 +157,73 @@ def test_wrong_methods_and_short_bodies_get_answers(http_server):
     s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\n{}")
     s.shutdown(socket.SHUT_WR)  # the client stops sending: the body ends short
     assert b" 400 " in s.recv(200)
+
+
+def _raw(port, data: bytes, wait: float = 3.0) -> bytes:
+    import socket
+
+    s = socket.create_connection(("127.0.0.1", port), timeout=wait)
+    s.sendall(data)
+    out = b""
+    try:
+        while True:
+            d = s.recv(65536)
+            if not d:
+                break
+            out += d
+    except (socket.timeout, ConnectionResetError):
+        pass
+    s.close()
+    return out
+
+
+def test_chunk_sizes_are_hex_digits_only(http_server):
+    """int() also took "-1", which read to the end of the connection past MAX_BODY (300 MB in memory), and "-2"
+    ended the request without an answer."""
+    head = b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+    for size in (b"-1", b"-2", b"0x10", b"+10", b"1_0"):
+        out = _raw(http_server, head + size + b"\r\n" + b"x" * 16 + b"\r\n0\r\n\r\n")
+        assert b" 413 " in out.split(b"\r\n")[0] and b"Connection: close" in out, size
+
+
+def test_a_body_has_one_deadline_not_one_per_read(http_server, monkeypatch):
+    import socket
+    import time
+
+    monkeypatch.setattr(srv, "BODY_TIMEOUT", 1.5)
+    s = socket.create_connection(("127.0.0.1", http_server), timeout=10)
+    s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 40\r\n\r\n")
+    t0, out = time.time(), b""
+    try:
+        for _ in range(40):  # a byte every 0.2 s: each read is quick, the whole body is not
+            s.sendall(b"x")
+            time.sleep(0.2)
+    except OSError:
+        pass
+    try:
+        out = s.recv(200)
+    except OSError:
+        pass
+    assert b" 408 " in out and time.time() - t0 < 6
+
+
+def test_an_answer_before_the_body_closes_the_connection(http_server):
+    """A 403 left the request's body on the connection, read as the next request (a GET after it got a 501)."""
+    body = b'{"messages": []}'
+    out = _raw(http_server, b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://evil.example\r\n"
+                            b"Content-Length: %d\r\n\r\n" % len(body) + body + b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+    assert out.startswith(b"HTTP/1.1 403") and b"Connection: close" in out and b" 501 " not in out
+
+
+def test_bad_inputs_get_an_answer(http_server):
+    """Inputs that ended the request with no answer and a traceback: a URL that does not parse, JSON nested past
+    Python's recursion, an infinite max_tokens (a 500 that SDKs retry)."""
+    out = _raw(http_server, b"GET http://[x/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+    assert out.split(b"\r\n")[0].startswith(b"HTTP/1.1 4")
+    status, body, _ = _post(http_server, '{"messages": [{"role": "user", "content": "hi"}], "x": ' + "[" * 3000 + "]" * 3000 + "}")
+    assert status == 400 and b"nested too deeply" in body
+    assert srv._whole(5.0, "n") == 5 and srv._whole(None, "n") is None
+    for bad in (float("inf"), float("nan"), True, "5"):
+        with pytest.raises(ValueError, match="whole number"):
+            srv._whole(bad, "max_tokens")
+    assert srv._printable("/x\x1b[31m") == "/x\\x1b[31m"

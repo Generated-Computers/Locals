@@ -35,8 +35,12 @@ Handler.do_POST
 
 1. **Checks.** `do_POST` refuses the following:
    - requests that fail `_allowed()`: 403;
-   - bodies larger than `MAX_BODY` (`64 << 20` bytes): 413;
-   - bodies that are not a JSON object: 400;
+   - bodies larger than `MAX_BODY` (`64 << 20` bytes), or chunks whose size is not hex digits (`-1` read to the end of the connection): 413;
+   - a body that has not all arrived `BODY_TIMEOUT` (60 s) after it began, in all, not per read: 408; a `Transfer-Encoding` other than chunked: 501;
+   - bodies that are not a JSON object, or nested past what Python's recursion takes: 400;
+   - any answer given before the body was read closes the connection (`Connection: close`): the unread body was read as the next request.
+
+   After the body, each write to the client may block for `SEND_TIMEOUT` (120 s) at most, and an idle keep-alive connection waits as long for its next request: a client that stops reading has its job cancelled (with no limit, the thread was held and the job decoded to its end). An error nobody caught is a 500 when no answer has begun (`_guarded`), and the server raises its open-file limit to 10240 at start (launchd's default of 256 reset new clients past it).
    - chat requests whose `messages` is not a non-empty list: 400.
 2. **Preparation.** `Server.prepare` (chat) or `Server.prepare_text` (text completions) runs the request checks that can be made before decoding, all before any byte of the response is sent. A regex or schema that does not compile is found only later, in the worker (`invalid: ...`; see How the constraint is chosen) (`service.BatchService._run_locals.source`; `server.Server._decode`, `server.make_handler.Handler.do_POST`). The handler maps exceptions to statuses:
    - `ContextTooLong`: 400 with code `context_length_exceeded`;
@@ -252,7 +256,7 @@ Streams are `text/event-stream` with `Transfer-Encoding: chunked`; the handler s
 
   Without `include_usage`, this chunk also carries `usage`. With it, usage goes in a separate last chunk with `choices: []`, which is where clients such as vLLM's and InferenceX's benchmarks read it.
 - **Usage fields.** `prompt_tokens`, `completion_tokens`, `total_tokens` and `prompt_tokens_details.cached_tokens` (prompt tokens served from the prompt cache). An extension object `locals` adds `engine`, `forced_tokens`, `passes`, `constrained` and `wall_s`.
-- **Errors after the stream has begun.** Once the headers are out, an error is sent as an event `data: {"error": {"message", "type": "server_error", ...}}`. Then come `data: [DONE]` and a clean end of the chunked body, not a second HTTP response.
+- **Errors after the stream has begun.** Once the headers are out, an error is sent as an event `data: {"error": {"message", "type": "server_error", ...}}` (`invalid_request_error`, with the plain message, for the request's own fault, such as a grammar that does not compile). Then come `data: [DONE]` and a clean end of the chunked body, not a second HTTP response.
 - **Engine errors.** The engine can fail before a reply has written any token, for example with a Metal out-of-memory error, which ends every request in flight. In that case `_decode` decodes the reply once more, since the engine has dropped its cache and serves again.
 - **Disconnects.** Every request, streamed or not, is checked about once a second with `_alive_socket`, a non-blocking `poll` and peek at the socket (`select` refuses file descriptors above 1023). A write that fails mid-stream (the agent's Esc or Ctrl-C) ends the same way: `_decode` cancels the job it submitted whenever its loop exits by an exception, so the batch row stops at the next commit instead of decoding on to `max_tokens` unread. A stream that writes nothing for a while (a long prompt being read, a tool call held back) is found by the probe, not by the next keepalive 15 s later. In the engine, a prompt read synchronously (nothing else decoding) stops between chunks once every request it reads has been cancelled (`prefills_given_up` in the stats), so the next request does not wait for a prompt nobody reads.
 

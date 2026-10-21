@@ -66,8 +66,8 @@ def _ollama_options(req: dict) -> dict:
         raise ValueError("options must be an object")
     for k in ("num_predict", "temperature", "top_p", "top_k", "seed", "num_ctx"):
         v = got.get(k)
-        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
-            raise ValueError(f"options.{k} must be a number")
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v in (float("inf"), -float("inf"))):
+            raise ValueError(f"options.{k} must be a number")  # (1e999 was an OverflowError, and no answer)
     return got
 
 

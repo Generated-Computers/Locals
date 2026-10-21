@@ -64,7 +64,9 @@ class BadRequest(ValueError):
 
 
 MAX_BODY = 64 << 20  # bytes of a request body
-BODY_TIMEOUT = 60  # seconds a request body may take to arrive (Handler.do_POST)
+BODY_TIMEOUT = 60  # seconds a request body may take to arrive, in all (Handler.do_POST)
+SEND_TIMEOUT = 120  # seconds one write to a client may block (a client that stopped reading: its job is cancelled),
+# and an idle keep-alive connection waits for its next request
 _LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 _APP_SCHEMES = ("app", "file", "tauri", "vscode-webview", "vscode-file",  # desktop apps and VS Code
                 "chrome-extension", "moz-extension", "safari-web-extension")  # browser extensions (as Ollama allows)
@@ -217,6 +219,8 @@ class Server:
         """The model id for a name an Ollama client sends: the server has one model, so any name is it
         (apps ask for what /api/tags lists); mlx/... picks the stock engine, and a name with "think"
         in it turns thinking on. A request for another model by our own names is refused (check_model)."""
+        if name and not isinstance(name, str):
+            raise ValueError("model must be a string")
         self.check_model(name)
         engine = oai.engine_of(name) if name else "locals"
         if engine not in self.engines:
@@ -384,8 +388,8 @@ class Server:
         if len(prompt) >= limit:
             raise ContextTooLong(f"This model's maximum context length is {limit} tokens. However, your messages "
                                  f"resulted in {len(prompt)} tokens. Please reduce the length of the messages.", len(prompt), limit)
-        asked = req.get("max_completion_tokens") or req.get("max_tokens")
-        max_tokens = int(asked) if asked is not None and int(asked) > 0 else self.max_tokens  # -1: "no limit"
+        asked = _whole(req.get("max_completion_tokens") or req.get("max_tokens"), "max_tokens")
+        max_tokens = asked if asked is not None and asked > 0 else self.max_tokens  # -1: "no limit"
         room = limit - len(prompt)
         if room < min(max_tokens, 256):  # a reply of a few tokens, cut: the client is told to make room instead
             raise ContextTooLong(f"This model's maximum context length is {limit} tokens. However, your messages "
@@ -471,8 +475,8 @@ class Server:
         if len(ids) >= limit:
             raise ContextTooLong(f"This model's maximum context length is {limit} tokens. However, your prompt "
                                  f"resulted in {len(ids)} tokens. Please reduce the length of the prompt.", len(ids), limit)
-        asked = req.get("max_tokens")
-        max_tokens = int(asked) if asked is not None and int(asked) > 0 else 256
+        asked = _whole(req.get("max_tokens"), "max_tokens")
+        max_tokens = asked if asked is not None and asked > 0 else 256
         max_tokens = max(1, min(max_tokens, self.max_tokens, limit - len(ids)))
         return {"engine": engine, "thinking": False, "svc": svc, "prompt": ids, "checkpoints": [], "text": None, "tools": [],
                 "schema": None, "regex": None, "max_tokens": max_tokens, "model": model, "fmt": None, "stop": _stops(req),
@@ -1255,24 +1259,44 @@ def make_handler(server: Server, ollama_root: bool = False):
                 self.send_header("Access-Control-Allow-Headers", asked if asked else "*")
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 
-        def _chunked_body(self) -> Optional[bytes]:
-            """A body in HTTP/1.1 chunked transfer encoding; None if malformed or past MAX_BODY."""
+        def _chunked_body(self, deadline: float) -> Optional[bytes]:
+            """A body in HTTP/1.1 chunked transfer encoding; None if malformed or past MAX_BODY. A chunk size is hex
+            digits only (int() also took "-1", which read to the end of the connection past MAX_BODY, and "0x10")."""
             parts, total = [], 0
             while True:
-                line = self.rfile.readline(1024)
-                try:
-                    n = int(line.split(b";")[0].strip(), 16)
-                except ValueError:
+                size = self.rfile.readline(1024).split(b";")[0].strip()
+                if not re.fullmatch(rb"[0-9A-Fa-f]{1,8}", size):
                     return None
+                n = int(size, 16)
                 if n == 0:
-                    while self.rfile.readline(1024).strip():  # trailers, up to the blank line
-                        pass
-                    return b"".join(parts)
+                    for _ in range(100):  # trailers, up to the blank line
+                        if not self.rfile.readline(1024).strip():
+                            return b"".join(parts)
+                    return None
                 total += n
                 if total > MAX_BODY:
                     return None
-                parts.append(self.rfile.read(n))
-                self.rfile.readline(4)  # the CRLF after each chunk
+                part = self._read_by(n, deadline)
+                if len(part) < n or self.rfile.readline(4) not in (b"\r\n", b"\n"):
+                    return None
+                parts.append(part)
+
+        def _read_by(self, n: int, deadline: float) -> bytes:
+            """``n`` bytes of the body, or fewer if the client stops; TimeoutError once ``deadline`` passes (the
+            socket's timeout bounded each read, and a body trickled in a byte at a time kept the thread for good)."""
+            import time as _t
+
+            out = bytearray()
+            while len(out) < n:
+                left = deadline - _t.monotonic()
+                if left <= 0:
+                    raise TimeoutError
+                self.connection.settimeout(left)
+                piece = self.rfile.read1(min(n - len(out), 1 << 16))
+                if not piece:
+                    break
+                out += piece
+            return bytes(out)
 
         def _allowed(self) -> bool:
             """False (with a 403 sent) for a request a web page may not make: from another site's page,
@@ -1289,19 +1313,50 @@ def make_handler(server: Server, ollama_root: bool = False):
         def _alive(self) -> bool:
             return _alive_socket(self.connection)
 
+        def _path(self) -> str:
+            try:
+                return urlparse(self.path).path.rstrip("/")
+            except ValueError:  # ("GET http://[x/health")
+                return "/?"
+
+        def send_response(self, *a, **k):
+            self._answered = True
+            super().send_response(*a, **k)
+
+        def _guarded(self, handle) -> None:
+            """``handle`` with a net under it: an error nobody caught is a 500 when no answer has begun (the client
+            got a closed connection, and the log a traceback), and the connection is closed."""
+            self._answered = False
+            try:
+                handle()
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                self.close_connection = True
+            except Exception as e:  # noqa: BLE001
+                import traceback
+
+                traceback.print_exc()
+                self.close_connection = True
+                if not self._answered:
+                    try:
+                        self._error(f"internal error: {type(e).__name__}: {e}", 500)
+                    except Exception:  # noqa: BLE001
+                        pass
+
         def _json(self, obj, status=200):
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(status)
             self._cors()
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            if self.close_connection:  # (the client then knows not to send its next request on it)
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
 
         def _error(self, msg: str, status=400, code=None):
             server.errors += 1
-            server.log(f"{status} {self.command} {self.path}: {msg[:200]}")
-            path = urlparse(self.path).path.rstrip("/")
+            server.log(f"{status} {self.command} {_printable(self.path)[:300]}: {msg[:200]}")
+            path = self._path()
             if path.endswith(("/v1/messages", "/v1/messages/count_tokens")):  # in each API's own shape (its SDK reads it)
                 kind = {403: "permission_error", 404: "not_found_error", 413: "request_too_large"}.get(
                     status, "invalid_request_error" if status < 500 else "api_error")
@@ -1312,7 +1367,7 @@ def make_handler(server: Server, ollama_root: bool = False):
                                   "param": "messages" if code else None, "code": code}}, status)
 
         def _no_method(self):
-            path = urlparse(self.path).path.rstrip("/")
+            path = self._path()
             if path == "/api/delete":  # `ollama rm`: an answer the ollama command can show
                 return self._error("locals does not delete models: they are in ~/.cache/huggingface/hub (delete a "
                                    "model's folder there to free the space)", 400)
@@ -1354,9 +1409,12 @@ def make_handler(server: Server, ollama_root: bool = False):
             self.end_headers()
 
         def do_GET(self):
+            self._guarded(self._get)
+
+        def _get(self):
             if not self._allowed():
                 return
-            path = urlparse(self.path).path.rstrip("/") or "/"
+            path = self._path() or "/"
             if path in ("/v1/models", "/models"):
                 # OpenAI's list, with the fields of Anthropic's (type, display_name, created_at, has_more) beside them
                 data = [dict(m, type="model", display_name=m.get("id"), created_at=apis._now_iso()) for m in server.models()]
@@ -1393,8 +1451,8 @@ def make_handler(server: Server, ollama_root: bool = False):
         def _ollama_raw(self, req: dict, shown: str, model: str, fail):
             """/api/generate with raw: the prompt untemplated, through /v1/completions."""
             t0 = time.time()
-            text_req = apis.ollama_to_text(req, model)
             try:
+                text_req = apis.ollama_to_text(req, model)
                 p = server.prepare_text(text_req)
             except ContextTooLong as e:
                 return fail(str(e), 400)
@@ -1533,6 +1591,8 @@ def make_handler(server: Server, ollama_root: bool = False):
             if os.environ.get("LOCALS_DEBUG"):  # the request as the client sent it (prepare saves the translated one)
                 _dump_request(req, kind)
             name = req.get("model") or ""
+            if not isinstance(name, str) or not isinstance(req.get("name") or "", str):
+                return fail("model must be a string", 400)
             if path == "/api/show":
                 return self._json(server.ollama_show(name or req.get("name") or ""))
             if path == "/api/pull":
@@ -1620,17 +1680,30 @@ def make_handler(server: Server, ollama_root: bool = False):
                     pass
 
         def do_POST(self):
+            self._guarded(self._post)
+
+        def _post(self):
+            # until its body is read, an answer closes the connection (a 403 left the body on it, read as the next
+            # request): the request's own keep-alive comes back once the body is in
+            keep_alive, self.close_connection = not self.close_connection, True
             if not self._allowed():
                 return
-            path = urlparse(self.path).path.rstrip("/")
+            path = self._path()
             # a client that stops sending its body (it crashed mid-upload, or announced more than it sent) held this
             # thread waiting forever: the body is read with a time limit, then the reply has none (long streams)
             self.connection.settimeout(BODY_TIMEOUT)
+            import time as _t
+
+            deadline = _t.monotonic() + BODY_TIMEOUT
+            te = (self.headers.get("Transfer-Encoding") or "").lower()
+            if te and "chunked" not in te:  # (a body that is not chunked nor counted: read as empty, it stayed on the connection)
+                self.close_connection = True
+                return self._error(f"Transfer-Encoding {te} is not supported (send chunked, or a Content-Length)", 501)
             try:
-                if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                if "chunked" in te:
                     # a body sent in chunks (Go's io.Pipe, streamed bodies of requests/httpx/Node): read as empty, it
                     # got a misleading 400 and its bytes stayed on the connection, read as the next request
-                    body = self._chunked_body()
+                    body = self._chunked_body(deadline)
                     if body is None:
                         self.close_connection = True
                         return self._error(f"the request body must be 0 to {MAX_BODY} bytes, in valid chunks", 413)
@@ -1638,11 +1711,12 @@ def make_handler(server: Server, ollama_root: bool = False):
                     try:
                         n = int(self.headers.get("Content-Length") or 0)
                     except ValueError:
+                        self.close_connection = True  # (its body stays unread on the connection)
                         return self._error("invalid Content-Length")
                     if n < 0 or n > MAX_BODY:
                         self.close_connection = True
                         return self._error(f"the request body must be 0 to {MAX_BODY} bytes", 413)
-                    body = self.rfile.read(n)
+                    body = self._read_by(n, deadline)
                     if len(body) < n:
                         self.close_connection = True
                         return self._error(f"the request body ended after {len(body)} of {n} bytes", 400)
@@ -1650,7 +1724,10 @@ def make_handler(server: Server, ollama_root: bool = False):
                 self.close_connection = True
                 return self._error(f"the request body did not arrive within {BODY_TIMEOUT} s", 408)
             finally:
-                self.connection.settimeout(None)
+                # (None here kept a client that stopped reading, or an idle pooled connection, on its thread forever;
+                # a long stream is unaffected: each write has the limit, not the whole reply)
+                self.connection.settimeout(SEND_TIMEOUT)
+            self.close_connection = not keep_alive or bool(te and self.headers.get("Content-Length"))
             enc = (self.headers.get("Content-Encoding") or "").strip().lower()
             if enc in ("gzip", "deflate"):  # Claude Code can compress its request bodies (CLAUDE_CODE_GZIP_REQUEST_BODIES)
                 import zlib
@@ -1671,7 +1748,10 @@ def make_handler(server: Server, ollama_root: bool = False):
                 return self._error("invalid JSON body")
             if not isinstance(req, dict):
                 return self._error("the request body must be a JSON object")
-            req = _clean_text(req)
+            try:
+                req = _clean_text(req)
+            except RecursionError:
+                return self._error("the request is nested too deeply")
             text_api = path in ("/v1/completions", "/completions")
             if path in OTHER_POSTS:
                 return self._other_api(path, req)
@@ -1761,6 +1841,22 @@ def _check_tool_choice(tc, names: List[str]) -> None:
             raise ValueError(f"tool_choice names {name!r}, which is not one of the tools")
     elif tc not in ("auto", "required", "none", None):
         raise ValueError("tool_choice must be auto, required, none, or a named function")
+
+
+def _whole(v, name: str) -> Optional[int]:
+    """A count from a request (None if not given): a finite number, taken as a whole number."""
+    import math
+
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or (isinstance(v, float) and not math.isfinite(v)):
+        raise ValueError(f"{name} must be a whole number")
+    return int(v)
+
+
+def _printable(text: str) -> str:
+    """``text`` for the log: control characters (a path's escape codes reached the terminal) as \\x.."""
+    return "".join(c if c.isprintable() else f"\\x{ord(c):02x}" for c in text)
 
 
 def _clean_text(x):
@@ -1995,6 +2091,20 @@ def _render(tok, msgs: List[dict], tools, add_generation_prompt: bool, **kw) -> 
         raise
 
 
+def _more_files() -> None:
+    """Open files for more connections than launchd's default of 256 (each client a socket; agents hold several):
+    past it, new clients were reset."""
+    import resource
+
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = 10240 if hard == resource.RLIM_INFINITY else min(10240, hard)
+        if soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    except (ValueError, OSError):
+        pass
+
+
 class _HTTPServer(ThreadingHTTPServer):
     # Connections waiting to be accepted: socketserver's default of 5 reset connections past it on macOS 27
     # (an M5 Pro: 1-8 of every batch of 8 or 16 requests at once failed with "Connection reset by peer")
@@ -2017,6 +2127,7 @@ class _HTTPServer(ThreadingHTTPServer):
 
 def serve(server: Server, host: str = "127.0.0.1", port: int = 8321, ollama_port: int = 0) -> None:
     server.bind_host = host
+    _more_files()
     httpd = _HTTPServer((host, port), make_handler(server))
     httpd.daemon_threads = True
     server.log(f"locals serve: http://{host}:{port}/v1  (models: {', '.join(m['id'] for m in server.models())})")
