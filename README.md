@@ -13,6 +13,7 @@
 </p>
 
 <p align="center">
+  <a href="https://pypi.org/project/locals/"><img src="https://img.shields.io/pypi/v/locals.svg" alt="PyPI"></a>
   <a href="https://github.com/Generated-Computers/Locals/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
   <a href="#getting-started"><img src="https://img.shields.io/badge/macOS-Apple%20silicon-lightgrey.svg" alt="macOS on Apple silicon"></a>
 </p>
@@ -27,6 +28,12 @@
 
 ```bash
 curl -LsSf https://raw.githubusercontent.com/Generated-Computers/Locals/main/install.sh | sh
+```
+
+Or, if you use [uv](https://docs.astral.sh/uv/), install it from [PyPI](https://pypi.org/project/locals/):
+
+```bash
+uv tool install --python 3.12 locals
 ```
 
 Then, in a new Terminal window:
