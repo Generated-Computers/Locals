@@ -21,7 +21,7 @@ This part of the package is the user-facing side. It is the `locals` command, th
 
 ## Packaging and install
 
-`pyproject.toml` declares the package `locals` version `0.2.0`, `requires-python = ">=3.11"` (the comment says mlx-lm 0.32 needs 3.11), and three console scripts:
+`pyproject.toml` declares the package `locals` version `0.2.1`, `requires-python = ">=3.11"` (the comment says mlx-lm 0.32 needs 3.11), and three console scripts:
 
 | Script | Target |
 |---|---|
@@ -48,7 +48,7 @@ Runtime dependencies are `mlx>=0.32,<0.34`, `mlx-lm>=0.32,<0.33`, `numpy>=1.26`,
 3. **Saved defaults.** For every other command, `--model` and `--port` default to the values in `~/.locals/config.json` (`_load_saved`), and otherwise to `DEFAULT_MODEL` and `DEFAULT_PORT = 8321`. Commands save them with `remember(**kw)`, which merges non-`None` keys (`model`, `port`, and `opencode` from setup) and ignores I/O and JSON errors.
 4. **Options before or after the subcommand.** `add_common` gives each subparser `--model`/`--port` with `default=argparse.SUPPRESS`. A value given before the subcommand is kept unless it is repeated after it.
 
-`--version` prints `locals <__version__>` (`0.2.0` in `locals/__init__.py`).
+`--version` prints `locals <__version__>` (`0.2.1` in `locals/__init__.py`).
 
 ## Model names (`--model`)
 

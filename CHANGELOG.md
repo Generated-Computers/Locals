@@ -1,9 +1,12 @@
 # Changelog
 
-## 0.2.1 (unreleased)
+## 0.2.1 (2026-10-21)
 
-- The installer installs the release from PyPI; `LOCALS_SOURCE` set to GitHub's archive installs the main branch.
+- The installer installs the release from PyPI; run again, it updates to the newest release. `LOCALS_SOURCE` set to
+  GitHub's archive installs the main branch.
+- The README on PyPI: `uv tool install locals` and `uv tool upgrade locals`.
 - `locals menubar` asks for `uv tool install 'locals[menubar]'` when rumps is missing.
+- Tested on Python 3.14 too, which a plain `uv tool install locals` picks on a Mac without a newer Python.
 
 ## 0.2.0 (2026-10-21)
 

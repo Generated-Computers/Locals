@@ -28,7 +28,7 @@ Serving (OpenAI-compatible, continuous batching for concurrent agents):
 ``locals serve`` runs the server alone; see ``locals --help``.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 # Every name is imported on first use: the command-line app (locals status, locals stop, the menu bar)
 # imports this package, and MLX and mlx-lm alone took 2.4 of the 2.9 s `locals --version` needed.

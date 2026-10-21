@@ -2,7 +2,7 @@
 # locals installer: an Apple-silicon Mac, uv (installed if missing), then locals.
 #
 #   curl -LsSf https://raw.githubusercontent.com/Generated-Computers/Locals/main/install.sh | sh
-#   LOCALS_SOURCE=dist/locals-0.2.0-py3-none-any.whl sh install.sh   # a wheel or a folder instead of PyPI
+#   LOCALS_SOURCE=dist/locals-0.2.1-py3-none-any.whl sh install.sh   # a wheel or a folder instead of PyPI
 #
 # Afterwards:  locals code ~/my-project   (sets up OpenCode, downloads the model, starts
 # the server and opens the agent; the first run takes a minute or two; --model gemma for Gemma 4).

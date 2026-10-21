@@ -1,6 +1,6 @@
 [project]
 name = "locals"
-version = "0.2.0"
+version = "0.2.1"
 description = "Run many AI agents at once on your Mac, up to 3x faster: an OpenAI- and Ollama-compatible MLX server with batched decoding, a prompt cache, and tool calls and JSON that always parse"
 readme = "README.md"
 license = "MIT"
