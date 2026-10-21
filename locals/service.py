@@ -143,6 +143,30 @@ _POOL_PLANNED = False  # our engine sized MLX's pool of freed buffers (memory_pl
 _REQUEST_ERRORS = (ValueError, TypeError, KeyError, AttributeError, RecursionError)  # (a schema or regex that cannot be read)
 
 
+_HEARTBEAT = threading.Event()
+
+
+def _start_heartbeat() -> None:
+    """Once per process: a thread that marks the GPU busy (kernels.mark_busy) each second while an engine of this
+    process has a request in flight or queued, or times a kernel shape: another locals server's idle tuner waits."""
+    if _HEARTBEAT.is_set():
+        return
+    _HEARTBEAT.set()
+
+    def beat():
+        from .kernels import mark_busy
+
+        while True:
+            time.sleep(1.0)
+            try:
+                if any(s._inflight or not s._q.empty() or getattr(s, "_tuning", False) for s in list(_SERVICES)):
+                    mark_busy()
+            except Exception:  # noqa: BLE001  # (a service going away meanwhile)
+                pass
+
+    threading.Thread(target=beat, name="locals-busy", daemon=True).start()
+
+
 def _job_sampler(temp: float, top_p: float, top_k: int, seed: Optional[int]):
     """mlx-lm's sampler for a request with its own settings; with a seed, its draws come from that seed."""
     from mlx_lm.sample_utils import make_sampler
@@ -190,6 +214,7 @@ class BatchService:
         self.prompt_tokens = 0
         self.cached_tokens = 0
         _SERVICES.add(self)
+        _start_heartbeat()
         self._thread = threading.Thread(target=self._main, name=f"batch-{engine}", daemon=True)
         self._thread.start()
         self._ready.wait()
@@ -303,17 +328,33 @@ class BatchService:
         """One pending kernel shape, tuned while there is nothing to do (in the engine's own thread,
         so the GPU is not shared); a request that arrives waits for this one shape at most."""
         work = getattr(self, "_tune_work", None)
-        if not work:
+        if not work or time.time() < getattr(self, "_tune_after", 0.0):
             return
         if any(s is not self and (s._inflight or not s._q.empty()) for s in list(_SERVICES)):
             return  # the other engine works (locals bench): timings on a shared GPU would be kept for good
-        mod, M = work.pop(0)
-        try:
-            from .kernels import tune_one
+        import fcntl
 
-            tune_one(mod, M)
-        except Exception:  # noqa: BLE001  # an untunable shape keeps MLX's kernel
-            pass
+        from . import kernels
+
+        if kernels.others_busy():  # another locals server works on this GPU (or times a shape): looked at again soon
+            self._tune_after = time.time() + 1.0
+            return
+        os.makedirs(kernels._BUSY_DIR, exist_ok=True)
+        with open(os.path.join(kernels._BUSY_DIR, "tuning.lock"), "a") as lock:
+            try:  # one tuner at a time across processes, and never while another marks itself busy
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                self._tune_after = time.time() + 1.0
+                return
+            mod, M = work.pop(0)
+            self._tuning = True
+            kernels.mark_busy(now=True)
+            try:
+                kernels.tune_one(mod, M)
+            except Exception:  # noqa: BLE001  # an untunable shape keeps MLX's kernel
+                pass
+            finally:
+                self._tuning = False
         if not work:
             print("locals: kernel tuning finished; batches now run on the tuned kernels", file=sys.stderr, flush=True)
 

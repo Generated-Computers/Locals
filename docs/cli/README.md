@@ -581,7 +581,6 @@ Variables read by the server process must be set in the environment of the comma
 - **Misleading status-page label.** The status page labels its last column "tok/s (decode)", but `decode_s` accumulates `t_done - t_submit` per request, which is wall time including queueing and prefill. `locals status` labels the same number correctly.
 - **Some delegated commands ignore saved defaults.** `generate` and `chat` on the server read the model and port saved in `~/.locals/config.json`, but `--local`, `agents` and `tune` use `DEFAULT_MODEL` unless `--model` is given. `menubar` ignores `--port` and uses the saved port.
 - **Incomplete `--no-exec` help.** `locals agents --no-exec` is documented as "disable run_python", but it also disables `run_file`.
-- **Two servers and idle tuning.** A server tuning kernels while idle sees only its own engines, not another Locals server on another port: timings it takes while the other one works are skewed, and kept. `locals tune` with no server running gives clean timings.
 - **Tuning and MLX upgrades.** The tune cache is not keyed on the MLX version: choices timed under an older MLX stay after an upgrade (`locals tune` times them again).
 - **`/json` with `/n` in chat.** In `locals chat --local`, a pending `/json` schema is not applied to a `/n` turn and stays pending for the turn after (on the server it applies to the `/n` turn).
 

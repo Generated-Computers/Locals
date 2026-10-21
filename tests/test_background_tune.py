@@ -88,3 +88,39 @@ def test_the_tuning_report(tmp_path, monkeypatch):
     rows = {line.split()[0]: line for line in text.splitlines() if line[:4].strip().isdigit()}
     assert "x" in rows["4"] and "ms" in rows["4"] and "not timed" in rows["8"]
     assert "1024x512 (2 layers): MLX" in text
+
+
+def test_an_idle_tuner_waits_while_another_server_works(tmp_path, monkeypatch):
+    """A server tuning while idle saw only its own engines: next to another locals server serving on the same GPU it
+    timed kernels anyway, and kept the skewed timings. Each busy process marks a file; the tuner waits for them."""
+    import os
+    import subprocess
+    import time
+
+    from locals import service
+
+    monkeypatch.setattr(kernels, "_TUNE_PATH", str(tmp_path / "tune.json"))
+    monkeypatch.setattr(kernels, "_BUSY_DIR", str(tmp_path))
+    other = tmp_path / f"busy-{os.getppid()}"  # a live process, busy a moment ago
+    other.write_text("")
+    assert kernels.others_busy()
+    os.utime(other, (time.time() - 10, time.time() - 10))
+    assert not kernels.others_busy()  # its last mark is old: idle now
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    (tmp_path / f"busy-{dead.pid}").write_text("")
+    assert not kernels.others_busy() and not (tmp_path / f"busy-{dead.pid}").exists()
+    kernels.mark_busy(now=True)
+    assert (tmp_path / f"busy-{os.getpid()}").exists() and not kernels.others_busy()  # (its own: not another's)
+
+    svc = service.BatchService.__new__(service.BatchService)
+    svc._tune_work, svc._inflight = [("layer", 1)], {}
+    tuned = []
+    monkeypatch.setattr(kernels, "tune_one", lambda mod, M: tuned.append((mod, M)))
+    os.utime(other, None)
+    svc._tune_while_idle()
+    assert tuned == [] and svc._tune_work == [("layer", 1)]  # left for later, not dropped
+    os.utime(other, (time.time() - 10, time.time() - 10))
+    svc._tune_after = 0.0
+    svc._tune_while_idle()
+    assert tuned == [("layer", 1)] and not svc._tune_work

@@ -231,6 +231,73 @@ _MARKER_LOCK = _threading.Lock()
 _STOPPING = False
 
 
+# Another locals server on this GPU: each process with work (requests, or a shape being timed) touches a file of its
+# own once a second (mark_busy), in this user's temporary folder (one for every process of the user, whatever cache
+# each uses); an idle tuner leaves its shapes while another one is busy (others_busy). It saw only its own engines, and
+# timings taken next to another server's work were skewed, and kept.
+_BUSY_AT = 0.0
+_BUSY_DIR = _os.path.join(__import__("tempfile").gettempdir(), "locals-gpu")
+
+
+def _busy_file(pid: int) -> str:
+    return _os.path.join(_BUSY_DIR, f"busy-{pid}")
+
+
+def mark_busy(now: bool = False) -> None:
+    """This process works on the GPU: its busy file is touched (at most once a second unless ``now``)."""
+    global _BUSY_AT
+    t = _time.time()
+    if not now and t - _BUSY_AT < 1.0:
+        return
+    _BUSY_AT = t
+    path = _busy_file(_os.getpid())
+    try:
+        _os.makedirs(_os.path.dirname(path), exist_ok=True)
+        with open(path, "a"):
+            pass
+        _os.utime(path, None)
+    except OSError:
+        pass
+
+
+def others_busy(window: float = 3.0) -> bool:
+    """Whether another live process marked the GPU busy in the last ``window`` seconds (a dead one's file goes)."""
+    import glob
+
+    t = _time.time()
+    for f in glob.glob(_os.path.join(glob.escape(_BUSY_DIR), "busy-*")):
+        try:
+            pid = int(f.rsplit("-", 1)[1])
+        except ValueError:
+            continue
+        if pid == _os.getpid():
+            continue
+        if not _alive(pid):
+            try:
+                _os.unlink(f)
+            except OSError:
+                pass
+            continue
+        try:
+            if t - _os.path.getmtime(f) < window:
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def _drop_busy() -> None:
+    try:
+        _os.unlink(_busy_file(_os.getpid()))
+    except OSError:
+        pass
+
+
+import atexit as _atexit  # noqa: E402
+
+_atexit.register(_drop_busy)
+
+
 def stop_timing() -> None:
     """This process is being stopped (SIGTERM: locals stop, a model switch, a restart): its marker goes, and no new
     one is written, so the shape it was timing does not count as one whose kernels crashed (two such stops kept
