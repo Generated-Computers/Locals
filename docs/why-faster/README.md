@@ -87,8 +87,10 @@ float16 is at least as close as bfloat16 to a float32 run of the probe (Gemma 4
 E4B); otherwise the model stays in bfloat16, as do models whose own code treats float16
 specially (Gemma 3). In bfloat16, the same Locals runs at 93 and 98 tokens/s with 4 and 8
 requests instead of 161 and 273: the small-batch kernels gain little without it.
-On GPUs with native bfloat16 (M3 and later) Locals keeps bfloat16; we have not
-measured those chips yet.
+On GPUs with native bfloat16 (M3 and later) Locals keeps bfloat16. On an M5
+Pro the whole of Locals was measured at 1.05x mlx-lm with one request and 1.5x
+with eight to sixteen ([Measurements](../measurements/README.md#on-an-m5-pro));
+M3 and M4 chips are not measured yet.
 
 ### 3. Fused projections
 
@@ -170,7 +172,9 @@ about 700 tokens/s at the start of a prompt on this chip, falling to 168 at
 
 **Newer chips.** All numbers here come from an M2 Pro. On M3 and later, which
 compute bfloat16 natively, the float16 difference does not apply, and the
-balance of the other parts may differ.
+balance of the other parts may differ: on an M5 Pro, mlx-lm itself is much
+faster (MLX has kernels for its neural accelerators), and Locals gains 1.5x
+with eight requests at once, not 3x.
 
 ## Repeating the measurement
 

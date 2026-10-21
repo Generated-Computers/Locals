@@ -2,7 +2,7 @@
 # locals installer: an Apple-silicon Mac, uv (installed if missing), then locals.
 #
 #   curl -LsSf https://raw.githubusercontent.com/Generated-Computers/Locals/main/install.sh | sh
-#   LOCALS_SOURCE=locals sh install.sh     # or a wheel or folder path, instead of GitHub's archive
+#   LOCALS_SOURCE=dist/locals-0.2.0-py3-none-any.whl sh install.sh   # a wheel or a folder instead of GitHub's archive
 #
 # Afterwards:  locals code ~/my-project   (sets up OpenCode, downloads the model, starts
 # the server and opens the agent; the first run takes a minute or two; --model gemma for Gemma 4).
@@ -37,7 +37,7 @@ fi
 command -v uv >/dev/null 2>&1 || fail "uv is not on PATH after installing it; open a new terminal and run this again."
 
 # GitHub's archive of the main branch: no git needed (a Mac without the Command Line Tools has none; installing
-# from git+https then failed); PyPI ("locals") after the first release
+# from git+https then failed)
 SOURCE="${LOCALS_SOURCE:-locals @ https://github.com/Generated-Computers/Locals/archive/refs/heads/main.tar.gz}"
 say "installing locals from $SOURCE ..."
 BIN="$(uv tool dir --bin 2>/dev/null || printf '%s' "$HOME/.local/bin")"

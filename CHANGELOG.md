@@ -4,12 +4,13 @@
 
 First public release.
 
-- **About three times faster with many requests at once.** GPU kernels written
+- **Up to 3x faster with many requests at once.** GPU kernels written
   and tuned for the few requests at a time that agents send, float16 on M1 and
   M2, fused layers, and a prompt cache that keeps each agent's conversation:
-  271 tokens/s with eight requests at once where mlx-lm gives 87, the same speed
-  for one request, and the same answers. What each part contributes is measured
-  in docs/why-faster.
+  271 tokens/s with eight requests at once where mlx-lm gives 87 (an M2 Pro with
+  16 GB), and no slower for one request. On an M5 Pro, where mlx-lm is much
+  faster, 1.5x with eight to sixteen requests at once. What each part
+  contributes is measured in docs/why-faster.
 - **Many agents on one task.** `locals run` puts a team of agents on a task, each
   in its own copy of the project, with your tests as the check; the project is
   changed only when they pass.
@@ -35,8 +36,9 @@ First public release.
   tested models (`qwen`, `gemma`, `lfm`, `minicpm`), any MLX model from Hugging
   Face, and a clear message for models that do not fit or come in the GGUF
   format.
-- **Safe defaults.** The server answers only apps on your Mac, and agents'
-  commands can write only inside their own copy of the project.
+- **Safe defaults.** The server answers only apps on your Mac, and the
+  commands of `locals run` and `locals solve` agents can write only inside their
+  own copy of the project (and the temporary and cache folders).
 - **Long conversations.** A request can be as long as fits in your Mac's
   memory next to the model, instead of a fixed 64k tokens: about 178,000 tokens
   for Qwen3.5-4B on a 16 GB Mac (`--max-context` still sets it). The next turn
@@ -44,8 +46,8 @@ First public release.
   a 138,000-token document starts in 2.4 seconds; it used to read the whole
   conversation again (eight minutes), and agents re-read their last tool result
   on every turn. Four multi-turn conversations at once now take 83% of their
-  prompts from memory instead of 28%, and finish 36 turns in four minutes
-  instead of 23.
+  prompts from memory instead of 28%, and finish 36 turns in four minutes,
+  against 23 before.
 - **No pause while a long prompt is read.** When a new request with a long
   prompt arrives, the requests already answering keep streaming: their next
   tokens are computed in the same passes over the model as the new prompt,
@@ -63,7 +65,12 @@ First public release.
   recurrent-layer op (which has a version for the M5's neural accelerators)
   and keeps it where it is faster. Batches of 8 to 16 requests are computed
   at a larger, faster size where tuning finds one: on an M5 Pro, 12 requests
-  at once ran 10-13% faster on a 4B model and 19-20% on a 9B.
+  at once ran 10-13% faster on a 4B model and 19-20% on a 9B. On the M5, a
+  4-bit matrix kernel for its neural accelerators (`nax`) is among the kernels
+  tuning chooses from: timed alone, one decode step's matrix products take
+  1.6-3.4x less time than with MLX's kernels at 6 to 32 requests. It is
+  experimental (whole decode steps are not measured yet); `LOCALS_NAX=0` turns
+  it off.
 - **Smoother commands.** `locals chat` and `locals generate` use the background
   server instead of loading a second copy of the model, so `--n` works with every
   model; `locals status`, `stop` and `--version` answer in a fraction of a second;

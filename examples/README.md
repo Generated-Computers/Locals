@@ -243,4 +243,10 @@ curl http://127.0.0.1:8321/v1/chat/completions -H "Content-Type: application/jso
 
 Libraries built on OpenAI's interface, such as LangChain, LlamaIndex, pydantic-ai
 and the OpenAI Agents SDK, work the same way: give them the address above and the
-model name.
+model name. Two need one setting more. The OpenAI Agents SDK talks to OpenAI's
+Responses API by default, which Locals does not answer: call
+`set_default_openai_api("chat_completions")` (and `set_tracing_disabled(True)`,
+since its traces go to OpenAI) after `set_default_openai_client(AsyncOpenAI(base_url=...,
+api_key="local"))`. LlamaIndex's `OpenAI` class accepts only OpenAI's model names:
+use `OpenAILike(model="locals", api_base="http://127.0.0.1:8321/v1", api_key="local",
+is_chat_model=True)` from `llama_index.llms.openai_like`.

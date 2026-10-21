@@ -1,4 +1,4 @@
-"""locals: run many AI agents at once on your Mac, about three times faster.
+"""locals: run many AI agents at once on your Mac, up to 3x faster.
 
     locals code [DIR]          a coding assistant (OpenCode) on a project; the first time it installs
                                OpenCode, downloads the model and starts the server (--run TASK: one task)

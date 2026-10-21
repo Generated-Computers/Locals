@@ -6,7 +6,7 @@
 <h1 align="center">Locals</h1>
 
 <p align="center">
-  <b>Run many AI agents at once on your Mac, about three times faster.</b><br>
+  <b>Run many AI agents at once on your Mac, up to 3x faster.</b><br>
   OpenCode, OpenHands, Cline, Aider and any OpenAI or Ollama app, on one local
   server built for many agents working at the same time.
 </p>
@@ -39,7 +39,7 @@ arrive at the same time. That is how today's AI agents work: a coding assistant
 runs several helpers in parallel, and a team of agents can work on one task
 together. Locals answers these requests together, and computes such a group of
 requests far more efficiently on your Mac's graphics chip, so the whole team gets
-its answers about three times faster than with the standard way of running
+its answers up to three times faster than with the standard way of running
 models on a Mac.
 
 It works with the coding assistants you may already use, such as OpenCode,
@@ -61,11 +61,11 @@ finishing 2.5 times sooner than with mlx-lm and llguidance.
 Coding assistants no longer send one request at a time. OpenCode, OpenHands and
 Cline run helpers in parallel, and teams of agents split one task between them.
 On a Mac, the standard way of running models, mlx-lm, answers such requests
-together but barely gets faster when there are more of them: it writes 87 tokens
-per second for four requests and the same 87 for eight, so every agent you add
-slows the others down. Locals keeps getting faster as requests are added, so the
-more agents you run, the more it gives you. It is also faster for a single agent
-at work, after a restart, and in long conversations:
+together but gets no faster from four of them to eight: it writes 87 tokens per
+second for four requests and the same 87 for eight. Locals keeps getting faster
+as requests are added, up to three times mlx-lm's speed with eight at once. It is
+also faster for a single agent at work, after a restart, and in long
+conversations:
 
 | On a MacBook Pro with an M2 Pro and 16 GB, Qwen3.5-4B | Without Locals | With Locals | |
 |---|---|---|---|
@@ -74,35 +74,42 @@ at work, after a restart, and in long conversations:
 | One agent rewriting a 100-line file | 43 tokens/s (mlx-lm) | 128 tokens/s | 3.0x |
 | An agent's first request after a restart | 16 s (mlx-lm) | 1.7 s | 9.6x sooner |
 | A follow-up question about a 48,000-token document | out of memory (mlx-lm) | 0.6 s | |
-| 16 coding agents calling tools (Qwen3.5-2B) | 75 s (mlx-lm) | 29 s | 2.5x |
-| 40 programming problems from LiveCodeBench, 8 at a time | 20 min (mlx-lm) | 8 min | 2.5x |
+| 16 coding agents calling tools (Qwen3.5-2B, from the paper) | 75 s (mlx-lm) | 29 s | 2.5x |
+| 40 programming problems from LiveCodeBench, 8 at a time (from the paper) | 20 min (mlx-lm) | 8 min | 2.5x |
 
 With 1, 2, 4, 8 and 16 requests at once, Locals writes 64, 116, 160, 271 and 341
 tokens per second, and mlx-lm 61, 82, 87, 87 and 157; a plain answer alone, with
 nothing to reuse, comes at about the same speed. A token is roughly a word
 piece. Ollama answers this model one request at a time, so the eighth waits for
 the other seven; Magnitude's first word came after 16 s. llama.cpp, running the
-same model file as Ollama, writes 71 tokens per second with eight requests at
-once where Locals writes 110, and 48 where Locals writes 153 for one agent
-rewriting a file. A file rewrite is faster even alone because the reply repeats
+GGUF file of the model that Ollama downloads (Q4_K_M), writes 71 tokens per
+second with eight requests at once where Locals writes 110, and 48 where Locals
+writes 153 for one agent rewriting a file (measured with llama.cpp in one
+session; the 128 above was measured with mlx-lm on another day). A file rewrite is faster even alone because the reply repeats
 the file, and Locals checks pieces of it taken from the prompt in the same pass
 as the next word. After a restart, Locals reads the agent's long system prompt
-from disk instead of again. On an M2 Max with 96 GB, eight requests at once get
+back from disk instead of computing it again. On an M2 Max with 96 GB, eight requests at once get
 403 tokens per second from Locals and 152 from mlx-lm, and bigger models gain
-more: 3.0x for Qwen3.5-9B and 3.1x for a 27B model. How
-each number was measured:
+more: 3.0x for Qwen3.5-9B and 3.1x for a 27B model. On an M5 Pro with 24 GB the
+gain is smaller, because mlx-lm is much faster there (MLX has its own kernels for
+the M5's neural accelerators): with Qwen3.5-4B, Locals writes 90 tokens per
+second for one request against mlx-lm's 86, 382 against 258 with eight at once
+(1.5x), and 508 against 333 with sixteen (1.5x); Qwen3.5-9B gets 1.6x with eight.
+These were measured before Locals had its own kernels for the M5's neural
+accelerators; M3 and M4 chips have not been measured yet. How each number was
+measured:
 [Ollama and Magnitude](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md#against-ollama-and-magnitude),
 [llama.cpp](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md#against-llamacpp),
 [mlx-lm's own server](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md#against-mlx-lms-own-server),
-[the M2 Max](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/m2-max.md).
-[An independent check](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md#an-independent-check-of-the-speed)
-counts the tokens on the client, through each server's own API with no prompt cache to help: 3.2x mlx-lm's
-server with eight requests at once, the same answers to checked problems, and replies nearer a float32
-computation of the model than mlx-lm's.
+[the M2 Max](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/m2-max.md),
+[the M5 Pro](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md#on-an-m5-pro).
+[A client-side check](https://github.com/Generated-Computers/Locals/blob/main/docs/measurements/README.md#a-client-side-check-of-the-speed)
+counts the tokens on the client, through each server's own API with no prompt cache to help: against
+mlx-lm's server, 1.3x with one request at once, 1.5x with two, 1.7x with four, 3.2x with eight and 2.5x
+with sixteen, and replies nearer a float32 computation of the model than mlx-lm's.
 
 - **Many agents in the time of a few.** Eight agents working at once finish in
-  about the time two would need one after the other, and the answers are the
-  same as mlx-lm's.
+  about the time two would need one after the other.
 - **Each turn picks up where the last one ended.** Locals keeps every
   conversation between turns, and long system prompts on disk across restarts,
   so an agent's next turn reads only what it added. With four agents in long
@@ -135,9 +142,10 @@ to repeat it.
 </p>
 
 Locals works with the coding agents and assistants people already use, on a
-model running on your Mac. Each of these was tested end to end with Qwen3.5-4B
-on a 16 GB Mac, on real tasks such as writing a program, running it and
-reporting what it printed. One command starts Locals and connects the tool to it:
+model running on your Mac. All of these but Roo Code were tested end to end with
+Qwen3.5-4B on a 16 GB Mac (Cline and Kilo Code through their command-line
+versions), on real tasks such as writing a program, running it and reporting
+what it printed. One command starts Locals and connects the tool to it:
 
 | Tool | Run |
 |---|---|
@@ -191,7 +199,7 @@ From then on it starts in seconds. Locals also makes itself OpenCode's default
 model, so plain `opencode` uses it too; `locals disconnect opencode` gives
 OpenCode its own settings back. To update Locals, run the install command again. To remove it, run
 `locals stop`, `locals disconnect opencode` and `uv tool uninstall locals`. If you already use the uv package manager,
-you can install with `uv tool install git+https://github.com/Generated-Computers/Locals`
+you can install with `uv tool install --python 3.12 git+https://github.com/Generated-Computers/Locals`
 instead.
 
 ### Coming from Ollama, LM Studio, mlx-lm or llama.cpp
@@ -212,7 +220,8 @@ locals launch --model qwen3.5:4b ollama
 
 Ollama's model names work in Locals, and for a model Locals does not know it
 names the MLX version on Hugging Face to use instead. Ollama's own downloads
-are in another format (GGUF), so a model is downloaded once more, in MLX's. To
+are in its own format (GGUF for most models), so a model is downloaded once
+more, in MLX's. To
 go back, run `locals stop` and start Ollama.
 
 **LM Studio.** LM Studio's MLX models run in Locals where they are, with no
@@ -332,13 +341,14 @@ run `locals launch ollama`.
 Locals picks a model that fits your Mac's memory, so most people never need to
 change it. To use another one, start Locals with its name, for example
 `locals start --model lfm`. Locals runs one model at a time. The last two
-columns are speeds in tokens per second (tps) with 8 requests at once.
+columns are speeds in tokens per second (tps) with 8 requests at once, on the
+M2 Pro with 16 GB above.
 
 | Model | Start it with | Name in your editor | Size | mlx-lm | Locals |
 |---|---|---|---|---|---|
 | Qwen3.5-4B (the default) | `--model qwen` | `locals/qwen3.5-4b` | 2.8 GB | 87 tps | 271 tps |
-| LFM2.5-2.6B | `--model lfm` | `locals/lfm2.5-2.6b` | 1.6 GB | 144 tps | 404 tps |
-| MiniCPM5-2B | `--model minicpm` | `locals/minicpm5-2b` | 1.4 GB | 160 tps | 478 tps |
+| LFM2.5-2.6B | `--model lfm` | `locals/lfm2.5-2.6b` | 1.5 GB | 144 tps | 404 tps |
+| MiniCPM5-2B | `--model minicpm` | `locals/minicpm5-2b` | 1.3 GB | 160 tps | 478 tps |
 | Gemma 4 E4B | `--model gemma` | `locals/gemma-4-e4b-it` | 4.8 GB | 80 tps | 224 tps |
 
 On a Mac with less than 12 GB of memory, the default is Qwen3.5-2B instead
@@ -349,9 +359,12 @@ Each model also has a thinking mode, in which it reasons before it answers: add
 models are good choices for a Mac with 8 GB of memory, and other models made for
 Apple silicon on [Hugging Face](https://huggingface.co/mlx-community) work too.
 
-Conversations can be long: about 178,000 tokens with the default model on a
-16 GB Mac, a few hundred pages of text. A long document takes a few minutes to
-read the first time; follow-up questions about it start in seconds.
+Conversations can be long: up to about 178,000 tokens with the default model
+on a 16 GB Mac, a few hundred pages of text. On the M2 Pro, reading a
+170,000-token document takes about 12 minutes the first time, and follow-up
+questions about it start in 2 seconds. OpenCode is set up for 32,000 tokens,
+and OpenClaw, Hermes Agent and Kilo Code for 64,000, which keeps each of their
+steps quick.
 
 ## Using it from your own code
 
@@ -379,15 +392,18 @@ as well; the [examples](https://github.com/Generated-Computers/Locals/blob/main/
 
 Everything runs on your Mac. Locals only accepts requests from apps on your own
 computer, so a website you visit cannot use it. When a team of agents works on a
-task, the commands they run can only change files in their own copy of your
-project.
+task (`locals run`, `locals solve`), the commands they run can change files only
+in their own copy of your project, and in the temporary and cache folders that
+tools write to. `locals code` runs OpenCode in your project itself, as OpenCode
+always runs.
 
 ## If something does not work
 
 Run `locals status`, or open http://127.0.0.1:8321 in your browser, to see whether
-Locals is running and what it is doing. The first time Locals runs on a new Mac,
-it spends a few minutes in the background tuning itself to your chip; you can
-use it during that time, and it gets faster once it finishes.
+Locals is running and what it is doing. On a chip other than the M2 Pro and
+M2 Max, whose tuning ships with Locals, it tunes itself to your chip the first
+time, in the background while it is idle: 10 to 20 minutes of idle time in all.
+You can use it during that time, and it gets faster once it finishes.
 
 Questions and problems are welcome as
 [issues on GitHub](https://github.com/Generated-Computers/Locals/issues).

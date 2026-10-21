@@ -314,7 +314,30 @@ generation thread stopped with Metal's "Insufficient Memory" on the follow-up
 the conversation and answered. The edit row is the second of three rounds (the
 rounds differed by less than 1%); the others ran once.
 
-## An independent check of the speed
+## On an M5 Pro
+
+Measured by a Locals user on their MacBook Pro (M5 Pro, 16-core GPU, 24 GB, macOS 27, MLX 0.32.3) with the M2
+Max report's decode sweep: n requests at once to `/v1/completions`, 256 tokens each, end of text ignored,
+temperature 0, two rounds per point, the median. Locals at commit `d55465b` (18 October 2026), before the
+kernels for the M5's neural accelerators and before batches of 8 to 16 requests were padded to faster sizes.
+Tokens per second (mlx-lm / Locals):
+
+| Requests at once | Qwen3.5-4B | Ratio | Qwen3.5-9B | Ratio |
+|---|---|---|---|---|
+| 1 | 86 / 90 | 1.05x | 52 / 54 | 1.05x |
+| 2 | 151 / 161 | 1.07x | 87 / 93 | 1.06x |
+| 4 | 232 / 253 | 1.09x | 129 / 131 | 1.02x |
+| 8 | 258 / 382 | 1.48x | 145 / 229 | 1.58x |
+| 16 | 333 / 508 | 1.53x | 200 / 307 | 1.53x |
+
+Locals' own speed is close to the M2 Max's (382 against 403 tokens/s at 8 requests on the 4B), while mlx-lm's
+is much higher (258 against 152): MLX's 4-bit kernels use the M5's neural accelerators. The 4B ran with both
+engines in one server, the 9B with one engine per server. Later rounds on the same Mac: padding 12 requests to
+16 made them 10-13% faster on the 4B and 19-20% on the 9B (commit `80c8828`), and Qwen3.8-27B wrote 18.5,
+33.0, 49.0, 78.2 and 76.1 tokens per second with 1, 2, 4, 8 and 16 requests at once (commit `9f49cdc`, Locals
+alone).
+
+## A client-side check of the speed
 
 The numbers above are checked here in a way that trusts nothing Locals reports, with the scripts in
 [audit/](audit/). The table at the top was measured inside the process, with the end-of-text token ignored;
@@ -424,6 +447,7 @@ repository's own source files was found at every length tried:
 | 110,749 | 348 s | yes |
 | 128,761 | 446 s | yes |
 | 139,387 | 501 s | yes |
+| 169,971 | 711 s | yes (21 October 2026, the limit of 178,176; its follow-up came in 2.0 s from the prompt cache) |
 
 A request of 158,012 tokens was refused with `context_length_exceeded` (by that
 limit of then).

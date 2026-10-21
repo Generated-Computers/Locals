@@ -1,4 +1,4 @@
-"""An independent check of tokens per second through a server's OpenAI API, trusting nothing the server says.
+"""A client-side check of tokens per second through a server's OpenAI API, trusting nothing the server says.
 
 - Tokens are counted by the client: the streamed text is tokenized again with the model's own tokenizer. The
   server's usage.completion_tokens is recorded only to compare.
