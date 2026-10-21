@@ -42,6 +42,14 @@ jobs:
               echo "::error::CHANGELOG.md still calls $v unreleased; put the release date there"; exit 1
             fi
           fi
+      - name: The README as PyPI shows it
+        # PyPI shows every image and drops <br clear>: keep the light-mode wordmark only (GitHub picks one of the
+        # two by its theme), and let the narrow chart sit above its text instead of floating beside the table
+        run: |
+          sed -i -e '/#gh-dark-mode-only/d' -e 's/<img align="right" width="48%"/<img width="70%"/' README.md
+          if grep -q -e 'gh-dark-mode-only' -e 'align="right" width="48%"' README.md; then
+            echo "::error::README.md changed: update this step"; exit 1
+          fi
       - name: Build the wheel and the source archive
         run: |
           python -m pip install --upgrade build twine
