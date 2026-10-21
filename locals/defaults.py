@@ -46,7 +46,7 @@ def chip() -> str:
     import subprocess
 
     try:
-        return subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True,
+        return subprocess.run(["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True,
                               timeout=5).stdout.strip()
     except Exception:  # noqa: BLE001
         return ""
@@ -57,7 +57,7 @@ def memory_gb() -> float:
     import subprocess
 
     try:
-        return int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5).stdout) / 2**30
+        return int(subprocess.run(["/usr/sbin/sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5).stdout) / 2**30
     except Exception:  # noqa: BLE001
         return 0.0
 

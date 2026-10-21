@@ -615,3 +615,12 @@ def test_a_tools_help_needs_no_model_and_no_server(monkeypatch):
     with pytest.raises(SystemExit) as e:
         menubar.main(["--help"])
     assert e.value.code == 0
+
+
+def test_this_macs_memory_is_read_without_usr_sbin_on_the_path(monkeypatch):
+    """With a PATH that lacks /usr/sbin (where sysctl is), the memory read as 0 GB: "Models for this Mac with 0 GB of
+    memory", and the default model was chosen as if the memory were unknown."""
+    from locals import defaults
+
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    assert defaults.memory_gb() > 1

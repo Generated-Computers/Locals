@@ -916,7 +916,7 @@ def _background_pid(port: int) -> Optional[int]:
 
 def _listener_pid(port: int) -> Optional[int]:
     """The process listening on the port (lsof), if any."""
-    p = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"], capture_output=True, text=True)
+    p = subprocess.run(["/usr/sbin/lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"], capture_output=True, text=True)
     pids = [int(x) for x in p.stdout.split() if x.strip().isdigit()]
     return pids[0] if pids else None
 
