@@ -28,14 +28,11 @@ def _filtered(logits: mx.array, top_p: float = 0.0, top_k: int = 0) -> mx.array:
     """Log-probabilities after mlx-lm's filters, in its order: top-p on the untempered
     distribution, then top-k (mlx_lm.sample_utils.make_sampler)."""
     lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-    if 0 < top_p < 1:
-        from mlx_lm.sample_utils import apply_top_p
-
-        lp = apply_top_p(lp, top_p)
-    if top_k and top_k < lp.shape[-1]:
-        from mlx_lm.sample_utils import apply_top_k
-
-        lp = apply_top_k(lp, top_k)
+    if (0 < top_p < 1) or (top_k and top_k < lp.shape[-1]):  # (in one sort: _keep)
+        flat = lp.reshape(-1, lp.shape[-1])
+        n = flat.shape[0]
+        keep = _keep(flat, mx.full((n,), float(top_p)), mx.full((n,), int(top_k or 0)))
+        lp = mx.where(keep, flat, -mx.inf).reshape(lp.shape)
     return lp
 
 
@@ -70,28 +67,40 @@ def row_key(seed: int, n: int) -> mx.array:
     return mx.random.key((int(seed) * 0x9E3779B97F4A7C15 + n) & 0x7FFFFFFFFFFFFFFF)
 
 
+def _keep(lp: mx.array, top_p: mx.array, top_k: mx.array) -> mx.array:
+    """(B, V): the tokens mlx-lm's filters keep in each row (top-p on the untempered distribution, then top-k), with
+    the row's own ``top_p`` and ``top_k`` ((B,) arrays; top_p 0 or 1 and top_k 0: no filter). One sort for every row
+    (mlx-lm's filters sorted twice, and a batch of rows with other settings took one pass per setting)."""
+    V = lp.shape[-1]
+    s = -mx.sort(-lp, axis=-1)  # descending
+    pr = mx.exp(s)
+    above = mx.cumsum(pr, axis=-1) - pr  # the mass of the tokens more likely than each
+    p = mx.where((top_p > 0) & (top_p < 1), top_p, 2.0)[:, None]
+    n = mx.sum(above < p, axis=-1)  # top-p's count: tokens until the ones above hold top_p
+    n = mx.minimum(n, mx.where(top_k > 0, mx.minimum(top_k, V), V))
+    thr = mx.take_along_axis(s, (mx.maximum(n, 1) - 1)[:, None].astype(mx.int32), axis=-1)
+    return lp >= thr
+
+
 def sample_each(logits: mx.array, specs) -> mx.array:
     """One token per row of ``logits`` (B, V), row i by ``specs[i]`` = (temperature, top_p, top_k, key or None),
-    each by mlx-lm's rule (sample_logits). Rows with the same settings and no key are drawn together; a row with a
-    key (a seeded request) is drawn with it."""
-    groups: dict = {}
-    keyed = []
-    for i, (t, p, k, key) in enumerate(specs):
-        if key is not None and t > 0:
-            keyed.append(i)
-        else:
-            groups.setdefault((t, p, k), []).append(i)
-    if len(groups) == 1 and not keyed:
-        ((t, p, k),) = groups
-        return sample_logits(logits, t, p, k)
-    out = mx.zeros((len(specs),), dtype=mx.uint32)
-    for (t, p, k), rows in groups.items():
-        idx = mx.array(rows)
-        out[idx] = sample_logits(logits[idx], t, p, k).astype(mx.uint32)
-    for i in keyed:
-        t, p, k, key = specs[i]
-        out[i] = sample_logits(logits[i: i + 1], t, p, k, key=key)[0].astype(mx.uint32)
-    return out
+    each by mlx-lm's rule (sample_logits) in one pass: the filters' mask, then one draw (the Gumbel maximum) at each
+    row's temperature; a row with a key (a seeded request) draws its noise with it, whatever else is in the batch."""
+    t = mx.array([float(x[0]) for x in specs], dtype=mx.float32)
+    lp = logits.astype(mx.float32)
+    lp = lp - mx.logsumexp(lp, axis=-1, keepdims=True)
+    if any((0 < x[1] < 1) or x[2] for x in specs):
+        lp = mx.where(_keep(lp, mx.array([float(x[1]) for x in specs]), mx.array([int(x[2] or 0) for x in specs])),
+                      lp, -mx.inf)
+    greedy = mx.argmax(lp, axis=-1)
+    if all(x[0] == 0 for x in specs):
+        return greedy
+    noise = mx.random.gumbel(lp.shape)
+    for i, (temp, _, _, key) in enumerate(specs):
+        if key is not None and temp > 0:
+            noise[i] = mx.random.gumbel(lp.shape[-1:], key=key)
+    drawn = mx.argmax(lp / mx.where(t > 0, t, 1.0)[:, None] + noise, axis=-1)
+    return mx.where(t == 0, greedy, drawn)
 
 
 class ConstraintExhausted(RuntimeError):

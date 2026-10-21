@@ -634,3 +634,24 @@ def test_a_requests_own_top_p_top_k_and_seed():
     seeded = [sample_each(logits, [(2.0, 0.0, 0, row_key(7, n)), (2.0, 0.0, 0, None)]).tolist()[0] for n in range(16)]
     again = [sample_each(logits[:1], [(2.0, 0.0, 0, row_key(7, n))]).tolist()[0] for n in range(16)]
     assert seeded == again and len(set(seeded)) >= 2  # the same draws alone or beside another row; draws differ
+
+
+def test_the_one_pass_filters_keep_what_mlx_lms_keep():
+    """top-p then top-k, as mlx-lm's make_sampler applies them, for each row's own values in one sort."""
+    import mlx.core as mx
+    from mlx_lm.sample_utils import apply_top_k, apply_top_p
+
+    from locals.engine import _keep
+
+    mx.random.seed(3)
+    differ = 0
+    for trial in range(30):
+        logits = mx.random.normal((4, 3000)) * (0.5 + trial % 5)
+        lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        p, k = [0.0, 0.5, 0.9, 1.0][trial % 4:] + [0.0, 0.5, 0.9, 1.0][:trial % 4], [0, 1, 20, 400]
+        mine = _keep(lp, mx.array(p), mx.array(k))
+        for i in range(4):
+            r = apply_top_p(lp[i:i + 1], p[i]) if 0 < p[i] < 1 else lp[i:i + 1]
+            r = apply_top_k(r, k[i]) if k[i] else r
+            differ += not mx.array_equal(r[0] > -mx.inf, mine[i]).item()
+    assert differ <= 1  # (a float32 sum taken in another order can move the top-p cut by one token)
