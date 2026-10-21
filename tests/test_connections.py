@@ -178,8 +178,9 @@ def test_bench_measures_requests_at_once(stream_server):
     four = bench.measure(stream_server, "m", 4, 12)
     assert one["tokens"] == [12] and four["tokens"] == [12] * 4
     # each request writes at most about 100 tokens a second (10 ms apart; a busy CI Mac sleeps longer: 22-30 there);
-    # four at once write about four times what one does, where a server answering one at a time writes no more (below)
-    assert 0 < one["tokens_per_s"] < 110 and 2.5 < four["tokens_per_s"] / one["tokens_per_s"] < 8
+    # four at once write about four times what one does, where a server answering one at a time writes under 1.3x
+    # (below): 1.8 keeps the two apart with room for a busy runner (one gave 2.38)
+    assert 0 < one["tokens_per_s"] < 110 and 1.8 < four["tokens_per_s"] / one["tokens_per_s"] < 8
     with pytest.raises(RuntimeError, match="HTTP 500"):
         bench.measure(stream_server, "broken", 2, 12)
 
