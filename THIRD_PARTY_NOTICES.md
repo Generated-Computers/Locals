@@ -12,6 +12,10 @@ https://github.com/ml-explore/mlx
 - `locals/mma_kernel.py` includes MLX's Metal headers from the installed `mlx`
   package when it compiles its kernels (nothing of them is copied into this
   repository).
+- `locals/nax_kernel.py` adapts MLX's `qmm_t_nax_tgp_impl` (`quantized_nax.h`)
+  for its tile variant, uses MLX's NAX fragment layout (`steel/gemm/nax.h`), and
+  includes MLX's Metal headers from the installed `mlx` package when it compiles
+  its kernels.
 
 ```
 MIT License

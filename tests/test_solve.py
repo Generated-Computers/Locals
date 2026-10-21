@@ -338,16 +338,20 @@ def test_an_abort_that_fails_prints_no_traceback_and_still_counts():
     old_hook = threading.excepthook
     threading.excepthook = lambda a: errors.append(a)
 
+    entered, release = threading.Event(), threading.Event()
+
     class Gone:
         def call(self, *a, **k):
-            time.sleep(0.3)
+            entered.set()
+            release.wait(5)
             raise ConnectionRefusedError
 
     try:
         timer, fired = abort_after(Gone(), "s1", "/tmp", 0.05)
-        time.sleep(0.1)
+        assert entered.wait(5)  # the abort is being sent
         assert fired.is_set() and timer.is_alive()  # (the old test said: not timed out)
-        timer.join(2)
-        assert not errors
+        release.set()
+        timer.join(5)
+        assert not timer.is_alive() and not errors
     finally:
         threading.excepthook = old_hook

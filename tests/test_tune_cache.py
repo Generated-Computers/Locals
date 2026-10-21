@@ -24,6 +24,7 @@ def test_a_save_keeps_what_another_process_wrote(tmp_path, monkeypatch):
 
 def test_tune_refuses_while_a_server_runs(monkeypatch):
     monkeypatch.setattr(app, "_locals_server_pids", lambda: [4242])
+    monkeypatch.setattr(app, "check_model", lambda m: None)  # (a 7 GB CI Mac refused the 4B for its size first)
     try:
         app.cmd_tune(["--model", "mlx-community/Qwen3.5-4B-MLX-4bit"])
     except SystemExit as e:

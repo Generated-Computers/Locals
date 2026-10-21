@@ -16,9 +16,12 @@ def _tok(repo):
     from transformers import AutoTokenizer
 
     try:
-        return AutoTokenizer.from_pretrained(repo, local_files_only=True)
+        tok = AutoTokenizer.from_pretrained(repo, local_files_only=True)
     except Exception:  # noqa: BLE001
         pytest.skip(f"{repo} tokenizer not cached")
+    if not tok.chat_template:  # (another test fetched some of the repo's files, not its template: CI)
+        pytest.skip(f"{repo} chat template not cached")
+    return tok
 
 
 def _turns():
