@@ -449,7 +449,7 @@ These commands are parsed in `app.py`. Both also accept the server options above
 
 ## `locals generate` (`cli.py`)
 
-This command runs on the background server: `client.connect` starts it if it is not running (as `locals code` does) or reuses it, with the model given by `--model`, else the model used last, else this Mac's default. One copy of the model stays in memory, and `--n` sends N requests that decode together in the server's batch, with or without a constraint. The prompt file and the schema are read and checked before anything starts. `--local`, `--dtype`, `--no-fuse` and `--no-forced` load the model in this process with `Runtime.load` instead (stop the server first: two copies of a model do not fit next to each other on a small Mac).
+This command runs on the background server: `client.connect` starts it if it is not running (as `locals code` does) or reuses it, with the model given by `--model`, else the model used last, else this Mac's default. One copy of the model stays in memory, and `--n` sends N requests that decode together in the server's batch, with or without a constraint. The prompt file and the schema are read and checked before anything starts. A reply cut at `--max-tokens` (`finish_reason` "length") is said on stderr; with `--schema` or `--regex` the command then exits 1, since the output stops before the end the constraint asks for. `--local`, `--dtype`, `--no-fuse` and `--no-forced` load the model in this process with `Runtime.load` instead (stop the server first: two copies of a model do not fit next to each other on a small Mac).
 
 | Option | Default | |
 |---|---|---|
@@ -458,7 +458,7 @@ This command runs on the background server: `client.connect` starts it if it is 
 | `--regex` | none | Regex constraint instead of a schema. |
 | `--max-tokens` | 512 | |
 | `--temp` | 0.0 | |
-| `--seed` | 0 | |
+| `--seed` | none | With `--local` only (0 there). On the server the replies are not seeded, and a note says so. |
 | `--n` | 1 | More than 1 means N samples at once (temperature 0.8 when `--temp` is 0), printed one after another. |
 | `--no-forced` | off | Disables forced-span compression. |
 | `--no-fuse` | off | Keeps separate q/k/v and gate/up matmuls. |
@@ -480,7 +480,7 @@ In-process (`--local`), `Conversation` keeps a ChatML conversation as one token 
 | `/stats` | Toggles the speed line. |
 | `/quit` | Exits. |
 
-Ctrl-C stops the current reply (on the server: the connection closes and the server stops decoding it) and drops that turn.
+Ctrl-C stops the current reply, or the `/n` alternatives (on the server: the connections close and the server stops decoding them), and drops that turn. A reply cut at `--max-tokens` is said; when thinking took the whole budget and there is no answer, the turn is dropped.
 
 ## `locals agents` (`agents.py`)
 

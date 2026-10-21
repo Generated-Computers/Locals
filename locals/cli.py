@@ -22,7 +22,7 @@ def main(argv=None):
     ap.add_argument("--regex", default=None, help="regex constraint instead of a schema")
     ap.add_argument("--max-tokens", type=int, default=512)
     ap.add_argument("--temp", type=float, default=0.0)
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=None, help="with --local only (default 0 there)")
     ap.add_argument("--n", type=int, default=1, help="parallel samples sharing the prompt KV")
     ap.add_argument("--no-forced", action="store_true", help="disable forced-span compression")
     ap.add_argument("--no-fuse", action="store_true", help="keep separate q/k/v and gate/up matmuls")
@@ -38,6 +38,11 @@ def main(argv=None):
     # the inputs first: a wrong path or a broken schema used to surface as a traceback after the model loaded
     try:
         prompt = open(args.prompt[1:]).read() if args.prompt.startswith("@") else args.prompt
+    except OSError as e:
+        sys.exit(f"locals generate: cannot read {e.filename}: {e.strerror}")
+    except UnicodeDecodeError as e:  # (it was reported as the schema's fault: "None is not valid JSON")
+        sys.exit(f"locals generate: {args.prompt[1:]} is not UTF-8 text: {e}")
+    try:
         schema = json.load(open(args.schema)) if args.schema else None
     except OSError as e:
         sys.exit(f"locals generate: cannot read {e.filename}: {e.strerror}")
@@ -50,6 +55,7 @@ def main(argv=None):
 
         return generate(args, prompt, schema)  # on the background server (started if it is not running)
     args.model = args.model or DEFAULT_MODEL
+    args.seed = 0 if args.seed is None else args.seed
     from .app import check_local_load
 
     check_local_load(args.model, "generate")

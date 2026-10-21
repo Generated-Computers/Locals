@@ -74,14 +74,16 @@ def parallel_replies(rt, ids, n, max_tokens, temp, top_p):
     uids = gen.insert([ids] * n, [max_tokens] * n)
     out = {u: [] for u in uids}
     t_first = None
-    while resps := gen.next_generated():
-        if t_first is None:
-            t_first = time.perf_counter()
-        for r in resps:
-            if r.finish_reason != "stop":
-                out[r.uid].append(r.token)
+    try:
+        while resps := gen.next_generated():
+            if t_first is None:
+                t_first = time.perf_counter()
+            for r in resps:
+                if r.finish_reason != "stop":
+                    out[r.uid].append(r.token)
+    finally:  # (Ctrl-C too)
+        gen.close()
     dt = time.perf_counter() - (t_first or time.perf_counter())
-    gen.close()
     total = sum(len(v) for v in out.values())
     return [rt.tokenizer.decode(out[u]) for u in uids], {"tokens": total, "tps": total / dt if dt else 0.0}
 
@@ -173,7 +175,12 @@ def main(argv=None):
         if cache is not None and ids[:len(history)] != history:  # the template wrote the past differently
             history, cache = [], None
         if n_alt > 1:
-            texts, stat = parallel_replies(rt, ids, n_alt, args.max_tokens, args.temp or 0.8, args.top_p)
+            try:
+                texts, stat = parallel_replies(rt, ids, n_alt, args.max_tokens, args.temp or 0.8, args.top_p)
+            except KeyboardInterrupt:  # (it ended the chat)
+                print("\n(stopped; this turn is not kept)")
+                n_alt = 1
+                continue
             for i, t in enumerate(texts):
                 print(f"\n--- reply {i + 1}\n{t}")
             if show_stats:

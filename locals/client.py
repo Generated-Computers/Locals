@@ -68,21 +68,54 @@ def _format(schema: Optional[dict], regex: Optional[str]) -> dict:
 
 
 def several(base: str, body: dict, n: int) -> List[dict]:
-    """n requests at once: they decode together in the server's batch."""
+    """n requests at once: they decode together in the server's batch. Ctrl-C closes their connections (the server
+    stops decoding them) and is raised again: it left the command waiting for every reply to finish."""
+    import socket
+    from urllib.parse import urlparse
+
+    u = urlparse(base)
+    data = json.dumps(dict(body, stream=False)).encode()
     out: List[Optional[dict]] = [None] * n
     errors: List[str] = []
+    stopped = threading.Event()
+    conns = [http.client.HTTPConnection(u.hostname, u.port, timeout=3600) for _ in range(n)]
 
     def one(i):
+        c = conns[i]
         try:
-            out[i] = complete(base, body)
-        except Exception as e:  # noqa: BLE001
-            errors.append(str(e))
+            if stopped.is_set():
+                return
+            c.request("POST", "/v1/chat/completions", data, {"Content-Type": "application/json"})
+            r = c.getresponse()
+            raw = r.read()
+            if r.status != 200:
+                try:
+                    errors.append(json.loads(raw)["error"]["message"])
+                except Exception:  # noqa: BLE001
+                    errors.append(f"HTTP {r.status}")
+                return
+            out[i] = json.loads(raw)
+        except (OSError, http.client.HTTPException, ValueError):
+            if not stopped.is_set():
+                errors.append(NOT_ANSWERING.format(base=base))
+        finally:
+            c.close()
 
-    threads = [threading.Thread(target=one, args=(i,)) for i in range(n)]
+    threads = [threading.Thread(target=one, args=(i,), daemon=True) for i in range(n)]
     for t in threads:
         t.start()
-    for t in threads:
-        t.join()
+    try:
+        for t in threads:
+            t.join()
+    except KeyboardInterrupt:
+        stopped.set()
+        for c in conns:
+            try:
+                if c.sock is not None:
+                    c.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        raise
     if errors:
         raise ValueError(errors[0])
     return [o for o in out if o is not None]
@@ -92,6 +125,8 @@ def several(base: str, body: dict, n: int) -> List[dict]:
 
 def generate(args, prompt: str, schema: Optional[dict]) -> None:
     base, model = connect(args.model)
+    if args.seed is not None:  # (the server samples every request's rows from one generator: no seed of its own)
+        print("locals generate: --seed applies with --local only; the server's replies are not seeded", file=sys.stderr)
     body = {"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": args.max_tokens,
             "temperature": args.temp if args.n == 1 else (args.temp or 0.8), **_format(schema, args.regex)}
     t0 = time.time()
@@ -99,13 +134,22 @@ def generate(args, prompt: str, schema: Optional[dict]) -> None:
         replies = several(base, body, args.n) if args.n > 1 else [complete(base, body)]
     except ValueError as e:
         sys.exit(f"locals generate: {e}")
+    cut = []
     for i, r in enumerate(replies):
         if args.n > 1:
             print(f"--- sample {i}")
         print(r["choices"][0]["message"].get("content") or "")
+        if r["choices"][0].get("finish_reason") == "length":
+            cut.append(i)
     if args.stats:
         out = sum(r["usage"]["completion_tokens"] for r in replies)
         print(f"[{out} tokens in {time.time() - t0:.1f}s on {model} at {base}]", file=sys.stderr)
+    if cut:  # (a JSON object cut at the limit printed as if whole, and the command said it went well)
+        what = "the reply was" if args.n == 1 else f"sample(s) {', '.join(map(str, cut))} were"
+        note = f"locals generate: {what} cut at --max-tokens {args.max_tokens}"
+        if schema is not None or args.regex:
+            sys.exit(note + ", before the end the schema or regex asks for: raise --max-tokens")
+        print(note, file=sys.stderr)
 
 
 # --- locals chat --------------------------------------------------------------------------------
@@ -168,6 +212,10 @@ def chat(args) -> None:
             except ValueError as e:
                 print(f"(error: {e})")
                 continue
+            except KeyboardInterrupt:
+                print("\n(stopped; this turn is not kept)")
+                n_alt, schema = 1, None
+                continue
             texts = [r["choices"][0]["message"].get("content") or "" for r in replies]
             for i, t in enumerate(texts):
                 print(f"\n--- reply {i + 1}\n{t}")
@@ -177,10 +225,13 @@ def chat(args) -> None:
             messages = turn + [{"role": "assistant", "content": texts[0]}]  # the conversation goes on from reply 1
             n_alt, schema = 1, None
             continue
-        text, usage, first = _stream(base, dict(body, stream=True, stream_options={"include_usage": True}))
+        text, usage, first, end = _stream(base, dict(body, stream=True, stream_options={"include_usage": True}))
         schema = None
-        if text is None:  # stopped with Ctrl-C
-            print("\n(stopped; this turn is not kept)")
+        if end == "length":  # (thinking that took the whole budget ended with no answer and no word why)
+            print(f"\n(cut at --max-tokens {args.max_tokens}" + ("; the thinking took it all, and there is no answer"
+                                                                if not text else "") + ")", file=sys.stderr)
+        if text is None or (end == "length" and not text):
+            print("\n(stopped; this turn is not kept)" if end == "stopped" else "(this turn is not kept)")
             continue
         messages = turn + [{"role": "assistant", "content": text}]
         if show_stats and usage:
@@ -192,14 +243,15 @@ def chat(args) -> None:
 
 
 def _stream(base: str, body: dict):
-    """Print a streamed reply as it comes: (its text, usage, when the first token came), or (None, None,
-    None) if Ctrl-C stopped it (closing the connection: the server stops decoding it)."""
-    text, usage, first, thinking = [], None, None, False
+    """Print a streamed reply as it comes: (its text, usage, when the first token came, how it ended). The end is
+    "stop", "length" (cut at max_tokens), "stopped" (Ctrl-C closed the connection: the server stops decoding it;
+    no text) or "failed" (an error, printed; no text)."""
+    text, usage, first, thinking, end = [], None, None, False, "stop"
     try:
         r = _post(base + "/v1/chat/completions", body)
     except ValueError as e:
         print(f"(error: {e})")
-        return None, None, None
+        return None, None, None, "failed"
     try:
         with r:
             for raw in r:
@@ -208,11 +260,13 @@ def _stream(base: str, body: dict):
                     continue
                 d = json.loads(line[6:])
                 if d.get("error"):
-                    print(f"\n(error: {d['error'].get('message')})")
-                    return None, None, None
+                    print((END if thinking else "") + f"\n(error: {d['error'].get('message')})")  # (it stayed dim)
+                    return None, None, None, "failed"
                 if d.get("usage") and not d.get("choices"):
                     usage = d["usage"]
                 for c in d.get("choices") or []:
+                    if c.get("finish_reason") == "length":
+                        end = "length"
                     delta = c.get("delta") or {}
                     for kind in ("reasoning_content", "content"):
                         piece = delta.get(kind)
@@ -231,12 +285,12 @@ def _stream(base: str, body: dict):
     except KeyboardInterrupt:
         if thinking:
             print(END, end="")
-        return None, None, None
+        return None, None, None, "stopped"
     except (OSError, http.client.HTTPException, ValueError):  # the server went away mid-reply
         if thinking:
             print(END, end="")
         print(f"\n(error: {NOT_ANSWERING.format(base=base)})")
-        return None, None, None
+        return None, None, None, "failed"
     if thinking:
         print(END, end="")
-    return "".join(text), usage, first
+    return "".join(text), usage, first, end
