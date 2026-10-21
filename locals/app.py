@@ -2405,7 +2405,8 @@ def _main(argv=None):
     p.add_argument("--attempts", type=int, default=5, help="attempts in all (default 5)")
     p.add_argument("--hedge", type=float, default=0, help="seconds without a result before one more agent starts "
                    "(default 0: none; on one Mac a second agent slows the first)")
-    p.add_argument("--fixes", type=int, default=1, help="times an agent sees its failed check and fixes it (default 1)")
+    p.add_argument("--fixes", type=int, default=1, help="times an agent sees its failed check and fixes it (default 1); with --plan, repair rounds: "
+                   "the first rewrites the parts at fault, the others are agents that run the code")
     p.add_argument("--agent", default="coder", help="OpenCode agent for the attempts (default coder)")
     p.add_argument("--timeout", type=float, default=600, help="seconds per attempt (default 600)")
     p.add_argument("--keep", action="store_true", help="keep the attempts' workspaces (default: their diffs only)")

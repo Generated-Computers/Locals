@@ -27,6 +27,35 @@ from typing import Dict, List, Optional, Tuple
 
 from .solve import SKIP_DIRS, make_workspace, read_source, run_check, write_source
 
+# Throwaway copies of the project in use (a candidate's check, a repair agent's copy), removed at exit too: on Ctrl-C
+# the finally of the daemon thread that made one never ran, and the copy stayed in the temporary folder for good.
+_LIVE_DIRS: set = set()
+_LIVE_LOCK = threading.Lock()
+
+
+def _live(d: Path) -> Path:
+    with _LIVE_LOCK:
+        _LIVE_DIRS.add(d)
+    return d
+
+
+def _gone(d: Path) -> None:
+    import shutil
+
+    shutil.rmtree(d, ignore_errors=True)
+    with _LIVE_LOCK:
+        _LIVE_DIRS.discard(d)
+
+
+def _remove_live() -> None:
+    for d in list(_LIVE_DIRS):
+        _gone(d)
+
+
+import atexit  # noqa: E402
+
+atexit.register(_remove_live)
+
 VERSION = "2026-10-09.12"  # recorded in plan.json: which way the parts and repairs were written
 
 # No maxLength on the strings: counted repetitions blow the automaton up (98 s to build with
@@ -166,6 +195,25 @@ def cover(parts: List[dict], task: str, project: Optional[Path] = None) -> List[
                           "instructions": f"Write {f} as the task asks: everything the task says about {f}."})
             have.add(f)
     return parts
+
+
+def cap_parts(parts: List[dict], max_parts: int, log=lambda m: None) -> List[dict]:
+    """At most ``max_parts`` parts: the others join the last one kept. (A slice dropped them, and the files the task
+    named past --parts were never written: cover puts them last, and no agent was allowed to touch them, so the
+    check could never pass.)"""
+    n = max(1, max_parts)
+    if len(parts) <= n:
+        return parts
+    kept, rest = [dict(p) for p in parts[: n - 1]], parts[n - 1:]
+    last = n - 1
+    files = list(dict.fromkeys(f for p in rest for f in p["files"]))
+    merged = {"title": "; ".join(p["title"] for p in rest), "files": files,
+              "needs": sorted({d for p in rest for d in p.get("needs", []) if d < last}),
+              "instructions": "\n".join(p["instructions"] for p in rest)}
+    for p in kept:  # a part that needed one of those needs the merged part
+        p["needs"] = sorted({d if d < last else last for d in p.get("needs", [])})
+    log(f"  {len(parts)} parts for at most {n}: the last {len(rest)} are done as one ({', '.join(files)})")
+    return kept + [merged]
 
 
 def tests_after_code(parts: List[dict]) -> List[dict]:
@@ -555,7 +603,7 @@ class _Checks:
         with self.sem:
             if stop is not None and stop.is_set():
                 return False, "(not checked: another one passed)"
-            tmp = Path(tempfile.mkdtemp(prefix="locals-cand-")) / "w"
+            tmp = _live(Path(tempfile.mkdtemp(prefix="locals-cand-"))) / "w"
             names = {str(tmp.parent.resolve() / "w"), str(tmp)}
             try:
                 shutil.copytree(self.team.ws, tmp, symlinks=True, ignore=shutil.ignore_patterns(*_COPY_SKIP))
@@ -564,7 +612,7 @@ class _Checks:
                     limit = max(30.0, 4 * statistics.median(self.secs)) if self.secs else 120.0
                 ok, out, secs = run_check(self.team.race.check, tmp, timeout=limit, keep=8000)
             finally:
-                shutil.rmtree(tmp.parent, ignore_errors=True)
+                _gone(tmp.parent)
         with self.lock:
             self.secs.append(secs)
         for n in sorted(names, key=len, reverse=True):
@@ -934,7 +982,7 @@ def _agent_repair(team, task: str, parts: List[dict], cur: List[Dict[str, str]],
     team.states.clear()
 
     def one(j, i, files):
-        ws = r.run_dir / f"fix{k}-{j}"
+        ws = _live(r.run_dir / f"fix{k}-{j}")
         shutil.rmtree(ws, ignore_errors=True)
         shutil.copytree(team.ws, ws, symlinks=True, ignore=shutil.ignore_patterns(*_COPY_SKIP), ignore_dangling_symlinks=True)
         copies[j] = ws
@@ -985,7 +1033,7 @@ def _agent_repair(team, task: str, parts: List[dict], cur: List[Dict[str, str]],
         tried = {c for c, _, _ in results} | {(0,) * n}
         results += _search(options, checks, tried, [((0,) * n, False, out)] + results)
     for ws in copies.values():  # their files are in options now; the copies were left in the run's folder
-        shutil.rmtree(ws, ignore_errors=True)
+        _gone(ws)
     return {"todo": todo, "agents": [runs[j] for j in sorted(runs)], "options": options, "results": results}
 
 
@@ -1010,7 +1058,8 @@ def solve_with_plan(race, project: Path, task: str, base_url: str, max_parts: in
     from .solve import Attempt, manifest
 
     t0 = time.time()
-    parts = tests_after_code(make_plan(base_url, race.model, task, project_digest(project), project=project, log=log)[:max_parts])
+    parts = tests_after_code(cap_parts(make_plan(base_url, race.model, task, project_digest(project), project=project, log=log),
+                                       max_parts, log))
     if not parts:
         raise RuntimeError("no plan: the model's plan did not parse and the task names no code files")
     log(f"  plan ({time.time() - t0:.0f}s): " + "; ".join(f"[{i}] {p['title']} -> {', '.join(p['files'])}"

@@ -33,7 +33,7 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .plan import (_COPY_SKIP, _DEF, asks_test_changes, _best, _blame, _check_all, _Checks, _is_test, _key, _merge, _names, _put, _score,
+from .plan import (_COPY_SKIP, _DEF, asks_test_changes, cap_parts, _best, _blame, _check_all, _Checks, _is_test, _key, _merge, _names, _put, _score,
                    _search, make_plan, project_digest, tests_after_code)
 from .solve import SKIP_DIRS, read_source, run_check, run_shell, write_source
 
@@ -605,7 +605,7 @@ class Run:
     def plan(self) -> List[dict]:
         t0 = time.time()
         parts = make_plan(self.base_url, self.model, self.task, project_digest(self.project), project=self.project, log=self.log)
-        parts = self._owned(parts[: self.max_parts] if parts else [])
+        parts = self._owned(cap_parts(parts, self.max_parts, self.log) if parts else [])
         parts = tests_after_code(parts) if parts else []
         if not parts:  # nothing to split: one part, every file the agent decides (normalize drops parts without files)
             parts = [{"title": "the whole task", "files": [], "instructions": "Do the whole task.", "needs": []}]

@@ -188,7 +188,8 @@ def cleanup_stale_runs(project: Path, root: Path) -> int:
         except (OSError, ValueError):  # no pid file (an older run, or done) or a dead one
             if not (run / "pid").exists():
                 continue
-        for ws in [d for d in run.iterdir() if d.is_dir() and d.name[:1] in ("a", "c", "p")]:  # aN, checkN, probeN
+        for ws in [d for d in run.iterdir() if d.is_dir() and (d.name[:1] in ("a", "c", "p") or d.name.startswith("fix"))]:
+            # aN, checkN, probeN, precheck, plan; fixK-J (a --plan repair agent's copy)
             remove_workspace(project, ws, "worktree" if (ws / ".git").is_file() else "copy")  # (a worktree: older runs)
             removed += 1
         (run / "pid").unlink(missing_ok=True)
@@ -745,9 +746,11 @@ def cmd_solve(args) -> None:
         if getattr(args, "plan_agents", False):
             plan = f"the task split into at most {args.parts} parts that agents do at once, then the check and {args.fixes} fix(es)"
         else:
+            # (it said "and an agent" whatever --fixes was: round 1 rewrites the parts at fault, agents come from round 2)
+            rounds = ("no repair" if args.fixes < 1 else "one repair round, a rewrite of the parts at fault" if args.fixes == 1
+                      else f"up to {args.fixes} repair rounds, a rewrite of the parts at fault, then agents that run the code")
             plan = (f"the task split into at most {args.parts} parts, {getattr(args, 'samples', 0) or 'two or three'} version(s) "
-                    f"of each written at once in one batch, the check picks a combination that passes; then up to "
-                    f"{args.fixes} repair round(s) and an agent")
+                    f"of each written at once in one batch, the check picks a combination that passes; then {rounds}")
     else:
         plan = (f"{args.start} agent(s) at the start" + (f", another every {args.hedge:.0f}s without a result" if args.hedge > 0 else "")
                 + f", {args.burst} fresh one(s) told what failed for each that fails, {max(args.n, args.start)} at once and "

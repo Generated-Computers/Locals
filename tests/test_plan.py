@@ -487,3 +487,45 @@ def test_a_bare_file_name_is_the_existing_file_in_a_subfolder(tmp_path):
     assert [p["files"] for p in cover([], "fix the bug in parser.py", tmp_path)] == [["src/mylib/parser.py"]]
     assert [p["files"] for p in cover([], "add a helper to util.py and write report.py", tmp_path)] == [["report.py"]]
     assert [p["files"] for p in cover([], "write new.py", tmp_path)] == [["new.py"]]
+
+
+def test_files_the_task_names_past_the_part_cap_are_still_planned(tmp_path):
+    """make_plan gives a part per named file, and the cap cut the last ones off: g.py and main.py were never
+    written, no agent could touch them, and the check could never pass."""
+    task = "Write a.py, b.py, c.py, d.py, e.py, f.py, g.py and main.py, which uses them all."
+    parts = plan.make_plan("http://x", "m", task, "", project=tmp_path)
+    assert len(parts) == 8
+    capped = plan.cap_parts(parts, 6)
+    assert len(capped) == 6 and [f for p in capped for f in p["files"]] == [f for p in parts for f in p["files"]]
+    assert capped[-1]["files"] == ["f.py", "g.py", "main.py"]
+    deps = [{"title": f"p{i}", "files": [f"{i}.py"], "instructions": "", "needs": n}
+            for i, n in enumerate([[], [3], [0], [1], [2]])]
+    capped = plan.cap_parts(deps, 3)  # parts 2-4 become one: who needed 3 needs it; its own needs inside it go
+    assert [p["needs"] for p in capped] == [[], [2], [0, 1]]
+    assert plan.cap_parts(parts, 8) is parts
+
+
+def test_a_candidates_copy_is_removed_when_the_run_is_stopped(tmp_path):
+    """Ctrl-C while a candidate's check ran: the copy is made in a daemon thread, whose finally never ran, and each
+    stop left a whole copy of the project in the temporary folder."""
+    import os
+    import subprocess
+    import sys
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "a.py").write_text("x = 0\n")
+    child = (
+        "import sys, threading, time\n"
+        "from pathlib import Path\n"
+        "from types import SimpleNamespace\n"
+        "from locals import plan\n"
+        "team = SimpleNamespace(ws=Path(sys.argv[1]), race=SimpleNamespace(check='sleep 30'))\n"
+        "threading.Thread(target=plan._Checks(team), args=({'a.py': 'x = 1'},), daemon=True).start()\n"
+        "time.sleep(1)\n"
+        "print(*plan._LIVE_DIRS, flush=True)\n"
+        "raise KeyboardInterrupt\n")
+    p = subprocess.run([sys.executable, "-c", child, str(ws)], capture_output=True, text=True, timeout=60,
+                       cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    copy = p.stdout.strip()
+    assert "locals-cand-" in copy and not os.path.exists(copy)

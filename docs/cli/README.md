@@ -436,7 +436,7 @@ These commands are parsed in `app.py`. Both also accept the server options above
 | `--burst` | 1 | Fresh agents per failure. |
 | `--attempts` | 5 | |
 | `--hedge` | 0 | Seconds without a result before one more agent starts. |
-| `--fixes` | 1 | |
+| `--fixes` | 1 | Times an agent sees its failed check and fixes it. With `--plan`: repair rounds; the first rewrites the parts at fault, the next ones are agents that run the code (`plan._agent_repair`), so agents need `--fixes 2` or more. |
 | `--agent` | `coder` | |
 | `--timeout` | 600 | Seconds per attempt. |
 | `--keep` | off | Keep the attempts' workspaces. |

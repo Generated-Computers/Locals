@@ -319,7 +319,8 @@ def test_stale_runs_of_other_projects_are_left_alone(tmp_path):
         return d
 
     mine, old = run("app-20261021-010101", app), run("app-20261020-010101")
+    (mine / "fix1-0").mkdir()  # a --plan repair agent's copy of the project
     v2, other = run("app-v2-20261021-010101"), run("app-20261021-020202", tmp_path / "elsewhere" / "app")
-    assert cleanup_stale_runs(app, root) == 2
-    assert not (mine / "a0").exists() and not (old / "a0").exists()
+    assert cleanup_stale_runs(app, root) == 3
+    assert not (mine / "a0").exists() and not (old / "a0").exists() and not (mine / "fix1-0").exists()
     assert (v2 / "a0").exists() and (other / "a0").exists()
