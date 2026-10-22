@@ -86,6 +86,9 @@
   46, about 68,000) is taken in float32 and scaled by a power of 2. It is closer to a float32 run than bfloat16
   (logit error median 0.77 against 2.0) and a 4,096-token prompt pass takes 8.0 s instead of 10.1. A model that
   keeps its values in float16's range says so (``float16_safe``) and skips the runtime's dtype probe.
+- A sliding layer of Flint attends over a long pass in blocks of 256 queries, each over the keys its window reaches
+  (the same softmax): 11.6 ms a layer over 4,096 tokens instead of 57 with the window as a mask over every key. A
+  4,096-token prompt pass takes 6.9 s (10.9 before these changes).
 - LOCALS_EXPERT_RAM_GB: experts Flint evicts from the GPU are kept in memory outside the GPU's share, purgeable
   (macOS takes it back before it would swap), and a later miss copies them back instead of reading the SSD.
 - Experts are read the most urgent first, the parts of one expert at once, bypassing macOS's file cache (which

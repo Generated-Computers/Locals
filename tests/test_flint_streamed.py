@@ -394,3 +394,24 @@ def test_float16_keeps_a_swiglu_product_past_its_range():
     assert not bool(mx.all(mx.isfinite(down(flint.swiglu(g.astype(mx.float16), u.astype(mx.float16))))))  # (plain float16)
     for a, b in zip(got.astype(mx.float32), want):  # (float16's own rounding of the weights, per row)
         assert float(mx.max(mx.abs(a - b))) <= 0.02 * float(mx.max(mx.abs(b)))
+
+
+def test_a_sliding_layers_long_pass_attends_in_blocks_over_each_ones_window(tiny, monkeypatch):
+    """Over a pass longer than two blocks of queries, a sliding layer's attention runs block by block over the keys
+    each block's window reaches (the mask's slices): what one attention over all the keys with the mask gives, in
+    one pass and in passes through the rotating cache (whose keys then start with the window before)."""
+    model, _ = tiny
+    tokens = mx.array([[3, 17, 42, 5, 88, 9, 61, 2, 33, 70, 11, 4, 19, 23, 7, 50, 64, 31, 8, 90]])
+    monkeypatch.setattr(flint, "WINDOW_BLOCK", 10 ** 6)
+    one = model(tokens)
+    cache = model.make_cache()
+    chunks = [model(tokens[:, :9], cache=cache), model(tokens[:, 9:], cache=cache)]
+    windowed = []
+    attn = flint.Attention._windowed
+    monkeypatch.setattr(flint.Attention, "_windowed", lambda self, *a: windowed.append(1) or attn(self, *a))
+    monkeypatch.setattr(flint, "WINDOW_BLOCK", 3)
+    assert mx.allclose(model(tokens), one, atol=1e-5).item()
+    cache = model.make_cache()
+    got = [model(tokens[:, :9], cache=cache), model(tokens[:, 9:], cache=cache)]
+    assert all(mx.allclose(a, b, atol=1e-5).item() for a, b in zip(got, chunks))
+    assert windowed

@@ -48,6 +48,7 @@ OPTIMISTIC = os.environ.get("LOCALS_FLINT_OPTIMISTIC") or "auto"
 OPTIMISTIC = "auto" if OPTIMISTIC == "1" else OPTIMISTIC
 KEEP_GPU_BUSY = os.environ.get("LOCALS_KEEP_GPU_BUSY", "1") != "0"  # while a pass waits for reads (ExpertStore._wait)
 DECAY = 0.5 ** (1 / 32)  # an expert's use counts half as much 32 passes over its layer later (which slot to take)
+WINDOW_BLOCK = 256  # queries a sliding layer's attention takes at once over a long pass (Attention._windowed)
 WHOLE = 96  # a pass that needs more of a layer's 256 experts (reading a prompt) reads the layer's expert tensors whole
 _PARTS = [(p, k) for p in ("gate_proj", "up_proj", "down_proj") for k in ("weight", "scales", "biases")]
 
@@ -89,6 +90,7 @@ class Attention(nn.Module):
         self.softmax_offset = mx.zeros((self.n_heads,))  # the sink logit of each head
         self.rope = None if layer in set(args.no_rope_layer_indices) else nn.RoPE(d, traditional=False, base=args.rope_theta)
         self.scale = d ** -0.5
+        self.window = args.sliding_window if args.layer_types[layer] == "sliding_attention" else None
 
     def __call__(self, x: mx.array, mask=None, cache=None) -> mx.array:
         B, L, _ = x.shape
@@ -100,8 +102,26 @@ class Attention(nn.Module):
             q, k = self.rope(q, offset=offset), self.rope(k, offset=offset)
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
-        out = scaled_dot_product_attention(q, k, v, cache=cache, scale=self.scale, mask=mask, sinks=self.softmax_offset)
+        if self.window is not None and isinstance(mask, mx.array) and L >= 2 * WINDOW_BLOCK:
+            out = self._windowed(q, k, v, mask)
+        else:
+            out = scaled_dot_product_attention(q, k, v, cache=cache, scale=self.scale, mask=mask, sinks=self.softmax_offset)
         return self.o_proj(out.transpose(0, 2, 1, 3).reshape(B, L, -1))
+
+    def _windowed(self, q: mx.array, k: mx.array, v: mx.array, mask: mx.array) -> mx.array:
+        """A sliding layer's attention over many queries, in blocks of WINDOW_BLOCK queries, each over the keys its
+        window reaches: the mask leaves a query's other keys out, so this is the same softmax (bit for bit on the
+        M2 Pro). One call with the window as a mask array computes every query against every key: over a
+        4,096-token pass 57 ms a layer, in blocks of 256 queries 11.6 ms. The queries are the keys' last L."""
+        L, T = q.shape[2], k.shape[2]
+        outs = []
+        for s in range(0, L, WINDOW_BLOCK):
+            e = min(L, s + WINDOW_BLOCK)
+            k0 = max(0, T - L + s - (self.window - 1))  # the first key the block's first query reaches
+            k1 = T - L + e
+            outs.append(mx.fast.scaled_dot_product_attention(q[:, :, s:e], k[:, :, k0:k1], v[:, :, k0:k1], scale=self.scale,
+                                                             mask=mask[..., s:e, k0:k1], sinks=self.softmax_offset))
+        return mx.concatenate(outs, axis=2)
 
 
 class MLP(nn.Module):
@@ -339,9 +359,10 @@ class _Reader:
 class _Layer:
     """One MoE layer's slots: which expert each holds, the reads under way, and how much each expert was used."""
 
-    __slots__ = ("arrays", "dst", "addr", "where", "free", "fills", "fresh", "score", "unit")
+    __slots__ = ("arrays", "dst", "addr", "where", "free", "fills", "fresh", "score", "unit", "n")
 
     def __init__(self, arrays: list, dst: list, addr: list, slots: int, experts: int):
+        self.n = slots
         self.arrays, self.dst = arrays, dst  # the nine slot arrays; dst[slot]: where each part of a slot is written
         self.addr = addr  # addr[slot]: the address of each part of the slot
         self.where = {}  # expert -> its slot (read, or being read)
@@ -652,10 +673,10 @@ class ExpertStore:
     def begin(self, layer: int, experts: list, dtype):
         """Like in_slots, without waiting: (the nine slot arrays, each expert's slot, the experts whose reads are
         under way). Their slots are usable once ``finish`` returns; the others' at once."""
-        if len(experts) > self.slots:
-            return None
         arrs = self._slot_arrays(layer)
         L = self.layers[layer]
+        if len(experts) > L.n:  # (the layer's slots as made: ``slots`` may have changed since; reset() remakes them)
+            return None
         wanted = set(experts)
         for e, f in list(L.fills.items()):  # guesses this pass's routing did not confirm: dropped if not started
             if e not in wanted:
