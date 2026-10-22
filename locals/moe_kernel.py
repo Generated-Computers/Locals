@@ -241,6 +241,11 @@ def switch_glu(x: mx.array, inds: mx.array, gate, up, down, mode: str, gsize: in
 
 ENABLED = __import__("os").environ.get("LOCALS_MOE_KERNEL", "1") != "0"
 MAX_ROWS = 64  # tokens of a step the grouped kernels take (decoding several requests); longer passes: MLX's
+# Pairs an expert has, on average, up to which the grouped kernels win: MLX's gather_qmm sorts a step's pairs by
+# expert from 64 of them and runs its tiled kernel, which fills its tiles from about 5 tokens an expert. On the M2
+# Pro the grouped kernels were 1.2-1.45x faster up to 4 an expert (64 mxfp4 experts, 8 a token: 32 requests; 128
+# affine experts: 64) and 0.71x at 6.
+MAX_PER_EXPERT = 4.5
 
 
 def _mats(glu) -> Optional[tuple]:
@@ -264,7 +269,7 @@ class GroupedSwitchGLU:
 
     def __call__(self, x, indices):
         rows = x.size // x.shape[-1]
-        if rows <= MAX_ROWS and indices.size <= 512:
+        if rows <= MAX_ROWS and indices.size <= 512 and indices.size / self.gate_proj["weight"].shape[0] <= MAX_PER_EXPERT:
             got = _mats(self)
             if got is not None:
                 (gate, up, down), (mode, gsize) = got

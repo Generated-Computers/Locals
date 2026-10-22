@@ -102,8 +102,9 @@
 - Mixture-of-experts models decode several requests at once with each expert read and decoded once a step: the
   step's (token, expert) pairs grouped by expert, one threadgroup per used expert and block of its rows (MLX's
   affine 4-bit and mxfp4). On the M2 Pro with Mellum2.1-12B-A2.5B (64 experts, 8 a token) 16 requests decode at
-  189 tokens per second together against 146 with mlx-lm's batch_generate (1.30x), 4 at 131 against 115; one
-  request as before (86 against 85.5). LOCALS_MOE_KERNEL=0: MLX's kernels.
+  187 tokens per second together against 142 with mlx-lm's batch_generate (1.32x), 4 at 131 against 115; one
+  request as before (86 against 85.5). From about 5 tokens an expert MLX's sorted kernel fills its tiles and is
+  used instead (64 requests: 367 against mlx-lm's 291). LOCALS_MOE_KERNEL=0: MLX's kernels.
 - A model can set its own prompt passes (HybridBatchEngine.prefill_tokens).
 
 ## 0.2.1 (2026-10-21)
