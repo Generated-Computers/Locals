@@ -79,6 +79,13 @@
   that missed one (its later layers' KV caches restored). With every expert on the GPU, a token takes 20 ms
   instead of 31 (50 tokens per second on the M2 Pro). Steps switch to it when 90% of the layers find their
   experts (LOCALS_FLINT_OPTIMISTIC: auto, always, 0).
+- Flint reads a prompt's layers into two reused buffers, the next layer while the GPU computes this one, and copies
+  the experts already on the GPU instead of reading them: a 1,024-token pass after some decoding, 5.4 s instead of
+  6.9. Its GPU memory holds the files' bytes in every compute dtype, converted on the GPU when used.
+- On M1 and M2 Flint computes in float16: its one value past float16's range (an expert's SwiGLU product in layer
+  46, about 68,000) is taken in float32 and scaled by a power of 2. It is closer to a float32 run than bfloat16
+  (logit error median 0.77 against 2.0) and a 4,096-token prompt pass takes 8.0 s instead of 10.1. A model that
+  keeps its values in float16's range says so (``float16_safe``) and skips the runtime's dtype probe.
 - LOCALS_EXPERT_RAM_GB: experts Flint evicts from the GPU are kept in memory outside the GPU's share, purgeable
   (macOS takes it back before it would swap), and a later miss copies them back instead of reading the SSD.
 - Experts are read the most urgent first, the parts of one expert at once, bypassing macOS's file cache (which

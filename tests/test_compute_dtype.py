@@ -55,3 +55,23 @@ def test_fp16_close_to_bf16_is_kept_without_a_float32_run(monkeypatch):
     monkeypatch.setattr(runtime, "_fp16_special", lambda model: False)
     m = Counting(by)
     assert runtime.set_compute_dtype(m, "auto") == "float16" and mx.float32 not in calls
+
+
+def test_a_model_that_declares_itself_float16_safe_takes_fp16_without_the_probe(monkeypatch):
+    """A model that keeps its own values in float16's range (Flint) says so: fp16 without running the model, even
+    where the probe would keep bf16 or its source mentions float16; on a GPU with native bf16 the probe decides."""
+    by = {mx.bfloat16: [22.0, 1, 0, 0], mx.float16: [26.0, 1, 0, 0], mx.float32: [22.1, 1, 0, 0]}  # the probe: bf16
+
+    class Safe(_Model):
+        float16_safe = True
+
+        def __call__(self, ids):
+            raise AssertionError("the probe ran")
+
+    monkeypatch.setattr(runtime, "native_bf16", lambda: False)
+    monkeypatch.setattr(runtime, "_fp16_special", lambda model: True)
+    m = Safe(by)
+    assert runtime.set_compute_dtype(m, "auto") == "float16" and m.w.dtype == mx.float16
+    monkeypatch.setattr(runtime, "native_bf16", lambda: True)
+    m = Safe(by)
+    assert runtime.set_compute_dtype(m, "auto") == "bfloat16" and m.w.dtype == mx.bfloat16

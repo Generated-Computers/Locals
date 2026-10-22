@@ -115,6 +115,12 @@ class MLP(nn.Module):
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
+def converted(arrs: list, dtype) -> list:
+    """Nine expert arrays (weights, scales, biases of gate, up, down) with the scales and biases in ``dtype`` (on the
+    GPU, when used): for MLX's quantized products, which take them in the input's type."""
+    return [a if i % 3 == 0 or a.dtype == dtype else a.astype(dtype) for i, a in enumerate(arrs)]
+
+
 class _Fill:
     """One expert's read into its slot: four reads (its three 4-bit weight arrays, then its six scales and biases)
     that reader threads take in turn, so the parts of one expert are read at once."""
@@ -139,17 +145,6 @@ def _pread(fd: int, dst: memoryview, offset: int) -> None:
         if n <= 0:
             raise OSError(errno.EIO, f"the weight file ends {len(dst)} bytes into an expert")
         dst, offset = dst[n:], offset + n
-
-
-_BF16_TO_F16: Optional[np.ndarray] = None  # float16 bits of each bfloat16 bit pattern
-
-
-def _bf16_to_f16() -> np.ndarray:
-    global _BF16_TO_F16
-    if _BF16_TO_F16 is None:
-        with np.errstate(over="ignore", invalid="ignore"):  # (NaN patterns stay NaN)
-            _BF16_TO_F16 = (np.arange(1 << 16, dtype=np.uint32) << 16).view(np.float32).astype(np.float16).view(np.uint16)
-    return _BF16_TO_F16
 
 
 _LIBC = None
@@ -301,7 +296,6 @@ class _Reader:
             self.cv.notify_all()
 
     def _work(self) -> None:
-        scratch = {}  # size -> a buffer for reads converted on the way (bf16 to float16)
         while True:
             with self.cv:
                 while not self.heap:
@@ -326,17 +320,11 @@ class _Reader:
                 guess = fill.guess
                 self.running_guesses += guess
             try:
-                for fd, offset, dst, conv in task:
+                for fd, offset, dst, n in task:
                     if fd < 0:  # a copy in memory: (-1, destination, source, bytes)
-                        _libc().memcpy(offset, dst, conv)
-                    elif conv is None:  # the file's bytes as they are
+                        _libc().memcpy(offset, dst, n)
+                    else:  # (fd, offset, destination, None): the file's bytes as they are
                         _pread(fd, dst, offset)
-                    else:  # bf16 in the file, float16 in the slot
-                        buf = scratch.get(conv.size)
-                        if buf is None:
-                            buf = scratch[conv.size] = np.empty(conv.size, dtype=np.uint16)
-                        _pread(fd, memoryview(buf).cast("B"), offset)
-                        np.take(_bf16_to_f16(), buf, out=conv)
             except Exception as e:  # noqa: BLE001 (the waiting pass raises it)
                 fill.error = e
             with self.cv:
@@ -391,18 +379,16 @@ class ExpertStore:
         self.ready = self.passes = 0  # MoE blocks of decode passes, and those that found every expert in a slot
         self.spec = {}  # (layer, part) -> (file descriptor, start, bytes per expert, shape per expert, dtype)
         self.where = {}  # tensor name -> its file
-        self.ranges = {}  # layer -> [(file descriptor, start, bytes)] of its expert tensors (read through the file cache)
         self.experts = {}  # layer -> experts in its tensors
-        self.warming = set()
         self.fds = []
         for f in sorted(folder.glob("model*.safetensors")):
             with open(f, "rb") as fh:
                 n = struct.unpack("<Q", fh.read(8))[0]
                 header = json.loads(fh.read(n))
-            fd, cached = os.open(f, os.O_RDONLY), os.open(f, os.O_RDONLY)
+            fd = os.open(f, os.O_RDONLY)
             if hasattr(fcntl, "F_NOCACHE"):
                 fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
-            self.fds += [fd, cached]
+            self.fds.append(fd)
             for name, t in header.items():
                 if name == "__metadata__" or ".mlp.switch_mlp." not in name:
                     continue
@@ -412,18 +398,20 @@ class ExpertStore:
                 experts = t["shape"][0]
                 self.spec[(layer, (proj, kind))] = (fd, 8 + n + begin, (end - begin) // experts, t["shape"][1:], t["dtype"])
                 self.where[name] = f
-                self.ranges.setdefault(layer, []).append((cached, 8 + n + begin, end - begin))
                 self.experts[layer] = experts
-        self.pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="locals-experts")  # stacked() and warm()
+        self.pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="locals-experts")  # stacked()
         self.reader = _Reader(readers, GUESS_READS)
         layers = sorted(self.experts)
         per = self.expert_bytes(layers[0]) if layers else 1
         self.slots = max(1, min(min(self.experts.values(), default=1), budget_bytes // max(1, per * len(layers))))
-        self.dtype = None
         self.arrays = {}  # layer -> its nine slot arrays (made on first use, in the compute dtype)
         self.layers = {}  # layer -> its _Layer
         self.uses = {}  # layer -> results computed from its slots, maybe not yet evaluated (see fence)
         self._filler = None  # (x, w) of the product that keeps the GPU busy while a pass waits for reads (_wait)
+        self._sets = None  # two sets of a whole layer's expert tensors, for passes over prompts (whole)
+        self.buf_of = {}  # layer -> (set, its read): a layer read into a set ahead of its pass
+        self.buf_uses = {}  # set -> results computed from it, maybe not yet evaluated
+        self._used_set = 0
         ram = int(ram_bytes // max(1, per)) if layers and _libc() is not None else 0
         self.ram = _RamCache(per, ram) if ram > 0 else None  # experts evicted from the slots, in the Mac's memory
 
@@ -458,10 +446,25 @@ class ExpertStore:
         """GPU memory of the slots once every layer's are made."""
         return sum(self.slots * self.expert_bytes(layer) for layer in self.experts)
 
-    def reserve(self, dtype) -> None:
+    def reset(self) -> None:
+        """Every slot emptied and made again on next use (with ``slots`` as it is then)."""
+        for L in self.layers.values():
+            for f in list(L.fills.values()):
+                self.reader.cancel(f)
+                f.done.wait()
+        if self.ram is not None:
+            self.ram.clear()
+        had = bool(self.arrays)
+        self.arrays.clear()
+        self.layers.clear()
+        self.uses.clear()
+        if had:  # (the old slots back to macOS now, not kept in MLX's pool next to the new ones)
+            mx.clear_cache()
+
+    def reserve(self, dtype=None) -> None:
         """Make every layer's slots now (so the memory they take is in use from the start)."""
         for layer in sorted(self.experts):
-            self._slot_arrays(layer, dtype)
+            self._slot_arrays(layer)
 
     def _raw(self, layer: int, e: int) -> np.ndarray:
         """An expert's nine arrays as one buffer (read straight into it)."""
@@ -487,47 +490,28 @@ class ExpertStore:
             parts.append(a)
         return parts
 
-    def _slot_arrays(self, layer: int, dtype) -> list:
-        if self.dtype is None or self.dtype != dtype:  # first use, or the runtime changed the compute dtype (its probe)
-            for L in self.layers.values():
-                for f in list(L.fills.values()):
-                    self.reader.cancel(f)
-                    f.done.wait()
-            if self.ram is not None:  # (its experts are in the old dtype's form)
-                self.ram.clear()
-            had = bool(self.arrays)
-            self.arrays.clear()
-            self.layers.clear()
-            self.uses.clear()
-            if had:  # the old slots back to macOS now: kept in MLX's pool, they and the new ones took twice the memory
-                mx.clear_cache()
-            self.dtype = dtype
+    def _slot_arrays(self, layer: int, dtype=None) -> list:
+        """The layer's nine slot arrays, made on first use: the files' bytes as they are (4-bit weights in MLX's
+        32-bit words, bfloat16 scales and biases), whatever the compute dtype; kernels read them as they are and
+        MLX's ops convert them on the GPU (``converted``)."""
         arrs = self.arrays.get(layer)
         if arrs is None:
             arrs, host = [], []
             for part in _PARTS:
                 size, shape, kind = self.spec[(layer, part)][2:]
-                if kind == "U8":  # 4-bit weights: the file's bytes are MLX's packing in 32-bit words
+                if kind == "U8":
                     a = mx.zeros((self.slots, shape[0], size // shape[0] // 4), dtype=mx.uint32)
                     mx.eval(a)
-                    arrs.append(a)
-                    host.append((np.asarray(memoryview(a)), False))
-                elif dtype == mx.bfloat16:  # the file's bf16 as they are: 16-bit slots seen as bfloat16
+                    h = np.asarray(memoryview(a))
+                else:  # BF16: 16-bit slots seen as bfloat16
                     raw = mx.zeros((self.slots, *shape), dtype=mx.uint16)
                     a = raw.view(mx.bfloat16)
                     mx.eval(raw, a)
-                    arrs.append(a)
-                    host.append((np.asarray(memoryview(raw)), False))
-                else:  # another compute dtype (float16 on M1/M2): converted as it is read
-                    a = mx.zeros((self.slots, *shape), dtype=dtype)
-                    mx.eval(a)
-                    arrs.append(a)
-                    host.append((np.asarray(memoryview(a)), dtype == mx.float16))
-            if any(conv is False and h.dtype not in (np.uint32, np.uint16) for h, conv in host):
-                raise TypeError(f"Flint's experts are read into bfloat16 or float16 slots, not {dtype}")
-            dst = [[(memoryview(h[s]).cast("B"), h[s].view(np.uint16).reshape(-1) if conv else None) for h, conv in host]
-                   for s in range(self.slots)]
-            addr = [[h[slot].ctypes.data for h, _ in host] for slot in range(self.slots)]
+                    h = np.asarray(memoryview(raw))
+                arrs.append(a)
+                host.append(h)
+            dst = [[memoryview(h[s]).cast("B") for h in host] for s in range(self.slots)]
+            addr = [[h[slot].ctypes.data for h in host] for slot in range(self.slots)]
             self.arrays[layer] = arrs
             self.layers[layer] = _Layer(arrs, dst, addr, self.slots, self.experts[layer])
         return arrs
@@ -635,8 +619,7 @@ class ExpertStore:
             if got is not None:
                 item = (-1, L.addr[s][j], got + o, size)
             else:
-                mv, conv = L.dst[s][j]
-                item = (fd, start + e * size, mv, conv)
+                item = (fd, start + e * size, L.dst[s][j], None)
             tasks[j // 3 if j % 3 == 0 else 3].append(item)
             o += size
         f = self.reader.submit(layer, tasks, guess)
@@ -647,7 +630,7 @@ class ExpertStore:
     def table(self, layer: int, dtype) -> mx.array:
         """The layer's slot of each expert, -1 for one without a slot or still being read (int32, on the GPU): for
         a pass that looks its experts up itself (Model's optimistic decode)."""
-        self._slot_arrays(layer, dtype)
+        self._slot_arrays(layer)
         L = self.layers[layer]
         self._settle(L)
         t = np.full(self.experts[layer], -1, dtype=np.int32)
@@ -671,7 +654,7 @@ class ExpertStore:
         under way). Their slots are usable once ``finish`` returns; the others' at once."""
         if len(experts) > self.slots:
             return None
-        arrs = self._slot_arrays(layer, dtype)
+        arrs = self._slot_arrays(layer)
         L = self.layers[layer]
         wanted = set(experts)
         for e, f in list(L.fills.items()):  # guesses this pass's routing did not confirm: dropped if not started
@@ -730,7 +713,7 @@ class ExpertStore:
     def stacked(self, layer: int, experts: list, dtype) -> list:
         """The nine arrays of ``experts`` (in this order), each stacked along a first axis: for a pass that needs
         more experts than a layer has slots. Those in slots are taken from there; nothing is kept."""
-        L = self.layers.get(layer) if self.dtype is not None and self.dtype == dtype else None
+        L = self.layers.get(layer)
         where = {}
         if L is not None:
             for e in experts:
@@ -746,42 +729,97 @@ class ExpertStore:
         self.misses += len(raw)
         cols = [[] for _ in _PARTS]
         for e in experts:
-            parts = [a[where[e]] for a in L.arrays] if e in where else self._arrays(layer, raw[e], dtype)
+            parts = converted([a[where[e]] for a in L.arrays], dtype) if e in where else self._arrays(layer, raw[e], dtype)
             for c, part in zip(cols, parts):
                 c.append(part)
         return [mx.stack(c) for c in cols]
 
+    def _layer_set(self) -> list:
+        """Two sets of a whole layer's nine expert tensors (every expert, the files' bytes), made once: whole() reads
+        a layer into one while the GPU computes the layer before from the other."""
+        if self._sets is None:
+            layer = sorted(self.experts)[0]
+            E = self.experts[layer]
+            sets = []
+            for _ in range(2):
+                arrs, dst = [], []
+                for part in _PARTS:
+                    size, shape, kind = self.spec[(layer, part)][2:]
+                    if kind == "U8":
+                        a = mx.zeros((E, shape[0], size // shape[0] // 4), dtype=mx.uint32)
+                        mx.eval(a)
+                        h = np.asarray(memoryview(a))
+                    else:
+                        raw = mx.zeros((E, *shape), dtype=mx.uint16)
+                        a = raw.view(mx.bfloat16)
+                        mx.eval(raw, a)
+                        h = np.asarray(memoryview(raw))
+                    arrs.append(a)
+                    dst.append((memoryview(h).cast("B"), h.ctypes.data))
+                sets.append((arrs, dst))
+            self._sets = sets
+        return self._sets
+
+    def _read_layer(self, layer: int, k: int) -> _Fill:
+        """Start reading ``layer``'s whole expert tensors into set ``k``, in 8 MB reads on the reader threads; the
+        experts in the layer's slots are copied from there instead (a prompt pass reads every expert, at the SSD's
+        3.3 GB/s on the M2 Pro: 6.6 s for the 21.3 GB of a pass)."""
+        _, dst = self._layer_set()[k]
+        L = self.layers.get(layer)
+        have = {e: s for e, s in L.where.items() if e not in L.fills} if L is not None else {}
+        E = self.experts[layer]
+        tasks, copies = [], []
+        chunk = 8 << 20
+        for j, part in enumerate(_PARTS):
+            fd, start, size = self.spec[(layer, part)][:3]
+            mv, base = dst[j]
+            e = 0
+            while e < E:
+                if e in have:
+                    copies.append((-1, base + e * size, L.addr[have[e]][j], size))
+                    e += 1
+                    continue
+                f = e
+                while f < E and f not in have:
+                    f += 1
+                for o in range(e * size, f * size, chunk):  # experts e to f - 1, read
+                    tasks.append([(fd, start + o, mv[o:o + min(chunk, f * size - o)], None)])
+                e = f
+        for i in range(0, len(copies), 16):  # (the copies in tasks of 16)
+            tasks.append(copies[i:i + 16])
+        return self.reader.submit(layer, tasks)
+
     def whole(self, layer: int, dtype) -> list:
-        """The layer's nine stacked expert tensors, read whole when used (MLX's lazy load of the file), for a pass
-        that needs most of the experts: not kept, and no per-expert work."""
-        loaded, out = {}, []
-        for proj, kind in _PARTS:
-            name = f"model.layers.{layer}.mlp.switch_mlp.{proj}.{kind}"
-            f = self.where[name]
-            if f not in loaded:
-                loaded[f] = mx.load(str(f))  # (its arrays are read only if evaluated: just these nine)
-            a = loaded[f][name]
-            out.append(a.view(mx.uint32) if kind == "weight" else a.astype(dtype))
-        return out
+        """The layer's nine stacked expert tensors (scales and biases in ``dtype``), for a pass that needs most of the
+        experts (reading a prompt): read into one of two reused sets while the GPU computes the layer before from the
+        other, and the next MoE layer's read started now. Direct reads into the set's memory: no buffer made per
+        layer and no copy through macOS's file cache (MLX's own load of the files took 7 s a pass over a 1,024-token
+        prompt)."""
+        sets = self._layer_set()
+        got = self.buf_of.pop(layer, None)
+        if got is None:  # (not read ahead: a pass that starts here)
+            k = 0 if all(v[0] != 0 for v in self.buf_of.values()) else 1
+            self.buf_fence(k)
+            got = (k, self._read_layer(layer, k))
+        k, fill = got
+        layers = sorted(self.experts)
+        i = layers.index(layer)
+        if i + 1 < len(layers) and layers[i + 1] not in self.buf_of:
+            self.buf_fence(1 - k)  # (the layer before's results from that set: computed before this layer's routing)
+            self.buf_of[layers[i + 1]] = (1 - k, self._read_layer(layers[i + 1], 1 - k))
+        self._wait([fill])
+        fill.wait()
+        self._used_set = k
+        return converted(sets[k][0], dtype)
 
-    def warm(self, layer: int) -> None:
-        """Read ``layer``'s expert tensors into macOS's file cache in the background, for whole() to find there."""
-        if layer not in self.ranges or layer in self.warming:
-            return
-        self.warming.add(layer)
+    def buf_used(self, result: mx.array) -> None:
+        """``result`` was computed from the set whole() last returned."""
+        self.buf_uses.setdefault(self._used_set, []).append(result)
 
-        def read():
-            buf = bytearray(8 << 20)
-            view = memoryview(buf)
-            for fd, start, size in self.ranges[layer]:
-                o = 0
-                while o < size:
-                    n = min(len(buf), size - o)
-                    os.preadv(fd, [view[:n]], start + o)
-                    o += n
-            self.warming.discard(layer)
-
-        self.pool.submit(read)
+    def buf_fence(self, k: int) -> None:
+        uses = self.buf_uses.pop(k, None)
+        if uses:
+            mx.eval(uses)
 
     def prefetch(self, layer: int, experts) -> None:
         """Start reading ``experts`` of ``layer`` into slots unless they are in one (or on their way); they are
@@ -797,6 +835,19 @@ class ExpertStore:
             L.fresh.add(e)
 
 
+def _swiglu_fp16(g: mx.array, u: mx.array, down) -> mx.array:
+    """down(swiglu(g, u)) in float16 without overflow. Flint's layer 46 makes the residual stream's massive
+    activation (about 24,000) through one expert whose SwiGLU product reaches about 68,000, past float16's 65,504:
+    the only value of the model outside its range (every other one stays under 24,000, where float16 also rounds
+    to 16 against bfloat16's 128). The product is taken in float32, and a row above 2^9 is divided by the power of
+    2 that brings it under (exactly), the down projection's output multiplied back: MLX's quantized products add a
+    group's 64 inputs in float16 (for the biases), which overflowed for inputs of 2^15 in its gather kernel."""
+    h = swiglu(g.astype(mx.float32), u.astype(mx.float32))
+    m = mx.max(mx.abs(h), axis=-1, keepdims=True)
+    scale = mx.power(2.0, mx.maximum(mx.ceil(mx.log2(mx.maximum(m, 1.0) / 512.0)), 0.0))
+    return (down((h / scale).astype(mx.float16)).astype(mx.float32) * scale).astype(mx.float16)
+
+
 class StreamedExperts(nn.Module):
     """SwitchGLU over experts the ExpertStore reads: the routed experts of this pass, stacked, and mx.gather_qmm."""
 
@@ -809,15 +860,15 @@ class StreamedExperts(nn.Module):
         mx.eval(inds)  # which experts this pass needs, before they are read
         flat = np.array(inds).reshape(-1)
         experts, inv = np.unique(flat, return_inverse=True)
-        uses_slots = False
+        uses_slots = whole = False
         if len(experts) > WHOLE:  # most of the layer's experts (reading a prompt): the layer's tensors, read whole
-            self.store.warm(self.layer + 1)
             gw, gs, gb, uw, us, ub, dw, ds, db = self.store.whole(self.layer, x.dtype)
+            whole = True
             idx = inds.astype(mx.uint32)
         else:
             got = self.store.in_slots(self.layer, experts.tolist(), x.dtype)
             if got is not None:  # decoding: the slots, indexed by each token's experts' slots
-                (gw, gs, gb, uw, us, ub, dw, ds, db), slots = got
+                (gw, gs, gb, uw, us, ub, dw, ds, db), slots = converted(got[0], x.dtype), got[1]
                 idx = mx.array(np.asarray(slots, dtype=np.uint32)[inv].reshape(inds.shape))
                 uses_slots = True
             else:  # more experts than a layer has slots (many requests at once): stacked for this pass
@@ -834,12 +885,17 @@ class StreamedExperts(nn.Module):
             return mx.gather_qmm(a, w, s, b, rhs_indices=idx, transpose=True, group_size=64, bits=4,
                                  sorted_indices=do_sort)
 
-        h = swiglu(qmm(x, gw, gs, gb), qmm(x, uw, us, ub))
-        y = qmm(h, dw, ds, db)
+        g, u = qmm(x, gw, gs, gb), qmm(x, uw, us, ub)
+        if x.dtype == mx.float16:  # (see _swiglu_fp16)
+            y = _swiglu_fp16(g, u, lambda h: qmm(h, dw, ds, db))
+        else:
+            y = qmm(swiglu(g, u), dw, ds, db)
         if do_sort:
             y = _scatter_unsort(y, inv_order, inds.shape)
         if uses_slots:
             self.store.used(self.layer, y)
+        if whole:
+            self.store.buf_used(y)
         return y.squeeze(-2)
 
 
@@ -1125,6 +1181,12 @@ class FlintModel(nn.Module):
 
 
 class Model(nn.Module):
+    # In float16 its values stay in range (_swiglu_fp16) and it is closer to a float32 run than in bfloat16 (over
+    # 1,800 positions on the M2 Pro: logit error median 0.77 against 2.0, float32's top token at 90.1% of them
+    # against 88.2%); and on GPUs without bfloat16 arithmetic (M1, M2) a 4,096-token prompt pass took 8.0 s
+    # against 10.1. Locals' runtime then takes float16 without its probe.
+    float16_safe = True
+
     # Each pass over a prompt reads every expert of a layer (about 7 s on the M2 Pro, whatever its length), so
     # prompts go in few long passes: 4096 tokens (a pass of 8192 peaked at 3.5 GB of GPU memory, too much next
     # to the slots on a 16 GB Mac). The fused attention makes no score matrix to bound (HybridBatchEngine).

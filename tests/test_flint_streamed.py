@@ -117,7 +117,10 @@ def _in_memory(model, w):
         conv = lambda n: (t(n, "weight").view(mx.uint32), t(n, "scales").astype(x.dtype), t(n, "biases").astype(x.dtype))  # noqa: E731
         xx = mx.expand_dims(x, (-2, -3))
         qmm = lambda a, n: mx.gather_qmm(a, *conv(n), rhs_indices=inds, transpose=True, group_size=64, bits=4)  # noqa: E731
-        return qmm(flint.swiglu(qmm(xx, "gate_proj"), qmm(xx, "up_proj")), "down_proj").squeeze(-2)
+        g, u = qmm(xx, "gate_proj"), qmm(xx, "up_proj")
+        if x.dtype == mx.float16:  # (the product in float32, as the model takes it in float16)
+            return flint._swiglu_fp16(g, u, lambda h: qmm(h, "down_proj")).squeeze(-2)
+        return qmm(flint.swiglu(g, u), "down_proj").squeeze(-2)
 
     return call
 
@@ -188,7 +191,7 @@ def test_few_slots_evict_without_losing_the_experts_a_pass_uses(tiny, monkeypatc
     model, w = tiny
     store = model.expert_store
     monkeypatch.setattr(store, "slots", 3)
-    store.dtype = None  # (start over: the earlier tests made slots of the default size)
+    store.reset()  # (start over: the earlier tests made slots of the default size)
     tokens = mx.array([[3, 17, 42, 5, 88, 9, 61, 2, 33]])
     cache = model.make_cache()
     got = [model(tokens[:, i:i + 1], cache=cache)[0, -1] for i in range(9)]
@@ -216,9 +219,9 @@ def test_a_pass_that_needs_most_experts_reads_the_layers_tensors_whole(tiny, mon
     assert mx.allclose(whole, model(tokens), atol=1e-4).item()
 
 
-def test_in_float16_the_reads_convert_the_scales_on_the_way_into_the_slots(tmp_path, monkeypatch):
-    """Locals computes in float16 on M1 and M2: an expert's bf16 scales and biases are converted as they are read
-    into float16 slots, and the experts give what they give in memory in float16."""
+def test_in_float16_the_slots_keep_the_files_bf16_and_the_experts_give_what_they_give_in_memory(tmp_path, monkeypatch):
+    """Locals computes in float16 on M1 and M2: the slots keep an expert's bf16 scales and biases as the files have
+    them (converted on the GPU when used), and the experts give what they give in memory in float16."""
     import mlx_lm.utils as mlx_utils
 
     w = _save(tmp_path)
@@ -227,7 +230,7 @@ def test_in_float16_the_reads_convert_the_scales_on_the_way_into_the_slots(tmp_p
     tokens = mx.array([[3, 17, 42, 5, 88, 9, 61, 2, 33]])
     cache = model.make_cache()
     got = [model(tokens[:, i:i + 1], cache=cache)[0, -1] for i in range(9)]
-    assert model.expert_store.dtype == mx.float16 and model.expert_store.arrays[1][1].dtype == mx.float16
+    assert model.expert_store.arrays[1][1].dtype == mx.bfloat16
     monkeypatch.setattr(flint.StreamedExperts, "__call__", _in_memory(model, w))
     cache = model.make_cache()
     want = [model(tokens[:, i:i + 1], cache=cache)[0, -1] for i in range(9)]
@@ -293,6 +296,7 @@ def test_the_decode_kernels_give_what_the_experts_in_memory_give(tmp_path, monke
     store = model.expert_store
     if slots:
         store.slots = slots
+        store.reset()
     tokens = [3, 17, 42, 5, 88, 9, 61, 2, 33, 70, 11, 4]
     calls = []
     route = flint.SparseMoe._route
@@ -333,8 +337,60 @@ def test_experts_evicted_to_the_ram_cache_come_back_from_it(tmp_path, monkeypatc
         store = model.expert_store
         assert (store.ram is not None) == (ram != "0")
         store.slots = 3
+        store.reset()
         cache = model.make_cache()
         runs.append([model(mx.array([[t]]), cache=cache)[0, -1] for t in tokens])
         if store.ram is not None:
             assert store.ram.puts > 50 and store.ram.hits > 50
     assert all(mx.array_equal(a, b).item() for a, b in zip(*runs))
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
+def test_a_prompt_pass_copies_the_experts_in_slots_and_reads_the_others(tmp_path, monkeypatch, dtype):
+    """A pass over a prompt reads its layers' expert tensors whole into two reused sets, the next layer while
+    the GPU computes this one; the experts decoding left in slots are copied from there instead of read. It gives
+    what the experts in memory give."""
+    import mlx_lm.utils as mlx_utils
+
+    w = _save_wide(tmp_path)
+    model, _ = mlx_utils.load_model(tmp_path)
+    model.set_dtype(dtype, predicate=lambda t: t == mx.bfloat16)
+    store = model.expert_store
+    cache = model.make_cache()
+    for t in [3, 17, 42, 5]:  # decoding fills slots
+        mx.eval(model(mx.array([[t]]), cache=cache))
+    assert any(store.layers[l].where for l in store.layers)
+    copies = []
+    read = flint.ExpertStore._read_layer
+
+    def counted(self, layer, k):
+        f = read(self, layer, k)
+        copies.append(sum(1 for task in f.tasks for item in task if item[0] < 0))
+        return f
+
+    monkeypatch.setattr(flint.ExpertStore, "_read_layer", counted)
+    monkeypatch.setattr(flint, "WHOLE", 1)
+    tokens = mx.array([[3, 17, 42, 5, 88, 9, 61, 2, 33, 70, 11, 4, 19, 23, 7, 50, 64, 31]])
+    got = model(tokens)
+    assert sum(copies) > 0
+    monkeypatch.setattr(flint.SparseMoe, "__call__", _reference_moe(model, w))
+    want = model(tokens)
+    tol = {mx.bfloat16: 0.05, mx.float16: 0.01, mx.float32: 1e-3}[dtype]
+    assert float(mx.max(mx.abs(got.astype(mx.float32) - want.astype(mx.float32)))) <= tol * (1 + float(mx.max(mx.abs(want.astype(mx.float32)))))
+
+
+def test_float16_keeps_a_swiglu_product_past_its_range():
+    """In float16 an expert's SwiGLU product past 65,504 (Flint's layer 46 reaches about 68,000) is taken in
+    float32 and scaled by a power of 2 for the down projection: finite, and what float32 gives."""
+    rng = np.random.default_rng(3)
+    w = mx.array(rng.normal(0, 0.002, (64, 128)).astype(np.float32))  # (the output stays in range, as Flint's does)
+    wq, s, b = mx.quantize(w, group_size=64, bits=4)
+    g = mx.array([[40.0] * 128, [0.5] * 128])  # silu(40) * 2000 = 80,000 in the first row
+    u = mx.array([[2000.0] * 128, [2.0] * 128])
+    down = lambda h: mx.quantized_matmul(h, wq, s.astype(h.dtype), b.astype(h.dtype), transpose=True, group_size=64, bits=4)  # noqa: E731
+    got = flint._swiglu_fp16(g.astype(mx.float16), u.astype(mx.float16), down)
+    want = down(flint.swiglu(g, u))
+    assert got.dtype == mx.float16 and bool(mx.all(mx.isfinite(got)))
+    assert not bool(mx.all(mx.isfinite(down(flint.swiglu(g.astype(mx.float16), u.astype(mx.float16))))))  # (plain float16)
+    for a, b in zip(got.astype(mx.float32), want):  # (float16's own rounding of the weights, per row)
+        assert float(mx.max(mx.abs(a - b))) <= 0.02 * float(mx.max(mx.abs(b)))

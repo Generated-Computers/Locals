@@ -176,6 +176,14 @@ def one() -> mx.array:
     return a
 
 
+def _placeholder(dtype) -> mx.array:
+    a = _CONST.get(("placeholder", dtype))
+    if a is None:
+        a = _CONST[("placeholder", dtype)] = mx.zeros((1024,), dtype=dtype)  # (one element would be a Metal constant)
+        mx.eval(a)
+    return a
+
+
 def _no_table(E: int) -> mx.array:
     a = _CONST.get(E)
     if a is None:
@@ -257,27 +265,32 @@ _UP = r"""
     }
     constexpr int Kw = K / 8;
     constexpr int Kg = K / 64;
+    // routed experts' scales and biases have type ST (the files' bf16), the shared expert's T: both read as float
     const device uint32_t* gwp;
-    const device T* gsp;
-    const device T* gbp;
     const device uint32_t* uwp;
-    const device T* usp;
-    const device T* ubp;
-    if (row0 < KE * EI) {
+    const device ST* gsp = nullptr;
+    const device ST* gbp = nullptr;
+    const device ST* usp = nullptr;
+    const device ST* ubp = nullptr;
+    const device T* hgsp = nullptr;
+    const device T* hgbp = nullptr;
+    const device T* husp = nullptr;
+    const device T* hubp = nullptr;
+    const bool routed = row0 < KE * EI;
+    if (routed) {
         const int j = row0 / EI;
         if (mask[b * KE + j] == 0) {
             return;
         }
         const int r = int(slots[b * KE + j]) * EI + row0 % EI;
-        gwp = gw + r * Kw; gsp = gs + r * Kg; gbp = gb + r * Kg;
-        uwp = uw + r * Kw; usp = us + r * Kg; ubp = ub + r * Kg;
+        gwp = gw + r * Kw; gsp = gs + r * Kg + (lane * 16) / 64; gbp = gb + r * Kg + (lane * 16) / 64;
+        uwp = uw + r * Kw; usp = us + r * Kg + (lane * 16) / 64; ubp = ub + r * Kg + (lane * 16) / 64;
     } else {
         const int r = row0 - KE * EI;
-        gwp = sgw + r * Kw; gsp = sgs + r * Kg; gbp = sgb + r * Kg;
-        uwp = suw + r * Kw; usp = sus + r * Kg; ubp = sub + r * Kg;
+        gwp = sgw + r * Kw; hgsp = sgs + r * Kg + (lane * 16) / 64; hgbp = sgb + r * Kg + (lane * 16) / 64;
+        uwp = suw + r * Kw; husp = sus + r * Kg + (lane * 16) / 64; hubp = sub + r * Kg + (lane * 16) / 64;
     }
     gwp += lane * 2; uwp += lane * 2;
-    gsp += (lane * 16) / 64; gbp += (lane * 16) / 64; usp += (lane * 16) / 64; ubp += (lane * 16) / 64;
     const device T* xp = x + b * K + lane * 16;
     float ag[R], au[R];
     UNROLL
@@ -295,13 +308,15 @@ _UP = r"""
 #define WORDS (gwp + r * Kw + k / 8)
 """ + _DOT + r"""
 #undef WORDS
-                ag[r] += float(gsp[r * Kg + k / 64]) * d + float(gbp[r * Kg + k / 64]) * xs;
+                const int q = r * Kg + k / 64;
+                ag[r] += (routed ? float(gsp[q]) : float(hgsp[q])) * d + (routed ? float(gbp[q]) : float(hgbp[q])) * xs;
             }
             {
 #define WORDS (uwp + r * Kw + k / 8)
 """ + _DOT + r"""
 #undef WORDS
-                au[r] += float(usp[r * Kg + k / 64]) * d + float(ubp[r * Kg + k / 64]) * xs;
+                const int q = r * Kg + k / 64;
+                au[r] += (routed ? float(usp[q]) : float(husp[q])) * d + (routed ? float(ubp[q]) : float(hubp[q])) * xs;
             }
         }
     }
@@ -346,8 +361,10 @@ _DOWN = r"""
         const device float* hp = h + b * NH + j * EI + lane * 16;
         const int row = shared ? n0 : int(slots[b * KE + j]) * D + n0;
         const device uint32_t* wp = (shared ? sdw : dw) + row * (KI / 8) + lane * 2;
-        const device T* sc = (shared ? sds : ds) + row * (KI / 64) + (lane * 16) / 64;
-        const device T* bi = (shared ? sdb : db) + row * (KI / 64) + (lane * 16) / 64;
+        const device ST* sc = ds + row * (KI / 64) + (lane * 16) / 64;  // (routed: ST; shared: T, below)
+        const device ST* bi = db + row * (KI / 64) + (lane * 16) / 64;
+        const device T* hsc = sds + row * (KI / 64) + (lane * 16) / 64;
+        const device T* hbi = sdb + row * (KI / 64) + (lane * 16) / 64;
         for (int k = 0; k < KI; k += 512) {
 #define XSRC (hp + k)
 """ + _X_BLOCK + r"""
@@ -357,7 +374,8 @@ _DOWN = r"""
 #define WORDS (wp + r * (KI / 8) + k / 8)
 """ + _DOT + r"""
 #undef WORDS
-                acc[r] += wj * (float(sc[r * (KI / 64) + k / 64]) * d + float(bi[r * (KI / 64) + k / 64]) * xs);
+                const int q = r * (KI / 64) + k / 64;
+                acc[r] += wj * ((shared ? float(hsc[q]) : float(sc[q])) * d + (shared ? float(hbi[q]) : float(bi[q])) * xs);
             }
         }
     }
@@ -376,8 +394,9 @@ def experts(x: mx.array, residual: mx.array, routed: List[mx.array], shared: Opt
             NSG: int = 2) -> mx.array:
     """residual + the masked routed experts of each row (weighted) + the shared expert (if ``shared``).
 
-    x, residual: (rows, D); routed: the nine slot arrays (gate, up, down x weight, scales, biases), slot first;
-    shared: the shared expert's nine arrays, or None; slots, mask: (rows, k) uint32; weights: (rows, k) float32.
+    x, residual: (rows, D); routed: the nine slot arrays (gate, up, down x weight, scales, biases), slot first, the
+    scales and biases in any float type (the files' bfloat16); shared: the shared expert's nine arrays, scales and
+    biases in x's type, or None; slots, mask: (rows, k) uint32; weights: (rows, k) float32.
     Returns (rows, D) in ``out_dtype`` (default x's). With a flag of ``ok`` (uint32, route's per-row flags) clear,
     nothing is computed and the result is the residual."""
     rows, D = x.shape
@@ -385,15 +404,19 @@ def experts(x: mx.array, residual: mx.array, routed: List[mx.array], shared: Opt
     EI = gw.shape[1]
     KE = slots.shape[1]
     SI = shared[0].shape[0] if shared is not None else 0
-    sh = shared if shared is not None else [gw[0], gs[0], gb[0], uw[0], us[0], ub[0], dw[0], ds[0], db[0]]
+    if shared is not None:
+        sh = shared
+    else:  # (not read: SHARED is 0)
+        z, zw = _placeholder(x.dtype), _placeholder(mx.uint32)
+        sh = [zw, z, z, zw, z, z, zw, z, z]
     if shared is None:
         SI = EI  # (h keeps the width; the shared rows are not computed)
     assert D % 512 == 0 and EI % 512 == 0 and SI % 512 == 0 and EI % R == 0 and D % R == 0
     T = x.dtype
     O = out_dtype or T
     okf = ok if ok is not None else one()
-    tmpl = [("T", T), ("K", D), ("D", D), ("EI", EI), ("SI", SI), ("KE", KE), ("SHARED", int(shared is not None)),
-            ("R", R), ("NSG", NSG), ("NOK", okf.size)]
+    tmpl = [("T", T), ("ST", gs.dtype), ("K", D), ("D", D), ("EI", EI), ("SI", SI), ("KE", KE),
+            ("SHARED", int(shared is not None)), ("R", R), ("NSG", NSG), ("NOK", okf.size)]
     n_up = KE * EI + (SI if shared is not None else 0)
     (h,) = _kernel("locals_flint_experts_up", ["x", "gw", "gs", "gb", "uw", "us", "ub", "sgw", "sgs", "sgb", "suw", "sus",
                                                "sub", "slots", "mask", "ok"], ["h"], _UP)(
