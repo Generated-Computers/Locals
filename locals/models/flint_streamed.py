@@ -38,9 +38,10 @@ MODEL_PATHS: List[Path] = []  # the folder being loaded (set by locals.models.re
 # the more reliably the higher the guess ranks (in a pass's top 6, on the M2 Pro: the top 3 one layer ahead 99, 97
 # and 90% of the time, the 6th 46%; the top 2 four layers ahead 95 and 84%), so each next layer gets fewer.
 GUESSES = tuple(int(g) for g in os.environ.get("LOCALS_EXPERT_GUESSES", "5,4,3,2").split(",") if g.strip())
-# Guessed reads running at once at most (each expert is four reads): a read a layer waits for then finds the SSD
-# with few others in its queue. On the M2 Pro, 4 made a token 139 ms instead of 156 (2: 150, 8: 149); 0: no limit.
-GUESS_READS = int(os.environ.get("LOCALS_EXPERT_GUESS_READS", "4"))
+# Guessed reads running at once at most, so a read a layer waits for finds the SSD with few others in its queue:
+# without the expert pack an expert is four reads, and 4 made a token 139 ms instead of 156 (2: 150, 8: 149);
+# with it an expert is one read, and 2 made it 86 ms instead of 98 (1: 88, 3: 92, 4: 94). 0: no limit.
+GUESS_READS = int(os.environ["LOCALS_EXPERT_GUESS_READS"]) if os.environ.get("LOCALS_EXPERT_GUESS_READS") else None
 FUSED = os.environ.get("LOCALS_FLINT_KERNELS", "1") != "0"  # decode passes' MoE blocks in Locals' kernels (flint_kernels)
 # Decode steps that ask the host only on a missing expert (FlintModel._optimistic): "auto" (when most layers find
 # their experts in slots), "always", or "0" (never)
@@ -440,7 +441,7 @@ class ExpertStore:
                 self.fds.append(fd)
                 self.pack[layer] = fd
         self.pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="locals-experts")  # stacked()
-        self.reader = _Reader(readers, GUESS_READS)
+        self.reader = _Reader(readers, GUESS_READS if GUESS_READS is not None else (2 if self.pack else 4))
         layers = sorted(self.experts)
         per = self.expert_bytes(layers[0]) if layers else 1
         self.slots = max(1, min(min(self.experts.values(), default=1), budget_bytes // max(1, per * len(layers))))
