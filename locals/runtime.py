@@ -262,6 +262,9 @@ class Runtime:
                 f"this GPU; those passes are split in two")
         if fuse:
             fuse_model(model)
+        from . import moe_kernel
+
+        moe_kernel.enable(model)  # (mixture-of-experts models: each expert read once a decode step, however many requests)
         enable_small_m(small_m_kernel, model)
         if small_m_kernel:
             from .kernels import tune_model
