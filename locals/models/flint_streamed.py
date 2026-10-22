@@ -159,12 +159,20 @@ class _Fill:
             raise self.error
 
 
-def _pread(fd: int, dst: memoryview, offset: int) -> None:
-    while len(dst):
-        n = os.preadv(fd, [dst], offset)
+def _pread(fd: int, dst, offset: int) -> None:
+    """Read into ``dst``, a buffer or a list of them filled in order (one scatter read: an expert of the pack into
+    its nine slot arrays)."""
+    bufs = dst if isinstance(dst, list) else [dst]
+    while bufs:
+        n = os.preadv(fd, bufs, offset)
         if n <= 0:
-            raise OSError(errno.EIO, f"the weight file ends {len(dst)} bytes into an expert")
-        dst, offset = dst[n:], offset + n
+            raise OSError(errno.EIO, f"the weight file ends {sum(len(b) for b in bufs)} bytes into an expert")
+        offset += n
+        while bufs and n >= len(bufs[0]):
+            n -= len(bufs[0])
+            bufs = bufs[1:]
+        if bufs and n:
+            bufs = [bufs[0][n:]] + bufs[1:]
 
 
 _LIBC = None
@@ -420,6 +428,17 @@ class ExpertStore:
                 self.spec[(layer, (proj, kind))] = (fd, 8 + n + begin, (end - begin) // experts, t["shape"][1:], t["dtype"])
                 self.where[name] = f
                 self.experts[layer] = experts
+        self.pack = {}  # layer -> the descriptor of its expert-major file (models/pack.py), if written
+        if os.environ.get("LOCALS_EXPERT_PACK", "1") != "0":
+            from . import pack as _pack
+
+            found = _pack.find(folder)
+            for layer in (sorted(self.experts) if found is not None else []):
+                fd = os.open(found / f"layer-{layer}.bin", os.O_RDONLY)
+                if hasattr(fcntl, "F_NOCACHE"):
+                    fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
+                self.fds.append(fd)
+                self.pack[layer] = fd
         self.pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="locals-experts")  # stacked()
         self.reader = _Reader(readers, GUESS_READS)
         layers = sorted(self.experts)
@@ -491,6 +510,9 @@ class ExpertStore:
         """An expert's nine arrays as one buffer (read straight into it)."""
         buf = np.empty(self.expert_bytes(layer), dtype=np.uint8)
         view, o = memoryview(buf), 0
+        if layer in self.pack:  # (the pack's layout is this buffer's)
+            _pread(self.pack[layer], view, e * len(buf))
+            return buf
         for part in _PARTS:
             fd, start, size, _, _ = self.spec[(layer, part)]
             _pread(fd, view[o:o + size], start + e * size)
@@ -634,15 +656,19 @@ class ExpertStore:
                     tasks[j // 3 if j % 3 == 0 else 3].append((-1, out + o, L.addr[s][j], size))
                     o += size
             got = self.ram.get((layer, e))
-        o = 0
-        for j, part in enumerate(_PARTS):
-            fd, start, size = self.spec[(layer, part)][:3]
-            if got is not None:
-                item = (-1, L.addr[s][j], got + o, size)
-            else:
-                item = (fd, start + e * size, L.dst[s][j], None)
-            tasks[j // 3 if j % 3 == 0 else 3].append(item)
-            o += size
+        if got is None and layer in self.pack:  # one read of the expert, scattered into the nine parts of its slot
+            tasks = [[item for t in tasks for item in t] + [(self.pack[layer], e * self.expert_bytes(layer), list(L.dst[s]), None)]]
+        else:
+            o = 0
+            for j, part in enumerate(_PARTS):
+                fd, start, size = self.spec[(layer, part)][:3]
+                if got is not None:
+                    item = (-1, L.addr[s][j], got + o, size)
+                else:
+                    item = (fd, start + e * size, L.dst[s][j], None)
+                tasks[j // 3 if j % 3 == 0 else 3].append(item)
+                o += size
+            tasks = [t for t in tasks if t]
         f = self.reader.submit(layer, tasks, guess)
         f.slot, f.victim, f.put, f.got = s, victim, put, got
         L.fills[e] = f
@@ -803,9 +829,22 @@ class ExpertStore:
                 f = e
                 while f < E and f not in have:
                     f += 1
-                for o in range(e * size, f * size, chunk):  # experts e to f - 1, read
-                    tasks.append([(fd, start + o, mv[o:o + min(chunk, f * size - o)], None)])
+                if layer not in self.pack:
+                    for o in range(e * size, f * size, chunk):  # experts e to f - 1, read
+                        tasks.append([(fd, start + o, mv[o:o + min(chunk, f * size - o)], None)])
                 e = f
+        if layer in self.pack:  # runs of 4 experts, each read whole and scattered into the nine tensors
+            per = self.expert_bytes(layer)
+            sizes = [self.spec[(layer, part)][2] for part in _PARTS]
+            todo = [e for e in range(E) if e not in have]
+            i = 0
+            while i < len(todo):
+                j = i
+                while j < len(todo) and j - i < 4 and todo[j] == todo[i] + (j - i):
+                    j += 1
+                bufs = [dst[q][0][e * sizes[q]:(e + 1) * sizes[q]] for e in todo[i:j] for q in range(len(_PARTS))]
+                tasks.append([(self.pack[layer], todo[i] * per, bufs, None)])
+                i = j
         for i in range(0, len(copies), 16):  # (the copies in tasks of 16)
             tasks.append(copies[i:i + 16])
         return self.reader.submit(layer, tasks)

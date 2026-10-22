@@ -415,3 +415,36 @@ def test_a_sliding_layers_long_pass_attends_in_blocks_over_each_ones_window(tiny
     got = [model(tokens[:, :9], cache=cache), model(tokens[:, 9:], cache=cache)]
     assert all(mx.allclose(a, b, atol=1e-5).item() for a, b in zip(got, chunks))
     assert windowed
+
+
+def test_with_an_expert_pack_the_experts_are_one_read_each_and_give_the_same(tmp_path, monkeypatch):
+    """models/pack.py writes the experts expert by expert; the store then reads an expert with one scatter read
+    into its slot (and a prompt pass, runs of them into the layer's tensors). Decoding and a prompt pass give, bit
+    for bit, what they give reading the safetensors files."""
+    import mlx_lm.utils as mlx_utils
+
+    from locals.models import pack
+
+    folder = tmp_path / "model"
+    folder.mkdir()
+    _save_wide(folder)
+    monkeypatch.setenv("LOCALS_EXPERT_PACK_DIR", str(tmp_path / "packs"))
+    tokens = [3, 17, 42, 5, 88, 9, 61, 2, 33, 70, 11, 4] * 2
+    prompt = mx.array([[3, 17, 42, 5, 88, 9, 61, 2, 33, 70, 11, 4, 19, 23, 7, 50]])
+    monkeypatch.setattr(flint, "WHOLE", 1)  # (the prompt pass, more experts than slots: whole layers; tokens: slots)
+    runs = []
+    for packed in (False, True):
+        if packed:
+            assert pack.find(folder) is None
+            pack.write(folder, log=lambda m: None)
+            assert pack.find(folder) is not None
+        model, _ = mlx_utils.load_model(folder)
+        store = model.expert_store
+        assert bool(store.pack) == packed
+        store.slots = 3
+        store.reset()
+        cache = model.make_cache()
+        out = [model(mx.array([[t]]), cache=cache)[0, -1] for t in tokens]
+        out.append(model(prompt))
+        runs.append(out)
+    assert all(mx.array_equal(a, b).item() for a, b in zip(*runs))
