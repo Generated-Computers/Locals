@@ -496,5 +496,9 @@ Locals is released under the MIT license. It is made by
 
 ## Star history
 
-<a href="https://github.com/Generated-Computers/Locals/stargazers"><img alt="Locals' GitHub stars from its first day" src="https://raw.githubusercontent.com/Generated-Computers/Locals/charts/stars.svg#gh-light-mode-only" width="480"></a>
-<a href="https://github.com/Generated-Computers/Locals/stargazers"><img alt="Locals' GitHub stars from its first day" src="https://raw.githubusercontent.com/Generated-Computers/Locals/charts/stars-dark.svg#gh-dark-mode-only" width="480"></a>
+<a href="https://github.com/Generated-Computers/Locals/stargazers">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Generated-Computers/Locals/charts/stars-dark.svg">
+    <img alt="Locals' GitHub stars from its first day" src="https://raw.githubusercontent.com/Generated-Computers/Locals/charts/stars.svg" width="480">
+  </picture>
+</a>
