@@ -108,6 +108,18 @@ _ROUTE = r"""
     }
     if (t == 0) {
         if (ri == 0) {
+            // each expert's slot (table: -1 for an expert not in one) and this row's flag: clear when one of its
+            // experts has no slot or a flag it came with (okin: the layer before's, every row's) was clear
+            bool good = true;
+            for (int r = 0; r < NOK; r++) {
+                good = good && okin[r] != 0;
+            }
+            for (int j = 0; j < K0; j++) {
+                const int sl = table[pick[j]];
+                slots[b * K0 + j] = sl < 0 ? 0u : uint(sl);
+                good = good && sl >= 0;
+            }
+            ok[b] = good ? 1u : 0u;
             float s[8];
             float total = 0.0f;
             for (int j = 0; j < K0; j++) {
@@ -152,21 +164,47 @@ def routers(x: mx.array, gates: List[mx.array], R: int = 4, NSG: int = 4) -> mx.
     return out
 
 
-def route(logits: mx.array, k: int, ranks: List[int]):
+_CONST = {}
+
+
+def one() -> mx.array:
+    """A set flag (uint32 (1,)): ``ok`` when there is nothing to check."""
+    a = _CONST.get("one")
+    if a is None:
+        a = _CONST["one"] = mx.ones((1,), dtype=mx.uint32)
+        mx.eval(a)
+    return a
+
+
+def _no_table(E: int) -> mx.array:
+    a = _CONST.get(E)
+    if a is None:
+        a = _CONST[E] = mx.zeros((E,), dtype=mx.int32)
+        mx.eval(a)
+    return a
+
+
+def route(logits: mx.array, k: int, ranks: List[int], table: Optional[mx.array] = None, okin: Optional[mx.array] = None):
     """From ``routers``' logits: (experts (rows, k) uint32, their weights (rows, k) float32, guesses (rows,
-    sum(ranks)) uint32): router 0's top k with renormalized sigmoid weights, router i's top ranks[i - 1]."""
+    sum(ranks)) uint32, slots (rows, k) uint32, ok (1,) uint32): router 0's top k with renormalized sigmoid weights,
+    router i's top ranks[i - 1]; with ``table`` (int32 (E,): each expert's slot, -1 if it has none), each expert's
+    slot and, per row, ok (rows,) uint32: whether every expert of the row has a slot and every flag in ``okin``
+    is set (the layer before's; otherwise slots and ok are not meaningful)."""
     rows, n = logits.shape
     NR = 1 + len(ranks)
     E = n // NR
     assert k <= 8 and all(0 < r <= 8 for r in ranks) and len(ranks) <= 4 and E % 32 == 0 and E <= 1024
     rk = list(ranks) + [0] * (4 - len(ranks))
     G = max(1, sum(ranks))
-    inds, weights, guesses = _kernel("locals_flint_route", ["logits"], ["inds", "weights", "guesses"], _ROUTE)(
-        inputs=[logits], template=[("E", E), ("NR", NR), ("K0", k), ("K1", rk[0]), ("K2", rk[1]), ("K3", rk[2]),
-                                   ("K4", rk[3]), ("G", G)],
-        grid=(NR * E, rows, 1), threadgroup=(E, 1, 1), output_shapes=[(rows, k), (rows, k), (rows, G)],
-        output_dtypes=[mx.uint32, mx.float32, mx.uint32])
-    return inds, weights, guesses[:, :sum(ranks)]
+    okin = okin if okin is not None else one()
+    inds, weights, guesses, slots, ok = _kernel("locals_flint_route", ["logits", "table", "okin"],
+                                                ["inds", "weights", "guesses", "slots", "ok"], _ROUTE)(
+        inputs=[logits, table if table is not None else _no_table(E), okin],
+        template=[("E", E), ("NR", NR), ("K0", k), ("K1", rk[0]), ("K2", rk[1]), ("K3", rk[2]), ("K4", rk[3]), ("G", G),
+                  ("NOK", okin.size)],
+        grid=(NR * E, rows, 1), threadgroup=(E, 1, 1), output_shapes=[(rows, k), (rows, k), (rows, G), (rows, k), (rows,)],
+        output_dtypes=[mx.uint32, mx.float32, mx.uint32, mx.uint32, mx.uint32])
+    return inds, weights, guesses[:, :sum(ranks)], slots, ok
 
 
 # --- 2. experts --------------------------------------------------------------------------------------------------
@@ -210,7 +248,11 @@ _UP = r"""
     const int row0 = (int(threadgroup_position_in_grid.x) * NSG + int(sg)) * R;
     const int b = int(threadgroup_position_in_grid.y);
     constexpr int NH = KE * EI + SI;
-    if (row0 >= KE * EI + (SHARED ? SI : 0)) {
+    bool go = true;
+    for (int r = 0; r < NOK; r++) {
+        go = go && ok[r] != 0;
+    }
+    if (row0 >= KE * EI + (SHARED ? SI : 0) || !go) {
         return;
     }
     constexpr int Kw = K / 8;
@@ -289,7 +331,12 @@ _DOWN = r"""
     for (int r = 0; r < R; r++) {
         acc[r] = 0.0f;
     }
-    for (int j = 0; j < KE + (SHARED ? 1 : 0); j++) {
+    bool go = true;
+    for (int r = 0; r < NOK; r++) {
+        go = go && ok[r] != 0;
+    }
+    const int nj = go ? KE + (SHARED ? 1 : 0) : 0;  // (a pass with a flag clear: the residual alone)
+    for (int j = 0; j < nj; j++) {
         const bool shared = j == KE;
         if (!shared && mask[b * KE + j] == 0) {
             continue;
@@ -325,12 +372,14 @@ _DOWN = r"""
 
 
 def experts(x: mx.array, residual: mx.array, routed: List[mx.array], shared: Optional[List[mx.array]], slots: mx.array,
-            mask: mx.array, weights: mx.array, out_dtype=None, R: int = 4, NSG: int = 2) -> mx.array:
+            mask: mx.array, weights: mx.array, out_dtype=None, ok: Optional[mx.array] = None, R: int = 4,
+            NSG: int = 2) -> mx.array:
     """residual + the masked routed experts of each row (weighted) + the shared expert (if ``shared``).
 
     x, residual: (rows, D); routed: the nine slot arrays (gate, up, down x weight, scales, biases), slot first;
     shared: the shared expert's nine arrays, or None; slots, mask: (rows, k) uint32; weights: (rows, k) float32.
-    Returns (rows, D) in ``out_dtype`` (default x's)."""
+    Returns (rows, D) in ``out_dtype`` (default x's). With a flag of ``ok`` (uint32, route's per-row flags) clear,
+    nothing is computed and the result is the residual."""
     rows, D = x.shape
     gw, gs, gb, uw, us, ub, dw, ds, db = routed
     EI = gw.shape[1]
@@ -342,17 +391,18 @@ def experts(x: mx.array, residual: mx.array, routed: List[mx.array], shared: Opt
     assert D % 512 == 0 and EI % 512 == 0 and SI % 512 == 0 and EI % R == 0 and D % R == 0
     T = x.dtype
     O = out_dtype or T
+    okf = ok if ok is not None else one()
     tmpl = [("T", T), ("K", D), ("D", D), ("EI", EI), ("SI", SI), ("KE", KE), ("SHARED", int(shared is not None)),
-            ("R", R), ("NSG", NSG)]
+            ("R", R), ("NSG", NSG), ("NOK", okf.size)]
     n_up = KE * EI + (SI if shared is not None else 0)
     (h,) = _kernel("locals_flint_experts_up", ["x", "gw", "gs", "gb", "uw", "us", "ub", "sgw", "sgs", "sgb", "suw", "sus",
-                                               "sub", "slots", "mask"], ["h"], _UP)(
-        inputs=[x, gw, gs, gb, uw, us, ub, sh[0], sh[1], sh[2], sh[3], sh[4], sh[5], slots, mask],
+                                               "sub", "slots", "mask", "ok"], ["h"], _UP)(
+        inputs=[x, gw, gs, gb, uw, us, ub, sh[0], sh[1], sh[2], sh[3], sh[4], sh[5], slots, mask, okf],
         template=tmpl, grid=(((n_up + NSG * R - 1) // (NSG * R)) * 32 * NSG, rows, 1), threadgroup=(32 * NSG, 1, 1),
         output_shapes=[(rows, KE * EI + SI)], output_dtypes=[mx.float32])
     (y,) = _kernel("locals_flint_experts_down", ["h", "dw", "ds", "db", "sdw", "sds", "sdb", "slots", "mask", "weights",
-                                                 "residual"], ["y"], _DOWN)(
-        inputs=[h, dw, ds, db, sh[6], sh[7], sh[8], slots, mask, weights, residual],
+                                                 "residual", "ok"], ["y"], _DOWN)(
+        inputs=[h, dw, ds, db, sh[6], sh[7], sh[8], slots, mask, weights, residual, okf],
         template=tmpl + [("O", O)], grid=((D // (NSG * R)) * 32 * NSG, rows, 1), threadgroup=(32 * NSG, 1, 1),
         output_shapes=[(rows, D)], output_dtypes=[O])
     return y

@@ -39,6 +39,10 @@ MODEL_PATHS: List[Path] = []  # the folder being loaded (set by locals.models.re
 # and 90% of the time, the 6th 46%; the top 2 four layers ahead 95 and 84%), so each next layer gets fewer.
 GUESSES = tuple(int(g) for g in os.environ.get("LOCALS_EXPERT_GUESSES", "5,4,3,2").split(",") if g.strip())
 FUSED = os.environ.get("LOCALS_FLINT_KERNELS", "1") != "0"  # decode passes' MoE blocks in Locals' kernels (flint_kernels)
+# Decode steps that ask the host only on a missing expert (FlintModel._optimistic): "auto" (when most layers find
+# their experts in slots), "always", or "0" (never)
+OPTIMISTIC = os.environ.get("LOCALS_FLINT_OPTIMISTIC") or "auto"
+OPTIMISTIC = "auto" if OPTIMISTIC == "1" else OPTIMISTIC
 KEEP_GPU_BUSY = os.environ.get("LOCALS_KEEP_GPU_BUSY", "1") != "0"  # while a pass waits for reads (ExpertStore._wait)
 DECAY = 0.5 ** (1 / 32)  # an expert's use counts half as much 32 passes over its layer later (which slot to take)
 WHOLE = 96  # a pass that needs more of a layer's 256 experts (reading a prompt) reads the layer's expert tensors whole
@@ -112,11 +116,12 @@ class _Fill:
     """One expert's read into its slot: four reads (its three 4-bit weight arrays, then its six scales and biases)
     that reader threads take in turn, so the parts of one expert are read at once."""
 
-    __slots__ = ("tasks", "next", "left", "done", "error", "cancelled")
+    __slots__ = ("tasks", "next", "left", "done", "error", "cancelled", "slot", "victim", "put", "got")
 
     def __init__(self, tasks: list):
         self.tasks, self.next, self.left = tasks, 0, len(tasks)
         self.done, self.error, self.cancelled = threading.Event(), None, False
+        self.slot = self.victim = self.put = self.got = None  # set by ExpertStore._take
 
     def wait(self) -> None:
         self.done.wait()
@@ -141,6 +146,110 @@ def _bf16_to_f16() -> np.ndarray:
         with np.errstate(over="ignore", invalid="ignore"):  # (NaN patterns stay NaN)
             _BF16_TO_F16 = (np.arange(1 << 16, dtype=np.uint32) << 16).view(np.float32).astype(np.float16).view(np.uint16)
     return _BF16_TO_F16
+
+
+_LIBC = None
+
+
+def _libc():
+    """libSystem through ctypes: memcpy (the GIL let go while it copies) and Mach's purgeable memory; None off macOS."""
+    global _LIBC
+    if _LIBC is None:
+        import ctypes
+
+        try:
+            lib = ctypes.CDLL(None, use_errno=True)
+            lib.memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+            lib.memcpy.restype = ctypes.c_void_p
+            lib.mach_vm_allocate.argtypes = [ctypes.c_uint, ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint64, ctypes.c_int]
+            lib.mach_vm_allocate.restype = ctypes.c_int
+            lib.mach_vm_deallocate.argtypes = [ctypes.c_uint, ctypes.c_uint64, ctypes.c_uint64]
+            lib.mach_vm_deallocate.restype = ctypes.c_int
+            lib.vm_purgable_control.argtypes = [ctypes.c_uint, ctypes.c_uint64, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+            lib.vm_purgable_control.restype = ctypes.c_int
+            lib.task = ctypes.c_uint.in_dll(lib, "mach_task_self_").value
+            _LIBC = lib
+        except (AttributeError, OSError, ValueError):
+            _LIBC = False
+    return _LIBC or None
+
+
+class _RamCache:
+    """Experts evicted from the GPU's slots, kept in the Mac's memory outside the GPU's share: a miss found here is
+    one memcpy into its slot (0.04 ms for an expert) instead of a read from the SSD (2 to 4 ms while reads queue).
+    Each expert is a purgeable region, volatile while it waits: when macOS needs the memory it empties regions
+    instead of writing them to swap, and an emptied one is a plain miss. The expert put in longest ago goes first."""
+
+    NONVOLATILE, VOLATILE, EMPTY = 0, 1, 2
+
+    def __init__(self, entry_bytes: int, capacity: int):
+        import ctypes
+
+        self.c = ctypes
+        self.lib = _libc()
+        self.size = -(-entry_bytes // 16384) * 16384
+        self.capacity = capacity
+        self.lru: "OrderedDict[tuple, int]" = OrderedDict()  # (layer, expert) -> address
+        self.free: list = []  # regions holding no expert
+        self.regions: list = []
+        self.hits = self.puts = self.purged = 0
+
+    def _state(self, addr: int, state: int) -> int:
+        st = self.c.c_int(state)
+        self.lib.vm_purgable_control(self.lib.task, addr, 0, self.c.byref(st))  # VM_PURGABLE_SET_STATE
+        return st.value
+
+    def region(self) -> Optional[int]:
+        """A region to copy an expert into (its old contents dropped), or None."""
+        if self.free:
+            addr = self.free.pop()
+        elif len(self.regions) < self.capacity:
+            a = self.c.c_uint64(0)
+            if self.lib.mach_vm_allocate(self.lib.task, self.c.byref(a), self.size, 0x1 | 0x2):  # ANYWHERE | PURGABLE
+                return None
+            addr = a.value
+            self.regions.append(addr)
+        elif self.lru:
+            addr = self.lru.popitem(last=False)[1]
+        else:
+            return None
+        self._state(addr, self.NONVOLATILE)
+        return addr
+
+    def put(self, key: tuple, addr: int) -> None:
+        self._state(addr, self.VOLATILE)
+        old = self.lru.pop(key, None)
+        if old is not None:
+            self.free.append(old)
+        self.lru[key] = addr
+        self.puts += 1
+
+    def get(self, key: tuple) -> Optional[int]:
+        """The region holding ``key``, taken out (keep it from being emptied until ``release``), or None."""
+        addr = self.lru.pop(key, None)
+        if addr is None:
+            return None
+        if self._state(addr, self.NONVOLATILE) == self.EMPTY:  # macOS took the memory back
+            self.purged += 1
+            self.release(addr)
+            return None
+        self.hits += 1
+        return addr
+
+    def release(self, addr: int) -> None:
+        self._state(addr, self.VOLATILE)
+        self.free.append(addr)
+
+    def clear(self) -> None:
+        for addr in self.lru.values():
+            self.free.append(addr)
+        self.lru.clear()
+
+    def close(self) -> None:
+        for addr in self.regions:
+            self.lib.mach_vm_deallocate(self.lib.task, addr, self.size)
+        self.regions, self.free = [], []
+        self.lru.clear()
 
 
 class _Reader:
@@ -199,7 +308,9 @@ class _Reader:
                     heapq.heappop(self.heap)
             try:
                 for fd, offset, dst, conv in task:
-                    if conv is None:  # the file's bytes as they are
+                    if fd < 0:  # a copy in memory: (-1, destination, source, bytes)
+                        _libc().memcpy(offset, dst, conv)
+                    elif conv is None:  # the file's bytes as they are
                         _pread(fd, dst, offset)
                     else:  # bf16 in the file, float16 in the slot
                         buf = scratch.get(conv.size)
@@ -218,17 +329,17 @@ class _Reader:
 class _Layer:
     """One MoE layer's slots: which expert each holds, the reads under way, and how much each expert was used."""
 
-    __slots__ = ("arrays", "dst", "where", "free", "fills", "fresh", "score", "unit", "limbo")
+    __slots__ = ("arrays", "dst", "addr", "where", "free", "fills", "fresh", "score", "unit")
 
-    def __init__(self, arrays: list, dst: list, slots: int, experts: int):
+    def __init__(self, arrays: list, dst: list, addr: list, slots: int, experts: int):
         self.arrays, self.dst = arrays, dst  # the nine slot arrays; dst[slot]: where each part of a slot is written
+        self.addr = addr  # addr[slot]: the address of each part of the slot
         self.where = {}  # expert -> its slot (read, or being read)
         self.free = list(range(slots - 1, -1, -1))
         self.fills = {}  # expert -> its read under way
         self.fresh = set()  # experts guessed for the layer's next pass: not evicted before it
         self.score = np.zeros(experts)  # each expert's uses, each counted DECAY times less a pass later (in self.unit)
         self.unit = 1.0
-        self.limbo = []  # (read, slot): a dropped read a thread may still pass; then its slot is free
 
 
 class ExpertStore:
@@ -252,9 +363,10 @@ class ExpertStore:
     result computed from a layer's slots is evaluated before one of them is written (``fence``), and a slot being
     filled is used only after its read is done."""
 
-    def __init__(self, folder: Path, budget_bytes: int, readers: int = 16):
+    def __init__(self, folder: Path, budget_bytes: int, readers: int = 16, ram_bytes: int = 0):
         self.budget = budget_bytes
         self.hits = self.misses = self.ahead = 0
+        self.ready = self.passes = 0  # MoE blocks of decode passes, and those that found every expert in a slot
         self.spec = {}  # (layer, part) -> (file descriptor, start, bytes per expert, shape per expert, dtype)
         self.where = {}  # tensor name -> its file
         self.ranges = {}  # layer -> [(file descriptor, start, bytes)] of its expert tensors (read through the file cache)
@@ -290,9 +402,13 @@ class ExpertStore:
         self.layers = {}  # layer -> its _Layer
         self.uses = {}  # layer -> results computed from its slots, maybe not yet evaluated (see fence)
         self._filler = None  # (x, w) of the product that keeps the GPU busy while a pass waits for reads (_wait)
+        ram = int(ram_bytes // max(1, per)) if layers and _libc() is not None else 0
+        self.ram = _RamCache(per, ram) if ram > 0 else None  # experts evicted from the slots, in the Mac's memory
 
     def close(self) -> None:
         self.reader.stop()
+        if getattr(self, "ram", None) is not None:
+            self.ram.close()
         self.pool.shutdown(wait=False)
         for fd in self.fds:
             try:
@@ -352,9 +468,11 @@ class ExpertStore:
     def _slot_arrays(self, layer: int, dtype) -> list:
         if self.dtype is None or self.dtype != dtype:  # first use, or the runtime changed the compute dtype (its probe)
             for L in self.layers.values():
-                for f in list(L.fills.values()) + [f for f, _ in L.limbo]:
+                for f in list(L.fills.values()):
                     self.reader.cancel(f)
                     f.done.wait()
+            if self.ram is not None:  # (its experts are in the old dtype's form)
+                self.ram.clear()
             self.arrays.clear()
             self.layers.clear()
             self.uses.clear()
@@ -384,8 +502,9 @@ class ExpertStore:
                 raise TypeError(f"Flint's experts are read into bfloat16 or float16 slots, not {dtype}")
             dst = [[(memoryview(h[s]).cast("B"), h[s].view(np.uint16).reshape(-1) if conv else None) for h, conv in host]
                    for s in range(self.slots)]
+            addr = [[h[slot].ctypes.data for h, _ in host] for slot in range(self.slots)]
             self.arrays[layer] = arrs
-            self.layers[layer] = _Layer(arrs, dst, self.slots, self.experts[layer])
+            self.layers[layer] = _Layer(arrs, dst, addr, self.slots, self.experts[layer])
         return arrs
 
     def used(self, layer: int, result: mx.array) -> None:
@@ -404,18 +523,43 @@ class ExpertStore:
             mx.eval(uses)
 
     def _settle(self, L: _Layer) -> dict:
-        """Reads of ``L`` that ended: their experts are in their slots, or (a failed read) not kept. Returns the
-        failed ones' errors."""
+        """Reads of ``L`` that ended: their experts are in their slots, or (a failed read) not kept; the experts
+        they evicted are in the RAM cache. Returns the failed ones' errors."""
         failed = {}
         for e, f in [(e, f) for e, f in L.fills.items() if f.done.is_set()]:
             del L.fills[e]
+            self._ended(f)
             if f.error is not None:
                 failed[e] = f.error
                 L.free.append(L.where.pop(e))
-        if L.limbo:
-            L.free += [s for f, s in L.limbo if f.done.is_set()]
-            L.limbo = [(f, s) for f, s in L.limbo if not f.done.is_set()]
         return failed
+
+    def _ended(self, f: _Fill) -> None:
+        if f.put is not None:
+            key, addr = f.put
+            if f.error is None and not f.cancelled:
+                self.ram.put(key, addr)
+            else:
+                self.ram.release(addr)
+        if f.got is not None:
+            self.ram.release(f.got)
+
+    def _cancel(self, layer: int, L: _Layer, e: int, f: _Fill) -> bool:
+        """Drop ``e``'s read if no part of it started: its slot is as it was, so the expert it would have evicted
+        keeps it (or it is free again), and a RAM cache region it would have used is not."""
+        if not self.reader.cancel(f):
+            return False
+        del L.fills[e]
+        s = L.where.pop(e)
+        if f.victim is not None and f.victim not in L.where:
+            L.where[f.victim] = s
+        else:
+            L.free.append(s)
+        if f.put is not None:
+            self.ram.release(f.put[1])
+        if f.got is not None:
+            self.ram.put((layer, e), f.got)
+        return True
 
     def _victim(self, L: _Layer, keep: set) -> Optional[int]:
         """The expert in a slot used least (decayed), not in ``keep``, not being read and not guessed for the
@@ -428,32 +572,64 @@ class ExpertStore:
     def _take(self, layer: int, e: int, keep: set, wait: bool = True) -> Optional[int]:
         """A slot for ``e``, its read started: a free one, else the one whose expert was used least and is not in
         ``keep``; with ``wait``, the next one a read under way leaves if every slot is taken. None (without
-        ``wait``) if there is none to take."""
+        ``wait``) if there is none to take. The evicted expert is copied to the RAM cache first, and ``e`` comes
+        from there if it is in it."""
         L = self.layers[layer]
         self.fence(layer)
+        victim = None
         while True:
             self._settle(L)
             if L.free:
                 s = L.free.pop()
                 break
-            old = self._victim(L, keep)
-            if old is not None:
-                s = L.where.pop(old)
+            victim = self._victim(L, keep)
+            if victim is not None:
+                s = L.where.pop(victim)
                 break
             if not wait:
                 return None
-            busy = [f for f, _ in L.limbo] + [f for x, f in L.fills.items() if x not in keep]
+            busy = [f for x, f in L.fills.items() if x not in keep]
             if not busy:
                 raise RuntimeError(f"no slot of layer {layer} to read expert {e} into")
             busy[0].done.wait()
         L.where[e] = s
-        tasks = [[], [], [], []]  # the gate, up and down weights each a read, the six scales and biases one more
+        tasks = [[], [], [], []]  # the gate, up and down weights each a task, the six scales and biases one more
+        put = got = None
+        if self.ram is not None:
+            out = self.ram.region() if victim is not None else None
+            if out is not None:
+                put, o = ((layer, victim), out), 0
+                for j, part in enumerate(_PARTS):
+                    size = self.spec[(layer, part)][2]
+                    tasks[j // 3 if j % 3 == 0 else 3].append((-1, out + o, L.addr[s][j], size))
+                    o += size
+            got = self.ram.get((layer, e))
+        o = 0
         for j, part in enumerate(_PARTS):
             fd, start, size = self.spec[(layer, part)][:3]
-            mv, conv = L.dst[s][j]
-            tasks[j // 3 if j % 3 == 0 else 3].append((fd, start + e * size, mv, conv))
-        L.fills[e] = self.reader.submit(layer, tasks)
+            if got is not None:
+                item = (-1, L.addr[s][j], got + o, size)
+            else:
+                mv, conv = L.dst[s][j]
+                item = (fd, start + e * size, mv, conv)
+            tasks[j // 3 if j % 3 == 0 else 3].append(item)
+            o += size
+        f = self.reader.submit(layer, tasks)
+        f.slot, f.victim, f.put, f.got = s, victim, put, got
+        L.fills[e] = f
         return s
+
+    def table(self, layer: int, dtype) -> mx.array:
+        """The layer's slot of each expert, -1 for one without a slot or still being read (int32, on the GPU): for
+        a pass that looks its experts up itself (Model's optimistic decode)."""
+        self._slot_arrays(layer, dtype)
+        L = self.layers[layer]
+        self._settle(L)
+        t = np.full(self.experts[layer], -1, dtype=np.int32)
+        for e, slot in L.where.items():
+            if e not in L.fills:
+                t[e] = slot
+        return mx.array(t)
 
     def in_slots(self, layer: int, experts: list, dtype):
         """For a pass needing at most ``slots`` experts: the layer's nine slot arrays with ``experts`` in them,
@@ -474,9 +650,8 @@ class ExpertStore:
         L = self.layers[layer]
         wanted = set(experts)
         for e, f in list(L.fills.items()):  # guesses this pass's routing did not confirm: dropped if not started
-            if e not in wanted and self.reader.cancel(f):
-                del L.fills[e]
-                L.limbo.append((f, L.where.pop(e)))
+            if e not in wanted:
+                self._cancel(layer, L, e, f)
         L.fresh.clear()
         L.unit /= DECAY
         if L.unit > 2.0 ** 64:
@@ -692,24 +867,40 @@ class SparseMoe(nn.Module):
         y = y + self.shared_expert(x)
         return y if residual is None else residual + y
 
+    def _route(self, x2: mx.array, ahead: list, table=None, okin=None):
+        """The layer's router and the read-ahead routers in one product, the selections in one more (flint_kernels):
+        (experts, weights, guesses, slots, ok); slots and ok are meaningful with ``table``."""
+        from . import flint_kernels as fk
+
+        logits = fk.routers(x2, [self.gate.weight] + [g.weight for g, _, _ in ahead])
+        return fk.route(logits, self.k, [r for *_, r in ahead], table, okin)
+
+    def _read_ahead(self, guesses: np.ndarray, ahead: list, after: int = -1) -> None:
+        """Start reading the guessed experts of the layers in ``ahead`` after layer ``after``."""
+        o = 0
+        for _, nxt, r in ahead:
+            if nxt > after:
+                self.experts.store.prefetch(nxt, np.unique(guesses[:, o:o + r]).tolist())
+            o += r
+
     def _fused(self, x: mx.array, residual: mx.array, rows: int, ahead: list) -> mx.array:
-        """A decode pass's MoE block in four Metal kernels (flint_kernels): the layer's router and the read-ahead
-        routers in one product, the selections in one more; then the experts in slots with the shared expert,
-        computed while the missing experts are read, and the missing ones added."""
+        """A decode pass's MoE block in Locals' kernels: routing (``_route``), then the experts (``_compute``)."""
+        D = x.shape[-1]
+        inds, w, guesses, _, _ = self._route(x.reshape(rows, D), ahead)
+        mx.eval(inds, guesses)  # the layer's one wait for the GPU: which experts, before they are read
+        if ahead:
+            self._read_ahead(np.array(guesses), ahead)
+        return self._compute(x, residual, rows, inds, w)
+
+    def _compute(self, x: mx.array, residual: mx.array, rows: int, inds: mx.array, w: mx.array) -> mx.array:
+        """residual + the routed experts ``inds`` (evaluated), weighted by ``w``, + the shared expert: the experts
+        in slots and the shared one computed while the others are read, the others added after."""
         from . import flint_kernels as fk
 
         shape, D = x.shape, x.shape[-1]
         x2, r2 = x.reshape(rows, D), residual.reshape(rows, D)
-        logits = fk.routers(x2, [self.gate.weight] + [g.weight for g, _, _ in ahead])
-        inds, w, guesses = fk.route(logits, self.k, [r for *_, r in ahead])
-        mx.eval(inds, guesses)  # the layer's one wait for the GPU: which experts, before they are read
         store = self.experts.store
         layer = self.experts.layer
-        if ahead:
-            g, o = np.array(guesses), 0
-            for _, nxt, r in ahead:
-                store.prefetch(nxt, np.unique(g[:, o:o + r]).tolist())
-                o += r
         experts, inv = np.unique(np.array(inds).reshape(-1), return_inverse=True)
         got = store.begin(layer, experts.tolist(), x.dtype)
         if got is None:  # more experts than slots (many requests at once): stacked, MLX's kernels
@@ -717,11 +908,12 @@ class SparseMoe(nn.Module):
             y = (y * w.reshape(*shape[:-1], self.k)[..., None].astype(y.dtype)).sum(axis=-2)
             return residual + y + self.shared_expert(x)
         arrs, slots, pending = got
+        store.passes += 1
+        store.ready += not pending
         idx = mx.array(np.asarray(slots, dtype=np.uint32)[inv].reshape(rows, self.k))
-        se = self.shared_expert
-        shared = [a for m in (se.gate_proj, se.up_proj, se.down_proj) for a in (m.weight, m.scales, m.biases)]
+        shared = self._shared()
         if not pending:
-            y = fk.experts(x2, r2, arrs, shared, idx, mx.ones((rows, self.k), dtype=mx.uint32), w)
+            y = fk.experts(x2, r2, arrs, shared, idx, _ones(rows, self.k), w)
             store.used(layer, y)
             return y.reshape(shape)
         late = np.isin(experts, pending)[inv].reshape(rows, self.k)
@@ -732,6 +924,48 @@ class SparseMoe(nn.Module):
         y = fk.experts(x2, part, arrs, None, idx, mx.array(late.astype(np.uint32)), w, out_dtype=x.dtype)
         store.used(layer, y)
         return y.reshape(shape)
+
+    def _shared(self) -> list:
+        se = self.shared_expert
+        return [a for m in (se.gate_proj, se.up_proj, se.down_proj) for a in (m.weight, m.scales, m.biases)]
+
+    def _optimistic(self, x: mx.array, residual: mx.array, rows: int, ahead: list, okin):
+        """The block without waiting for the host: the experts are looked up in the layer's slot table on the GPU
+        and computed if every one has a slot (and okin, the layer before's flags, is set), else the result is
+        the residual and the flags are clear. Returns (result, flags, (experts, weights, guesses))."""
+        from . import flint_kernels as fk
+
+        shape, D = x.shape, x.shape[-1]
+        store = self.experts.store
+        layer = self.experts.layer
+        table = store.table(layer, x.dtype)
+        inds, w, guesses, slots, ok = self._route(x.reshape(rows, D), ahead, table, okin)
+        y = fk.experts(x.reshape(rows, D), residual.reshape(rows, D), store.arrays[layer], self._shared(), slots,
+                       _ones(rows, self.k), w, ok=ok)
+        store.used(layer, y)
+        return y.reshape(shape), ok, (inds, w, guesses)
+
+
+_ONES = {}
+
+
+def _ones(rows: int, k: int) -> mx.array:
+    a = _ONES.get((rows, k))
+    if a is None:
+        a = _ONES[(rows, k)] = mx.ones((rows, k), dtype=mx.uint32)
+        mx.eval(a)
+    return a
+
+
+def _snapshot(c) -> dict:
+    """What a decode step changes in a KV cache (KVCache, RotatingKVCache and the batch ones): written back, the
+    step is undone. A rotating cache's step overwrites the entry leaving its window, which no later step reads."""
+    return {k: getattr(c, k) for k in ("keys", "values", "offset", "_idx", "_offset") if hasattr(c, k)}
+
+
+def _restore(c, snap: dict) -> None:
+    for k, v in snap.items():
+        setattr(c, k, v)
 
 
 class DecoderLayer(nn.Module):
@@ -760,6 +994,14 @@ class FlintModel(nn.Module):
         self.layer_types = args.layer_types
         self.swa_idx = self.layer_types.index("sliding_attention")
         self.fa_idx = self.layer_types.index("full_attention")
+        self._window = 1  # MoE layers an optimistic decode step evaluates at once (adapted as it goes)
+        self._fusable_for = {}
+        # Optimistic steps save the host's turn at every layer whose experts are all in slots (31 -> 20 ms a token
+        # on the M2 Pro with every expert in one), but read guessed experts later: where experts are read most
+        # layers, they were slower (156 -> 166 ms with 55 slots, 119 -> 134 with 96). Decode steps take them once
+        # 90% of the MoE blocks found every expert in a slot, until fewer than 80% do.
+        self._ready = 0.0  # running share of decode passes' MoE blocks that found every expert in a slot
+        self._windows = False
 
     def __call__(self, inputs: mx.array, cache=None, input_embeddings: Optional[mx.array] = None) -> mx.array:
         h = input_embeddings if input_embeddings is not None else self.embed_tokens(inputs)
@@ -767,9 +1009,92 @@ class FlintModel(nn.Module):
             cache = [None] * len(self.layers)
         full_mask = create_attention_mask(h, cache[self.fa_idx])
         swa_mask = create_attention_mask(h, cache[self.swa_idx], window_size=self.args.sliding_window)
-        for layer, c, kind in zip(self.layers, cache, self.layer_types):
-            h = layer(h, full_mask if kind == "full_attention" else swa_mask, c)
+        masks = [full_mask if kind == "full_attention" else swa_mask for kind in self.layer_types]
+        if OPTIMISTIC != "0" and h.shape[1] == 1 and cache[0] is not None and self._optimizable(h):
+            store = self._store()
+            p0, r0 = store.passes, store.ready
+            # (two thresholds: no flapping between the two ways)
+            if OPTIMISTIC == "always" or self._ready >= (0.8 if self._windows else 0.9):
+                self._windows = True
+                h = self._optimistic(h, cache, masks)
+            else:
+                self._windows = False
+                for layer, c, m in zip(self.layers, cache, masks):
+                    h = layer(h, m, c)
+            if store.passes > p0:
+                self._ready = 0.9 * self._ready + 0.1 * (store.ready - r0) / (store.passes - p0)
+            return self.norm(h)
+        for layer, c, m in zip(self.layers, cache, masks):
+            h = layer(h, m, c)
         return self.norm(h)
+
+    def _store(self):
+        return next(l.mlp.experts.store for l in self.layers if isinstance(l.mlp, SparseMoe))
+
+    def _optimizable(self, h: mx.array) -> bool:
+        key = (h.shape[0], h.dtype)
+        ok = self._fusable_for.get(key)
+        if ok is None:
+            ok = self._fusable_for[key] = all(
+                l.mlp._fusable(h, h.shape[0], l.mlp._ahead(h.shape[0])) for l in self.layers if isinstance(l.mlp, SparseMoe))
+        return ok
+
+    def _optimistic(self, h: mx.array, cache: list, masks: list) -> mx.array:
+        """A decode step that asks the host only when an expert is missing. Layers run in windows evaluated
+        at once: each MoE block looks its experts up on the GPU (SparseMoe._optimistic) and clears a flag when
+        one has no slot, and the blocks after it compute nothing. The host then reads the flags: the layers up
+        to the first clear one are done; that layer's routing is valid (its input was), so its missing experts
+        are read and its block computed as usual; the caches of the layers after it are restored and the step
+        resumes there. The window grows while layers find their experts and shrinks when one waits."""
+        n = len(self.layers)
+        i = 0
+        rows = h.shape[0]
+        while i < n:
+            if not isinstance(self.layers[i].mlp, SparseMoe):
+                h = self.layers[i](h, masks[i], cache[i])
+                i += 1
+                continue
+            win, okin, j = [], None, i
+            while j < n and len(win) < self._window and isinstance(self.layers[j].mlp, SparseMoe):
+                lay, c = self.layers[j], cache[j]
+                snap = _snapshot(c)
+                ha = h + lay.self_attn(lay.input_layernorm(h), masks[j], c)
+                xn = lay.post_attention_layernorm(ha)
+                ahead = lay.mlp._ahead(rows)
+                h, okin, rec = lay.mlp._optimistic(xn, ha, rows, ahead, okin)
+                win.append((j, snap, ha, xn, okin, rec, ahead))
+                j += 1
+            mx.eval(h, *[a for _, _, _, _, ok, rec, _ in win for a in (ok, rec[0], rec[2])])
+            bad = next((k for k, wd in enumerate(win) if not np.array(wd[4]).all()), None)
+            done = win if bad is None else win[:bad]
+            store = self.layers[i].mlp.experts.store
+            for j_, _, _, xn, _, rec, _ in done:  # their experts were in slots: the store counts the uses
+                store.begin(j_, np.unique(np.array(rec[0])).tolist(), h.dtype)
+            store.passes += len(done)
+            store.ready += len(done)
+            last = done[-1][0] if done else i - 1
+            src = win if bad is None else win[:bad + 1]
+            latest = {}  # each later layer's guesses from the closest layer before it
+            for j_, _, _, _, _, rec, ahead in src:
+                o = 0
+                for _, nxt, r in ahead:
+                    latest[nxt] = (rec[2], o, r)
+                    o += r
+            for nxt in sorted(latest):
+                if nxt > (win[bad][0] if bad is not None else last):
+                    g, o, r = latest[nxt]
+                    store.prefetch(nxt, np.unique(np.array(g)[:, o:o + r]).tolist())
+            if bad is None:
+                self._window = min(n, 2 * self._window)
+                i = j
+                continue
+            jb, _, ha, xn, _, rec, _ = win[bad]
+            for jj, snap, *_ in win[bad + 1:]:
+                _restore(cache[jj], snap)
+            h = self.layers[jb].mlp._compute(xn, ha, rows, rec[0], rec[1])
+            self._window = max(1, bad + 1)
+            i = jb + 1
+        return h
 
 
 class Model(nn.Module):
@@ -805,9 +1130,9 @@ class Model(nn.Module):
             out[name] = w
         if not MODEL_PATHS:
             raise RuntimeError("Flint's experts are read from its folder: load it with locals (locals.models.register)")
-        from ..defaults import expert_cache_gb
+        from ..defaults import expert_cache_gb, expert_ram_gb
 
-        store = ExpertStore(MODEL_PATHS[-1], int(expert_cache_gb() * 2**30))
+        store = ExpertStore(MODEL_PATHS[-1], int(expert_cache_gb() * 2**30), ram_bytes=int(expert_ram_gb() * 2**30))
         moe = [i for i, layer in enumerate(self.model.layers) if isinstance(layer.mlp, SparseMoe)]
         for n, i in enumerate(moe):
             self.model.layers[i].mlp.experts.store = store

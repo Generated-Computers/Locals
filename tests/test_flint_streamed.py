@@ -122,6 +122,22 @@ def _in_memory(model, w):
     return call
 
 
+def _reference_moe(model, w):
+    """A MoE block as MLX's own ops compute it from the experts in memory, routed on float32 logits as the router
+    kernel routes (bf16 logits tie often, and a tie may go either way)."""
+    experts = _in_memory(model, w)
+
+    def call(self, x, residual=None):
+        logits = x.astype(mx.float32) @ self.gate.weight.astype(mx.float32).T
+        inds = mx.argpartition(-logits, kth=self.k - 1, axis=-1)[..., : self.k]
+        s = mx.sigmoid(mx.take_along_axis(logits, inds, axis=-1))
+        y = experts(self.experts, x, inds)
+        y = (y * (s / s.sum(axis=-1, keepdims=True))[..., None].astype(y.dtype)).sum(axis=-2) + self.shared_expert(x)
+        return y if residual is None else residual + y
+
+    return call
+
+
 def test_streamed_experts_give_what_the_experts_in_memory_give(tiny, monkeypatch):
     model, w = tiny
     tokens = mx.array([[3, 17, 42, 5, 88, 9, 61, 2, 33]])
@@ -259,31 +275,66 @@ def _save_wide(folder):
     return w
 
 
+@pytest.mark.parametrize("slots", [None, 3])
+@pytest.mark.parametrize("optimistic", [True, False])
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-def test_the_decode_kernels_give_what_the_experts_in_memory_give(tmp_path, monkeypatch, dtype):
+def test_the_decode_kernels_give_what_the_experts_in_memory_give(tmp_path, monkeypatch, dtype, optimistic, slots):
     """Decoding one token at a time, a model as wide as Flint's kernels need routes with the fused router kernels
-    and computes its MoE blocks with the fused expert kernels: the experts already in slots and the shared one
-    first, the ones being read added after (the first tokens find no expert in a slot, later ones most). It gives
-    what MLX's own ops on the experts in memory give."""
+    and computes its MoE blocks with the fused expert kernels, the experts already in slots and the shared one
+    first and the ones being read after; optimistically, each step's windows of layers look their experts up on
+    the GPU and resume after the first layer that misses one (its caches after it restored). With 3 slots a
+    layer, layers miss experts all the time. It gives what MLX's own ops on the experts in memory give."""
     import mlx_lm.utils as mlx_utils
 
+    monkeypatch.setattr(flint, "OPTIMISTIC", "always" if optimistic else "0")
     w = _save_wide(tmp_path)
     model, _ = mlx_utils.load_model(tmp_path)
     model.set_dtype(dtype, predicate=lambda t: t == mx.bfloat16)
+    store = model.expert_store
+    if slots:
+        store.slots = slots
     tokens = [3, 17, 42, 5, 88, 9, 61, 2, 33, 70, 11, 4]
     calls = []
-    fused = flint.SparseMoe._fused
-    monkeypatch.setattr(flint.SparseMoe, "_fused", lambda self, *a: calls.append(1) or fused(self, *a))
+    route = flint.SparseMoe._route
+    monkeypatch.setattr(flint.SparseMoe, "_route", lambda self, *a: calls.append(1) or route(self, *a))
+    restores = []
+    restore = flint._restore
+    monkeypatch.setattr(flint, "_restore", lambda *a: restores.append(1) or restore(*a))
     cache = model.make_cache()
     got = [model(mx.array([[t]]), cache=cache)[0, -1] for t in tokens]
-    assert len(calls) == 2 * len(tokens)  # both MoE layers, every token, took the kernels
-    store = model.expert_store
+    assert len(calls) >= 2 * len(tokens)  # both MoE layers, every token, took the kernels
     assert store.misses > 0 and store.hits > 0
-    monkeypatch.setattr(flint, "FUSED", False)
-    monkeypatch.setattr(flint.StreamedExperts, "__call__", _in_memory(model, w))
+    if optimistic and slots:
+        assert restores  # a window went past a layer that missed an expert
+    monkeypatch.setattr(flint.SparseMoe, "__call__", _reference_moe(model, w))
+    monkeypatch.setattr(flint, "OPTIMISTIC", "0")
     cache = model.make_cache()
     want = [model(mx.array([[t]]), cache=cache)[0, -1] for t in tokens]
     tol = 0.05 if dtype == mx.bfloat16 else 0.01
     for a, b in zip(got, want):
         a, b = a.astype(mx.float32), b.astype(mx.float32)
         assert float(mx.max(mx.abs(a - b))) <= tol * (1 + float(mx.max(mx.abs(b))))
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_experts_evicted_to_the_ram_cache_come_back_from_it(tmp_path, monkeypatch, dtype):
+    """With 3 slots a layer of 32 experts, decoding evicts experts all the time; with a RAM cache they are copied
+    there first, and a later miss copies them back instead of reading the file. The logits are bit for bit those
+    of the same decode reading every expert from the file."""
+    import mlx_lm.utils as mlx_utils
+
+    _save_wide(tmp_path)
+    tokens = [3, 17, 42, 5, 88, 9, 61, 2, 33, 70, 11, 4] * 3
+    runs = []
+    for ram in ("0.5", "0"):
+        monkeypatch.setenv("LOCALS_EXPERT_RAM_GB", ram)
+        model, _ = mlx_utils.load_model(tmp_path)
+        model.set_dtype(dtype, predicate=lambda t: t == mx.bfloat16)
+        store = model.expert_store
+        assert (store.ram is not None) == (ram != "0")
+        store.slots = 3
+        cache = model.make_cache()
+        runs.append([model(mx.array([[t]]), cache=cache)[0, -1] for t in tokens])
+        if store.ram is not None:
+            assert store.ram.puts > 50 and store.ram.hits > 50
+    assert all(mx.array_equal(a, b).item() for a, b in zip(*runs))

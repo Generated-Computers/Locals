@@ -74,6 +74,13 @@
   guess the next layers' experts in one product and one selection (0.27 ms of a layer's GPU time became 0.04),
   and the routed and shared experts in two kernels instead of about fourteen; the experts already on the GPU are
   computed while the others are read. Without reads a token takes 31 ms instead of 40.
+- Where Flint's layers mostly find their experts on the GPU, a decode step asks the host only when one is missing:
+  each layer looks its experts up on the GPU, and the step runs windows of layers at once, resuming after a layer
+  that missed one (its later layers' KV caches restored). With every expert on the GPU, a token takes 20 ms
+  instead of 31 (50 tokens per second on the M2 Pro). Steps switch to it when 90% of the layers find their
+  experts (LOCALS_FLINT_OPTIMISTIC: auto, always, 0).
+- LOCALS_EXPERT_RAM_GB: experts Flint evicts from the GPU are kept in memory outside the GPU's share, purgeable
+  (macOS takes it back before it would swap), and a later miss copies them back instead of reading the SSD.
 - Experts are read the most urgent first, the parts of one expert at once, bypassing macOS's file cache (which
   held the same experts a second time); the slot taken is the least used one (uses counted less as they age), and
   more experts are read ahead the more surely they are guessed.

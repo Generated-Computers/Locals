@@ -151,6 +151,17 @@ def expert_cache_gb() -> float:
     return 0.4 * (gpu_limit_gb() or 10.0)
 
 
+def expert_ram_gb() -> float:
+    """Memory outside the GPU's share for experts a streamed model evicts from its GPU slots (purgeable: macOS
+    takes it back before it would swap): LOCALS_EXPERT_RAM_GB, else 0."""
+    import os
+
+    try:
+        return max(0.0, float(os.environ.get("LOCALS_EXPERT_RAM_GB") or 0))
+    except ValueError:
+        return 0.0
+
+
 def _resident_gb(path: Path) -> "float | None":
     """For a model whose experts stay in its files (``streamed``): what stays in GPU memory, its weights without
     the experts (from the files' headers) and the expert cache. None for any other model."""
