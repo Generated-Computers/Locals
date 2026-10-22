@@ -1,0 +1,47 @@
+name: Star history
+
+# The README's star chart (.github/star-history/make.py): drawn again when the repository gets a star, every day
+# (for the dates, and stars taken back), when the chart's code changes, and on demand, then published as the only commit of the charts branch,
+# which the README's images point to.
+
+on:
+  watch:
+    types: [started]
+  push:
+    branches: [main]
+    paths: [".github/star-history/**", ".github/workflows/stars.yml"]
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: star-history
+  cancel-in-progress: false
+
+jobs:
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Draw
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python .github/star-history/make.py "$RUNNER_TEMP/charts"
+      - name: Publish to the charts branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git worktree add --detach "$RUNNER_TEMP/branch"
+          cd "$RUNNER_TEMP/branch"
+          git checkout -q --orphan "charts-$GITHUB_RUN_ID"
+          git rm -rfq .
+          cp "$RUNNER_TEMP/charts/stars.svg" "$RUNNER_TEMP/charts/stars-dark.svg" .
+          git add stars.svg stars-dark.svg
+          git commit -q -m "Star history"
+          git push -f origin HEAD:charts
