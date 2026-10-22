@@ -448,3 +448,52 @@ def test_with_an_expert_pack_the_experts_are_one_read_each_and_give_the_same(tmp
         out.append(model(prompt))
         runs.append(out)
     assert all(mx.array_equal(a, b).item() for a, b in zip(*runs))
+
+
+def test_the_layer_sets_go_while_decoding_and_come_back_for_the_next_prompt(tmp_path, monkeypatch):
+    """A prompt pass makes the two layer sets; decoding with no prompt pass for SETS_IDLE_S lets them go, and the
+    next prompt pass makes them again, with the same results."""
+    import mlx_lm.utils as mlx_utils
+
+    _save_wide(tmp_path)
+    model, _ = mlx_utils.load_model(tmp_path)
+    store = model.expert_store
+    monkeypatch.setattr(flint, "WHOLE", 1)
+    monkeypatch.setattr(flint, "SETS_IDLE_S", 0.0)
+    prompt = mx.array([[3, 17, 42, 5, 88, 9, 61, 2, 33, 70, 11, 4, 19, 23, 7, 50, 64, 31]])
+    first = model(prompt)
+    mx.eval(first)
+    assert store._sets is not None
+    cache = model.make_cache()
+    mx.eval(model(mx.array([[3]]), cache=cache))  # a decode step (the fused path: slots)
+    assert store._sets is None
+    again = model(prompt)
+    assert store._sets is not None and mx.array_equal(first, again).item()
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_experts_split_between_two_calls_give_the_bits_of_one(dtype):
+    """The experts in slots first, the others after their reads: the second call sums every contribution in the
+    experts' order (those of the first call taken from it), so the result does not depend on which reads had
+    ended - bit for bit what one call over all of them gives."""
+    from locals.models import flint_kernels as fk
+
+    rng = np.random.default_rng(5)
+    D, EI, S, rows = 512, 512, 6, 3
+    q = lambda *shape: _q(mx.array(rng.normal(0, 0.05, shape).astype(np.float32)))  # noqa: E731
+    routed = []
+    for o, k in ((EI, D), (EI, D), (D, EI)):
+        parts = [q(o, k) for _ in range(S)]
+        routed += [mx.stack([p[i] for p in parts]) for i in range(3)]
+    routed = [a.view(mx.uint32) if a.dtype == mx.uint8 else a for a in routed]
+    shared = [a.view(mx.uint32) if a.dtype == mx.uint8 else a.astype(dtype) for o, k in ((EI, D), (EI, D), (D, EI)) for a in q(o, k)]
+    x = mx.array(rng.normal(0, 0.5, (rows, D)).astype(np.float32)).astype(dtype)
+    res = mx.array(rng.normal(0, 1, (rows, D)).astype(np.float32)).astype(dtype)
+    slots = mx.array(np.stack([rng.choice(S, 2, replace=False) for _ in range(rows)]).astype(np.uint32))
+    w = mx.array(rng.random((rows, 2)).astype(np.float32))
+    one = fk.experts(x, res, routed, shared, slots, mx.ones((rows, 2), dtype=mx.uint32), w)
+    first = mx.array(np.array([[1, 0], [0, 1], [1, 1]], dtype=np.uint32))
+    part, contrib = fk.experts(x, res, routed, shared, slots, first, w, out_dtype=mx.float32, keep=True)
+    two = fk.experts(x, res, routed, shared, slots, mx.where(first == 1, 2, 1).astype(mx.uint32), w, prev=contrib,
+                     shared_from_prev=True)
+    assert mx.array_equal(one, two).item()

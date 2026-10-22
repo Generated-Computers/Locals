@@ -19,6 +19,7 @@ import json
 import os
 import struct
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -51,6 +52,7 @@ REFINE = int(os.environ.get("LOCALS_EXPERT_REFINE", "6"))  # guesses of the next
 KEEP_GPU_BUSY = os.environ.get("LOCALS_KEEP_GPU_BUSY", "1") != "0"  # while a pass waits for reads (ExpertStore._wait)
 DECAY = 0.5 ** (1 / 32)  # an expert's use counts half as much 32 passes over its layer later (which slot to take)
 WINDOW_BLOCK = 256  # queries a sliding layer's attention takes at once over a long pass (Attention._windowed)
+SETS_IDLE_S = 2.0  # seconds of decoding without a prompt pass after which the layer sets are let go (drop_sets)
 WHOLE = 96  # a pass that needs more of a layer's 256 experts (reading a prompt) reads the layer's expert tensors whole
 _PARTS = [(p, k) for p in ("gate_proj", "up_proj", "down_proj") for k in ("weight", "scales", "biases")]
 
@@ -451,6 +453,7 @@ class ExpertStore:
         self.uses = {}  # layer -> results computed from its slots, maybe not yet evaluated (see fence)
         self._filler = None  # (x, w) of the product that keeps the GPU busy while a pass waits for reads (_wait)
         self._sets = None  # two sets of a whole layer's expert tensors, for passes over prompts (whole)
+        self._sets_used = 0.0
         self.buf_of = {}  # layer -> (set, its read): a layer read into a set ahead of its pass
         self.buf_uses = {}  # set -> results computed from it, maybe not yet evaluated
         self._used_set = 0
@@ -701,6 +704,8 @@ class ExpertStore:
     def begin(self, layer: int, experts: list, dtype):
         """Like in_slots, without waiting: (the nine slot arrays, each expert's slot, the experts whose reads are
         under way). Their slots are usable once ``finish`` returns; the others' at once."""
+        if self._sets is not None and not self.buf_of and time.monotonic() - self._sets_used > SETS_IDLE_S:
+            self.drop_sets()
         arrs = self._slot_arrays(layer)
         L = self.layers[layer]
         if len(experts) > L.n:  # (the layer's slots as made: ``slots`` may have changed since; reset() remakes them)
@@ -858,6 +863,7 @@ class ExpertStore:
         layer and no copy through macOS's file cache (MLX's own load of the files took 7 s a pass over a 1,024-token
         prompt)."""
         sets = self._layer_set()
+        self._sets_used = time.monotonic()
         got = self.buf_of.pop(layer, None)
         if got is None:  # (not read ahead: a pass that starts here)
             k = 0 if all(v[0] != 0 for v in self.buf_of.values()) else 1
@@ -873,6 +879,14 @@ class ExpertStore:
         fill.wait()
         self._used_set = k
         return converted(sets[k][0], dtype)
+
+    def drop_sets(self) -> None:
+        """Give the layer sets' memory back (0.84 GB for Flint) once decoding has gone on without a prompt pass:
+        they are made again for the next one."""
+        for k in range(2):
+            self.buf_fence(k)
+        self._sets = None
+        mx.clear_cache()
 
     def buf_used(self, result: mx.array) -> None:
         """``result`` was computed from the set whole() last returned."""
@@ -1076,7 +1090,8 @@ class SparseMoe(nn.Module):
             store.used(layer, y)
             return y.reshape(shape)
         late = np.isin(experts, pending)[inv].reshape(rows, self.k)
-        part = fk.experts(x2, r2, arrs, shared, idx, mx.array((~late).astype(np.uint32)), w, out_dtype=mx.float32)
+        part, contrib = fk.experts(x2, r2, arrs, shared, idx, mx.array((~late).astype(np.uint32)), w, out_dtype=mx.float32,
+                                   keep=True)
         store.used(layer, part)
         mx.async_eval(part)  # the experts in slots and the shared one, while the others are read
         refine = self._refine
@@ -1091,7 +1106,10 @@ class SparseMoe(nn.Module):
             mx.eval(g)
             store.revise(nxt, np.unique(np.array(g)).tolist())
         store.finish(layer, pending)
-        y = fk.experts(x2, part, arrs, None, idx, mx.array(late.astype(np.uint32)), w, out_dtype=x.dtype)
+        # the whole sum again from the residual, the experts in slots and the shared one taken from the first call:
+        # in the same order as when every expert was in a slot, so the result does not depend on when reads end
+        y = fk.experts(x2, r2, arrs, shared, idx, mx.array(np.where(late, 1, 2).astype(np.uint32)), w, out_dtype=x.dtype,
+                       prev=contrib, shared_from_prev=True)
         store.used(layer, y)
         return y.reshape(shape)
 

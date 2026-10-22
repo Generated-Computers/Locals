@@ -260,7 +260,7 @@ _UP = r"""
     for (int r = 0; r < NOK; r++) {
         go = go && ok[r] != 0;
     }
-    if (row0 >= KE * EI + (SHARED ? SI : 0) || !go) {
+    if (row0 >= KE * EI + (SHARED == 1 ? SI : 0) || !go) {
         return;
     }
     constexpr int Kw = K / 8;
@@ -279,7 +279,7 @@ _UP = r"""
     const bool routed = row0 < KE * EI;
     if (routed) {
         const int j = row0 / EI;
-        if (mask[b * KE + j] == 0) {
+        if (mask[b * KE + j] != 1) {
             return;
         }
         const int r = int(slots[b * KE + j]) * EI + row0 % EI;
@@ -331,8 +331,11 @@ _UP = r"""
 """
 
 _DOWN = r"""
-    // y[b, n] = residual[b, n] + sum_j mask[b, j] weights[b, j] (down_j[n] . h[b, j]) (+ the shared expert's
-    // down row on its h, if SHARED). A simdgroup computes R rows of y.
+    // y[b, n] = residual[b, n] + sum over j in order of weights[b, j] c_j[n] + c_shared[n], where c_j = down_j[n] .
+    // h[b, j] (one simd_sum per expert) is computed where mask[b, j] == 1, taken from ``prev`` (an earlier launch's
+    // ``contrib``) where 2, left out where 0; the shared expert's likewise by SHARED (1 computed, 2 taken, 0 none).
+    // Every contribution computed is written to ``contrib`` (b, j, n), the shared one at j = KE. The sum's order is
+    // the same however the experts are split between launches: the same bits.
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
     const int n0 = (int(threadgroup_position_in_grid.x) * NSG + int(sg)) * R;
@@ -341,91 +344,117 @@ _DOWN = r"""
     if (n0 >= D) {
         return;
     }
-    float acc[R];
+    float total[R];
     UNROLL
     for (int r = 0; r < R; r++) {
-        acc[r] = 0.0f;
+        total[r] = 0.0f;
     }
     bool go = true;
     for (int r = 0; r < NOK; r++) {
         go = go && ok[r] != 0;
     }
-    const int nj = go ? KE + (SHARED ? 1 : 0) : 0;  // (a pass with a flag clear: the residual alone)
+    const int nj = go ? KE + 1 : 0;  // (a pass with a flag clear: the residual alone)
     for (int j = 0; j < nj; j++) {
         const bool shared = j == KE;
-        if (!shared && mask[b * KE + j] == 0) {
+        const int how = shared ? SHARED : int(mask[b * KE + j]);
+        if (how == 0) {
             continue;
         }
-        const int KI = shared ? SI : EI;
         const float wj = shared ? 1.0f : weights[b * KE + j];
-        const device float* hp = h + b * NH + j * EI + lane * 16;
-        const int row = shared ? n0 : int(slots[b * KE + j]) * D + n0;
-        const device uint32_t* wp = (shared ? sdw : dw) + row * (KI / 8) + lane * 2;
-        const device ST* sc = ds + row * (KI / 64) + (lane * 16) / 64;  // (routed: ST; shared: T, below)
-        const device ST* bi = db + row * (KI / 64) + (lane * 16) / 64;
-        const device T* hsc = sds + row * (KI / 64) + (lane * 16) / 64;
-        const device T* hbi = sdb + row * (KI / 64) + (lane * 16) / 64;
-        for (int k = 0; k < KI; k += 512) {
+        float c[R];
+        if (how == 2) {
+            UNROLL
+            for (int r = 0; r < R; r++) {
+                c[r] = prev[(b * (KE + 1) + j) * D + n0 + r];
+            }
+        } else {
+            float acc[R];
+            UNROLL
+            for (int r = 0; r < R; r++) {
+                acc[r] = 0.0f;
+            }
+            const int KI = shared ? SI : EI;
+            const device float* hp = h + b * NH + j * EI + lane * 16;
+            const int row = shared ? n0 : int(slots[b * KE + j]) * D + n0;
+            const device uint32_t* wp = (shared ? sdw : dw) + row * (KI / 8) + lane * 2;
+            const device ST* sc = ds + row * (KI / 64) + (lane * 16) / 64;  // (routed: ST; shared: T, below)
+            const device ST* bi = db + row * (KI / 64) + (lane * 16) / 64;
+            const device T* hsc = sds + row * (KI / 64) + (lane * 16) / 64;
+            const device T* hbi = sdb + row * (KI / 64) + (lane * 16) / 64;
+            for (int k = 0; k < KI; k += 512) {
 #define XSRC (hp + k)
 """ + _X_BLOCK + r"""
 #undef XSRC
-            UNROLL
-            for (int r = 0; r < R; r++) {
+                UNROLL
+                for (int r = 0; r < R; r++) {
 #define WORDS (wp + r * (KI / 8) + k / 8)
 """ + _DOT + r"""
 #undef WORDS
-                const int q = r * (KI / 64) + k / 64;
-                acc[r] += wj * ((shared ? float(hsc[q]) : float(sc[q])) * d + (shared ? float(hbi[q]) : float(bi[q])) * xs);
+                    const int q = r * (KI / 64) + k / 64;
+                    acc[r] += (shared ? float(hsc[q]) : float(sc[q])) * d + (shared ? float(hbi[q]) : float(bi[q])) * xs;
+                }
             }
+            UNROLL
+            for (int r = 0; r < R; r++) {
+                c[r] = simd_sum(acc[r]);
+                if (lane == 0) {
+                    contrib[(b * (KE + 1) + j) * D + n0 + r] = c[r];
+                }
+            }
+        }
+        UNROLL
+        for (int r = 0; r < R; r++) {
+            total[r] += wj * c[r];
         }
     }
     UNROLL
     for (int r = 0; r < R; r++) {
-        const float v = simd_sum(acc[r]);
         if (lane == 0) {
-            y[b * D + n0 + r] = static_cast<O>(float(residual[b * D + n0 + r]) + v);
+            y[b * D + n0 + r] = static_cast<O>(float(residual[b * D + n0 + r]) + total[r]);
         }
     }
 """
 
 
 def experts(x: mx.array, residual: mx.array, routed: List[mx.array], shared: Optional[List[mx.array]], slots: mx.array,
-            mask: mx.array, weights: mx.array, out_dtype=None, ok: Optional[mx.array] = None, R: int = 4,
-            NSG: int = 2) -> mx.array:
-    """residual + the masked routed experts of each row (weighted) + the shared expert (if ``shared``).
+            mask: mx.array, weights: mx.array, out_dtype=None, ok: Optional[mx.array] = None, prev: Optional[mx.array] = None,
+            shared_from_prev: bool = False, keep: bool = False, R: int = 4, NSG: int = 2):
+    """residual + the routed experts of each row (weighted, in their order) + the shared expert (if ``shared``).
 
     x, residual: (rows, D); routed: the nine slot arrays (gate, up, down x weight, scales, biases), slot first, the
     scales and biases in any float type (the files' bfloat16); shared: the shared expert's nine arrays, scales and
-    biases in x's type, or None; slots, mask: (rows, k) uint32; weights: (rows, k) float32.
-    Returns (rows, D) in ``out_dtype`` (default x's). With a flag of ``ok`` (uint32, route's per-row flags) clear,
-    nothing is computed and the result is the residual."""
+    biases in x's type, or None; slots: (rows, k) uint32; mask: (rows, k) uint32, per expert 1 = computed here,
+    2 = its contribution taken from ``prev`` (an earlier call's ``contrib``, with ``keep``), 0 = left out (and
+    ``shared_from_prev`` for the shared expert's); weights: (rows, k) float32. Returns (rows, D) in ``out_dtype``
+    (default x's), and with ``keep`` also the contributions computed here (rows, k + 1, D) float32. Splitting the
+    experts between calls this way gives the same bits as one call. With a flag of ``ok`` (uint32, route's per-row
+    flags) clear, nothing is computed and the result is the residual."""
     rows, D = x.shape
     gw, gs, gb, uw, us, ub, dw, ds, db = routed
     EI = gw.shape[1]
     KE = slots.shape[1]
-    SI = shared[0].shape[0] if shared is not None else 0
     if shared is not None:
-        sh = shared
-    else:  # (not read: SHARED is 0)
+        sh, SI = shared, shared[0].shape[0]
+    else:  # (not read)
         z, zw = _placeholder(x.dtype), _placeholder(mx.uint32)
-        sh = [zw, z, z, zw, z, z, zw, z, z]
-    if shared is None:
-        SI = EI  # (h keeps the width; the shared rows are not computed)
+        sh, SI = [zw, z, z, zw, z, z, zw, z, z], EI
+    SH = 0 if shared is None else (2 if shared_from_prev else 1)
     assert D % 512 == 0 and EI % 512 == 0 and SI % 512 == 0 and EI % R == 0 and D % R == 0
     T = x.dtype
     O = out_dtype or T
     okf = ok if ok is not None else one()
-    tmpl = [("T", T), ("ST", gs.dtype), ("K", D), ("D", D), ("EI", EI), ("SI", SI), ("KE", KE),
-            ("SHARED", int(shared is not None)), ("R", R), ("NSG", NSG), ("NOK", okf.size)]
-    n_up = KE * EI + (SI if shared is not None else 0)
+    pv = prev if prev is not None else _placeholder(mx.float32)
+    tmpl = [("T", T), ("ST", gs.dtype), ("K", D), ("D", D), ("EI", EI), ("SI", SI), ("KE", KE), ("SHARED", SH),
+            ("R", R), ("NSG", NSG), ("NOK", okf.size)]
+    n_up = KE * EI + (SI if SH == 1 else 0)
     (h,) = _kernel("locals_flint_experts_up", ["x", "gw", "gs", "gb", "uw", "us", "ub", "sgw", "sgs", "sgb", "suw", "sus",
                                                "sub", "slots", "mask", "ok"], ["h"], _UP)(
         inputs=[x, gw, gs, gb, uw, us, ub, sh[0], sh[1], sh[2], sh[3], sh[4], sh[5], slots, mask, okf],
         template=tmpl, grid=(((n_up + NSG * R - 1) // (NSG * R)) * 32 * NSG, rows, 1), threadgroup=(32 * NSG, 1, 1),
         output_shapes=[(rows, KE * EI + SI)], output_dtypes=[mx.float32])
-    (y,) = _kernel("locals_flint_experts_down", ["h", "dw", "ds", "db", "sdw", "sds", "sdb", "slots", "mask", "weights",
-                                                 "residual", "ok"], ["y"], _DOWN)(
-        inputs=[h, dw, ds, db, sh[6], sh[7], sh[8], slots, mask, weights, residual, okf],
+    y, contrib = _kernel("locals_flint_experts_down", ["h", "dw", "ds", "db", "sdw", "sds", "sdb", "slots", "mask", "weights",
+                                                       "residual", "ok", "prev"], ["y", "contrib"], _DOWN)(
+        inputs=[h, dw, ds, db, sh[6], sh[7], sh[8], slots, mask, weights, residual, okf, pv],
         template=tmpl + [("O", O)], grid=((D // (NSG * R)) * 32 * NSG, rows, 1), threadgroup=(32 * NSG, 1, 1),
-        output_shapes=[(rows, D)], output_dtypes=[O])
-    return y
+        output_shapes=[(rows, D), (rows, KE + 1, D)], output_dtypes=[O, mx.float32])
+    return (y, contrib) if keep else y

@@ -89,6 +89,10 @@
 - A sliding layer of Flint attends over a long pass in blocks of 256 queries, each over the keys its window reaches
   (the same softmax): 11.6 ms a layer over 4,096 tokens instead of 57 with the window as a mask over every key. A
   4,096-token prompt pass takes 6.9 s (10.9 before these changes).
+- Flint's results no longer depend on when expert reads end: the second call of a split MoE block sums every
+  expert's contribution in the experts' order, taking those of the first call from it (the same bits as one call;
+  a float32 sum in another order rounded differently now and then). The layer sets for prompt passes are let go
+  after 2 s of decoding without one (0.84 GB) and made again for the next prompt (66 ms).
 - `python -m locals.models.pack MODEL` writes an expert-major copy of a streamed model's experts (21.4 GB for
   Flint, in ~/.cache/locals/experts, 34 s on the M2 Pro). Flint's experts are stacked per tensor in its files, nine
   slices of one expert in nine places; from the copy each is one read, scattered into its slot: decoding 10.7
