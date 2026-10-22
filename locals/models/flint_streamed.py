@@ -473,9 +473,12 @@ class ExpertStore:
                     f.done.wait()
             if self.ram is not None:  # (its experts are in the old dtype's form)
                 self.ram.clear()
+            had = bool(self.arrays)
             self.arrays.clear()
             self.layers.clear()
             self.uses.clear()
+            if had:  # the old slots back to macOS now: kept in MLX's pool, they and the new ones took twice the memory
+                mx.clear_cache()
             self.dtype = dtype
         arrs = self.arrays.get(layer)
         if arrs is None:
