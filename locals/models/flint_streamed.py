@@ -47,6 +47,7 @@ FUSED = os.environ.get("LOCALS_FLINT_KERNELS", "1") != "0"  # decode passes' MoE
 # their experts in slots), "always", or "0" (never)
 OPTIMISTIC = os.environ.get("LOCALS_FLINT_OPTIMISTIC") or "auto"
 OPTIMISTIC = "auto" if OPTIMISTIC == "1" else OPTIMISTIC
+REFINE = int(os.environ.get("LOCALS_EXPERT_REFINE", "6"))  # guesses of the next layer from a partial result (0: off)
 KEEP_GPU_BUSY = os.environ.get("LOCALS_KEEP_GPU_BUSY", "1") != "0"  # while a pass waits for reads (ExpertStore._wait)
 DECAY = 0.5 ** (1 / 32)  # an expert's use counts half as much 32 passes over its layer later (which slot to take)
 WINDOW_BLOCK = 256  # queries a sliding layer's attention takes at once over a long pass (Attention._windowed)
@@ -882,6 +883,19 @@ class ExpertStore:
         if uses:
             mx.eval(uses)
 
+    def revise(self, layer: int, experts) -> None:
+        """A better guess of ``layer``'s experts: the guessed reads for it not started and not in ``experts`` are
+        dropped (their slots back as they were), and ``experts`` read ahead."""
+        L = self.layers.get(layer)
+        if L is None:
+            return
+        keep = set(experts)
+        for e, f in list(L.fills.items()):
+            if f.guess and e not in keep:
+                self._cancel(layer, L, e, f)
+                L.fresh.discard(e)
+        self.prefetch(layer, experts)
+
     def prefetch(self, layer: int, experts) -> None:
         """Start reading ``experts`` of ``layer`` into slots unless they are in one (or on their way); they are
         kept until the layer's next pass."""
@@ -968,6 +982,7 @@ class SparseMoe(nn.Module):
         self.shared_expert = MLP(args.hidden_size, args.shared_expert_intermediate_size)
         self.experts = StreamedExperts(layer)
         self._next = ()  # (router, index, guesses) of the next MoE layers, to guess their experts (Model.sanitize)
+        self._refine = None  # (norm, router, index) of the next MoE layer, to guess again from a partial result
 
     def _ahead(self, rows: int) -> list:
         """(router, layer, guesses per token) of the layers read ahead by a pass of ``rows`` tokens: the guesses
@@ -1064,6 +1079,17 @@ class SparseMoe(nn.Module):
         part = fk.experts(x2, r2, arrs, shared, idx, mx.array((~late).astype(np.uint32)), w, out_dtype=mx.float32)
         store.used(layer, part)
         mx.async_eval(part)  # the experts in slots and the shared one, while the others are read
+        refine = self._refine
+        if refine is not None and REFINE and rows <= 16:
+            # The residual with the shared expert and the experts in slots is the next layer's input but for the
+            # missing experts and the next layer's attention: through its norm and router it names the next
+            # layer's experts far better than this layer's input does (on Flint, the top 6 held 86% of them
+            # against 78%; by rank 100, 99, 96, 90, 78% against 99, 96, 89, 78, 62%). Computed while this layer
+            # waits for its reads, it revises the next layer's reads ahead.
+            norm, gate, nxt = refine
+            g = mx.argpartition(-gate(norm(part.astype(x.dtype))).astype(mx.float32), kth=REFINE - 1, axis=-1)[..., :REFINE]
+            mx.eval(g)
+            store.revise(nxt, np.unique(np.array(g)).tolist())
         store.finish(layer, pending)
         y = fk.experts(x2, part, arrs, None, idx, mx.array(late.astype(np.uint32)), w, out_dtype=x.dtype)
         store.used(layer, y)
@@ -1290,6 +1316,10 @@ class Model(nn.Module):
             ahead = tuple((self.model.layers[j].mlp.gate, j, min(rank, self.args.num_experts))
                           for j, rank in zip(moe[n + 1:], GUESSES) if rank > 0)
             object.__setattr__(self.model.layers[i].mlp, "_next", ahead)
+            if n + 1 < len(moe):
+                j = moe[n + 1]
+                object.__setattr__(self.model.layers[i].mlp, "_refine",
+                                   (self.model.layers[j].post_attention_layernorm, self.model.layers[j].mlp.gate, j))
         self.expert_store = store
         return out
 

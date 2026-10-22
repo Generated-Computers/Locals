@@ -99,6 +99,9 @@
   held the same experts a second time); the slot taken is the least used one (uses counted less as they age), and
   more experts are read ahead the more surely they are guessed. At most four guessed reads run at once
   (LOCALS_EXPERT_GUESS_READS), so a read a layer waits for finds the SSD free: 139 ms a token instead of 156.
+  While a layer of Flint waits for its reads, the residual with the shared expert and the experts in slots goes
+  through the next layer's norm and router: it names the next layer's experts far better than this layer's
+  input (86% of them in its top 6 against 78%), and the next layer's reads ahead are revised (87 -> 83 ms a token).
 - Mixture-of-experts models decode several requests at once with each expert read and decoded once a step: the
   step's (token, expert) pairs grouped by expert, one threadgroup per used expert and block of its rows (MLX's
   affine 4-bit and mxfp4). On the M2 Pro with Mellum2.1-12B-A2.5B (64 experts, 8 a token) 16 requests decode at
