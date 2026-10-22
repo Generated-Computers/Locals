@@ -38,6 +38,9 @@ MODEL_PATHS: List[Path] = []  # the folder being loaded (set by locals.models.re
 # the more reliably the higher the guess ranks (in a pass's top 6, on the M2 Pro: the top 3 one layer ahead 99, 97
 # and 90% of the time, the 6th 46%; the top 2 four layers ahead 95 and 84%), so each next layer gets fewer.
 GUESSES = tuple(int(g) for g in os.environ.get("LOCALS_EXPERT_GUESSES", "5,4,3,2").split(",") if g.strip())
+# Guessed reads running at once at most (each expert is four reads): a read a layer waits for then finds the SSD
+# with few others in its queue. On the M2 Pro, 4 made a token 139 ms instead of 156 (2: 150, 8: 149); 0: no limit.
+GUESS_READS = int(os.environ.get("LOCALS_EXPERT_GUESS_READS", "4"))
 FUSED = os.environ.get("LOCALS_FLINT_KERNELS", "1") != "0"  # decode passes' MoE blocks in Locals' kernels (flint_kernels)
 # Decode steps that ask the host only on a missing expert (FlintModel._optimistic): "auto" (when most layers find
 # their experts in slots), "always", or "0" (never)
@@ -116,12 +119,13 @@ class _Fill:
     """One expert's read into its slot: four reads (its three 4-bit weight arrays, then its six scales and biases)
     that reader threads take in turn, so the parts of one expert are read at once."""
 
-    __slots__ = ("tasks", "next", "left", "done", "error", "cancelled", "slot", "victim", "put", "got")
+    __slots__ = ("tasks", "next", "left", "done", "error", "cancelled", "slot", "victim", "put", "got", "guess")
 
     def __init__(self, tasks: list):
         self.tasks, self.next, self.left = tasks, 0, len(tasks)
         self.done, self.error, self.cancelled = threading.Event(), None, False
         self.slot = self.victim = self.put = self.got = None  # set by ExpertStore._take
+        self.guess = False  # read ahead on a guess (and not yet wanted by its layer's pass)
 
     def wait(self) -> None:
         self.done.wait()
@@ -257,21 +261,31 @@ class _Reader:
     in the model, so the reads a layer waits for come before those guessed for the layers after it, and a guess
     that the layer's routing did not confirm is dropped if no thread has started it."""
 
-    def __init__(self, threads: int):
+    def __init__(self, threads: int, guesses: int = 0):
         self.heap: list = []
         self.seq = 0
         self.stopped = False
+        self.guesses = guesses  # guessed reads running at once at most (0: no limit), leaving the SSD to wanted ones
+        self.running_guesses = 0
         self.cv = threading.Condition(threading.Lock())
         for i in range(threads):
             threading.Thread(target=self._work, name=f"locals-experts-{i}", daemon=True).start()
 
-    def submit(self, priority: int, tasks: list) -> _Fill:
+    def submit(self, priority: int, tasks: list, guess: bool = False) -> _Fill:
         fill = _Fill(tasks)
+        fill.guess = guess
         with self.cv:
             heapq.heappush(self.heap, (priority, self.seq, fill))
             self.seq += 1
             self.cv.notify(len(tasks))
         return fill
+
+    def want(self, fill: _Fill) -> None:
+        """``fill`` was a guess its layer's pass now wants: past the limit on guesses."""
+        with self.cv:
+            if fill.guess:
+                fill.guess = False
+                self.cv.notify_all()
 
     def cancel(self, fill: _Fill) -> bool:
         """Drop ``fill`` if no part of it was started (then its slot is free once a thread passes it)."""
@@ -295,6 +309,9 @@ class _Reader:
                         return
                     self.cv.wait()
                 fill = self.heap[0][2]
+                if fill.guess and self.guesses and self.running_guesses >= self.guesses and not fill.cancelled:
+                    self.cv.wait(0.002)  # (a wanted read, queued first, or a guess's end, wakes it sooner)
+                    continue
                 if fill.cancelled:
                     heapq.heappop(self.heap)
                     fill.left -= len(fill.tasks) - fill.next
@@ -306,6 +323,8 @@ class _Reader:
                 fill.next += 1
                 if fill.next == len(fill.tasks):
                     heapq.heappop(self.heap)
+                guess = fill.guess
+                self.running_guesses += guess
             try:
                 for fd, offset, dst, conv in task:
                     if fd < 0:  # a copy in memory: (-1, destination, source, bytes)
@@ -322,8 +341,11 @@ class _Reader:
                 fill.error = e
             with self.cv:
                 fill.left -= 1
+                self.running_guesses -= guess
                 if fill.left == 0:
                     fill.done.set()
+                if guess:
+                    self.cv.notify()
 
 
 class _Layer:
@@ -393,7 +415,7 @@ class ExpertStore:
                 self.ranges.setdefault(layer, []).append((cached, 8 + n + begin, end - begin))
                 self.experts[layer] = experts
         self.pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="locals-experts")  # stacked() and warm()
-        self.reader = _Reader(readers)
+        self.reader = _Reader(readers, GUESS_READS)
         layers = sorted(self.experts)
         per = self.expert_bytes(layers[0]) if layers else 1
         self.slots = max(1, min(min(self.experts.values(), default=1), budget_bytes // max(1, per * len(layers))))
@@ -572,7 +594,7 @@ class ExpertStore:
             return None
         return cands[int(np.argmin(L.score[np.array(cands)]))]
 
-    def _take(self, layer: int, e: int, keep: set, wait: bool = True) -> Optional[int]:
+    def _take(self, layer: int, e: int, keep: set, wait: bool = True, guess: bool = False) -> Optional[int]:
         """A slot for ``e``, its read started: a free one, else the one whose expert was used least and is not in
         ``keep``; with ``wait``, the next one a read under way leaves if every slot is taken. None (without
         ``wait``) if there is none to take. The evicted expert is copied to the RAM cache first, and ``e`` comes
@@ -617,7 +639,7 @@ class ExpertStore:
                 item = (fd, start + e * size, mv, conv)
             tasks[j // 3 if j % 3 == 0 else 3].append(item)
             o += size
-        f = self.reader.submit(layer, tasks)
+        f = self.reader.submit(layer, tasks, guess)
         f.slot, f.victim, f.put, f.got = s, victim, put, got
         L.fills[e] = f
         return s
@@ -664,6 +686,7 @@ class ExpertStore:
             if e in L.where:
                 if e in L.fills:
                     self.ahead += 1  # read ahead: its read may still be under way
+                    self.reader.want(L.fills[e])
                 else:
                     self.hits += 1
             else:
@@ -768,8 +791,9 @@ class ExpertStore:
             return
         keep = set(experts)
         for e in experts:
-            if e not in L.where and self._take(layer, e, keep | L.fresh, wait=False) is None:
-                break  # no slot to spare: the rest are read when needed
+            if e not in L.where:
+                if self._take(layer, e, keep | L.fresh, wait=False, guess=True) is None:
+                    break  # no slot to spare: the rest are read when needed
             L.fresh.add(e)
 
 

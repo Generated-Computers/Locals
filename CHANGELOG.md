@@ -83,7 +83,8 @@
   (macOS takes it back before it would swap), and a later miss copies them back instead of reading the SSD.
 - Experts are read the most urgent first, the parts of one expert at once, bypassing macOS's file cache (which
   held the same experts a second time); the slot taken is the least used one (uses counted less as they age), and
-  more experts are read ahead the more surely they are guessed.
+  more experts are read ahead the more surely they are guessed. At most four guessed reads run at once
+  (LOCALS_EXPERT_GUESS_READS), so a read a layer waits for finds the SSD free: 139 ms a token instead of 156.
 - A model can set its own prompt passes (HybridBatchEngine.prefill_tokens).
 
 ## 0.2.1 (2026-10-21)
