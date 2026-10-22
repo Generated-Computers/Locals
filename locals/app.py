@@ -30,6 +30,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -46,7 +47,7 @@ HOME = Path.home()
 LOCALS_DIR = HOME / ".locals"
 OPENCODE_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "opencode" / "opencode.json"  # (as OpenCode looks)
 OPENCODE_BIN = HOME / ".opencode" / "bin" / "opencode"
-OPENCODE_VERSION = "1.18.32"  # the version this integration was built and tested against
+OPENCODE_VERSION = "1.18.32"  # default first install; existing v1 and v2 CLIs are detected at launch
 DEFAULT_PORT = 8321
 
 PROVIDERS = {
@@ -986,6 +987,106 @@ def cmd_status(args) -> None:
 
 # --- opencode ---------------------------------------------------------------------------------------
 
+def _opencode_v2(oc: str) -> bool:
+    """Probe the TUI contract before downloading a model; unknown CLIs fail without guessing flags."""
+    try:
+        p = subprocess.run([oc, "--help"], capture_output=True, text=True, timeout=10,
+                           env=dict(os.environ, NO_COLOR="1", OPENCODE_DISABLE_AUTOUPDATE="1"))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        sys.exit(f"could not inspect OpenCode at {oc}: {e}")
+    help_text = p.stdout + p.stderr  # v1's yargs writes help to stderr; v2 writes it to stdout
+    if p.returncode == 0:
+        if re.search(r"--standalone\b", help_text):
+            return True
+        if re.search(r"--model\b", help_text):
+            return False
+    sys.exit(f"OpenCode at {oc} has no supported TUI launch interface. Run '{oc} --help' to check the installation. "
+             "Locals supports the v1 --model interface and the v2 --standalone interface.")
+
+
+def _opencode_v2_config(cfg: dict, ref: str) -> dict:
+    """A launch-only native v2 overlay, after project config; never persist a comparison engine."""
+    inherited = os.environ.get("OPENCODE_CONFIG_CONTENT") or "{}"
+    try:
+        # OpenCode accepts JSONC here too. Match whole string literals first, so URLs, escaped quotes and
+        # literal comment/comma text stay intact. Comments become whitespace rather than joining tokens.
+        strings = r'("(?:[^"\\]|\\.)*")'
+        inherited = re.sub(strings + r'|//[^\r\n]*|/\*.*?\*/', lambda m: m[1] or " ", inherited, flags=re.S)
+        inherited = re.sub(strings + r'|,(?=\s*[}\]])', lambda m: m[1] or "", inherited)
+        overlay = json.loads(inherited)
+    except ValueError:
+        sys.exit("OPENCODE_CONFIG_CONTENT must be a JSON or JSONC object for locals code with OpenCode v2")
+    if not isinstance(overlay, dict):
+        sys.exit("OPENCODE_CONFIG_CONTENT must be a JSON object")
+
+    def merge(base, patch):
+        out = dict(base)
+        for key, value in patch.items():
+            out[key] = merge(out[key], value) if isinstance(out.get(key), dict) and isinstance(value, dict) else value
+        return out
+
+    provider, model = ref.split("/", 1)
+    selection = {"providerID": provider, "model": model}
+    providers = {}
+    for pid in _locals_providers(cfg.get("provider")):
+        old = cfg["provider"][pid]
+        providers[pid] = {"name": old["name"], "package": "aisdk:" + old["npm"], "settings": old["options"],
+                          "models": {mid: {"name": m.get("name", mid), "limit": m.get("limit", {}),
+                                           "capabilities": {"tools": m.get("tool_call", True), "temperature": m.get("temperature", True),
+                                                            "reasoning": {"supported": m.get("reasoning", False)}}}
+                                     for mid, m in old["models"].items()}}
+    agents = {}
+    actions = {"bash": "shell", "task": "subagent", "write": "edit", "patch": "edit"}
+    for name, definition in (cfg.get("agent") or {}).items():
+        # User-owned agents keep their definitions, migrated by OpenCode itself. Only our prompts name v1 tools.
+        if (name not in AGENTS or definition != AGENTS[name] or name in (cfg.get("agents") or {})
+                or name in (overlay.get("agents") or {}) or name in (overlay.get("agent") or {})):
+            continue
+        prompt = definition["prompt"]
+        for before, after in (("bash", "shell"), ("task tool", "subagent tool"), ("task calls", "subagent calls"),
+                              ("subagent_type:", "agent:"), ("with write", "with edit")):
+            prompt = prompt.replace(before, after)
+        permissions = []
+        for action, rule in definition["permission"].items():
+            for resource, effect in ({"*": rule} if isinstance(rule, str) else rule).items():
+                permissions.append({"action": actions.get(action, action), "resource": resource, "effect": effect})
+        agents[name] = {k: v for k, v in definition.items() if k not in ("prompt", "permission")}
+        agents[name].update(system=prompt, permissions=permissions)
+    agent = cfg.get("default_agent", "orchestrator")
+    # V2 selects an agent's model before the global default. Override that initial selection too, so a project's
+    # agent model cannot send the first prompt to a cloud provider. /models can still change it interactively.
+    agents.setdefault(agent, {})["model"] = selection
+    return merge(overlay, {"model": selection, "default_agent": agent, "providers": providers, "agents": agents,
+                           "experimental": {"subagent_depth": cfg.get("subagent_depth", 1)}})
+
+
+def _opencode_v2_continue(oc: str, directory: Path, ref: str, env: dict) -> List[str]:
+    """Resume the same root session as v2's -c, applying our model before the full TUI opens it."""
+    def api(*args):
+        try:
+            p = subprocess.run([oc, "api", "--standalone", *args], env=env, cwd=str(directory),
+                               capture_output=True, text=True, timeout=60)
+            if p.returncode == 0:
+                return json.loads(p.stdout) if p.stdout.strip() else None
+        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+            sys.exit(f"could not continue the OpenCode session: {e}")
+        sys.exit(f"could not continue the OpenCode session: {p.stderr[-1000:]}")
+
+    page = api("session.list", "--param", f"directory={directory}", "--param", "parentID=null",
+               "--param", "order=desc", "--param", "limit=1")
+    if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+        sys.exit("could not continue the OpenCode session: unexpected session.list response")
+    sessions = page["data"]
+    if not sessions:
+        return []
+    if not isinstance(sessions[0], dict) or not isinstance(sessions[0].get("id"), str):
+        sys.exit("could not continue the OpenCode session: missing session ID")
+    sid = sessions[0]["id"]
+    provider, model = ref.split("/", 1)
+    api("session.switchModel", "--param", f"sessionID={sid}", "--data", json.dumps({"model": {"providerID": provider, "id": model}}))
+    return ["--session", sid]
+
+
 def _opencode_ready(model: str, port: int = DEFAULT_PORT) -> bool:
     """OpenCode is installed and its config serves this model, at this port."""
     if opencode_bin() is None or not OPENCODE_CONFIG.exists():
@@ -1642,6 +1743,7 @@ def cmd_code(args) -> None:
         print(agent_note(args.model), flush=True)
     if opencode_bin() is None:  # asked before the model's gigabytes download, not after
         install_opencode(OPENCODE_VERSION)
+    v2 = _opencode_v2(opencode_bin())
     fetch_model(args.model)  # checked (and downloaded) before OpenCode's settings name it
     if not _opencode_ready(args.model, args.port) or (args.engine == "mlx" and not _has_provider("mlx")):
         print(f"setting up OpenCode for {args.model} ...", flush=True)
@@ -1654,19 +1756,23 @@ def cmd_code(args) -> None:
     if args.agent and cfg.get("default_agent") != args.agent:  # OpenCode's default agent, kept for later launches
         cfg["default_agent"] = args.agent
         _write_atomic(OPENCODE_CONFIG, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
-    # The model is given on OpenCode's command line on every launch: a model set by a project's own opencode.json
-    # (or a global .jsonc) would otherwise win over ours, and could send the project to a cloud model. An engine
-    # asked for here (--engine mlx) is for this launch only: later servers start without the stock engine.
+    # Override project model defaults on every launch (v1: -m, v2: inline config). Otherwise the project's own
+    # opencode.json or a global .jsonc could send it to a cloud model. --engine mlx is for this launch only.
     ref = oc_model(args.engine or "locals", short)
     env = dict(os.environ, OPENCODE_DISABLE_AUTOUPDATE="1", PWD=str(d))  # OpenCode reads its project directory from $PWD
+    if v2:
+        env["OPENCODE_CONFIG_CONTENT"] = json.dumps(_opencode_v2_config(cfg, ref))
     os.chdir(d)
     shown = f"{short} on the {args.engine or 'locals'} engine, agent {args.agent or cfg.get('default_agent')}"
     if args.run:
         print(f"opencode in {d}: running the task ({shown}) ...", flush=True)
-        sys.exit(_opencode_run([oc, "run", "--format", "json", "-m", ref, *(["-c"] if args.cont else []), args.run], env))
-    print(f"opencode in {d}  ({shown}; /models switches the engine, Tab the agent)")
+        sys.exit(_opencode_run([oc, "run", *(["--standalone"] if v2 else []), "--format", "json", "-m", ref,
+                               *(["-c"] if args.cont else []), args.run], env))
+    print(f"opencode in {d}  ({shown}; /models switches the engine, {'Shift+Tab' if v2 else 'Tab'} the agent)")
+    resume = _opencode_v2_continue(oc, d, ref, env) if v2 and args.cont else (["-c"] if args.cont else [])
     _space_opencode_starts()
-    os.execve(oc, [oc, str(d), "-m", ref] + (["--print-logs"] if args.logs else []), env)
+    os.execve(oc, [oc, str(d), *(["--standalone"] if v2 else ["-m", ref]),
+                   *resume, *(["--print-logs"] if args.logs else [])], env)
 
 
 OPENCODE_START_GAP = 2.0  # seconds between OpenCode starts (see _space_opencode_starts)

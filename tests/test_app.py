@@ -185,6 +185,8 @@ def test_code_run_end_to_end_with_stand_ins(tmp_path, monkeypatch, capsys):
     real_run = subprocess.run
 
     def run(cmd, **kw):
+        if cmd == ["/bin/echo", "--help"]:
+            return subprocess.CompletedProcess(cmd, 0, "--model Model to use", "")
         if cmd[0] == "/bin/echo" and "--version" in cmd:
             return real_run(["echo", "1.18.32"], **kw)
         calls.append(("opencode", cmd[1:]))
