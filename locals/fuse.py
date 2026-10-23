@@ -411,6 +411,9 @@ def fuse_model(model) -> int:
         from .qkv import opt_in
 
         opt_in(model)  # full-attention keys and values in 8 bits, as Flint's config asks (locals/qkv.py)
+        # no chunk's scores held (hybrid_batch.PREFILL_SCORES), and 2,048-token chunks read 5% faster than 1,024: a
+        # prompt goes in 2,048-token chunks to about 30k tokens, 1,024 to about 63k
+        model.prefill_scores, model.prefill_chunk_tokens = 1 << 26, 2048
     mx.eval(model.parameters())
     # the projections fused away stay in MLX's buffer cache, which keeps freed buffers for reuse: 2.5 GB of Flint's
     # (its experts' gate and up), which a 24 GB Mac then swapped for

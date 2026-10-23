@@ -314,3 +314,17 @@ def test_banded_window_attention_is_the_masked_one(monkeypatch):
 
     for got, ref in zip(run(4), run(0)):
         assert float(mx.abs(got - ref).max()) <= 1e-3 * (1 + float(mx.abs(ref).max()))
+
+
+def test_flint_reads_prompts_in_longer_chunks():
+    """Flint's prompt attention holds no chunk's scores (MLX's fused causal attention, bands in the window layers), so
+    fuse_model lets the engine keep 2,048-token chunks where hybrid_batch.PREFILL_SCORES halves them."""
+    import locals
+    from locals.hybrid_batch import PREFILL_SCORES, prefill_chunk
+    from locals.kernels import text_model
+
+    m = _model(seed=2)
+    locals.patch(m, tune="off", kernels=False)
+    lm = text_model(m)
+    assert lm.prefill_chunk_tokens == 2048 and lm.prefill_scores > PREFILL_SCORES
+    assert prefill_chunk(16384, 1, 2048, lm.prefill_scores) == 2048 and prefill_chunk(16384, 1, 2048) == 512

@@ -78,6 +78,9 @@ _MIXLOG = bool(os.environ.get("LOCALS_MIXLOG"))  # print each mixed pass (locals
 # 48k, 128 beyond 100k. Without this, a 47k-token prompt's last chunks needed
 # 3.5 GB above the model and a 64k one did not fit next to it on 16 GB.
 PREFILL_SCORES = 1 << 24
+# A model whose prompt attention never holds a chunk's scores (fuse.py sets its ``prefill_scores``: Flint's, MLX's
+# fused causal attention in the full layers and bands in the window layers) keeps longer chunks further: a 32k prompt
+# in 2,048-token chunks read at 560 tokens/s against 506 in chunks halved to 512, 0.5 GB more at the peak.
 # Tokens of all rows in one prefill forward. Its activations grow with them (Qwen3.5-4B: about 1 GB
 # at 2048, 4.3 GB at 8 rows x 1024, past the GPU's memory at 16 x 1024: sixteen requests arriving
 # together failed with a Metal out-of-memory error); the prefill rate is the same from ~1k tokens up
@@ -374,10 +377,10 @@ class DiskPromptCache:
             return 0
 
 
-def prefill_chunk(done: int, rows: int = 1, base: int = 2048) -> int:
+def prefill_chunk(done: int, rows: int = 1, base: int = 2048, scores: int = PREFILL_SCORES) -> int:
     """Tokens of the next prefill chunk after ``done`` cached positions."""
     c = base
-    while c > 128 and rows * c * (done + c) > PREFILL_SCORES:
+    while c > 128 and rows * c * (done + c) > scores:
         c //= 2
     while c > 16 and rows * c > PREFILL_TOKENS:
         c //= 2
@@ -456,6 +459,8 @@ class HybridBatchEngine(BatchEngine):
         self.top_p, self.top_k = 0.0, 0  # sampling filters at temp > 0 (see engine.sample_logits)
         self.tree_count = 0
         self.lm = text_model(model)
+        self._prefill_scores = getattr(self.lm, "prefill_scores", PREFILL_SCORES)
+        self._prefill_base = getattr(self.lm, "prefill_chunk_tokens", 1024)  # a prompt's chunk where it may be longest
         # GPU bytes the engine may use (0: no guard). Before a prefill, prompt-cache
         # entries are dropped if the prefill would not fit next to them.
         self.memory_limit = 0
@@ -697,12 +702,14 @@ class HybridBatchEngine(BatchEngine):
             print(f"[mem] room for {need / 1e9:.2f} GB: active {mx.get_active_memory() / 1e9:.2f} GB, prompt cache "
                   f"{lru.nbytes / 1e9:.2f} GB in {len(lru)}, limit {self.memory_limit / 1e9:.2f}", flush=True)
 
-    def _prefill_batch(self, prompts: List[List[int]], others: List[List[int]], chunk: int = 1024, starts=None, stop=None):
+    def _prefill_batch(self, prompts: List[List[int]], others: List[List[int]], chunk: Optional[int] = None, starts=None,
+                       stop=None):
         """Prefill several prompts in one right-padded batch; returns a batch
         cache. ``starts[i]``, if given, is a (cache, remaining tokens) pair; the
         list is emptied once its caches are merged (the caller hands them over:
         held there too, every prompt's KV existed twice at the join).
         ``stop()``, asked between chunks: true gives up the prefill (returns None)."""
+        chunk = chunk or self._prefill_base
         given = starts
         caches, rests = [], []
         for i, p in enumerate(prompts):
@@ -759,7 +766,7 @@ class HybridBatchEngine(BatchEngine):
         base = next((c._idx for c in cache if isinstance(c, BatchKVCache)), 0)  # positions already in the batch cache
         i = 0
         while i < L:
-            n = prefill_chunk(done + i, len(prompts), chunk)
+            n = prefill_chunk(done + i, len(prompts), chunk, self._prefill_scores)
             a0 = mx.get_active_memory()
             _reset_peak()
             self.lm.model(x[:, i : i + n], cache)
@@ -782,7 +789,7 @@ class HybridBatchEngine(BatchEngine):
         False if ``stop()`` (asked between chunks) gave it up."""
         done, i = _cached(cache), 0
         while i < len(toks):
-            n = prefill_chunk(done + i, 1, chunk)
+            n = prefill_chunk(done + i, 1, chunk, self._prefill_scores)
             a0 = mx.get_active_memory()
             _reset_peak()
             self.lm.model(mx.array([toks[i : i + n]]), cache)
@@ -1223,7 +1230,7 @@ class HybridBatchEngine(BatchEngine):
             e["reserved"] = stop
         # the pass's rows (decode rows and prompt tokens) a whole number of matmul tiles: one row past
         # a multiple of 32 or 64 costs a whole tile more, more than the decode step the pass saves
-        n = min(self.mix_chunk - int(x.shape[0]), stop - e["pos"], prefill_chunk(e["pos"], 1, self.mix_chunk))
+        n = min(self.mix_chunk - int(x.shape[0]), stop - e["pos"], prefill_chunk(e["pos"], 1, self.mix_chunk, self._prefill_scores))
         n = max(n, 1)
         h = forward(self.lm.model, x[:, None], cache, mx.array([r.prompt[e["pos"]: e["pos"] + n]]), c)
         out = self._pick(self._head(h), g, temp, budget)
