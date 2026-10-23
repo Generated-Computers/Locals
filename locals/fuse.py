@@ -84,7 +84,11 @@ class FusedFlintAttention(nn.Module):
                 return out.transpose(0, 2, 1, 3).reshape(B, L, -1)
             if cache is not None:
                 k, v = cache.update_and_fetch(k, v)
-            out = scaled_dot_product_attention(q, k, v, cache=cache, scale=self.scale, mask=mask, sinks=self.softmax_offset)
+            W = getattr(cache, "max_size", None)  # a sliding window's ring (mlx-lm's RotatingKVCache)
+            if FLINT_BAND and L >= 2 * FLINT_BAND and isinstance(mask, mx.array) and isinstance(W, int):
+                out = self._banded(q, k, v, mask, cache, W)
+            else:
+                out = scaled_dot_product_attention(q, k, v, cache=cache, scale=self.scale, mask=mask, sinks=self.softmax_offset)
             return out.transpose(0, 2, 1, 3).reshape(B, L, -1)
         q = self.q_norm(qkv[..., :nq].reshape(B, L, self.n_heads, -1)).transpose(0, 2, 1, 3)
         k = self.k_norm(qkv[..., nq : nq + nk].reshape(B, L, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
@@ -100,6 +104,24 @@ class FusedFlintAttention(nn.Module):
             k, v = cache.update_and_fetch(k, v)
         out = scaled_dot_product_attention(q, k, v, cache=cache, scale=self.scale, mask=mask, sinks=self.softmax_offset)
         return out.transpose(0, 2, 1, 3).reshape(B, L, -1)
+
+
+    def _banded(self, q, k, v, mask, cache, W: int) -> mx.array:
+        """A prompt chunk's attention in a sliding-window layer, FLINT_BAND queries at a time against the keys their
+        window reaches (slices of the keys and of the mask): the same scores, without the 2,048 x 2,560 of a chunk
+        under a 513-token window, most of them masked. 8 to 10% of a Flint prompt's reading."""
+        L = q.shape[2]
+        P = k.shape[2] - L  # the ring's keys before the chunk's
+        outs = []
+        for a in range(0, L, FLINT_BAND):
+            b = min(L, a + FLINT_BAND)
+            lo, hi = max(0, P + a - (W - 1)), P + b
+            outs.append(scaled_dot_product_attention(q[:, :, a:b], k[:, :, lo:hi], v[:, :, lo:hi], cache=cache, scale=self.scale,
+                                                     mask=mask[..., a:b, lo:hi], sinks=self.softmax_offset))
+        return mx.concatenate(outs, axis=2)
+
+
+FLINT_BAND = int(os.environ.get("LOCALS_FLINT_BAND", "512"))  # queries per band; 0: one attention over the chunk
 
 
 class FusedMLP(nn.Module):

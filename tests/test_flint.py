@@ -292,3 +292,25 @@ def test_a_span_in_one_pass_is_its_tokens_one_at_a_time(kv_bits, monkeypatch):
     eng.lm = SimpleNamespace(model=m)
     r = SimpleNamespace(controller=SimpleNamespace())
     assert eng._solo_ok(r, one) and not eng._solo_drafts_ok(one)
+
+
+def test_banded_window_attention_is_the_masked_one(monkeypatch):
+    """A prompt chunk in the sliding-window layers, a few queries at a time against the keys their window reaches
+    (FusedFlintAttention._banded), gives the scores of the whole chunk under the window's mask: from an empty ring
+    and from a full one."""
+    from mlx_lm.models.cache import make_prompt_cache
+
+    import locals
+    from locals import fuse
+
+    m = _model(seed=11)
+    locals.patch(m, tune="off", kernels=False)
+    toks = [[int(t) for t in mx.random.randint(0, 512, (n,), key=mx.random.key(n)).tolist()] for n in (12, 20)]
+
+    def run(band):
+        monkeypatch.setattr(fuse, "FLINT_BAND", band)
+        c = make_prompt_cache(m)
+        return [m(mx.array([t]), cache=c).astype(mx.float32) for t in toks]
+
+    for got, ref in zip(run(4), run(0)):
+        assert float(mx.abs(got - ref).max()) <= 1e-3 * (1 + float(mx.abs(ref).max()))
