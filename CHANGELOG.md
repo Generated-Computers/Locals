@@ -12,8 +12,9 @@
   code ships with Locals (mlx-lm has it only in an unreleased pull request), its tool calls have their own format
   (`<tool_call>NAME<arg_key>...</arg_key><arg_value>...</arg_value></tool_call>`; it was taken for the hermes form,
   whose grammar held Flint to JSON calls), and its reasoning, which it opens itself, comes back as reasoning. Kernels
-  for its router, experts and q/k norms: on an M4 Pro with 24 GB, 102 tokens/s for one request where mlx-lm gives 85,
-  255 for eight at once where it gives 202; prompts are read as fast as mlx-lm reads them (docs/benchmarks, section 11).
+  for its router, experts and q/k norms: on an M4 Pro with 24 GB, 115 tokens/s for one request where mlx-lm gives 85,
+  264 for eight at once where it gives 202; prompts are read 7 to 12% faster than mlx-lm reads them from 4,096 tokens
+  (docs/benchmarks, section 11).
 - On a Mac with the memory for a model but macOS's default GPU limit below what it needs (Flint on 24 GB), the memory
   check says how to raise the limit (`sudo sysctl iogpu.wired_limit_mb=...`) instead of only naming a smaller model.
 - A matrix product tuned to MLX's own kernel skips Locals's routing: 4 us of Python a call, which a one-token step
@@ -31,6 +32,13 @@
 - One request alone gets its forced spans in one pass on models with sliding-window or 8-bit caches too (Flint,
   Gemma): those caches cannot be rewound, which drafts need and forced spans do not. Flint's typed calls take 10%
   fewer passes.
+- Flint's expert kernels no longer end a command buffer each: MLX ends one once its inputs pass 50 MB, counted at
+  their whole size, and the kernels were handed a layer's whole expert tensors (350 MB). Handed one-expert views of
+  the same buffers, a one-token step takes 8.75 ms instead of 10.2: 115 tokens/s for one request instead of 102, and
+  8 to 9% more after long prompts.
+- Flint's sliding-window layers read a prompt chunk in bands of 512 queries against the keys their window reaches,
+  instead of the whole chunk under a mask: prompts 11% faster from 4,096 tokens (844 tokens/s instead of 760 at 4k,
+  560 instead of 504 at 32k), the same logits.
 - MLX 0.32.4 and mlx-lm 0.32.2 in the lock file, as a fresh install gets them.
 
 ## 0.2.1 (2026-10-21)

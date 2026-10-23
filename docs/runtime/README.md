@@ -150,7 +150,8 @@ a model. Where the installed mlx-lm has its own, that one stays: `mlx/<model>` i
 
 **Why.** On an M4 Pro a one-token Flint step is about 600 dependent kernel launches deep, and each costs about 5 us
 before it reads anything, whatever its size (a residual add: 5.5 us, an RMS norm: 6.6 us). The 1.3 GB a token reads
-take 4.9 ms at the chip's bandwidth; stock mlx-lm's step took 11.7 ms. The kernels here remove launches on that chain:
+take 5.9 ms at the 218 GB/s this M4 Pro reads at best (a kernel summing a 256 MB buffer; MLX's qmv reaches 202 on a
+large 4-bit matrix, 125 to 155 on Flint's 5 MB attention projections); stock mlx-lm's step took 11.7 ms. The kernels here remove launches on that chain:
 
 - **Router** (`router_logits`): one simdgroup per expert in 64 small threadgroups, the bf16 weight read as it is and
   every dot product summed in float32 (as `x.astype(f32) @ W.astype(f32).T`, within 1.5e-7). MLX's float32
@@ -171,6 +172,15 @@ take 4.9 ms at the chip's bandwidth; stock mlx-lm's step took 11.7 ms. The kerne
   exactly (the normalized value is rounded before the weight's product); the rotation equals `mx.fast.rope` in 99% of
   values and is a last bit off in the rest.
 
+**Command buffers.** MLX ends a command buffer once the inputs encoded into it pass `MLX_MAX_MB_PER_BUFFER` (50 MB on
+an M4 Pro), counting each input at its whole size. The expert kernels were handed a layer's whole expert tensors (350
+MB, of which a token reads 8), so each of them ended a command buffer: about 94 a step, and the GPU waited between them
+(the main thread spent 28% of a step waiting for it, 13% after). `moe._experts_buffers` hands them a view of the first
+expert of each (the same buffer, which the kernels index past it): 8.75 ms a step instead of 10.2, the same tokens,
+114.6 tokens/s for one request instead of 102 and 264 instead of 255 at eight. Raising the limit itself does as well
+for one request, but a command buffer then keeps more of a prompt's temporaries alive: reading 8 x 256 tokens, or a
+32k prompt, ran out of GPU memory on 24 GB.
+
 **Memory.** Two things held memory that stock mlx-lm does not: the projections fused away stayed in MLX's buffer cache
 (2.5 GB of Flint's; `fuse_model` now ends with `mx.clear_cache()`), and v, a view of the fused projection, kept the
 whole projection of each sliding-window layer alive in the ring that keeps a prompt's first chunk as it is handed it
@@ -181,6 +191,13 @@ what stock mlx-lm holds, 18.04 GB.
 server, three replies streaming while an 8,000-token prompt arrived stalled for at most 2.8 s, against 9.7 s (the whole
 prompt) with `LOCALS_MIX_CHUNK=0`; the prompt's first token came after 10.4 s against 9.8, the three wrote 104 tokens/s
 together against 107.
+
+**Prompts in bands** (`FusedFlintAttention._banded`). A 2,048-token chunk in a sliding-window layer was one attention
+of 2,048 queries against the ring's 512 keys and the chunk's 2,048 under a mask, four in five of the scores masked.
+In bands of `FLINT_BAND` (512) queries against the keys their window reaches (slices of the keys and of the mask), the
+scores are the same (equal logits) and a prompt is read 11% faster from 4k tokens: 844 tokens/s instead of 760 at 4k,
+694 instead of 627 at 16k, 560 instead of 504 at 32k (the body, as the engine reads a prompt). `LOCALS_FLINT_BAND=0`
+turns it off.
 
 **Long contexts.** One growing prompt (the package's own source), read 2,048 tokens at a time, one request writing:
 
@@ -248,17 +265,32 @@ Tried and left out:
   output fell to 53 tokens/s from 83. And a pass of several tokens rounds differently from one-token steps, which in
   Flint changed the greedy reply. A gather that reads each expert once for all the tokens that chose it would make
   such passes cheap.
-- A fused residual add + RMS norm body (`norm_kernel.add_rms`): no faster here either (10.46 against 10.22 ms).
+- A fused residual add + RMS norm body (`norm_kernel.add_rms`): no faster here either (8.84 against 8.70 ms a step);
+  a custom kernel's call costs the CPU more than MLX's two, and the step is as much the CPU's as the GPU's.
+- **The choice inside the expert kernels**, each simdgroup computing its token's top 6 from the logits (one launch a
+  layer fewer): 9.23 ms against 8.80. Every simdgroup waits on the choice before its first weight load.
+- **Four barrier stages instead of six** (the shared expert's kernels ordered with `mx.depends` next to the router,
+  the choice and the experts' gate/up, so MLX's encoder needs fewer barriers): no change (8.75 / 8.81 against 8.68 /
+  8.84 ms), nor with each layer's MoE half under `mx.compile`, which cut the CPU's graph building from 3.1 to 1.7 ms a
+  step: the GPU then bounds the step at about 8.7 ms.
+- **Experts shared by rows read once**: the grid ordered so the simdgroups of one weight row for every token run side
+  by side (262 against 265 tokens/s at 8 rows), and a down kernel that reads each distinct expert once for all its
+  tokens (the same output; 155 against 142 us at 8 rows, 324 against 260 at 16: finding the shared experts in each
+  simdgroup cost more than the reads it saved).
+- **Faster 8-bit attention**: four score accumulators (448 against 477 us a layer at 32k), MLX's GQA two-pass layout
+  with the scale and bias folded into the dot products (553), keys on lanes with one reduction per 32 keys (461), and
+  the matrix-unit kernel on bf16 keys (520 against MLX's 394). All are bound by arithmetic, not by the bytes read.
+- `MLX_MAX_OPS_PER_BUFFER` from 20 to 1,000: within noise once the expert kernels stopped ending command buffers.
 
 Measured on an M4 Pro (24 GB, the GPU limit raised to 20 GB), mlx-community/flint-mixed-3-4bit, 256-token prompts,
 decode steps pipelined as the engines run them (all of it, and through the servers: docs/benchmarks, section 11):
 
 | Requests at once | stock mlx-lm | Locals before | Locals |
 |---|---|---|---|
-| 1 | 85 tok/s | 79 | 102 |
-| 4 | 177 | 174 | 199 |
-| 8 | 202 | 223 | 255 |
-| 16 | 245 | 279 | 283 |
+| 1 | 85 tok/s | 79 | 115 |
+| 4 | 177 | 174 | 206 |
+| 8 | 202 | 223 | 264 |
+| 16 | 245 | 279 | 288 |
 
 **Accuracy.** Teacher-forced over 256 decode steps of real text, the patched model's choices against stock mlx-lm's
 are as far apart as stock mlx-lm's against itself with the prompt read in two chunks instead of one: top-1 agreement

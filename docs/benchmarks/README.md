@@ -540,14 +540,16 @@ after 4 warm-up steps; tokens per second all rows write together:
 
 | Requests at once | mlx-lm | Locals before | Locals | Locals / mlx-lm |
 |---|---|---|---|---|
-| 1 | 85.3 | 78.6 | 102.0 | 1.20x |
-| 2 | 123.3 | 127.0 | 159.8 | 1.30x |
-| 4 | 176.9 | 173.5 | 198.7 | 1.12x |
-| 8 | 201.6 | 223.3 | 254.6 | 1.26x |
-| 16 | 244.5 | 278.8 | 282.5 | 1.16x |
+| 1 | 85.3 | 78.6 | 114.6 | 1.34x |
+| 2 | 123.3 | 127.0 | 167.3 | 1.36x |
+| 4 | 176.9 | 173.5 | 205.9 | 1.16x |
+| 8 | 201.6 | 223.3 | 264.0 | 1.31x |
+| 16 | 244.5 | 278.8 | 288.1 | 1.18x |
 
 Before, Locals was slower than mlx-lm for one request (its kernel routing cost 4 us of Python a matrix product, and
-it fused nothing of Flint's) and gained only from its batching at 8 and 16. Past 16 rows the experts go back to
+it fused nothing of Flint's) and gained only from its batching at 8 and 16. Of the 1.34x at one request, 0.14x is
+MLX's command buffers: handed a layer's whole expert tensors, the expert kernels ended one each (102 tokens/s before
+they were given one-expert views, docs/runtime, "Flint"). Past 16 rows the experts go back to
 MLX's sorted gather, which reads each expert once for all the tokens that chose it.
 
 **In the process: prompt length.** One request: a prompt read from nothing in 2,048-token chunks, then 64 greedy
@@ -555,17 +557,20 @@ steps written after it (4 warm-up steps first; a warm-up prompt before all of it
 
 | Prompt tokens | Prompt read, tokens/s: mlx-lm / Locals before / Locals | Writing after it, tokens/s: mlx-lm / Locals before / Locals | Peak GPU memory, GB |
 |---|---|---|---|
-| 1,024 | 755 / 747 / 762 (1.4 s) | 83.8 / 73.7 / 100.5 | 19.04 / 19.11 / 19.12 |
-| 4,096 | 680 / 675 / 670 (6.1 s) | 80.3 / 73.7 / 94.1 | 19.53 / 19.54 / 19.86 |
-| 8,192 | 635 / 645 / 628 (13.0 s) | 76.6 / 70.6 / 89.7 | 19.66 / 19.67 / 19.86 |
-| 16,384 | 567 / 575 / 563 (29 s) | 67.7 / 64.3 / 80.6 | 19.88 / 19.92 / 20.08 |
-| 32,768 | 468 / 470 / 464 (70 s) | 60.6 / 56.0 / 63.9 | 20.39 / 20.24 / 20.49 |
+| 1,024 | 755 / 747 / 766 (1.3 s) | 83.8 / 73.7 / 109.2 | 19.04 / 19.11 / 19.00 |
+| 4,096 | 680 / 675 / 763 (5.4 s) | 80.3 / 73.7 / 102.7 | 19.53 / 19.54 / 19.74 |
+| 8,192 | 635 / 645 / 710 (11.5 s) | 76.6 / 70.6 / 94.7 | 19.66 / 19.67 / 19.77 |
+| 16,384 | 567 / 575 / 625 (26 s) | 67.7 / 64.3 / 84.2 | 19.88 / 19.92 / 20.02 |
+| 32,768 | 468 / 470 / 502 (65 s) | 60.6 / 56.0 / 68.9 | 20.39 / 20.24 / 20.46 |
 
-Reading a prompt is the same in all three (within 2%): Flint's kernels are for few rows, and a prompt's experts run
-through MLX's sorted gather. With `LOCALS_KV_BITS=8` (8-bit keys and values in the full-attention layers) the
+Prompts are read 7 to 12% faster from 4,096 tokens: the 35 sliding-window layers attend in bands of 512 queries
+against the keys their 513-token window reaches, not a whole 2,048-token chunk under a mask (docs/runtime, "Flint");
+the rest is the same as mlx-lm's (Flint's kernels are for few rows, and a prompt's experts run through MLX's sorted
+gather). These timings include the output layer's logits for every prompt token, as mlx-lm's own loop computes them;
+the engine reads a prompt without them, at 849, 844, 788, 694 and 560 tokens/s for these lengths. With `LOCALS_KV_BITS=8` (8-bit keys and values in the full-attention layers) the
 server takes up to 67,584 tokens instead of about 35,800, and found a codename hidden in 59,778 tokens of source in
-177 s; writing is 4 to 13% slower (docs/runtime, "Flint"). Writing is 1.20x mlx-lm's at 1,024 tokens and 1.05x at 32,768, where reading the
-14 full-attention layers' keys and values takes a growing share of each step. On a 24 GB Mac the server allows about
+177 s; writing is 4 to 13% slower (docs/runtime, "Flint"). Writing is 1.30x mlx-lm's at 1,024 tokens and 1.14x at
+32,768, where reading the 14 full-attention layers' keys and values takes a growing share of each step. On a 24 GB Mac the server allows about
 35,000 tokens next to Flint.
 
 **Through each server's API, counted by the client.** mlx-lm's own server (`python -m mlx_lm server`, with Flint),
@@ -575,14 +580,15 @@ text's tokens with the model's tokenizer, after a warm-up request:
 
 | At once | All done, s: mlx-lm / Locals before / Locals | Tokens/s end to end | First token, median s | One reply's writing, tokens/s |
 |---|---|---|---|---|
-| 1 | 4.79 / 4.91 / 4.10 | 52.8 / 52.1 / 61.7 (1.17x) | 1.12 / 1.10 / 1.10 | 68.7 / 66.8 / 84.1 |
-| 4 | 11.6 / 11.1 / 10.3 | 87.8 / 92.6 / 99.4 (1.13x) | 4.40 / 4.39 / 4.44 | 35.2 / 35.1 / 40.9 |
-| 8 | 21.1 / 19.4 / 17.7 | 96.4 / 105.4 / 115.2 (1.19x) | 8.79 / 6.58 / 6.26 | 20.6 / 21.0 / 24.0 |
+| 1 | 4.79 / 4.91 / 3.71 | 52.8 / 52.1 / 68.1 (1.29x) | 1.12 / 1.10 / 1.10 | 68.7 / 66.8 / 96.5 |
+| 4 | 11.6 / 11.1 / 10.1 | 87.8 / 92.6 / 97.9 (1.12x) | 4.40 / 4.39 / 4.46 | 35.2 / 35.1 / 41.6 |
+| 8 | 21.1 / 19.4 / 17.9 | 96.4 / 105.4 / 114.0 (1.18x) | 8.79 / 6.58 / 7.05 | 20.6 / 21.0 / 23.6 |
 
 End to end is from sending the requests to the last token, the prompts' reading included (8,000 tokens at about
 700 tokens/s is most of it at 8 at once). mlx-lm's server reads every prompt before it writes; Locals answers the
 first requests while it reads the others (mixed passes), so its first tokens come sooner and its replies spend
-longer under way: counted from each reply's first token, mlx-lm's server writes 165 tokens/s at 8 at once, Locals 162.
+longer under way: counted from the first reply's first token, mlx-lm's server writes 165 tokens/s at 8 at once,
+Locals 139.
 Replies stream without a stall while another long prompt is read: at most 2.8 s, against 9.7 without mixed passes
 (docs/runtime, "Flint").
 
