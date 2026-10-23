@@ -1,4 +1,4 @@
-"""Fuse projections in Llama/Qwen2-style mlx-lm models.
+"""Fuse projections in Llama/Qwen2-style mlx-lm models (and Flint's, with locals/moe.py).
 
 q/k/v become one quantized matmul and gate/up another. Quantization groups
 run along the input dimension, so concatenating along the output dimension
@@ -61,6 +61,38 @@ class FusedAttention(nn.Module):
             keys = self.rope(keys)
         out = scaled_dot_product_attention(queries, keys, values, cache=cache, scale=self.scale, mask=mask)
         return self.o_proj(out.transpose(0, 2, 1, 3).reshape(B, L, -1))
+
+
+class FusedFlintAttention(nn.Module):
+    """Flint's attention (locals.models.flint or mlx-lm's) with q/k/v as one matmul: per-head q/k norms, RoPE on the
+    sliding-window layers only, a learned sink per head. ``_mix`` is everything between the projections, so that
+    locals/mixed.py can run them once over decode rows and a prompt chunk together."""
+
+    def __call__(self, x: mx.array, mask: Optional[mx.array] = None, cache: Optional[Any] = None) -> mx.array:
+        return self.o_proj(self._mix(self.qkv_proj(x), mask, cache))
+
+    def _mix(self, qkv: mx.array, mask: Optional[mx.array] = None, cache: Optional[Any] = None) -> mx.array:
+        from .qk_kernel import fits, qk_norm_rope
+
+        B, L, _ = qkv.shape
+        nq, nk = self.n_heads * self.head_dim, self.n_kv_heads * self.head_dim
+        if fits(self, qkv):  # norms and RoPE in one kernel
+            q, k, v = qk_norm_rope(qkv, self, cache.offset if cache is not None else 0)
+            if cache is not None:
+                k, v = cache.update_and_fetch(k, v)
+            out = scaled_dot_product_attention(q, k, v, cache=cache, scale=self.scale, mask=mask, sinks=self.softmax_offset)
+            return out.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        q = self.q_norm(qkv[..., :nq].reshape(B, L, self.n_heads, -1)).transpose(0, 2, 1, 3)
+        k = self.k_norm(qkv[..., nq : nq + nk].reshape(B, L, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
+        v = mx.contiguous(qkv[..., nq + nk :].reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3))  # (see qk_kernel)
+        if self.rope is not None:
+            offset = cache.offset if cache is not None else 0
+            q = self.rope(q, offset=offset)
+            k = self.rope(k, offset=offset)
+        if cache is not None:
+            k, v = cache.update_and_fetch(k, v)
+        out = scaled_dot_product_attention(q, k, v, cache=cache, scale=self.scale, mask=mask, sinks=self.softmax_offset)
+        return out.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
 
 class FusedMLP(nn.Module):
@@ -331,9 +363,24 @@ def fuse_model(model) -> int:
                 attn.qkv_proj = _concat_quantized(parts)
                 del attn.q_proj, attn.k_proj, attn.v_proj
                 attn.__class__ = type("Fused" + type(attn).__name__, (FusedGatedAttention, type(attn)), {})
+        if attn is not None and type(attn).__name__ == "Attention" and type(attn).__module__.split(".")[-1] == "flint":
+            parts = [attn.q_proj, attn.k_proj, attn.v_proj]
+            if all(isinstance(m, nn.QuantizedLinear) for m in parts) and _fusable(parts) and not any("bias" in m for m in parts):
+                attn.head_dim = attn.q_norm.weight.shape[0]
+                attn.qkv_proj = _concat_quantized(parts)
+                del attn.q_proj, attn.k_proj, attn.v_proj
+                attn.__class__ = type("Fused" + type(attn).__name__, (FusedFlintAttention, type(attn)), {})
+        if mlp is not None and type(mlp).__name__ == "SparseMoeBlock":
+            from .moe import fuse_flint_moe
+
+            fuse_flint_moe(mlp)  # Flint's: router, experts, shared expert (another model's block stays as it is)
         if (isinstance(getattr(mlp, "gate_proj", None), nn.QuantizedLinear) and isinstance(getattr(mlp, "up_proj", None), nn.QuantizedLinear)
                 and _fusable([mlp.gate_proj, mlp.up_proj]) and _swiglu_mlp(mlp)):
             _fuse_mlp(mlp)
         n += 1
     mx.eval(model.parameters())
+    # the projections fused away stay in MLX's buffer cache, which keeps freed buffers for reuse: 2.5 GB of Flint's
+    # (its experts' gate and up), which a 24 GB Mac then swapped for
+    mx.clear_cache()
     return n
+
