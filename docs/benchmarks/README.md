@@ -586,6 +586,27 @@ longer under way: counted from each reply's first token, mlx-lm's server writes 
 Replies stream without a stall while another long prompt is read: at most 2.8 s, against 9.7 without mixed passes
 (docs/runtime, "Flint").
 
+**Agent tool calls.** Flint as a coding agent's model in the batch engine, one request at a time: six tools shaped
+as OpenCode's (`read` with `filePath`, `offset`, `limit`; `write`; `edit`; `bash` with a required `description`;
+`glob`; `grep`), a system prompt that says to act through them, 12 tasks ("Show me the first 40 lines of
+/repo/src/server.py", "Run the test suite in /repo with pytest", ...), `tool_choice` auto. A call is broken when it
+names a parameter its tool lacks or leaves out a required one (the model card reports 41 of 85 OpenCode calls
+failing on mlx-vlm for wrong parameter names):
+
+| Grammar | Spans | Broken calls, greedy | Broken calls, sampled | Passes for the greedy replies | Writing, tokens/s |
+|---|---|---|---|---|---|
+| Untyped (the default) | a token a step | 4 of 12 | | 667 for 643 tokens | 79.5 |
+| Untyped | in one pass | 4 of 12 | 11 of 39 | 667 for 643 | 77.6 |
+| Typed (`--typed-tools`) | a token a step | 0 of 12 | | 672 for 648 | 77.3 |
+| Typed | in one pass | 0 of 12 | 0 of 39 | 603 for 644 | 80.0 |
+
+Sampled: the model card's settings (temperature 1.0, top_p 0.95, top_k 20), three seeds a task, 36 requests. The
+untyped grammar's broken calls were `write` and `read` with `path` for `filePath`, and `bash` without its
+`description`. The typed grammar writes the parameter names (`<arg_key>filePath</arg_key><arg_value>` after `read`
+is five tokens the model does not choose), and one request alone feeds such a span in one pass: 10% fewer passes.
+Writing time is wall time less the prompt's reading; the untyped grammar has no span of 3 tokens or more, so its
+two rows differ only by noise. The typed automaton for these six tools took 3.9 s to build, once per tool set.
+
 ## How the measurements were made
 
 - **Decode speed**: n requests at once, 256 tokens each with the end-of-text token

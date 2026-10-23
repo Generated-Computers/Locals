@@ -224,6 +224,20 @@ step (two quantize kernels and six writes a layer), which is most of what the sw
 
 So it is a switch for long work, off by default: twice the context for 4 to 13% of the writing speed.
 
+**Forced spans in one pass, typed calls.** One request alone gets its forced spans in one pass (`hybrid_batch._solo`),
+which the engine refused for Flint because sliding-window caches cannot be rewound. A forced span never is: its
+tokens are certain, and only the pass's last position is sampled. So `_solo_ok` now takes `BatchRotatingKVCache`
+and `qkv.BatchQuantizedKVCache` layers for spans, and drafts (which a rejection rewinds) stay off for them
+(`_solo_drafts_ok`). Flint's tool calls then gain from `--typed-tools` (`FlintXML.typed_call`, docs/decoding): the
+grammar writes parameter names, so `<arg_key>filePath</arg_key><arg_value>` after `read` is a span of five tokens.
+On 12 OpenCode-like tasks the untyped grammar let Flint break 4 of 12 greedy calls and 11 of 39 sampled ones
+(`path` for `filePath`, `bash` without its required `description`); the typed one none, with 10% fewer passes
+(603 against 672) and 80.0 tokens/s against 77.3 when the spans go a token a step (docs/benchmarks, section 11).
+A pass of several tokens reads every token's experts, so a pass over a sampled token and its span of five costs
+about three one-token steps (34 ms against 10), not one.
+The typed grammar fixes the schema's order, so a model that would write `path` before `pattern` writes `pattern`
+first; with `--walk`, which large tool sets need, spans go a token a step.
+
 Tried and left out:
 
 - **Prompt-lookup drafts** (`hybrid_batch._solo`), which need sliding-window caches that can be rewound (tried: a ring

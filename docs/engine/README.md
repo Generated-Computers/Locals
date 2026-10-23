@@ -252,8 +252,9 @@ and every token they keep is one a one-token step would have produced:
   drafts need `_gdn_ok` layers and float32 states). A forced span after an accepted draft token ends the
   draft there; the span is fed next.
 
-**When.** At a boundary, when one row runs, nothing waits and no prompt is filling (`_solo_ok`: no sliding-
-window caches, so not Gemma; no walk or pushdown constraints). After a chained step, `solo_next` asks for a
+**When.** At a boundary, when one row runs, nothing waits and no prompt is filling (`_solo_ok`: no walk or
+pushdown constraints). Sliding-window caches (Gemma, Flint) and 8-bit ones (`qkv.py`) are not rewound, so those
+models get forced spans in one pass and no drafts (`_solo_drafts_ok`). After a chained step, `solo_next` asks for a
 boundary when the only row has a forced span of 3 or more tokens or a draft: entering costs about one step,
 since the pipeline drains. Without a span or a draft, `_solo` returns and the row goes on in pipelined
 steps. It also returns as soon as `source` yields a request, which then joins as usual.

@@ -25,6 +25,12 @@
 - `LOCALS_KV_BITS=8`: Flint's full-attention keys and values in 8 bits, as its config asks, read by a kernel of
   their own on the GPU's matrix units with Flint's attention sinks; a 24 GB Mac takes 67,584-token requests instead
   of about 35,800, for 4 to 13% of the writing speed.
+- `--typed-tools` types Flint's tool calls too: the grammar writes each call's parameter names in the schema's order,
+  required ones present, values of their types. On 12 OpenCode-like tasks Flint broke 4 of 12 greedy calls and 11 of
+  39 sampled ones without it (`path` for `filePath`, `bash` without its `description`), none with it.
+- One request alone gets its forced spans in one pass on models with sliding-window or 8-bit caches too (Flint,
+  Gemma): those caches cannot be rewound, which drafts need and forced spans do not. Flint's typed calls take 10%
+  fewer passes.
 - MLX 0.32.4 and mlx-lm 0.32.2 in the lock file, as a fresh install gets them.
 
 ## 0.2.1 (2026-10-21)

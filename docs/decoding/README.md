@@ -335,6 +335,7 @@ These are found with a Bellman-Ford fixpoint over the token-step graph.
                 with "tool_results"            -> mistral_legacy
                 otherwise                      -> mistral
 "<|tool_call>call:"                            -> gemma4
+"<arg_key>" and "<arg_value>"                  -> flint_xml
 "<tool_call>"                                  -> hermes
 '"parameters"' and ("ipython" or "<|python_tag|>") -> llama3_json
 anything else                                  -> fallback
@@ -353,6 +354,7 @@ mistral_v11  [TOOL_CALLS]NAME[ARGS]{...}  (repeated per call, after the turn's t
 minicpm_xml  <function name="NAME"><param name="P">V</param>...</function>   (V with <, & or \n in <![CDATA[...]]>)
 lfm2_python  <|tool_call_start|>[NAME(P='text', N=3, O={"k": 1}), ...]<|tool_call_end|>
 gemma4       <|tool_call>call:NAME{key:<|"|>text<|"|>,n:3}<tool_call|>
+flint_xml    <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>   (V as it is if a string, else JSON)
 fallback     the hermes form; the tools are described in the system prompt
 ```
 
@@ -367,6 +369,7 @@ fallback     the hermes form; the tools are described in the system prompt
 | `minicpm_xml` | MiniCPM5 | yes, separated by `\n` | Parameter names `[A-Za-z0-9_.\-]+` (`PARAM_RE_`); value a CDATA block or `[^<&\n]*` | yes |
 | `lfm2_python` | LFM2.5 | yes, in one Python-style list | Single-quoted string, number, `True/False/None`, JSON object or JSON list | yes |
 | `gemma4` | Gemma 4 | yes | Keys `[A-Za-z_][A-Za-z0-9_.\-]*`; values `<\|"\|>`-quoted strings, numbers, booleans, `null`, nested objects and lists three levels deep | no |
+| `flint_xml` | Recursive's Flint | yes, back to back or separated by `\n` | Keys `[A-Za-z0-9_.\-]+`, values any text without `</arg_value>` (typed with `--typed-tools`) | yes |
 | `fallback` | Templates without tools (Gemma 3, ...) | no: a model without tool training chains dependent calls blindly | `json_args_regex()` | yes |
 
 `json_args_regex(space=r"[ ]?")` accepts any JSON object nested four levels deep (objects of lists of objects of lists, as Hermes Agent's clarify tool needs). It allows JSON string escapes including `\uXXXX`, JSON numbers, and an optional single space between JSON tokens, because templates write `", "` and `": "`. Its docstring puts it at about 700 automaton states. Arguments nested deeper cannot be written in these formats: Claude Code's `AskUserQuestion` puts its option objects at level five, so a model in one of them writes the options as strings. Five levels would take 1420 states, a 2.5 GB token table per tool set; Qwen's XML and MiniCPM's values have no such limit; an LFM2 value nests four levels, one more than these formats' arguments, which is enough for `AskUserQuestion`; and `--walk` needs no table.
@@ -396,7 +399,7 @@ How free text excludes a call. `not_containing(*lits)` is an exact regex for str
 
 `llama3_json` and `mistral` put their calls at the start of the reply. For them, `"auto"` is "calls or free text", and `"required"` (or a named function) is the calls alone.
 
-**Thinking.** With `thinking`, the body is preceded by `not_containing("</think>") + "</think>" + think_sep` for qwen_xml (`oai.reply_regex`) and for every format that uses `ToolFormat.reply_regex` (hermes, mistral_v11, minicpm_xml, lfm2_python, fallback), so the reply starts inside an open think block. llama3_json, mistral and mistral_legacy override `reply_regex` and ignore `thinking`. `think_sep` is `\n\n`, or `""` for `lfm2_python`. Gemma 4 instead prefixes `thought_regex()`, an optional `<|channel>thought ... <channel|>` block, whatever the thinking setting. When the server steers a repeated call with a text prefix, it removes that optional block from the regex.
+**Thinking.** With `thinking`, the body is preceded by `not_containing("</think>") + "</think>" + think_sep` for qwen_xml (`oai.reply_regex`) and for every format that uses `ToolFormat.reply_regex` (hermes, mistral_v11, minicpm_xml, lfm2_python, fallback), so the reply starts inside an open think block. llama3_json, mistral and mistral_legacy override `reply_regex` and ignore `thinking`. `think_sep` is `\n\n`, or `""` for `lfm2_python`. Gemma 4 instead prefixes `thought_regex()`, an optional `<|channel>thought ... <channel|>` block, whatever the thinking setting; Flint likewise an optional `<think> ... </think>` block. When the server steers a repeated call with a text prefix, it removes that optional block from the regex.
 
 **Typed Qwen calls.** `--typed-tools` switches Qwen's XML calls to `typed_call_regex`. Every parameter name is then fixed in schema order, required parameters are mandatory, and values are typed by `_value_regex`:
 
@@ -407,7 +410,9 @@ How free text excludes a call. `not_containing(*lits)` is an exact regex for str
 - an integer, number or boolean whose `type` list includes `"null"` also allows `null`;
 - anything else: free text.
 
-These automata have thousands of states, so the comment pairs the flag with the walk kernel. Other formats ignore `typed`.
+These automata have thousands of states, so the comment pairs the flag with the walk kernel.
+
+**Typed Flint calls.** For Flint the flag gives `FlintXML.reply_regex` the tools' schemas (`specs`), and `typed_call` writes each call as Qwen's typed calls are written: parameter names in schema order, required ones mandatory, others optional. Values come from `_flint_value`, as Flint's template writes them: a string (or an untyped parameter) as it is, any text without `</arg_value>`; an `enum` as its alternatives; `integer`, `number`, `boolean` and `null` as JSON; arrays and objects as JSON nested three levels. The parameter names are then forced text: `<arg_key>filePath</arg_key><arg_value>` after a call's name is a span of five tokens, which one request alone feeds in one pass (docs/engine, `_solo`). Other formats ignore `typed`.
 
 ### Parsing
 

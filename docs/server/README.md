@@ -216,7 +216,7 @@ Properties of the grammar:
 - With thinking on, the grammar starts inside the open `<think>` block.
 - Formats other than `qwen_xml` build their own grammar with `fmt.reply_regex`.
 
-By default, parameter names and values are free, and values are converted to the schema's types after parsing (`oai.coerce`). This keeps the automaton at a few hundred states. `--typed-tools` instead fixes parameter names, their order and simple value types (`typed_call_regex`). Required parameters are mandatory and the others optional. It applies only to the `qwen_xml` format; other formats build their grammar with `fmt.reply_regex` and ignore it (`oai.typed_call_regex`, `oai.reply_regex`). Use it with `--walk`, which handles grammars of any size.
+By default, parameter names and values are free, and values are converted to the schema's types after parsing (`oai.coerce`). This keeps the automaton at a few hundred states. `--typed-tools` instead fixes parameter names, their order and simple value types (`typed_call_regex`). Required parameters are mandatory and the others optional. It applies to the `qwen_xml` format and to Flint's (`flint_xml`, whose `reply_regex` takes the schemas, `FlintXML.typed_call`); other formats build their grammar with `fmt.reply_regex` and ignore it (`oai.typed_call_regex`, `oai.reply_regex`). Use it with `--walk`, which handles grammars of any size.
 
 ## Text completions
 
