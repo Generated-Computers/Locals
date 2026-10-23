@@ -196,8 +196,24 @@ together against 107.
 of 2,048 queries against the ring's 512 keys and the chunk's 2,048 under a mask, four in five of the scores masked.
 In bands of `FLINT_BAND` (512) queries against the keys their window reaches (slices of the keys and of the mask), the
 scores are the same (equal logits) and a prompt is read 11% faster from 4k tokens: 844 tokens/s instead of 760 at 4k,
-694 instead of 627 at 16k, 560 instead of 504 at 32k (the body, as the engine reads a prompt). `LOCALS_FLINT_BAND=0`
-turns it off.
+694 instead of 627 at 16k, 560 instead of 504 at 32k (the body, in 2,048-token chunks). `LOCALS_FLINT_BAND=0` turns it
+off.
+
+**Prompt chunks.** The engine reads a prompt in 1,024-token chunks, halved as the context grows (`PREFILL_SCORES`: 512
+past 15k, 256 past 31k) so that a chunk's attention scores stay small. Flint's prompt attention holds none (MLX's fused
+causal attention in the full layers, the bands in the window layers), and 2,048-token chunks read 5% faster than
+1,024 (851 against 799 tokens/s at 4k, 560 against 535 at 32k, 0.3 GB more at the peak). `fuse_model` sets the
+model's `prefill_chunk_tokens` (2,048) and `prefill_scores` (2^26), which the engine takes over its defaults: 2,048
+tokens to about 30k, 1,024 to about 63k. Through the server the first token of a 30k-token prompt came after 54.3 s
+instead of 58.1; a 35k prompt, the most a 24 GB Mac's server takes, read without error, and a 60k one with
+`LOCALS_KV_BITS=8` in 159 s instead of 177.
+
+**The batch caches' mask.** The engine decodes even one request through mlx-lm's batch caches, whose mask for one
+query a row only marks left padding. With no row padded it is all true, and it costs MLX's attention 40% (510 us
+against 358 a layer at 30k keys): one request wrote 61.7 tokens/s at 30k through batch caches, 72.4 through its own.
+`fuse._unpadded` reads the padding on the host (already evaluated, but for the step after rows join or leave) and the
+full-attention layers then attend without the mask: 72.1. A padded batch keeps it. The window layers' masks (513
+keys) cost about 1%, and stay.
 
 **Long contexts.** One growing prompt (the package's own source), read 2,048 tokens at a time, one request writing:
 

@@ -39,6 +39,12 @@
 - Flint's sliding-window layers read a prompt chunk in bands of 512 queries against the keys their window reaches,
   instead of the whole chunk under a mask: prompts 11% faster from 4,096 tokens (844 tokens/s instead of 760 at 4k,
   560 instead of 504 at 32k), the same logits.
+- Flint reads prompts in 2,048-token chunks to about 30k tokens (a model's `prefill_chunk_tokens` and
+  `prefill_scores`, set where its attention holds no chunk's scores): a 30k prompt's first token after 54 s instead
+  of 58, a 60k one with `LOCALS_KV_BITS=8` after 159 s instead of 177.
+- One request through the engine attends without the batch caches' mask when no row is padded (all true, and 40% of
+  MLX's attention at 30k keys): after a 30k-token prompt Flint writes 63.7 tokens/s instead of 55.9, after 13k 74.5
+  instead of 70.1.
 - MLX 0.32.4 and mlx-lm 0.32.2 in the lock file, as a fresh install gets them.
 
 ## 0.2.1 (2026-10-21)

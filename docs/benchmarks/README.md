@@ -567,7 +567,9 @@ Prompts are read 7 to 12% faster from 4,096 tokens: the 35 sliding-window layers
 against the keys their 513-token window reaches, not a whole 2,048-token chunk under a mask (docs/runtime, "Flint");
 the rest is the same as mlx-lm's (Flint's kernels are for few rows, and a prompt's experts run through MLX's sorted
 gather). These timings include the output layer's logits for every prompt token, as mlx-lm's own loop computes them;
-the engine reads a prompt without them, at 849, 844, 788, 694 and 560 tokens/s for these lengths. With `LOCALS_KV_BITS=8` (8-bit keys and values in the full-attention layers) the
+the engine reads a prompt without them, at 849, 844, 788, 694 and 560 tokens/s for these lengths. Through the
+server, a 13,000-token prompt's first token came after 18.7 s and the reply went on at 74.5 tokens/s; a 30,000-token
+one's after 55.1 s, at 63.7 tokens/s. With `LOCALS_KV_BITS=8` (8-bit keys and values in the full-attention layers) the
 server takes up to 67,584 tokens instead of about 35,800, and found a codename hidden in 59,778 tokens of source in
 177 s; writing is 4 to 13% slower (docs/runtime, "Flint"). Writing is 1.30x mlx-lm's at 1,024 tokens and 1.14x at
 32,768, where reading the 14 full-attention layers' keys and values takes a growing share of each step. On a 24 GB Mac the server allows about

@@ -140,7 +140,7 @@ This prefills several prompts in one right-padded batch and returns a batch cach
 - **Rows with nothing to prefill** are separated out, for example the second of two requests that share a whole prompt. Only the rows that need work are prefilled; the others are merged in afterwards. The comment gives the reason: padding such rows "cost most of an admission (8 of 10 rows, 236 tokens each)".
 - **One prompt that continues a cached prefix** grows its own KV buffers to the final length (`_reserve`) and wraps them as a batch of one (`_wrap_one`). It does not copy the prefix into a new batch buffer. The comment's example: "a 36k-token prefix of a full-attention 3B model is 4 GB: the copies did not fit next to each other on a 16 GB Mac".
 - **Ragged lengths** are handled with `prepare(right_padding=...)` on `BatchKVCache` and `prepare(lengths=...)` on `ArraysCache`, followed by `finalize()`.
-- **Chunks** are sized by `prefill_chunk(done + i, len(prompts), chunk)`, where `done` is the longest reused prefix. After the first chunk, the KV buffers are reserved for the full length.
+- **Chunks** are sized by `prefill_chunk(done + i, len(prompts), chunk, self._prefill_scores)`, where `done` is the longest reused prefix and `chunk` defaults to `self._prefill_base` (1024, or the model's `prefill_chunk_tokens`). After the first chunk, the KV buffers are reserved for the full length.
 
 ### `_prefill_start` and shared-prefix snapshots
 
@@ -152,7 +152,7 @@ Only `max_snapshots` snapshots are kept (`LOCALS_MAX_SNAPSHOTS`, default 4, at l
 
 This prefills a single sequence through the body only. It is used for checkpoints in a prefill at once, for a filling entry's remaining checkpoints (`_fill_checkpoints`, when no rows are left), for shared-prefix snapshots in `_prefill_start`, and for primes. The rest of a filling entry after its last checkpoint goes through `_prefill_batch`, not `_run`. It reserves the KV buffers after the first chunk.
 
-### Chunk size: `prefill_chunk(done, rows, base)`
+### Chunk size: `prefill_chunk(done, rows, base, scores)`
 
 Two limits shrink the chunk. Start from `base` and halve:
 
@@ -162,6 +162,8 @@ Two limits shrink the chunk. Start from `base` and halve:
 | `PREFILL_TOKENS` | `2048` | Halve while `c > 16` and `rows * c > PREFILL_TOKENS` | Activations grow with the total tokens in a forward: about 1 GB at 2048 and 4.3 GB at 8 x 1024. At 16 x 1024 the GPU ran out of memory when sixteen requests arrived together. The prefill rate is the same from about 1k tokens up (750 tok/s for 1 x 2048, 8 x 256, 16 x 128 or 32 x 64), so capping the total costs nothing. |
 
 The score rule stops halving at 128. Beyond that point it no longer bounds the scores.
+
+A model whose prompt attention holds no chunk's scores can say so: `fuse.fuse_model` sets Flint's `prefill_scores` (2^26, used in place of `PREFILL_SCORES`) and `prefill_chunk_tokens` (2048, the base of `_prefill_batch`), which the engine reads at construction (`_prefill_scores`, `_prefill_base`). Flint's full layers use MLX's fused causal attention and its window layers attend in bands, and 2,048-token chunks read 5% faster than 1,024 (docs/runtime, "Flint").
 
 ### `_reserve(cache, upto)`
 
@@ -370,7 +372,7 @@ Any other exception escapes `serve`, for example a Metal out-of-memory error. `B
 | `LOCALS_GROWTH_TRIM` | `1` | `0` turns off the trim every 32 steps |
 | `LOCALS_SOLO` | `1` | `0`: one token per step for a request alone too (no forced spans in one pass, no drafts) |
 | `LOCALS_MEMLOG`, `LOCALS_MIXLOG`, `LOCALS_PREFILL_LOG` | unset (off) | Logging, described above. Any non-empty value turns them on, `0` included, because the code tests `bool(os.environ.get(...))` |
-| `PREFILL_SCORES`, `PREFILL_TOKENS` | `1 << 24`, 2048 | Module constants in `hybrid_batch.py` |
+| `PREFILL_SCORES`, `PREFILL_TOKENS` | `1 << 24`, 2048 | Module constants in `hybrid_batch.py` (a model's `prefill_scores` and `prefill_chunk_tokens` take precedence) |
 | `memory_limit` | 0 in the engine | Set by `BatchService` as above |
 
 ## Counters
