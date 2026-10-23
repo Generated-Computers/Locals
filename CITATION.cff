@@ -6,7 +6,7 @@ authors:
   - family-names: Asadulaev
     given-names: Arip
 version: 0.2.1
-license: MIT
+license: Apache-2.0
 repository-code: "https://github.com/Generated-Computers/Locals"
 preferred-citation:
   type: article
