@@ -562,7 +562,9 @@ steps written after it (4 warm-up steps first; a warm-up prompt before all of it
 | 32,768 | 468 / 470 / 464 (70 s) | 60.6 / 56.0 / 63.9 | 20.39 / 20.24 / 20.49 |
 
 Reading a prompt is the same in all three (within 2%): Flint's kernels are for few rows, and a prompt's experts run
-through MLX's sorted gather. Writing is 1.20x mlx-lm's at 1,024 tokens and 1.05x at 32,768, where reading the
+through MLX's sorted gather. With `LOCALS_KV_BITS=8` (8-bit keys and values in the full-attention layers) the
+server takes up to 67,584 tokens instead of about 35,800, and found a codename hidden in 59,778 tokens of source in
+177 s; writing is 4 to 13% slower (docs/runtime, "Flint"). Writing is 1.20x mlx-lm's at 1,024 tokens and 1.05x at 32,768, where reading the
 14 full-attention layers' keys and values takes a growing share of each step. On a 24 GB Mac the server allows about
 35,000 tokens next to Flint.
 

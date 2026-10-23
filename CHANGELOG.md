@@ -22,6 +22,9 @@
   stall for at most 2.8 s instead of 9.7.
 - The projections `locals.patch` fuses away no longer stay in MLX's buffer cache (2.5 GB of Flint's, which a 24 GB Mac
   swapped for).
+- `LOCALS_KV_BITS=8`: Flint's full-attention keys and values in 8 bits, as its config asks, read by a kernel of
+  their own on the GPU's matrix units with Flint's attention sinks; a 24 GB Mac takes 67,584-token requests instead
+  of about 35,800, for 4 to 13% of the writing speed.
 - MLX 0.32.4 and mlx-lm 0.32.2 in the lock file, as a fresh install gets them.
 
 ## 0.2.1 (2026-10-21)

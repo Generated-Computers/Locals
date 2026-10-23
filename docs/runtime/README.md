@@ -21,6 +21,7 @@ After these steps, `mx.set_wired_limit` is set to the GPU's `max_recommended_wor
 | `models/` | Architectures the pinned mlx-lm lacks, registered where mlx-lm imports models (`models.register`): Flint |
 | `moe.py` | Flint's mixture-of-experts block: the router and expert kernels, fused expert gate/up |
 | `qk_kernel.py` | Per-head q/k RMS norms and RoPE in one kernel (Flint's attention) |
+| `qkv.py` | 8-bit keys and values for full-attention layers (`LOCALS_KV_BITS=8`): the attention kernels and the batch cache |
 | `kernels.py` | Matmul routing (`enable_small_m`, `_linear_switch`), the dense prefill path, row packing, `qmm_small`, the autotuner and its cache, and output-layer helpers |
 | `qmv_multi.py` | The `multi` and `v3` multi-row matrix-vector kernels |
 | `qmv_frag.py` | The `frag` and `fragh` kernels, which dequantize straight into 8x8 MMA fragments |
@@ -194,6 +195,34 @@ together against 107.
 Reading a prompt is as fast as mlx-lm's (these kernels are for few rows). At 32,768 tokens both pass the 20 GB the GPU
 was given and the gain is gone; the server lets a 24 GB Mac's Flint take about 35,000 tokens. Through the server, the
 first token of a 13,094-token prompt came after 20.7 s and the reply went on at 74 tokens/s.
+
+**8-bit keys and values** (`qkv.py`, `LOCALS_KV_BITS=8`). Flint's 14 full-attention layers keep 28 KB a token in
+bf16, so a 24 GB Mac holds about 35,800 tokens next to the model; its config asks for 8-bit keys and values
+(`kv_key_bits`, `kv_value_bits`, which mlx-lm's loader drops). With the switch on, those layers keep MLX's affine 8-bit
+groups of 64 (15 KB a token; the sliding-window layers stay bf16, 513 tokens each) and the server takes requests up
+to 67,584 tokens: a codename hidden in 37,844 and in 59,778 tokens of source was found (87 and 177 s). mlx-lm's own
+quantized cache attends with three kernels and no attention sinks, which Flint has on every head, so `qkv.attend`
+is a kernel of its own: Flint's 8 query heads a key/value head are an 8 x 128 matrix, so 8 keys at a time give an
+8 x 8 tile of scores on the GPU's matrix units with no sums across lanes; each lane unpacks its own two elements of
+each fragment straight from the 8-bit words (no threadgroup memory), with the head dimensions permuted so that a lane
+reads whole words; a head's softmax row lives in four lanes; a second kernel joins the blocks with the sink. A
+prompt unpacks what it reads and goes through MLX's attention. `BatchQuantizedKVCache` is mlx-lm's BatchKVCache with
+every buffer a (words, scales, biases) triple, and the batch engine counts its bytes a token.
+
+One 32,768-key layer (14 of them chained), against MLX's bf16 attention at 389 us: a simdgroup a head, summing
+across lanes each key, 1,240 us; the 8 heads in one simdgroup, 950; on the matrix units through threadgroup memory,
+1,310 (one threadgroup a core); fragments filled in place, 889; dims permuted for whole words, 498; the join in
+parallel, 479. At 8,192 keys: 173 against 120. Each new token's keys and values are quantized and stored at every
+step (two quantize kernels and six writes a layer), which is most of what the switch costs at short contexts:
+
+| Context | Writing, 8-bit / bf16 | Keys and values, 8-bit / bf16 |
+|---|---|---|
+| 1,024 | 83.8 / 96.5 tokens/s | 0.06 / 0.07 GB |
+| 8,192 | 75.8 / 84.8 | 0.17 / 0.28 GB |
+| 16,384 | 67.7 / 77.2 | 0.29 / 0.51 GB |
+| 32,768 | 59.2 / 61.4 | 0.54 / 0.98 GB |
+
+So it is a switch for long work, off by default: twice the context for 4 to 13% of the writing speed.
 
 Tried and left out:
 
@@ -417,6 +446,7 @@ To re-tune from scratch, stop every Locals server, delete the cache file (or poi
 | `LOCALS_PAD_ROWS` | `1` | `0`: never compute a batch at more rows. By default batches of 8 to 16 are computed at a larger size, up to twice the rows, where the tuned timings show it at least 7% faster (`_pad_rows`; on an M5 Pro 12 requests computed as 16 ran 10-20% faster). `all`: other sizes too (the timings also pad 2 rows to 3, 4 to 5 and 24 to 32 on some M5 layers; measured end to end, within noise) |
 | `LOCALS_EXPERT_KERNELS` | `1` | `0`: Flint's routed experts through `FusedSwitchGLU` (gather_qmm) at every row count (`moe.USE_EXPERT_KERNELS`) |
 | `LOCALS_QK_KERNEL` | `1` | `0`: Flint's q/k norms and RoPE as four MLX kernels (`qk_kernel.USE_QK_KERNEL`) |
+| `LOCALS_KV_BITS` | `16` | `8`: Flint's full-attention keys and values in 8 bits (`qkv.py`): about twice the context, 4 to 13% slower writing |
 | `LOCALS_GDN_FAST` | timed | `1`: unpadded prompts through MLX's `mx.fast.gated_delta_update` in Qwen3.5's recurrent layers; `0`: through mlx-lm's kernel (`kernels.gdn_fast`) |
 
 ## Code switches
