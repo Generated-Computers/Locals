@@ -372,6 +372,68 @@ def test_minicpm5_calls():
     assert f.count_complete(good) == 2 and f.cut_after(good, 1).endswith("ls -la</param></function>")
 
 
+def test_flint_calls():
+    """Flint writes <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>, a non-string value as
+    JSON, and opens its own <think> block. The template's <tool_call> alone made it the hermes form, whose grammar
+    held Flint to JSON calls."""
+    from locals.formats import FORMATS, detect_from_template
+    from locals.regex import compile_nfa, determinize, trim_and_minimize
+
+    tpl = ("For each function call, output the function name and arguments within the following XML format:\n"
+           "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>")
+    f = detect_from_template(tpl)
+    assert f is FORMATS["flint_xml"]
+    d = trim_and_minimize(determinize(compile_nfa(f.reply_regex(["get_weather", "write"], "auto"))))
+    good = ("<think>The user wants the weather. I could write <tool_call>x</tool_call> here: it is thought.</think>"
+            "Let me check.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>"
+            "<arg_key>days</arg_key><arg_value>3</arg_value></tool_call>"
+            "<tool_call>write<arg_key>content</arg_key><arg_value>print('</tool_call>')\nx = 1 < 2</arg_value></tool_call>")
+    assert d.matches(good.encode())
+    assert d.matches(b"<think>Easy.</think>It is sunny.") and d.matches(b"It is sunny.")
+    assert not d.matches(good.replace("get_weather", "rm_rf").encode())
+    assert not d.matches(b"It is <think>sunny</think>.")  # a thought block only opens the reply
+    assert not d.matches(b'<tool_call>\n{"name": "get_weather", "arguments": {}}\n</tool_call>')  # the hermes form
+    tools = TOOLS + [{"type": "function", "function": {"name": "write", "parameters": {
+        "type": "object", "properties": {"content": {"type": "string"}}}}}]
+    reasoning, content, calls = oai.parse_reply(good, tools, fmt=f)
+    assert reasoning.startswith("The user wants the weather.") and content == "Let me check."
+    assert [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls] == [
+        ("get_weather", {"city": "Paris", "days": 3}), ("write", {"content": "print('</tool_call>')\nx = 1 < 2"})]
+    assert f.count_complete(good) == 2 and f.count_complete(good[:good.rfind("<tool_call>") + 20]) == 1  # streaming
+    assert f.cut_after(good, 1).endswith("<arg_value>3</arg_value></tool_call>")
+    r, c, cut = oai.parse_reply("<think>Still thinking when the token limit", tools, fmt=f)
+    assert (r, c, cut) == ("Still thinking when the token limit", "", [])
+
+
+def test_flint_template_renders_calls_the_grammar_writes():
+    """The chat template writes an earlier turn's calls in the form the grammar gives the model now, so a replayed
+    turn and a new reply look alike to it (a mismatch teaches the model the other form mid-conversation)."""
+    try:
+        from huggingface_hub import snapshot_download
+        from mlx_lm.utils import load_tokenizer
+
+        tok = load_tokenizer(Path(snapshot_download("mlx-community/flint-mixed-3-4bit", local_files_only=True)))
+    except Exception:  # noqa: BLE001
+        pytest.skip("Flint tokenizer not cached")
+    from locals.regex import compile_nfa, determinize, trim_and_minimize
+
+    f = formats.detect(tok)
+    assert f is formats.FORMATS["flint_xml"] and formats.thinking_style(tok) == "model"
+    msgs = [{"role": "user", "content": "Weather in Paris for 3 days?"},
+            {"role": "assistant", "content": "", "reasoning_content": "Call the tool.",
+             "tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Paris", "days": 3}}}]}]
+    text = tok.apply_chat_template(msgs, tools=TOOLS, tokenize=False)
+    reply = text[text.rindex("<|assistant|>") + len("<|assistant|>"):]
+    d = trim_and_minimize(determinize(compile_nfa(f.reply_regex(NAMES, "auto"))))
+    assert d.matches(reply.encode()), reply
+    from locals.vocab import TokenVocab
+
+    v = TokenVocab.from_hf(tok._tokenizer, len(tok._tokenizer), tok.eos_token_ids)
+    ids = tok._tokenizer.convert_tokens_to_ids(["<tool_call>", "<arg_key>", "</arg_value>", "<think>", "</think>"])
+    assert [v.token_bytes[i] for i in ids] == [b"<tool_call>", b"<arg_key>", b"</arg_value>", b"<think>", b"</think>"]
+    assert v.token_bytes[tok._tokenizer.convert_tokens_to_ids("<|observation|>")] is None  # a control token stays out
+
+
 def test_lfm2_python_calls():
     """LFM2.5 writes a reply's calls as one Python-style list between <|tool_call_start|> and <|tool_call_end|>:
     strings in single quotes with backslash escapes, Python numbers and None, lists and objects as JSON."""

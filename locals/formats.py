@@ -11,6 +11,7 @@ shows it (and the template renders earlier calls the same way):
   minicpm_xml  MiniCPM5               <function name="NAME"><param name="P">V</param></function>   (V with <, & or a
                newline as <![CDATA[...]]>)
   lfm2_python  LFM2.5                 <|tool_call_start|>[NAME(P='text', N=3, O={"k": 1}), ...]<|tool_call_end|>
+  flint_xml    Flint                  <tool_call>NAME<arg_key>P</arg_key><arg_value>V</arg_value></tool_call>
   fallback     templates without tools (Gemma 3, ...): the tools are described in
                the system prompt and calls use the hermes form
 
@@ -395,6 +396,99 @@ class MiniCPMXML(ToolFormat):
             out.append((m.group(1), {p.group(1): p.group(2) if p.group(2) is not None else p.group(3)
                                      for p in _MC_PARAM.finditer(m.group(2))}))
         return out
+
+
+_FL_CALL = re.compile(r"<tool_call>([^<\n]+)")
+_FL_ARG = re.compile(r"\s*<arg_key>([^<]*)</arg_key>\s*<arg_value>")
+_FL_END = re.compile(r"\s*</tool_call>")
+
+
+def _flint_calls(part: str) -> List[Tuple[str, dict, int]]:
+    """The complete calls in a calls part: (name, raw values, end). A value runs to its "</arg_value>", which the
+    grammar keeps out of values, so it may hold "</tool_call>" (a test fixture, documentation); a call cut before
+    its "</tool_call>" is not a call."""
+    out, pos = [], 0
+    while True:
+        m = _FL_CALL.search(part, pos)
+        if not m:
+            return out
+        j, args = m.end(), {}
+        while True:
+            a = _FL_ARG.match(part, j)
+            if not a:
+                break
+            k = part.find("</arg_value>", a.end())
+            if k < 0:
+                return out
+            args.setdefault(a.group(1).strip(), part[a.end():k])  # a repeated key: the first
+            j = k + len("</arg_value>")
+        e = _FL_END.match(part, j)
+        if e is None:  # not a call the grammar writes: skip this opener
+            pos = m.end()
+            continue
+        out.append((m.group(1).strip(), args, e.end()))
+        pos = e.end()
+
+
+class FlintXML(ToolFormat):
+    """Recursive's Flint: ``<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>``, calls
+    back to back. The template writes a string value as it is and any other value as JSON; values are typed by
+    the tool's schema when parsed, like Qwen's XML values. Flint opens a ``<think>`` block itself at the start of
+    a reply (the template has no switch). Without this the template's ``<tool_call>`` made it the hermes form,
+    and the grammar held Flint to JSON calls it was not trained to write."""
+
+    name = "flint_xml"
+    opener = "<tool_call>"
+    closer = "</tool_call>"
+    opens_thinking = True
+
+    def thought_regex(self) -> str:
+        from .oai import not_containing
+
+        return "(<think>" + not_containing(self.think_close) + "</think>\\n*)?"
+
+    def free_text(self) -> str:
+        from .oai import not_containing
+
+        # a thought block only opens the reply (see reply_regex); its markers are never content
+        return not_containing(self.opener, self.think_open, self.think_close)
+
+    def call(self, names: List[str]) -> str:
+        from .oai import PARAM_RE_, not_containing
+
+        arg = "<arg_key>" + PARAM_RE_ + "</arg_key><arg_value>" + not_containing("</arg_value>") + "</arg_value>"
+        return "<tool_call>" + _alts(names) + "(" + arg + ")*</tool_call>"
+
+    def calls(self, call: str, many: bool, at_least_one: bool) -> str:
+        return call + ("(\\n?" + call + ")*" if self.multi and many else "")
+
+    def reply_regex(self, names, tool_choice="auto", thinking=False, preamble=True, parallel=True):
+        body = super().reply_regex(names, tool_choice, False, preamble, parallel)
+        return None if body is None else self.thought_regex() + body
+
+    def split(self, text: str) -> Tuple[str, str]:
+        """(free text, the calls part) after the thought block a reply may open with: a call the model thinks
+        about is not a call (streaming counted it as one)."""
+        s = text.lstrip()
+        if s.startswith(self.think_open):
+            j = s.find(self.think_close)
+            if j < 0:
+                return text, ""
+            head = text[: len(text) - len(s) + j + len(self.think_close)]
+            free, part = super().split(text[len(head):])
+            return head + free, part
+        return super().split(text)
+
+    def parse_calls(self, part: str) -> List[Tuple[str, dict]]:
+        return [(name, args) for name, args, _ in _flint_calls(part)]
+
+    def count_complete(self, text: str) -> int:
+        return len(_flint_calls(self.split(text)[1]))
+
+    def cut_after(self, text: str, n: int) -> str:
+        free, part = self.split(text)
+        calls = _flint_calls(part)
+        return text if len(calls) <= n else free + part[: calls[n - 1][2]]
 
 
 class Llama3JSON(ToolFormat):
@@ -871,7 +965,7 @@ class MistralLegacy(MistralV3):
 
 
 FORMATS = {f.name: f for f in (QwenXML(), Hermes(), Llama3JSON(), MistralV3(), MistralLegacy(), MistralV11(), Gemma4(), MiniCPMXML(),
-                                LFM2Python(), Fallback())}
+                                LFM2Python(), FlintXML(), Fallback())}
 
 
 def detect_from_template(template: Optional[str]) -> ToolFormat:
@@ -888,6 +982,8 @@ def detect_from_template(template: Optional[str]) -> ToolFormat:
         return FORMATS["mistral_legacy"] if "tool_results" in t else FORMATS["mistral"]
     if "<|tool_call>call:" in t:
         return FORMATS["gemma4"]
+    if "<arg_key>" in t and "<arg_value>" in t:
+        return FORMATS["flint_xml"]
     if "<tool_call>" in t:
         return FORMATS["hermes"]
     if "\"parameters\"" in t and ("ipython" in t or "<|python_tag|>" in t):
