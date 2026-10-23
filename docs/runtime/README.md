@@ -208,13 +208,14 @@ Tried and left out:
 - A fused residual add + RMS norm body (`norm_kernel.add_rms`): no faster here either (10.46 against 10.22 ms).
 
 Measured on an M4 Pro (24 GB, the GPU limit raised to 20 GB), mlx-community/flint-mixed-3-4bit, 256-token prompts,
-decode steps pipelined as the engines run them:
+decode steps pipelined as the engines run them (all of it, and through the servers: docs/benchmarks, section 11):
 
 | Requests at once | stock mlx-lm | Locals before | Locals |
 |---|---|---|---|
-| 1 | 85 tok/s | 73 | 99 |
-| 4 | 169 | 169 | 205 |
-| 8 | 192 | 207 | 266 |
+| 1 | 85 tok/s | 79 | 102 |
+| 4 | 177 | 174 | 199 |
+| 8 | 202 | 223 | 255 |
+| 16 | 245 | 279 | 283 |
 
 **Accuracy.** Teacher-forced over 256 decode steps of real text, the patched model's choices against stock mlx-lm's
 are as far apart as stock mlx-lm's against itself with the prompt read in two chunks instead of one: top-1 agreement

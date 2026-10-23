@@ -182,7 +182,9 @@ same Mac found:
 
 ### M1, M3 and M4
 
-Not measured yet. On M1 (like the M2) Locals computes in float16, which those
+An M4 Pro (24 GB) has Flint's measurements (section 11). Qwen3.5-4B on it, through the server (`locals bench`, its
+kernel tuning not finished): 81 / 78 tokens/s for one request (mlx-lm / Locals), 181 / 199 for four, 192 / 207 for
+eight. The rest are not measured yet. On M1 (like the M2) Locals computes in float16, which those
 GPUs handle natively; M3 and later keep bfloat16. Results from these chips are
 welcome as [issues](https://github.com/Generated-Computers/Locals/issues), with
 `locals bench` and `locals tune --report`.
@@ -523,6 +525,64 @@ that ask for them. The same seeded request alone gives the same reply.
   experimental).
 - **8 agents in the paper's suite**: 22.1 s against 19.4 s for the stock engine,
   though with more tokens per second and more agents finishing.
+
+## 11. Recursive's Flint (M4 Pro, 24 GB)
+
+Flint (40B, 2.5B active per token: 256 routed experts, 6 a token, and a shared expert) on a MacBook Pro with an M4
+Pro and 24 GB, the GPU's limit raised to 20 GB (`sudo sysctl iogpu.wired_limit_mb=20480`),
+`mlx-community/flint-mixed-3-4bit` (17.8 GB: experts at 3 bits), MLX 0.32.4. Three setups, each alone on the GPU
+(two copies of the model do not fit): mlx-lm with Flint (0.32.3.dev, ml-explore/mlx-lm#1998); Locals as on main
+before Flint's support (e6be78c), given the same model code; and Locals with it. Both Locals setups use the kernel
+choices this Mac's idle tuner had cached (`locals tune` in full mode does not fit next to macOS in 24 GB).
+
+**In the process: requests at once.** A 256-token prompt each (the package's own source), then 48 greedy steps
+after 4 warm-up steps; tokens per second all rows write together:
+
+| Requests at once | mlx-lm | Locals before | Locals | Locals / mlx-lm |
+|---|---|---|---|---|
+| 1 | 85.3 | 78.6 | 102.0 | 1.20x |
+| 2 | 123.3 | 127.0 | 159.8 | 1.30x |
+| 4 | 176.9 | 173.5 | 198.7 | 1.12x |
+| 8 | 201.6 | 223.3 | 254.6 | 1.26x |
+| 16 | 244.5 | 278.8 | 282.5 | 1.16x |
+
+Before, Locals was slower than mlx-lm for one request (its kernel routing cost 4 us of Python a matrix product, and
+it fused nothing of Flint's) and gained only from its batching at 8 and 16. Past 16 rows the experts go back to
+MLX's sorted gather, which reads each expert once for all the tokens that chose it.
+
+**In the process: prompt length.** One request: a prompt read from nothing in 2,048-token chunks, then 64 greedy
+steps written after it (4 warm-up steps first; a warm-up prompt before all of it, so no kernel compiles in a timing):
+
+| Prompt tokens | Prompt read, tokens/s: mlx-lm / Locals before / Locals | Writing after it, tokens/s: mlx-lm / Locals before / Locals | Peak GPU memory, GB |
+|---|---|---|---|
+| 1,024 | 755 / 747 / 762 (1.4 s) | 83.8 / 73.7 / 100.5 | 19.04 / 19.11 / 19.12 |
+| 4,096 | 680 / 675 / 670 (6.1 s) | 80.3 / 73.7 / 94.1 | 19.53 / 19.54 / 19.86 |
+| 8,192 | 635 / 645 / 628 (13.0 s) | 76.6 / 70.6 / 89.7 | 19.66 / 19.67 / 19.86 |
+| 16,384 | 567 / 575 / 563 (29 s) | 67.7 / 64.3 / 80.6 | 19.88 / 19.92 / 20.08 |
+| 32,768 | 468 / 470 / 464 (70 s) | 60.6 / 56.0 / 63.9 | 20.39 / 20.24 / 20.49 |
+
+Reading a prompt is the same in all three (within 2%): Flint's kernels are for few rows, and a prompt's experts run
+through MLX's sorted gather. Writing is 1.20x mlx-lm's at 1,024 tokens and 1.05x at 32,768, where reading the
+14 full-attention layers' keys and values takes a growing share of each step. On a 24 GB Mac the server allows about
+35,000 tokens next to Flint.
+
+**Through each server's API, counted by the client.** mlx-lm's own server (`python -m mlx_lm server`, with Flint),
+Locals's as on main and Locals's now, one at a time: requests sent at once, each a prompt of about 1,000 tokens of
+its own (a nonce first, so no prompt cache helps), temperature 0, up to 256 tokens; the client counts the streamed
+text's tokens with the model's tokenizer, after a warm-up request:
+
+| At once | All done, s: mlx-lm / Locals before / Locals | Tokens/s end to end | First token, median s | One reply's writing, tokens/s |
+|---|---|---|---|---|
+| 1 | 4.79 / 4.91 / 4.10 | 52.8 / 52.1 / 61.7 (1.17x) | 1.12 / 1.10 / 1.10 | 68.7 / 66.8 / 84.1 |
+| 4 | 11.6 / 11.1 / 10.3 | 87.8 / 92.6 / 99.4 (1.13x) | 4.40 / 4.39 / 4.44 | 35.2 / 35.1 / 40.9 |
+| 8 | 21.1 / 19.4 / 17.7 | 96.4 / 105.4 / 115.2 (1.19x) | 8.79 / 6.58 / 6.26 | 20.6 / 21.0 / 24.0 |
+
+End to end is from sending the requests to the last token, the prompts' reading included (8,000 tokens at about
+700 tokens/s is most of it at 8 at once). mlx-lm's server reads every prompt before it writes; Locals answers the
+first requests while it reads the others (mixed passes), so its first tokens come sooner and its replies spend
+longer under way: counted from each reply's first token, mlx-lm's server writes 165 tokens/s at 8 at once, Locals 162.
+Replies stream without a stall while another long prompt is read: at most 2.8 s, against 9.7 without mixed passes
+(docs/runtime, "Flint").
 
 ## How the measurements were made
 

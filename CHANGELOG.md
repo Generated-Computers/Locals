@@ -12,8 +12,8 @@
   code ships with Locals (mlx-lm has it only in an unreleased pull request), its tool calls have their own format
   (`<tool_call>NAME<arg_key>...</arg_key><arg_value>...</arg_value></tool_call>`; it was taken for the hermes form,
   whose grammar held Flint to JSON calls), and its reasoning, which it opens itself, comes back as reasoning. Kernels
-  for its router, experts and q/k norms: on an M4 Pro with 24 GB, 99 tokens/s for one request where mlx-lm gives 85,
-  266 for eight at once where it gives 192 (docs/runtime, "Flint").
+  for its router, experts and q/k norms: on an M4 Pro with 24 GB, 102 tokens/s for one request where mlx-lm gives 85,
+  255 for eight at once where it gives 202; prompts are read as fast as mlx-lm reads them (docs/benchmarks, section 11).
 - On a Mac with the memory for a model but macOS's default GPU limit below what it needs (Flint on 24 GB), the memory
   check says how to raise the limit (`sudo sysctl iogpu.wired_limit_mb=...`) instead of only naming a smaller model.
 - A matrix product tuned to MLX's own kernel skips Locals's routing: 4 us of Python a call, which a one-token step
