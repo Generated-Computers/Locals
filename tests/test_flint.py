@@ -328,3 +328,43 @@ def test_flint_reads_prompts_in_longer_chunks():
     lm = text_model(m)
     assert lm.prefill_chunk_tokens == 2048 and lm.prefill_scores > PREFILL_SCORES
     assert prefill_chunk(16384, 1, 2048, lm.prefill_scores) == 2048 and prefill_chunk(16384, 1, 2048) == 512
+
+
+def test_batch_rows_decode_as_alone_with_and_without_padding():
+    """A batch of rows of different lengths (left-padded) keeps its mask; a batch whose rows are not padded (one row,
+    or rows left after the longer one finished) attends without it (fuse._unpadded); both decode as each row alone."""
+    from mlx_lm.models.cache import make_prompt_cache
+
+    import locals
+    from locals import fuse
+
+    m = _model(seed=12)
+    locals.patch(m, tune="off", kernels=False)
+    seqs = [[int(t) for t in mx.random.randint(0, 512, (n,), key=mx.random.key(40 + n)).tolist()] for n in (26, 14)]
+    steps = [3, 77, 401, 9]
+
+    def alone(s):
+        c = make_prompt_cache(m)
+        mx.eval(m(mx.array([s]), cache=c))
+        return c, [m(mx.array([[t]]), cache=c)[0, -1].astype(mx.float32) for t in steps]
+
+    def close(a, b):  # (the same here; a padded row attending without its mask is 0.03 off)
+        return float(mx.abs(a - b).max()) <= 2e-3 * (1 + float(mx.abs(b).max()))
+
+    refs = [alone(s)[1] for s in seqs]
+    rows = []
+    for s in seqs:
+        c = make_prompt_cache(m)
+        mx.eval(m(mx.array([s]), cache=c))
+        rows.append(c)
+    batch = [rows[0][i].merge([r[i] for r in rows]) for i in range(len(rows[0]))]
+    full = [c for c in batch if type(c).__name__ == "BatchKVCache"]
+    assert full and not fuse._unpadded(full[0])  # the shorter row is padded
+    for i in range(2):
+        out = m(mx.array([[steps[i]], [steps[i]]]), cache=batch)[:, -1].astype(mx.float32)
+        assert close(out[0], refs[0][i]) and close(out[1], refs[1][i])
+    for c in batch:
+        c.filter(mx.array([1]))  # the longer row is done: the other's padding is trimmed
+    assert fuse._unpadded(full[0])
+    for i in range(2, 4):
+        assert close(m(mx.array([[steps[i]]]), cache=batch)[0, -1].astype(mx.float32), refs[1][i])

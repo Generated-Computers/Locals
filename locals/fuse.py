@@ -84,6 +84,8 @@ class FusedFlintAttention(nn.Module):
                 return out.transpose(0, 2, 1, 3).reshape(B, L, -1)
             if cache is not None:
                 k, v = cache.update_and_fetch(k, v)
+            if L == 1 and isinstance(mask, mx.array) and _unpadded(cache):
+                mask = None  # one query a row and no row padded: the mask is all true, and costs MLX's attention 40%
             W = getattr(cache, "max_size", None)  # a sliding window's ring (mlx-lm's RotatingKVCache)
             if FLINT_BAND and L >= 2 * FLINT_BAND and isinstance(mask, mx.array) and isinstance(W, int):
                 out = self._banded(q, k, v, mask, cache, W)
@@ -119,6 +121,16 @@ class FusedFlintAttention(nn.Module):
             outs.append(scaled_dot_product_attention(q[:, :, a:b], k[:, :, lo:hi], v[:, :, lo:hi], cache=cache, scale=self.scale,
                                                      mask=mask[..., a:b, lo:hi], sinks=self.softmax_offset))
         return mx.concatenate(outs, axis=2)
+
+
+def _unpadded(cache) -> bool:
+    """Whether ``cache`` is a batch of full-attention rows none of which is left-padded (mlx-lm's BatchKVCache, whose
+    mask then only says every key is in view: at 30k keys MLX's attention took 510 us with it, 358 without, a 15%
+    slower step for one request through the engine). The padding is read on the host, where it is already
+    evaluated but for the step after rows join or leave."""
+    from mlx_lm.models.cache import BatchKVCache
+
+    return type(cache) is BatchKVCache and not any(cache.left_padding.tolist())
 
 
 FLINT_BAND = int(os.environ.get("LOCALS_FLINT_BAND", "512"))  # queries per band; 0: one attention over the chunk
