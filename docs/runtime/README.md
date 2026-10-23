@@ -17,7 +17,10 @@ After these steps, `mx.set_wired_limit` is set to the GPU's `max_recommended_wor
 |---|---|
 | `runtime.py` | `Runtime` (load, patch, constraint and prompt caches), `set_compute_dtype`, `native_bf16` |
 | `lm.py` | Drop-in replacement for mlx-lm: `load`, `patch`, and mlx-lm's `generate`, `stream_generate`, `batch_generate` and `BatchGenerator` re-exported unchanged |
-| `fuse.py` | Projection fusion, `FusedAttention`, `FusedMLP`, `FusedGatedDeltaNet`, `FusedGatedAttention`, `FusedHybridBody` |
+| `fuse.py` | Projection fusion, `FusedAttention`, `FusedFlintAttention`, `FusedMLP`, `FusedGatedDeltaNet`, `FusedGatedAttention`, `FusedHybridBody` |
+| `models/` | Architectures the pinned mlx-lm lacks, registered where mlx-lm imports models (`models.register`): Flint |
+| `moe.py` | Flint's mixture-of-experts block: the router and expert kernels, fused expert gate/up |
+| `qk_kernel.py` | Per-head q/k RMS norms and RoPE in one kernel (Flint's attention) |
 | `kernels.py` | Matmul routing (`enable_small_m`, `_linear_switch`), the dense prefill path, row packing, `qmm_small`, the autotuner and its cache, and output-layer helpers |
 | `qmv_multi.py` | The `multi` and `v3` multi-row matrix-vector kernels |
 | `qmv_frag.py` | The `frag` and `fragh` kernels, which dequantize straight into 8x8 MMA fragments |
@@ -124,6 +127,101 @@ When `want_states` is on and S > 1, the layer stores `cache.token_states` and `c
 
 **Prompts and MLX's op.** An unpadded prompt (no mask, no `cache.lengths`, more than 4 tokens) can go through MLX's own `mx.fast.gated_delta_update` instead, a chunked algorithm of matrix products with a version for the M5's neural accelerators. `kernels.gdn_fast` decides per layer shape and dtype, from timings `locals tune` makes with the whole model reading 512- and 2,048-token prompts each way (`gdn_model_tune`, keys `GDN{Hk}x{Hv}x{Dk}x{Dv}xT{512|2048}`); the op is kept where it is at least 3% faster. Timed alone, the op is 1.3-1.9x faster on an M2 Pro, but inside Qwen3.5-4B it was not (909 against 898 ms for 512 tokens, 3,389 against 3,366 ms for 2,048), so it is timed whole. Untimed shapes keep mlx-lm's kernel. With a mask the op is 12-50x slower and is never used. `LOCALS_GDN_FAST=1` or `0` forces it; `locals tune --report` shows the timings.
 
+## Flint: a mixture of experts (`models/flint.py`, `moe.py`, `qk_kernel.py`)
+
+Recursive's Flint is a 40B mixture of experts with 2.5B parameters active per token: 49 layers, the first two with a
+dense SwiGLU MLP, the other 47 with 256 routed experts (6 per token, by sigmoid scores renormalized to sum to 1) and a
+shared expert; grouped-query attention (32 query heads, 4 key/value heads of 128) with q/k RMS norms and a learned sink
+per head, RoPE only on the sliding-window layers (3 of 4, a window of 513). mlx-lm has it only in an unreleased pull
+request (ml-explore/mlx-lm#1998), so `models/flint.py` carries the same computation in MLX operations, and
+`models.register()` puts it at `mlx_lm.models.flint` before `Runtime.load`, `locals.lm.load` and the stock engine load
+a model. Where the installed mlx-lm has its own, that one stays: `mlx/<model>` is then still stock mlx-lm. With MLX
+0.32.4 the module's logits equal the pull request's bit for bit.
+
+`fuse_model` recognizes both modules' classes (by class and module name) and makes, in each layer:
+
+| Target | Result |
+|---|---|
+| Attention q/k/v | `qkv_proj`, `FusedFlintAttention`; q/k norms and RoPE through `qk_kernel.qk_norm_rope` (16-bit activations, heads a multiple of 128), which also writes v as its own array; `_mix` (between the projections) for `mixed.py` |
+| `SparseMoeBlock` | `FusedFlintMoe`: router logits from `moe.router`, the choice from `moe.route_topk`; few tokens through `moe.experts_up` / `moe.experts_down`, more through `FusedSwitchGLU` |
+| `switch_mlp` gate/up | One `QuantizedSwitchLinear` of twice the rows (`moe.fuse_switch_glu`): quantization groups run along the input, so it is exact |
+| Shared expert | gate/up fused as any SwiGLU MLP (`FusedMLP`) |
+
+**Why.** On an M4 Pro a one-token Flint step is about 600 dependent kernel launches deep, and each costs about 5 us
+before it reads anything, whatever its size (a residual add: 5.5 us, an RMS norm: 6.6 us). The 1.3 GB a token reads
+take 4.9 ms at the chip's bandwidth; stock mlx-lm's step took 11.7 ms. The kernels here remove launches on that chain:
+
+- **Router** (`router_logits`): one simdgroup per expert in 64 small threadgroups, the bf16 weight read as it is and
+  every dot product summed in float32 (as `x.astype(f32) @ W.astype(f32).T`, within 1.5e-7). MLX's float32
+  matrix-vector product took 42 us a layer, after casting the 1 MB weight to float32 each step: 2.0 ms of the step,
+  now 0.6. Up to `ROUTER_MAX_ROWS` (16) rows; a prompt takes the stock path.
+- **Choice** (`route_topk`): sigmoid, top-k by k rounds of a simdgroup argmax (ties to the lower index), and the
+  renormalization, in one kernel instead of five. The same experts as the reference on every row tested.
+- **Experts** (`experts_up`, `experts_down`): gather, slices, swiglu, gather, weighted sum, cast and the shared
+  expert's add were eight dependent kernels, 70 us a layer at one token. `experts_up` writes swiglu(gate, up) for every
+  (token, expert) pair; `experts_down` sums the down projections with the routing weights and adds the shared expert's
+  output. A lane takes a group of 64 weights; a value is masked in place against inputs pre-divided by its power of
+  two, as MLX's qmv does (shifting each value made the first version compute-bound: 74 us against MLX's 42). On an M4
+  Pro at one token: 43.7 and 35.6 us against 42 + 5 (swiglu) and 45 for the stock kernels. They round where the stock
+  graph does, so values differ by a last bit where a sum runs in another order. Up to `EXPERT_MAX_ROWS` (16) tokens;
+  more take `FusedSwitchGLU`, whose sorted gather reads each expert once for all its tokens.
+- **q/k** (`qk_norm_rope`): both norms and both rotations in one kernel instead of four. It saved only 0.1 ms: the q
+  and k branches did not wait on each other, and MLX's encoder overlaps them. The norms equal `mx.fast.rms_norm`
+  exactly (the normalized value is rounded before the weight's product); the rotation equals `mx.fast.rope` in 99% of
+  values and is a last bit off in the rest.
+
+**Memory.** Two things held memory that stock mlx-lm does not: the projections fused away stayed in MLX's buffer cache
+(2.5 GB of Flint's; `fuse_model` now ends with `mx.clear_cache()`), and v, a view of the fused projection, kept the
+whole projection of each sliding-window layer alive in the ring that keeps a prompt's first chunk as it is handed it
+(0.7 GB for a 2k chunk; `qk_norm_rope` writes v as its own array). After a 2,048-token chunk the patched model holds
+what stock mlx-lm holds, 18.04 GB.
+
+**Mixed passes** (`mixed.py`): decode rows and a prompt chunk in one pass work for Flint as for Qwen3.5. Through the
+server, three replies streaming while an 8,000-token prompt arrived stalled for at most 2.8 s, against 9.7 s (the whole
+prompt) with `LOCALS_MIX_CHUNK=0`; the prompt's first token came after 10.4 s against 9.8, the three wrote 104 tokens/s
+together against 107.
+
+**Long contexts.** One growing prompt (the package's own source), read 2,048 tokens at a time, one request writing:
+
+| Context | Reading, mlx-lm / Locals | Writing, mlx-lm / Locals | Peak GPU memory, mlx-lm / Locals |
+|---|---|---|---|
+| 2,048 | 642 / 647 tok/s | 79 / 90 tok/s | 19.54 / 19.86 GB |
+| 8,192 | 545 / 551 | 74 / 84 | 20.29 / 20.45 |
+| 16,384 | 456 / 459 | 67 / 74 | 20.51 / 20.71 |
+| 24,576 | 383 / 390 | 63 / 71 | 20.77 / 20.90 |
+| 32,768 | 329 / 336 | 59 / 59 | 21.02 / 21.12 |
+
+Reading a prompt is as fast as mlx-lm's (these kernels are for few rows). At 32,768 tokens both pass the 20 GB the GPU
+was given and the gain is gone; the server lets a 24 GB Mac's Flint take about 35,000 tokens. Through the server, the
+first token of a 13,094-token prompt came after 20.7 s and the reply went on at 74 tokens/s.
+
+Tried and left out:
+
+- **Prompt-lookup drafts** (`hybrid_batch._solo`), which need sliding-window caches that can be rewound (tried: a ring
+  of the window plus 64 slots, and a linear batch cache dropping its oldest slots in chunks). A pass reads the experts
+  of every token in it, so its cost grows with its width as a dense model's does not: 12.4 ms for 1 token, 17.0 for 2,
+  25.0 for 4, 43.2 for 8, against about 10 ms for a pipelined one-token step. On a file rewrite drafts kept 102 tokens
+  of 400 and the reply took 4.4 s against 4.5; through the server at temperature 1, where most drafts were rejected, the
+  output fell to 53 tokens/s from 83. And a pass of several tokens rounds differently from one-token steps, which in
+  Flint changed the greedy reply. A gather that reads each expert once for all the tokens that chose it would make
+  such passes cheap.
+- A fused residual add + RMS norm body (`norm_kernel.add_rms`): no faster here either (10.46 against 10.22 ms).
+
+Measured on an M4 Pro (24 GB, the GPU limit raised to 20 GB), mlx-community/flint-mixed-3-4bit, 256-token prompts,
+decode steps pipelined as the engines run them:
+
+| Requests at once | stock mlx-lm | Locals before | Locals |
+|---|---|---|---|
+| 1 | 85 tok/s | 73 | 99 |
+| 4 | 169 | 169 | 205 |
+| 8 | 192 | 207 | 266 |
+
+**Accuracy.** Teacher-forced over 256 decode steps of real text, the patched model's choices against stock mlx-lm's
+are as far apart as stock mlx-lm's against itself with the prompt read in two chunks instead of one: top-1 agreement
+95.3% and mean KL 0.048, against 95.3% and 0.038 (per component 0.027 to 0.048); the loss moved by -0.02 to +0.03.
+A 3-bit mixture of experts in bf16 is that sensitive to the order of a sum: a token whose sixth and seventh experts
+score within rounding of each other routes differently.
+
 ## Switched-off kernels
 
 - **Fused add + RMS norm** (`norm_kernel.add_rms`). It computes `h = x + r` and `rms_norm(h) * w` in one kernel, which would halve the norm launches of a pre-norm layer (`norm_kernel.py`). It needs a hidden size divisible by 256 and uses 256 threads per row (`norm_kernel.supported`). `FusedHybridBody` would use it, but `USE_ADD_RMS = False`: measured, it was no faster than MLX's two kernels. With the flag off, the body calls the stock `__call__` (`fuse.py`, `fuse.py`).
@@ -140,11 +238,14 @@ When `want_states` is on and S > 1, the layer stores `cache.token_states` and `c
 ```
 _linear_switch
   _enabled    -> _linear_call       -> _maybe_packed -> _linear_call_inner
+                                                          tuned to MLX's kernel, unpadded -> mlx-lm's original __call__
                                                           _dense_ok  -> _dense_matmul   (rows >= PREFILL_M)
                                                           _eligible  -> _small_matmul   (tuned kernel choice)
                                                           otherwise  -> mlx-lm's original __call__
   not enabled -> _linear_call_plain -> _maybe_packed -> mlx-lm's original __call__
 ```
+
+The first line is a fast path: where `_CHOICE` (final choices only; a deferred one is not stored there) holds MLX's own kernel for the shape at these rows and `_PAD` keeps the rows as they are, the call goes straight to MLX. The routing after it cost 4 us of Python a call against 0.6 for MLX's (two reshapes, `_tunable` twice, a dtype's name, three lookups), 0.8 ms of a one-token Flint step, which building and encoding its graph bounds; with the fast path, 1.4 us.
 
 A tied embedding head goes through `QuantizedEmbedding.as_linear` -> `_embed_switch`. It takes only the small-row path, with no dense path and no packing (`kernels._embed_as_linear`).
 
@@ -313,6 +414,8 @@ To re-tune from scratch, stop every Locals server, delete the cache file (or poi
 | `LOCALS_GDN_KERNEL` | `1` | `0`: mlx-lm's Gated DeltaNet decode instead of `gdn_kernel.py` (`fuse.USE_GDN_KERNEL`) |
 | `LOCALS_DENSE_PREFILL` | timed | `1`: prompts always through dequantize + dense GEMM; `0`: through MLX's quantized GEMM |
 | `LOCALS_PAD_ROWS` | `1` | `0`: never compute a batch at more rows. By default batches of 8 to 16 are computed at a larger size, up to twice the rows, where the tuned timings show it at least 7% faster (`_pad_rows`; on an M5 Pro 12 requests computed as 16 ran 10-20% faster). `all`: other sizes too (the timings also pad 2 rows to 3, 4 to 5 and 24 to 32 on some M5 layers; measured end to end, within noise) |
+| `LOCALS_EXPERT_KERNELS` | `1` | `0`: Flint's routed experts through `FusedSwitchGLU` (gather_qmm) at every row count (`moe.USE_EXPERT_KERNELS`) |
+| `LOCALS_QK_KERNEL` | `1` | `0`: Flint's q/k norms and RoPE as four MLX kernels (`qk_kernel.USE_QK_KERNEL`) |
 | `LOCALS_GDN_FAST` | timed | `1`: unpadded prompts through MLX's `mx.fast.gated_delta_update` in Qwen3.5's recurrent layers; `0`: through mlx-lm's kernel (`kernels.gdn_fast`) |
 
 ## Code switches

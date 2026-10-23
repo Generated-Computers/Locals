@@ -8,6 +8,21 @@
   instead of its shared background service. `locals swarm`, `locals solve` and `locals solve --plan` speak OpenCode
   2's server API (sessions, prompts and waits, interrupts, permission replies), and read its messages as version 1's.
   The agents are not given OpenCode 2's web search and code mode tools. Tested with OpenCode 1.18.32 and 2.1.2.
+- **Recursive's Flint** (`--model flint`: mlx-community/flint-mixed-3-4bit, 17.8 GB, a 24 GB Mac and up). The model's
+  code ships with Locals (mlx-lm has it only in an unreleased pull request), its tool calls have their own format
+  (`<tool_call>NAME<arg_key>...</arg_key><arg_value>...</arg_value></tool_call>`; it was taken for the hermes form,
+  whose grammar held Flint to JSON calls), and its reasoning, which it opens itself, comes back as reasoning. Kernels
+  for its router, experts and q/k norms: on an M4 Pro with 24 GB, 99 tokens/s for one request where mlx-lm gives 85,
+  266 for eight at once where it gives 192 (docs/runtime, "Flint").
+- On a Mac with the memory for a model but macOS's default GPU limit below what it needs (Flint on 24 GB), the memory
+  check says how to raise the limit (`sudo sysctl iogpu.wired_limit_mb=...`) instead of only naming a smaller model.
+- A matrix product tuned to MLX's own kernel skips Locals's routing: 4 us of Python a call, which a one-token step
+  of a model with many layers felt (0.8 ms of Flint's).
+- Decode rows and a prompt chunk in one pass for Flint too: replies streaming while an 8,000-token prompt is read
+  stall for at most 2.8 s instead of 9.7.
+- The projections `locals.patch` fuses away no longer stay in MLX's buffer cache (2.5 GB of Flint's, which a 24 GB Mac
+  swapped for).
+- MLX 0.32.4 and mlx-lm 0.32.2 in the lock file, as a fresh install gets them.
 
 ## 0.2.1 (2026-10-21)
 
