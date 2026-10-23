@@ -280,6 +280,25 @@ def experts_fit(x: mx.array, gate_up, down) -> bool:
             and gate_up["scales"].dtype == x.dtype and down["scales"].dtype == x.dtype)
 
 
+def _experts_buffers(q):
+    """(weight, scales, biases) of ``q``'s first expert, views of their buffers, for a kernel that reads the experts
+    ``inds`` names from those buffers. MLX commits a command buffer once its inputs pass MLX_MAX_MB_PER_BUFFER (50 MB
+    on an M4 Pro), counting each input at its size; a layer's whole expert tensors (Flint's: 350 MB, of which a token
+    reads 8) made that every expert kernel, about 94 commits a step: 10.2 ms a Flint step, 8.75 with the views (the
+    same tokens). Kept on ``q`` while its arrays are the same (a view made each call is a graph node each call)."""
+    src = (q["weight"], q["scales"], q["biases"])
+    c = getattr(q, "_one_expert", None)
+    if c is not None and c[0] is src[0] and c[1] is src[1] and c[2] is src[2]:
+        return c[3:]
+    views = tuple(a[:1] for a in src)
+    mx.eval(views)
+    try:
+        object.__setattr__(q, "_one_expert", src + views)  # (not a parameter: outside the module's mapping)
+    except AttributeError:
+        pass
+    return views
+
+
 def experts_up(x: mx.array, inds: mx.array, gate_up, rj: int = 1, tg: int = 128) -> mx.array:
     """swiglu(gate, up) of each token for each of its experts: ``x`` (T, D), ``inds`` (T, K) -> (T * K, I).
     ``rj`` hidden units per simdgroup and ``tg`` threads per threadgroup: the fastest on an M4 Pro at 1 and 8 tokens
@@ -293,7 +312,8 @@ def experts_up(x: mx.array, inds: mx.array, gate_up, rj: int = 1, tg: int = 128)
     I = gate_up["weight"].shape[1] // 2
     S, RJ = T_ * K, rj
     n_sg = S * (I // RJ)
-    (h,) = _up_kernel(inputs=[x, inds, gate_up["weight"], gate_up["scales"], gate_up["biases"], mx.array([S], dtype=mx.uint32)],
+    w, sc, bi = _experts_buffers(gate_up)
+    (h,) = _up_kernel(inputs=[x, inds, w, sc, bi, mx.array([S], dtype=mx.uint32)],
                       template=[("T", x.dtype), ("BITS", gate_up.bits), ("D", D), ("I", I), ("K", K), ("RJ", RJ)],
                       grid=(n_sg * 32, 1, 1), threadgroup=(tg, 1, 1), output_shapes=[(S, I)], output_dtypes=[x.dtype])
     return h
@@ -311,7 +331,8 @@ def experts_down(h: mx.array, inds: mx.array, weights: mx.array, down, shared=No
     rps = 32 // (I // 64)
     n_sg = NT * (D // rps)
     has = shared is not None
-    (y,) = _down_kernel(inputs=[h, inds, weights, down["weight"], down["scales"], down["biases"],
+    w, sc, bi = _experts_buffers(down)
+    (y,) = _down_kernel(inputs=[h, inds, weights, w, sc, bi,
                                 shared if has else mx.zeros((1,), dtype=h.dtype), mx.array([NT], dtype=mx.uint32)],
                         template=[("T", h.dtype), ("BITS", down.bits), ("D", D), ("I", I), ("K", K), ("HAS_SHARED", int(has))],
                         grid=(n_sg * 32, 1, 1), threadgroup=(tg, 1, 1), output_shapes=[(NT, D)], output_dtypes=[h.dtype])
