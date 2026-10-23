@@ -281,7 +281,7 @@ def abort_after(ocs, sid: str, directory: str, seconds: float):
     def abort():
         fired.set()
         try:
-            ocs.call("POST", f"/session/{sid}/abort", None, directory, timeout=10)
+            ocs.abort(sid, directory)
         except Exception:  # noqa: BLE001  # (OpenCode busy or gone)
             pass
 
@@ -479,13 +479,10 @@ def write_check(ocs, project: Path, task: str, run_dir: Path, agent: str, provid
         kind = "copy"  # removed in the finally even if making it fails
         try:
             kind = make_workspace(project, ws)
-            sid = ocs.call("POST", "/session", {"title": "locals solve: the check", "agent": agent,
-                                                "model": {"providerID": provider, "id": model}}, str(ws), timeout=60)["id"]
+            sid = ocs.new_session(str(ws), "locals solve: the check", agent, provider, model)
             timer, _ = abort_after(ocs, sid, str(ws), timeout)
             try:
-                ocs.call("POST", f"/session/{sid}/message", {"model": {"providerID": provider, "modelID": model}, "agent": agent,
-                                                            "parts": [{"type": "text", "text": CHECK_WRITER.format(task=task.strip())}]},
-                         str(ws), timeout=timeout + 60)
+                ocs.prompt(sid, str(ws), CHECK_WRITER.format(task=task.strip()), agent, provider, model, timeout=timeout + 60)
             except Exception:  # noqa: BLE001
                 pass
             finally:
@@ -579,21 +576,17 @@ class Race:
     def _abort(self, a: Attempt) -> None:
         if a.session:
             try:
-                self.ocs.call("POST", f"/session/{a.session}/abort", None, str(a.ws), timeout=10)
+                self.ocs.abort(a.session, str(a.ws))
             except Exception:  # noqa: BLE001
                 pass
 
     def _send(self, a: Attempt, text: str) -> None:
-        self.ocs.call("POST", f"/session/{a.session}/message",
-                      {"model": {"providerID": self.provider, "modelID": self.model}, "agent": self.agent,
-                       "parts": [{"type": "text", "text": text}]}, str(a.ws), timeout=self.timeout + 60)
+        self.ocs.prompt(a.session, str(a.ws), text, self.agent, self.provider, self.model, timeout=self.timeout + 60)
 
     def _run(self, a: Attempt, prompt: str) -> None:
         a.t0 = time.time()
         try:
-            s = self.ocs.call("POST", "/session", {"title": f"locals solve {a.name}", "agent": self.agent,
-                                                   "model": {"providerID": self.provider, "id": self.model}}, str(a.ws), timeout=60)
-            a.session = s["id"]
+            a.session = self.ocs.new_session(str(a.ws), f"locals solve {a.name}", self.agent, self.provider, self.model)
             timer = threading.Timer(self.timeout, lambda: self._abort(a))
             timer.daemon = True
             timer.start()
@@ -645,7 +638,7 @@ class Race:
         finally:
             a.t1 = time.time()
             try:
-                msgs = self.ocs.call("GET", f"/session/{a.session}/message", directory=str(a.ws), timeout=60) if a.session else []
+                msgs = self.ocs.messages(a.session, str(a.ws)) if a.session else []
             except Exception:  # noqa: BLE001
                 msgs = []
             a.answer, a.tools = _final_text(msgs)

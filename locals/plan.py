@@ -503,15 +503,13 @@ class Team:
         r = self.race
         if sid is None:
             try:
-                sid = r.ocs.call("POST", "/session", {"title": title, "agent": r.agent, "model": {"providerID": r.provider, "id": r.model}},
-                                 str(self.ws), timeout=60)["id"]
+                sid = r.ocs.new_session(str(self.ws), title, r.agent, r.provider, r.model)
             except Exception as e:  # noqa: BLE001
                 return {"title": title, "session": None, "wall_s": 0.0, "error": f"no session: {type(e).__name__}: {e}"}
         timer, _ = abort_after(r.ocs, sid, str(self.ws), r.timeout)
         t0 = time.time()
         try:
-            r.ocs.call("POST", f"/session/{sid}/message", {"model": {"providerID": r.provider, "modelID": r.model}, "agent": r.agent,
-                                                          "parts": [{"type": "text", "text": text}]}, str(self.ws), timeout=r.timeout + 60)
+            r.ocs.prompt(sid, str(self.ws), text, r.agent, r.provider, r.model, timeout=r.timeout + 60)
             error = None
         except Exception as e:  # noqa: BLE001
             error = f"{type(e).__name__}: {e}"

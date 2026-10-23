@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.2 (unreleased)
+
+- OpenCode 2 works with Locals as OpenCode 1 does. `locals code` opened OpenCode 2's interface with `-m`, which it
+  rejects ("Unrecognized flag: -m"); the model (and the agent `--agent` names) now goes in OPENCODE_CONFIG_CONTENT,
+  which wins over a project's own opencode.json, and OpenCode's server runs for that launch (`--standalone`)
+  instead of its shared background service. `locals swarm`, `locals solve` and `locals solve --plan` speak OpenCode
+  2's server API (sessions, prompts and waits, interrupts, permission replies), and read its messages as version 1's.
+  The agents are not given OpenCode 2's web search and code mode tools. Tested with OpenCode 1.18.32 and 2.1.2.
+
 ## 0.2.1 (2026-10-21)
 
 - The installer installs the release from PyPI; run again, it updates to the newest release. `LOCALS_SOURCE` set to

@@ -243,7 +243,7 @@ It refuses a file that is not plain JSON (comments or trailing commas, which Ope
 
 ### The agent team (`AGENTS`)
 
-Permissions double as the tool list: a denied tool is not offered to the model. The comment says a 2B model does best with few tools and a short, procedural prompt. Every agent denies `skill`, `todowrite`, `webfetch`, `doom_loop`, `question` and `external_directory` (`_NO`).
+Permissions double as the tool list: a denied tool is not offered to the model. The comment says a 2B model does best with few tools and a short, procedural prompt. Every agent denies `skill`, `todowrite`, `webfetch`, `doom_loop`, `question` and `external_directory` (`_NO`), and OpenCode 2's `websearch` and `execute` (its code mode, which calls tools from code). OpenCode 2 reads this version-1 config and converts it (`bash` is its `shell`, `task` its `subagent`), so one file serves both versions.
 
 | Agent | Mode | edit | bash | task (subagents) |
 |---|---|---|---|---|
@@ -267,15 +267,24 @@ Every agent, plus `build` and `plan`, gets `steps = AGENT_STEPS = 40`. The comme
 6. Writes `--agent` into the OpenCode config, so it persists for later launches. `--engine` is for this launch only.
 7. Runs OpenCode with `OPENCODE_DISABLE_AUTOUPDATE=1` and `PWD=<dir>` (OpenCode reads its project directory from `$PWD`), and always with `-m <provider>/<engine>/<short>`: a model set in the project's own `opencode.json` or a global `.jsonc` would otherwise win over the one Locals wrote, and could send the project to a cloud model.
 
-Without `--run`, it `execve`s `opencode <dir> -m ...` (`--logs` adds `--print-logs`). With `--run TASK`, it runs `opencode run --format json -m ... [-c] TASK` (`-c` comes from `--continue`) with stdin closed (`opencode run` reads a piped stdin into the task, and waited forever when Locals ran from a script). Each tool call is printed as one line as it happens (`_opencode_step`, for example `bash: python3 -m pytest -q`); then the last text part found by `_opencode_answer` (or the raw output tail) is printed, and the command exits with OpenCode's return code. Ctrl-C stops OpenCode.
+Without `--run`, it `execve`s `opencode <dir> -m ...` (`--logs` adds `--print-logs`). OpenCode 2 (`opencode_major`, from `opencode --version`: version 1 prints `1.18.32`, version 2 `opencode v2.1.2`) has no `-m` for its full-screen interface ("Unrecognized flag: -m"): Locals gives the model, and `--agent` when it is given, in `OPENCODE_CONFIG_CONTENT` (merged over the user's own, if any), which version 2 ranks above a project's `opencode.json` and `.opencode/opencode.json`, and starts `opencode --standalone <dir>`, so that OpenCode's server runs with this environment rather than its shared background service (started earlier, from anywhere). With `--run TASK`, it runs `opencode run --format json -m ... [-c] TASK` (`opencode run --standalone ...` on OpenCode 2; its events have version 1's shape, with `shell` and `subagent` for `bash` and `task`) (`-c` comes from `--continue`) with stdin closed (`opencode run` reads a piped stdin into the task, and waited forever when Locals ran from a script). Each tool call is printed as one line as it happens (`_opencode_step`, for example `bash: python3 -m pytest -q`); then the last text part found by `_opencode_answer` (or the raw output tail) is printed, and the command exits with OpenCode's return code. Ctrl-C stops OpenCode.
 
 ### `locals swarm` and `OpenCodeServer`
 
-`OpenCodeServer` starts one `opencode serve --port <free port>` and drives it over HTTP. Every agent is a session inside the one process, because separate `opencode run` processes contend for OpenCode's SQLite database.
+`OpenCodeServer` starts one `opencode serve --port <free port>` and drives it over HTTP. Every agent is a session inside the one process, because separate `opencode run` processes contend for OpenCode's SQLite database. OpenCode 2's API is another one; `new_session`, `prompt`, `abort` and `messages` speak either, and `swarm`, `solve` and `solve --plan` use only them:
 
-- **Startup:** it waits up to 90 s for `/global/health`.
+| | OpenCode 1 | OpenCode 2 |
+|---|---|---|
+| server up | `GET /global/health` | `GET /api/info`, with Basic auth (`opencode`, a password Locals sets in `OPENCODE_PASSWORD`) |
+| `new_session` | `POST /session?directory=` | `POST /api/session` with `location.directory` |
+| `prompt` | `POST /session/{id}/message`, which returns when the turn is over | `POST /api/session/{id}/prompt` returns at once; `POST /api/experimental/session/{id}/wait` until an `idle` message newer than the prompt (an `outcome` of `failed` raises) |
+| `abort` | `POST /session/{id}/abort` | `POST /api/session/{id}/interrupt` |
+| `messages` | `GET /session/{id}/message` | `GET /api/session/{id}/message?order=asc` (paged), turned into version 1's `{"info": {"role": ...}, "parts": [...]}` by `_v1_message` |
+| events | `GET /global/event` | `GET /api/event` |
+
+- **Startup:** it waits up to 90 s for the server.
 - **`run_task`:** creates a session, posts the task, and aborts it after `timeout` seconds with a timer (`solve.abort_after`: an abort OpenCode does not answer is ignored, and whether the timer fired is recorded, so a timeout is always reported as one). It returns the transcript.
-- **`start_approver`:** headless mode. It listens on `/global/event` and answers `permission.asked` / `permission.v2.asked` with `once`. It answers `reject` when a property value is `external_directory` or `doom_loop` (with `refuse_all`, always), and rejects all questions.
+- **`start_approver`:** headless mode. It listens on the event stream and answers `permission.asked` / `permission.v2.asked` with `once` (on OpenCode 2, `{"decision": "once"}` at `/api/session/{id}/permission/{request}/reply`). It answers `reject` when a property value is `external_directory` or `doom_loop` (with `refuse_all`, always), and rejects all questions.
 
 `cmd_swarm` takes tasks from `--tasks FILE` (a JSON list of strings or `{"task": ...}` objects, else one task per line with `#` comments skipped) or from `--task TEXT` repeated `--n` times (default 4). Other options:
 
