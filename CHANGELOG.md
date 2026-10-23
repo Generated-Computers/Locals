@@ -31,7 +31,7 @@
   39 sampled ones without it (`path` for `filePath`, `bash` without its `description`), none with it.
 - One request alone gets its forced spans in one pass on models with sliding-window or 8-bit caches too (Flint,
   Gemma): those caches cannot be rewound, which drafts need and forced spans do not. Flint's typed calls take 10%
-  fewer passes.
+  fewer passes (about the same time: a pass of several tokens reads each token's experts).
 - Flint's expert kernels no longer end a command buffer each: MLX ends one once its inputs pass 50 MB, counted at
   their whole size, and the kernels were handed a layer's whole expert tensors (350 MB). Handed one-expert views of
   the same buffers, a one-token step takes 8.75 ms instead of 10.2: 115 tokens/s for one request instead of 102, and

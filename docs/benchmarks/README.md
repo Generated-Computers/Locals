@@ -603,15 +603,16 @@ failing on mlx-vlm for wrong parameter names):
 
 | Grammar | Spans | Broken calls, greedy | Broken calls, sampled | Passes for the greedy replies | Writing, tokens/s |
 |---|---|---|---|---|---|
-| Untyped (the default) | a token a step | 4 of 12 | | 667 for 643 tokens | 79.5 |
-| Untyped | in one pass | 4 of 12 | 11 of 39 | 667 for 643 | 77.6 |
-| Typed (`--typed-tools`) | a token a step | 0 of 12 | | 672 for 648 | 77.3 |
-| Typed | in one pass | 0 of 12 | 0 of 39 | 603 for 644 | 80.0 |
+| Untyped (the default) | a token a step | 4 of 12 | | 667 for 643 tokens | 99.2 |
+| Untyped | in one pass | 4 of 12 | 11 of 39 | 667 for 643 | 99.3 |
+| Typed (`--typed-tools`) | a token a step | 0 of 12 | | 672 for 648 | 98.8 |
+| Typed | in one pass | 0 of 12 | 0 of 39 | 603 for 644 | 99.5 |
 
 Sampled: the model card's settings (temperature 1.0, top_p 0.95, top_k 20), three seeds a task, 36 requests. The
 untyped grammar's broken calls were `write` and `read` with `path` for `filePath`, and `bash` without its
 `description`. The typed grammar writes the parameter names (`<arg_key>filePath</arg_key><arg_value>` after `read`
-is five tokens the model does not choose), and one request alone feeds such a span in one pass: 10% fewer passes.
+is five tokens the model does not choose), and one request alone feeds such a span in one pass: 10% fewer passes,
+though a pass of several tokens reads each token's experts, so the time is about the same.
 Writing time is wall time less the prompt's reading; the untyped grammar has no span of 3 tokens or more, so its
 two rows differ only by noise. The typed automaton for these six tools took 3.9 s to build, once per tool set.
 

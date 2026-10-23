@@ -265,7 +265,7 @@ and `qkv.BatchQuantizedKVCache` layers for spans, and drafts (which a rejection 
 grammar writes parameter names, so `<arg_key>filePath</arg_key><arg_value>` after `read` is a span of five tokens.
 On 12 OpenCode-like tasks the untyped grammar let Flint break 4 of 12 greedy calls and 11 of 39 sampled ones
 (`path` for `filePath`, `bash` without its required `description`); the typed one none, with 10% fewer passes
-(603 against 672) and 80.0 tokens/s against 77.3 when the spans go a token a step (docs/benchmarks, section 11).
+(603 against 672), and 99.5 tokens/s against 98.8 when the spans go a token a step (docs/benchmarks, section 11).
 A pass of several tokens reads every token's experts, so a pass over a sampled token and its span of five costs
 about three one-token steps (34 ms against 10), not one.
 The typed grammar fixes the schema's order, so a model that would write `path` before `pattern` writes `pattern`
@@ -288,7 +288,8 @@ Tried and left out:
 - **Four barrier stages instead of six** (the shared expert's kernels ordered with `mx.depends` next to the router,
   the choice and the experts' gate/up, so MLX's encoder needs fewer barriers): no change (8.75 / 8.81 against 8.68 /
   8.84 ms), nor with each layer's MoE half under `mx.compile`, which cut the CPU's graph building from 3.1 to 1.7 ms a
-  step: the GPU then bounds the step at about 8.7 ms.
+  step: the GPU then bounds the step at about 8.7 ms. Through the server, whose engine adds its own work on the CPU,
+  one reply wrote 107.9 and 106.9 tokens/s with it against 108.1 and 107.4 without.
 - **Experts shared by rows read once**: the grid ordered so the simdgroups of one weight row for every token run side
   by side (262 against 265 tokens/s at 8 rows), and a down kernel that reads each distinct expert once for all its
   tokens (the same output; 155 against 142 us at 8 rows, 324 against 260 at 16: finding the shared experts in each
