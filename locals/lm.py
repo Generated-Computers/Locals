@@ -69,7 +69,9 @@ def patch(model, dtype: Optional[str] = "auto", fuse: bool = True, kernels: bool
 def load(path_or_hf_repo: str, *args, dtype: Optional[str] = "auto", tune: Optional[str] = None, **kwargs):
     """``mlx_lm.load`` with the model patched (``patch``); same arguments and returns."""
     from .defaults import model_id
+    from .models import register
 
+    register()  # architectures this mlx-lm lacks (Flint)
     out = _mlx_load(model_id(path_or_hf_repo), *args, **kwargs)  # short names too: "qwen", "gemma"
     patch(out[0], dtype=dtype, tune=tune)
     return out

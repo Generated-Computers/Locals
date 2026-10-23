@@ -553,6 +553,9 @@ class BatchService:
         from mlx_lm.models.cache import ArraysCache, LRUPromptCache
         from mlx_lm.sample_utils import make_sampler
 
+        from .models import register
+
+        register()  # architectures this mlx-lm lacks (Flint)
         model, tok = load(self.model_id)
         mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
         self.tokenizer = tok

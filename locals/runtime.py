@@ -298,7 +298,9 @@ class Runtime:
     @classmethod
     def load(cls, path: str, **kw) -> "Runtime":
         from .defaults import model_id
+        from .models import register
 
+        register()  # architectures this mlx-lm lacks (Flint)
         model, tok = mlx_load(model_id(path))  # short names too: "qwen", "gemma"
         return cls(model, tok, **kw)
 
