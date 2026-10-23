@@ -535,7 +535,10 @@ class HybridBatchEngine(BatchEngine):
             a = self.lm.args
             a = getattr(a, "text_config", None) or a
             get = (lambda k, d=None: a.get(k, d)) if isinstance(a, dict) else (lambda k, d=None: getattr(a, k, d))
-            n_kv = sum(1 for c in make_prompt_cache(self.model) if isinstance(c, KVCache))
+            caches = make_prompt_cache(self.model)
+            n_kv = sum(1 for c in caches if isinstance(c, KVCache))
+            # 8-bit keys and values (locals/qkv.py): a byte each, plus a bf16 scale and bias a group of 64
+            n_q = sum(1 for c in caches if getattr(c, "bits", None) == 8 and getattr(c, "group_size", None) == 64)
             heads = get("num_key_value_heads") or get("num_attention_heads") or 8
             dim = get("head_dim") or (get("hidden_size", 4096) // (get("num_attention_heads") or 32))
             per = 2 * heads * dim  # keys and values of one layer, from the config
@@ -545,8 +548,8 @@ class HybridBatchEngine(BatchEngine):
                 k, v = getattr(m, "k_proj", None), getattr(m, "v_proj", None)
                 if k is not None and v is not None and hasattr(k, "weight") and hasattr(v, "weight"):
                     per = max(per, int(k.weight.shape[0]) + int(v.weight.shape[0]))
-            self._kv_layers = max(1, n_kv)
-            self._kv_tok = self._kv_layers * per * 2
+            self._kv_layers = max(1, n_kv + n_q)
+            self._kv_tok = max(1, n_kv) * per * 2 if not n_q else n_kv * per * 2 + n_q * (per + per * 4 // 64)
         return self._kv_tok
 
     def _row_state(self) -> int:

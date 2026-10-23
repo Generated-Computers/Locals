@@ -162,6 +162,76 @@ def test_mixed_pass_is_a_decode_step_and_a_prefill():
     assert float(mx.abs(a - b).max()) <= 0.05 * float(mx.abs(a).max()) + 0.05
 
 
+@pytest.mark.parametrize("H,KVH", [(32, 4), (4, 2)])  # 8 query heads a key/value head (the matrix kernel), and 2
+def test_8bit_attention_is_mlx_attention_over_the_same_keys(H, KVH):
+    """qkv.attend against MLX's attention over the 8-bit keys and values unpacked, with sinks, left padding and a
+    buffer larger than its valid part: the same to a last bit of the output."""
+    from locals import qkv
+
+    HD = 128
+    sinks = (mx.random.normal((H,), key=mx.random.key(0)) * 2).astype(mx.bfloat16)
+    for B, n, cap, pads in ((1, 1, 256, [0]), (1, 13, 256, [0]), (1, 2100, 2304, [0]), (3, 700, 768, [0, 37, 300])):
+        q = mx.random.normal((B, H, 1, HD), key=mx.random.key(n)).astype(mx.bfloat16)
+        kq = mx.quantize((mx.random.normal((B, KVH, cap, HD), key=mx.random.key(n + 1)) * 2).astype(mx.bfloat16), group_size=64, bits=8)
+        vq = mx.quantize(mx.random.normal((B, KVH, cap, HD), key=mx.random.key(n + 2)).astype(mx.bfloat16), group_size=64, bits=8)
+        start = mx.array(pads, dtype=mx.int32)
+        got = qkv.attend(q, kq, vq, n, sinks, 0.0884, start)
+        mask = mx.arange(n)[None, None, None, :] >= start[:, None, None, None]
+        ref = mx.fast.scaled_dot_product_attention(q, qkv.dequantized(kq)[..., :n, :], qkv.dequantized(vq)[..., :n, :],
+                                                   scale=0.0884, mask=mask, sinks=sinks)
+        assert float(mx.abs(got.astype(mx.float32) - ref.astype(mx.float32)).max()) <= 2 ** -7 * (1 + float(mx.abs(ref).max()))
+
+
+def test_8bit_cache_in_a_batch_decodes_as_alone(monkeypatch):
+    """Flint's full-attention layers in 8-bit caches (LOCALS_KV_BITS=8): two requests merged into a batch decode as
+    each does alone, a third joins (extend), one leaves (filter), and a row taken out (extract) goes on as alone."""
+    from mlx_lm.models.cache import make_prompt_cache
+
+    import locals
+    from locals.qkv import BatchQuantizedKVCache, QuantizedKVCache8
+
+    monkeypatch.setenv("LOCALS_KV_BITS", "8")
+    m = _model(seed=8)
+    locals.patch(m, tune="off", kernels=False)
+    assert isinstance(make_prompt_cache(m)[0], QuantizedKVCache8)
+    seqs = [[int(t) for t in mx.random.randint(0, 512, (n,), key=mx.random.key(n)).tolist()] for n in (30, 13, 21)]
+
+    def alone(s, steps):
+        c = make_prompt_cache(m)
+        mx.eval(m(mx.array([s]), cache=c))
+        return c, [m(mx.array([[t]]), cache=c)[0, -1].astype(mx.float32) for t in steps]
+
+    def close(a, b):
+        return float(mx.abs(a - b).max()) <= 0.05 * (1 + float(mx.abs(b).max()))
+
+    steps = list(range(1, 11))
+    refs = [alone(s, steps)[1] for s in seqs]
+    rows = []
+    for s in seqs[:2]:
+        c = make_prompt_cache(m)
+        mx.eval(m(mx.array([s]), cache=c))
+        rows.append(c)
+    batch = [rows[0][i].merge([r[i] for r in rows]) for i in range(len(rows[0]))]
+    assert isinstance(batch[0], BatchQuantizedKVCache)
+    for i in range(5):
+        out = m(mx.array([[steps[i]], [steps[i]]]), cache=batch)[:, -1].astype(mx.float32)
+        assert close(out[0], refs[0][i]) and close(out[1], refs[1][i])
+    third, _ = alone(seqs[2], steps[:5])  # the third request, prefilled alone up to here, joins
+    joined = [third[i].merge([third[i]]) for i in range(len(third))]
+    for c, j in zip(batch, joined):
+        c.extend(j)
+    for i in range(5, 8):
+        out = m(mx.array([[steps[i]]] * 3), cache=batch)[:, -1].astype(mx.float32)
+        assert all(close(out[r], refs[r][i]) for r in range(3))
+    for c in batch:
+        c.filter(mx.array([1, 2]))  # the first request is done
+    out = m(mx.array([[steps[8]]] * 2), cache=batch)[:, -1].astype(mx.float32)
+    assert close(out[0], refs[1][8]) and close(out[1], refs[2][8])
+    back = [c.extract(1) for c in batch]  # the third request, back to a cache of its own
+    assert isinstance(back[0], QuantizedKVCache8)
+    assert close(m(mx.array([[steps[9]]]), cache=back)[0, -1].astype(mx.float32), refs[2][9])
+
+
 def test_patched_flint_decodes_as_the_stock_one():
     """The fused model (q/k/v, router, experts, shared expert, q/k norm-rope) against the stock one, greedily, on
     a prompt pass and on decode steps (the one-token kernels)."""

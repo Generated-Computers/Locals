@@ -72,12 +72,16 @@ class FusedFlintAttention(nn.Module):
         return self.o_proj(self._mix(self.qkv_proj(x), mask, cache))
 
     def _mix(self, qkv: mx.array, mask: Optional[mx.array] = None, cache: Optional[Any] = None) -> mx.array:
+        from . import qkv as qkv_cache
         from .qk_kernel import fits, qk_norm_rope
 
         B, L, _ = qkv.shape
         nq, nk = self.n_heads * self.head_dim, self.n_kv_heads * self.head_dim
         if fits(self, qkv):  # norms and RoPE in one kernel
             q, k, v = qk_norm_rope(qkv, self, cache.offset if cache is not None else 0)
+            if qkv_cache.quantized(cache):  # 8-bit keys and values (locals/qkv.py)
+                out = qkv_cache.attention(q, k, v, cache, self.scale, mask, self.softmax_offset)
+                return out.transpose(0, 2, 1, 3).reshape(B, L, -1)
             if cache is not None:
                 k, v = cache.update_and_fetch(k, v)
             out = scaled_dot_product_attention(q, k, v, cache=cache, scale=self.scale, mask=mask, sinks=self.softmax_offset)
@@ -89,6 +93,9 @@ class FusedFlintAttention(nn.Module):
             offset = cache.offset if cache is not None else 0
             q = self.rope(q, offset=offset)
             k = self.rope(k, offset=offset)
+        if qkv_cache.quantized(cache):
+            out = qkv_cache.attention(q, k, v, cache, self.scale, mask, self.softmax_offset)
+            return out.transpose(0, 2, 1, 3).reshape(B, L, -1)
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
         out = scaled_dot_product_attention(q, k, v, cache=cache, scale=self.scale, mask=mask, sinks=self.softmax_offset)
@@ -378,6 +385,10 @@ def fuse_model(model) -> int:
                 and _fusable([mlp.gate_proj, mlp.up_proj]) and _swiglu_mlp(mlp)):
             _fuse_mlp(mlp)
         n += 1
+    if type(model).__module__.split(".")[-1] == "flint" and hasattr(model, "make_cache"):
+        from .qkv import opt_in
+
+        opt_in(model)  # full-attention keys and values in 8 bits, as Flint's config asks (locals/qkv.py)
     mx.eval(model.parameters())
     # the projections fused away stay in MLX's buffer cache, which keeps freed buffers for reuse: 2.5 GB of Flint's
     # (its experts' gate and up), which a 24 GB Mac then swapped for
