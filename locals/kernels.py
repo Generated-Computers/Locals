@@ -949,7 +949,21 @@ def _dense_matmul(x, mod):
     return x @ w.T
 
 
+_DTYPE_NAME = {mx.float16: "float16", mx.bfloat16: "bfloat16"}
+
+
 def _linear_call_inner(self, x):
+    # A shape whose tuned choice at these rows is MLX's own kernel, unpadded, goes straight to it: the routing below
+    # (two reshapes, the checks, the lookups) cost 4 us of Python a call, 0.8 ms of a one-token Flint step, which
+    # at one row is bound by building and encoding its graph. Only a final choice counts (_CHOICE; a deferred one
+    # is not stored there), so the idle tuner can still give the shape a kernel of its own.
+    K = x.shape[-1]
+    M = x.size // K
+    dt = _DTYPE_NAME.get(x.dtype)
+    if dt is not None and M < PREFILL_M and not _RETIME:
+        key = (self["weight"].shape[0], K, M, dt)
+        if _CHOICE.get(key) == ("mlx",) and _PAD.get(key, 0) == M:
+            return _orig_linear_call(self, x)
     if _dense_ok(x, self):
         y = _dense_matmul(x, self)
         if "bias" in self:
