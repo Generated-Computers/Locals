@@ -25,6 +25,7 @@ _SRC = """
     constexpr int HALF = HD / 2, PER = HALF / 64;  // pairs of elements a lane holds in each half
     const uint sgid = thread_position_in_grid.x / 32;  // (a partial last threadgroup is smaller: not its size times its index)
     const uint lane = thread_index_in_simdgroup;
+    const uint B = dims[0], L = dims[1];  // runtime: a kernel for each prompt chunk's length was a compile each
     const uint head = sgid % (H + 2 * KV), bl = sgid / (H + 2 * KV);
     if (bl >= B * L) return;
     const uint b = bl / L, l = bl % L;
@@ -91,7 +92,7 @@ def qk_norm_rope(qkv: mx.array, attn, offset):
     global _kernel
     if _kernel is None:
         _kernel = mx.fast.metal_kernel(name="locals_qk_norm_rope",
-                                       input_names=["qkv", "qw", "kw", "offsets", "eps", "log2_base"],
+                                       input_names=["qkv", "qw", "kw", "offsets", "eps", "log2_base", "dims"],
                                        output_names=["q", "k", "v"], source=_SRC)
     B, L, _ = qkv.shape
     H, KV, HD = attn.n_heads, attn.n_kv_heads, attn.head_dim
@@ -100,8 +101,8 @@ def qk_norm_rope(qkv: mx.array, attn, offset):
     base = attn.rope.base if attn.rope is not None else 10000.0
     n_sg = B * L * (H + 2 * KV)
     q, k, v = _kernel(inputs=[qkv, attn.q_norm.weight, attn.k_norm.weight, offsets, mx.array([attn.q_norm.eps], dtype=mx.float32),
-                           mx.array([math.log2(base)], dtype=mx.float32)],
-                   template=[("T", qkv.dtype), ("H", H), ("KV", KV), ("HD", HD), ("B", B), ("L", L),
+                           mx.array([math.log2(base)], dtype=mx.float32), mx.array([B, L], dtype=mx.uint32)],
+                   template=[("T", qkv.dtype), ("H", H), ("KV", KV), ("HD", HD),
                              ("ROPE", int(attn.rope is not None)), ("OFFSETS_PER_ROW", int(per_row))],
                    grid=(n_sg * 32, 1, 1), threadgroup=(128, 1, 1),
                    output_shapes=[(B, H, L, HD), (B, KV, L, HD), (B, KV, L, HD)], output_dtypes=[qkv.dtype] * 3)

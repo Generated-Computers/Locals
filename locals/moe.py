@@ -33,7 +33,7 @@ from mlx_lm.models.activations import swiglu
 _ROUTE_SRC = """
     const uint t = thread_position_in_grid.x / 32;
     const uint lane = thread_index_in_simdgroup;
-    if (t >= T) return;
+    if (t >= nrows[0]) return;
     constexpr int PER = (E + 31) / 32;
     float s[PER];
     for (int j = 0; j < PER; j++) {
@@ -75,20 +75,21 @@ _LOGITS_SRC = """
     const uint e = thread_position_in_grid.x / 32;  // (a partial last threadgroup is smaller: not its size times its index)
     const uint lane = thread_index_in_simdgroup;
     if (e >= E) return;
-    float acc[T];
-    for (int t = 0; t < T; t++) acc[t] = 0.0f;
+    const int T = nrows[0];  // at most TMAX, the register tile's size (a power of two: few kernels to compile)
+    float acc[TMAX];
+    for (int t = 0; t < TMAX; t++) acc[t] = 0.0f;
     const device auto* wrow = w + size_t(e) * D;
     for (uint d = lane * 8; d < D; d += 256) {
         float wv[8];
         for (int i = 0; i < 8; i++) wv[i] = float(wrow[d + i]);
-        for (int t = 0; t < T; t++) {
+        for (int t = 0; t < TMAX && t < T; t++) {
             const device auto* xr = x + size_t(t) * D + d;
             float s = 0.0f;
             for (int i = 0; i < 8; i++) s += wv[i] * float(xr[i]);
             acc[t] += s;
         }
     }
-    for (int t = 0; t < T; t++) {
+    for (int t = 0; t < TMAX && t < T; t++) {
         const float v = simd_sum(acc[t]);
         if (lane == 0) logits[t * E + e] = v;
     }
@@ -102,12 +103,13 @@ def router_logits(x: mx.array, w: mx.array) -> mx.array:
     """float32 ``x @ w.T`` for a router: ``x`` (..., D), ``w`` (E, D), both bf16 or fp16, at most ROUTER_MAX_ROWS rows."""
     global _logits_kernel
     if _logits_kernel is None:
-        _logits_kernel = mx.fast.metal_kernel(name="locals_router_logits", input_names=["x", "w"],
+        _logits_kernel = mx.fast.metal_kernel(name="locals_router_logits", input_names=["x", "w", "nrows"],
                                               output_names=["logits"], source=_LOGITS_SRC)
     E, D = w.shape
     T = x.size // D
     sg = 4  # simdgroups (experts) per threadgroup: 64 threadgroups for 256 experts
-    (out,) = _logits_kernel(inputs=[x, w], template=[("T", T), ("E", E), ("D", D)],
+    tmax = 1 << max(0, (T - 1).bit_length())
+    (out,) = _logits_kernel(inputs=[x, w, mx.array([T], dtype=mx.uint32)], template=[("TMAX", tmax), ("E", E), ("D", D)],
                             grid=((E + sg - 1) // sg * sg * 32, 1, 1), threadgroup=(sg * 32, 1, 1),
                             output_shapes=[(*x.shape[:-1], E)], output_dtypes=[mx.float32])
     return out
@@ -126,12 +128,13 @@ def route_topk(logits: mx.array, k: int):
     expert indices and float32 weights that sum to 1. ``flint.route`` in one kernel."""
     global _route_kernel
     if _route_kernel is None:
-        _route_kernel = mx.fast.metal_kernel(name="locals_route_topk", input_names=["logits"],
+        _route_kernel = mx.fast.metal_kernel(name="locals_route_topk", input_names=["logits", "nrows"],
                                              output_names=["inds", "weights"], source=_ROUTE_SRC)
     E = logits.shape[-1]
     T = logits.size // E
     inds, weights = _route_kernel(
-        inputs=[logits], template=[("T", T), ("E", E), ("K", k)], grid=(T * 32, 1, 1), threadgroup=(min(256, T * 32), 1, 1),
+        inputs=[logits, mx.array([T], dtype=mx.uint32)], template=[("E", E), ("K", k)], grid=(T * 32, 1, 1),
+        threadgroup=(min(256, T * 32), 1, 1),
         output_shapes=[(*logits.shape[:-1], k)] * 2, output_dtypes=[mx.uint32, mx.float32])
     return inds, weights
 
@@ -194,7 +197,7 @@ _UP_SRC = """
     const uint sgid = thread_position_in_grid.x / 32;  // (a partial last threadgroup is smaller: not its size times its index)
     const uint lane = thread_index_in_simdgroup;
     const uint jb = sgid % (I / RJ), slot = sgid / (I / RJ);
-    if (slot >= S) return;
+    if (slot >= nslots[0]) return;
     const uint t = slot / K, e = inds[slot];
     float ga[RJ], ua[RJ];
     for (int r = 0; r < RJ; r++) { ga[r] = 0.0f; ua[r] = 0.0f; }
@@ -235,7 +238,7 @@ _DOWN_SRC = """
     const uint sgid = thread_position_in_grid.x / 32;  // (a partial last threadgroup is smaller: not its size times its index)
     const uint lane = thread_index_in_simdgroup;
     const uint t = sgid / (D / RPS), row = (sgid % (D / RPS)) * RPS + lane / NG, g = lane % NG;
-    if (t >= NT) return;
+    if (t >= ntok[0]) return;
     float acc = 0.0f;
     for (int k = 0; k < K; k++) {
         const uint slot = t * K + k;
@@ -283,15 +286,15 @@ def experts_up(x: mx.array, inds: mx.array, gate_up, rj: int = 1, tg: int = 128)
     (43.7 and 239 us a layer of Flint against 49 and 265 with two units; four, eight were slower still)."""
     global _up_kernel
     if _up_kernel is None:
-        _up_kernel = mx.fast.metal_kernel(name="locals_experts_up", input_names=["x", "inds", "w", "scales", "biases"],
+        _up_kernel = mx.fast.metal_kernel(name="locals_experts_up", input_names=["x", "inds", "w", "scales", "biases", "nslots"],
                                           output_names=["h"], source=_UP_SRC, header=_QDOT_HEADER)
     T_, D = x.shape
     K = inds.shape[-1]
     I = gate_up["weight"].shape[1] // 2
     S, RJ = T_ * K, rj
     n_sg = S * (I // RJ)
-    (h,) = _up_kernel(inputs=[x, inds, gate_up["weight"], gate_up["scales"], gate_up["biases"]],
-                      template=[("T", x.dtype), ("BITS", gate_up.bits), ("D", D), ("I", I), ("K", K), ("S", S), ("RJ", RJ)],
+    (h,) = _up_kernel(inputs=[x, inds, gate_up["weight"], gate_up["scales"], gate_up["biases"], mx.array([S], dtype=mx.uint32)],
+                      template=[("T", x.dtype), ("BITS", gate_up.bits), ("D", D), ("I", I), ("K", K), ("RJ", RJ)],
                       grid=(n_sg * 32, 1, 1), threadgroup=(tg, 1, 1), output_shapes=[(S, I)], output_dtypes=[x.dtype])
     return h
 
@@ -301,7 +304,7 @@ def experts_down(h: mx.array, inds: mx.array, weights: mx.array, down, shared=No
     global _down_kernel
     if _down_kernel is None:
         _down_kernel = mx.fast.metal_kernel(name="locals_experts_down",
-                                            input_names=["h", "inds", "weights", "w", "scales", "biases", "shared"],
+                                            input_names=["h", "inds", "weights", "w", "scales", "biases", "shared", "ntok"],
                                             output_names=["y"], source=_DOWN_SRC, header=_QDOT_HEADER)
     NT, K = inds.shape
     D, I = down["weight"].shape[1], h.shape[-1]
@@ -309,9 +312,8 @@ def experts_down(h: mx.array, inds: mx.array, weights: mx.array, down, shared=No
     n_sg = NT * (D // rps)
     has = shared is not None
     (y,) = _down_kernel(inputs=[h, inds, weights, down["weight"], down["scales"], down["biases"],
-                                shared if has else mx.zeros((1,), dtype=h.dtype)],
-                        template=[("T", h.dtype), ("BITS", down.bits), ("D", D), ("I", I), ("K", K), ("NT", NT),
-                                  ("HAS_SHARED", int(has))],
+                                shared if has else mx.zeros((1,), dtype=h.dtype), mx.array([NT], dtype=mx.uint32)],
+                        template=[("T", h.dtype), ("BITS", down.bits), ("D", D), ("I", I), ("K", K), ("HAS_SHARED", int(has))],
                         grid=(n_sg * 32, 1, 1), threadgroup=(tg, 1, 1), output_shapes=[(NT, D)], output_dtypes=[h.dtype])
     return y
 
