@@ -112,10 +112,11 @@ class ToolFormat:
         return call + "(\\n" + call + ")*"
 
     def reply_regex(self, names: List[str], tool_choice: Any = "auto", thinking: bool = False, preamble: bool = True,
-                    parallel: bool = True) -> Optional[str]:
+                    parallel: bool = True, call=None) -> Optional[str]:
         """The grammar of a reply to a request offering tools ``names``
         (``preamble=False``: a reply that must call starts with the call;
-        ``parallel=False``: at most one call)."""
+        ``parallel=False``: at most one call; ``call``: the grammar of one call
+        of the chosen names, where a format types its calls)."""
         if not names:
             return None
         free = self.free_text()
@@ -126,7 +127,8 @@ class ToolFormat:
             if isinstance(tool_choice, dict):
                 fn = (tool_choice.get("function") or {}).get("name") or tool_choice.get("name")
                 chosen = [fn] if fn in names else names
-            calls = self.calls(self.call(chosen), many=parallel and not isinstance(tool_choice, dict), at_least_one=True)
+            one = call(chosen) if call is not None else self.call(chosen)
+            calls = self.calls(one, many=parallel and not isinstance(tool_choice, dict), at_least_one=True)
             if tool_choice == "required" or isinstance(tool_choice, dict):
                 body = (free if preamble else "") + calls
             else:
@@ -403,6 +405,38 @@ _FL_ARG = re.compile(r"\s*<arg_key>([^<]*)</arg_key>\s*<arg_value>")
 _FL_END = re.compile(r"\s*</tool_call>")
 
 
+def _flint_value(schema: Optional[dict]) -> str:
+    """A parameter value as Flint's template writes it: a string as it is (any text without "</arg_value>"), any
+    other value as JSON; typed where the schema says what it is."""
+    from .oai import _types, not_containing
+
+    free = not_containing("</arg_value>")
+    if not isinstance(schema, dict) or not schema:
+        return free
+    if isinstance(schema.get("enum"), list) and schema["enum"]:
+        return "(" + "|".join(re.escape(v if isinstance(v, str) else json.dumps(v)) for v in schema["enum"]) + ")"
+    types = _types(schema)
+    if not types or "string" in types:
+        return free
+    alts = []
+    if "integer" in types:
+        alts.append(r"-?(0|[1-9][0-9]*)")
+    if "number" in types:
+        alts.append(_JNUM)
+    if "boolean" in types:
+        alts.append("(true|false)")
+    if "null" in types:
+        alts.append("null")
+    sp = r"[ ]?"
+    inner = _json_value(2, sp)
+    if "array" in types:
+        alts.append(r"\[" + sp + "(" + inner + "(" + sp + "," + sp + inner + ")*)?" + sp + r"\]")
+    if "object" in types:
+        alts.append(r"\{" + sp + "(" + _JSTR + sp + ":" + sp + inner + "(" + sp + "," + sp + _JSTR + sp + ":" + sp + inner
+                    + ")*)?" + sp + r"\}")
+    return "(" + "|".join(alts) + ")" if alts else free
+
+
 def _flint_calls(part: str) -> List[Tuple[str, dict, int]]:
     """The complete calls in a calls part: (name, raw values, end). A value runs to its "</arg_value>", which the
     grammar keeps out of values, so it may hold "</tool_call>" (a test fixture, documentation); a call cut before
@@ -462,8 +496,36 @@ class FlintXML(ToolFormat):
     def calls(self, call: str, many: bool, at_least_one: bool) -> str:
         return call + ("(\\n?" + call + ")*" if self.multi and many else "")
 
-    def reply_regex(self, names, tool_choice="auto", thinking=False, preamble=True, parallel=True):
-        body = super().reply_regex(names, tool_choice, False, preamble, parallel)
+    typed = True  # (oai.reply_regex hands it the tools' schemas when the server types tool calls)
+
+    def typed_call(self, specs: List[dict]) -> str:
+        """One call of one of ``specs`` with its parameters fixed: in the schema's order, the required ones present,
+        each value of its type. The grammar then writes a parameter's name itself, so a model cannot write ``path``
+        where the tool says ``filePath`` (mlx-community's Flint card: 41 of 85 OpenCode calls failed so on mlx-vlm
+        0.7.10), and the names are forced text, fed with the token before them in one pass."""
+        from .oai import param_schemas, tool_specs
+
+        out = []
+        for t in tool_specs(specs):
+            fn = t["function"]
+            params = param_schemas(fn.get("parameters"))
+            req = fn["parameters"].get("required") if isinstance(fn.get("parameters"), dict) else None
+            required = {r for r in req if isinstance(r, str)} if isinstance(req, list) else set()
+            body = ""
+            for p, sc in params.items():
+                if "<" in p or "\n" in p:
+                    continue  # (a name the model could not write between the tags)
+                piece = "<arg_key>" + re.escape(p) + "</arg_key><arg_value>" + _flint_value(sc) + "</arg_value>"
+                body += piece if p in required else "(" + piece + ")?"
+            out.append("<tool_call>" + re.escape(fn["name"]) + body + "</tool_call>")
+        return "(" + "|".join(out) + ")"
+
+    def reply_regex(self, names, tool_choice="auto", thinking=False, preamble=True, parallel=True, specs=None):
+        call = None
+        if specs:
+            def call(chosen):
+                return self.typed_call([t for t in specs if (t.get("function") or t).get("name") in chosen])
+        body = super().reply_regex(names, tool_choice, False, preamble, parallel, call=call)
         return None if body is None else self.thought_regex() + body
 
     def split(self, text: str) -> Tuple[str, str]:

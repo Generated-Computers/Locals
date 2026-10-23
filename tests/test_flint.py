@@ -254,3 +254,41 @@ def test_patched_flint_decodes_as_the_stock_one():
         ys = [mx.argmax(a[:, -1:], axis=-1)] * 2  # both go on from the stock token
         same += 1
     assert same == 12
+
+
+@pytest.mark.parametrize("kv_bits", ["16", "8"])
+def test_a_span_in_one_pass_is_its_tokens_one_at_a_time(kv_bits, monkeypatch):
+    """One request alone gets a forced span (tool-call syntax, a typed call's parameter names) in one pass
+    (HybridBatchEngine._solo): over Flint's batch caches, sliding-window rings past their window and full-attention
+    layers in bf16 or 8 bits, that pass gives the logits one-token steps give and leaves the caches as they do. No
+    drafts: a rejected draft would need those caches rewound."""
+    from types import SimpleNamespace
+
+    from mlx_lm.models.cache import BatchRotatingKVCache, make_prompt_cache
+
+    import locals
+    from locals.hybrid_batch import HybridBatchEngine
+
+    monkeypatch.setenv("LOCALS_KV_BITS", kv_bits)
+    m = _model(seed=9)
+    locals.patch(m, tune="off", kernels=False)
+    prompt = mx.array([[int(t) for t in mx.random.randint(0, 512, (30,), key=mx.random.key(3)).tolist()]])
+    span = [11, 400, 23, 7, 7, 260, 3]
+
+    def batch_of_one():
+        c = make_prompt_cache(m)
+        mx.eval(m(prompt, cache=c))
+        return [x.merge([x]) for x in c]
+
+    drip, one = batch_of_one(), batch_of_one()
+    assert any(isinstance(c, BatchRotatingKVCache) for c in one)
+    ref = mx.concatenate([m(mx.array([[t]]), cache=drip)[:, -1] for t in span]).astype(mx.float32)
+    got = m(mx.array([span]), cache=one)[0].astype(mx.float32)
+    assert float(mx.abs(got - ref).max()) <= 0.05 * (1 + float(mx.abs(ref).max()))
+    for t in (5, 99, 300):  # one-token steps after the span, past the window again
+        a, b = (m(mx.array([[t]]), cache=c)[0, -1].astype(mx.float32) for c in (drip, one))
+        assert float(mx.abs(a - b).max()) <= 0.05 * (1 + float(mx.abs(a).max()))
+    eng = HybridBatchEngine.__new__(HybridBatchEngine)
+    eng.lm = SimpleNamespace(model=m)
+    r = SimpleNamespace(controller=SimpleNamespace())
+    assert eng._solo_ok(r, one) and not eng._solo_drafts_ok(one)

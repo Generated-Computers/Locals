@@ -916,7 +916,14 @@ class HybridBatchEngine(BatchEngine):
         if not _SOLO or cache is None or getattr(self, "_walk", None) is not None:
             return False
         if any(type(c) not in (BatchKVCache, ArraysCache) for c in cache):
-            return False  # sliding-window layers (Gemma) are not rewound
+            # sliding-window layers (Gemma, Flint) and 8-bit ones (locals/qkv.py) are not rewound, which a draft needs
+            # and a forced span does not: those get their spans in one pass, and no drafts (_solo_drafts_ok)
+            from .qkv import BatchQuantizedKVCache
+
+            if any(type(c) not in (BatchKVCache, ArraysCache, BatchRotatingKVCache, BatchQuantizedKVCache) for c in cache):
+                return False
+            if self._solo_drafts_ok(cache):
+                return False
         name = type(r.controller).__name__
         return name not in ("WalkController", "PDAController")
 

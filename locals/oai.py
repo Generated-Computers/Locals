@@ -257,9 +257,11 @@ def reply_regex(tools: List[dict], tool_choice: Any = "auto", thinking: bool = F
     ``parallel=False`` (a request's ``parallel_tool_calls: false``): at most
     one call. With ``thinking`` the reply starts inside an open ``<think>``
     block. ``fmt`` is the model's tool-call format (locals.formats; default
-    Qwen3.5's XML calls, the only one with ``typed`` calls)."""
+    Qwen3.5's XML calls; it and Flint's have ``typed`` calls)."""
     names = [t["function"]["name"] for t in tool_specs(tools)]
     if fmt is not None and fmt.name != "qwen_xml":
+        if typed and getattr(fmt, "typed", False):  # a format with typed calls of its own (Flint's)
+            return fmt.reply_regex(names, tool_choice, thinking, preamble=preamble, parallel=parallel, specs=tool_specs(tools))
         return fmt.reply_regex(names, tool_choice, thinking, preamble=preamble, parallel=parallel)
     free = not_containing(*FREE_TEXT)
     if not names:

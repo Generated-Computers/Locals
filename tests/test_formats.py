@@ -490,3 +490,43 @@ def test_lfm2_reads_every_call_its_grammar_allows():
                                     ("Grep", {"pattern": "a, (b)", "-n": True}),
                                     ("run", {"cmd": "x=1", "n": -3, "opts": {"a": [1, True]}})]
     assert f.parse_calls("<|tool_call_start|>[run('positional')]<|tool_call_end|>") == []
+
+
+def test_flint_typed_calls():
+    """With the tools' schemas (the server's --typed-tools), Flint's grammar writes each call's parameter names
+    itself: in the schema's order, the required ones present, each value of its type. The untyped grammar takes any
+    name, as the model card's failing OpenCode calls had them (``path`` for ``filePath``)."""
+    f = formats.FORMATS["flint_xml"]
+    tools = [{"type": "function", "function": {"name": "read", "parameters": {"type": "object", "properties": {
+                 "filePath": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["filePath"]}}},
+             {"type": "function", "function": {"name": "edit", "parameters": {"type": "object", "properties": {
+                 "filePath": {"type": "string"}, "oldString": {"type": "string"}, "newString": {"type": "string"},
+                 "replaceAll": {"type": "boolean"}, "mode": {"enum": ["fast", "safe"]}, "lines": {"type": "array", "items": {"type": "integer"}}},
+                 "required": ["filePath", "oldString", "newString"]}}}]
+    typed = compile_dfa(oai.reply_regex(tools, "auto", typed=True, fmt=f), 400_000)
+    free = compile_dfa(oai.reply_regex(tools, "auto", fmt=f), 400_000)
+
+    def call(name, *kv):
+        return "<tool_call>" + name + "".join(f"<arg_key>{k}</arg_key><arg_value>{v}</arg_value>" for k, v in kv) + "</tool_call>"
+
+    good = ("<think>Read it first.</think>" + call("read", ("filePath", "/a.py"), ("limit", 40)) +
+            call("edit", ("filePath", "/a.py"), ("oldString", "x = 1 < 2"), ("newString", "x = 2"), ("replaceAll", "true"),
+                 ("mode", "safe"), ("lines", "[1, 2]")))
+    assert typed.matches(good.encode()) and free.matches(good.encode())
+    assert typed.matches(b"No call needed.") and typed.matches(call("read", ("filePath", "/a.py")).encode())
+    bad = [call("read", ("path", "/a.py")),  # the card's wrong name
+           call("read", ("limit", "40")),  # the required filePath left out
+           call("read", ("limit", "40"), ("filePath", "/a.py")),  # out of the schema's order
+           call("read", ("filePath", "/a.py"), ("offset", "ten")),  # not an integer
+           call("edit", ("filePath", "/a"), ("oldString", "a"), ("newString", "b"), ("mode", "quick")),  # not in the enum
+           call("edit", ("filePath", "/a"), ("oldString", "a"), ("newString", "b"), ("lines", "1, 2")),  # not an array
+           call("write", ("filePath", "/a"))]  # no such tool
+    assert not any(typed.matches(b.encode()) for b in bad)
+    assert free.matches(bad[0].encode()) and free.matches(bad[3].encode())
+    _, _, calls = oai.parse_reply(good, tools, fmt=f)
+    assert [json.loads(c["function"]["arguments"]) for c in calls] == [
+        {"filePath": "/a.py", "limit": 40},
+        {"filePath": "/a.py", "oldString": "x = 1 < 2", "newString": "x = 2", "replaceAll": True, "mode": "safe", "lines": [1, 2]}]
+    one = compile_dfa(oai.reply_regex(tools, {"type": "function", "function": {"name": "read"}}, typed=True, fmt=f), 400_000)
+    assert one.matches(call("read", ("filePath", "/a.py")).encode())
+    assert not one.matches(call("edit", ("filePath", "/a"), ("oldString", "a"), ("newString", "b")).encode())
