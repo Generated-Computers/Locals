@@ -40,6 +40,7 @@ def _no_real_user_files(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(app, "OPENCODE_BIN", home / ".opencode" / "bin" / "opencode")
     # what a server on the default port runs (the user's own may be up): none, unless a test says so
     monkeypatch.setattr(app, "_serving_short", lambda port: None, raising=False)
+    monkeypatch.setattr(app, "_OPENCODE_MAJOR", {}, raising=False)  # (stand-ins share paths: /bin/echo is OpenCode 1 or 2)
 
 
 @pytest.fixture(autouse=True, scope="session")

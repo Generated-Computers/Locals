@@ -243,7 +243,7 @@ It refuses a file that is not plain JSON (comments or trailing commas, which Ope
 
 ### The agent team (`AGENTS`)
 
-Permissions double as the tool list: a denied tool is not offered to the model. The comment says a 2B model does best with few tools and a short, procedural prompt. Every agent denies `skill`, `todowrite`, `webfetch`, `doom_loop`, `question` and `external_directory` (`_NO`).
+Permissions double as the tool list: a denied tool is not offered to the model. The comment says a 2B model does best with few tools and a short, procedural prompt. Every agent denies `skill`, `todowrite`, `webfetch`, `doom_loop`, `question` and `external_directory` (`_NO`), and OpenCode 2's `websearch` and `execute` (its code mode, which calls tools from code). OpenCode 2 reads this version-1 config and converts it (`bash` is its `shell`, `task` its `subagent`), so one file serves both versions.
 
 | Agent | Mode | edit | bash | task (subagents) |
 |---|---|---|---|---|
@@ -271,17 +271,26 @@ Without `--run`, it `execve`s `opencode <dir> -m ...` on v1 or `opencode <dir> -
 
 OpenCode v2's full TUI does not accept `-m`. Locals supplies a native `OPENCODE_CONFIG_CONTENT` overlay, loaded after project settings, with the selected model and default agent, local providers, tool and thinking capabilities, limits, and subagent depth. The initial agent's model is also set because v2 gives it precedence over the global default. Locals-owned agent prompts and permission rules use v2's `shell` and `subagent` names and the `agent` argument for delegation. User-owned agent definitions are kept. The full TUI still supports `/models` and agent switching (Shift+Tab in v2).
 
-The private v2 server inherits that launch's configuration, avoiding an existing background service with stale settings. The comparison engine is never written as the persistent default, and project files are not rewritten. Existing JSON or JSONC object settings in `OPENCODE_CONFIG_CONTENT` are merged, keeping unrelated fields; malformed values fail explicitly. The on-disk setup and disconnect format remains compatible with v1. This compatibility path covers `locals code`, `locals launch opencode`, and `locals code --run`; the separate `OpenCodeServer` integration used by `swarm` and `solve` still uses its existing HTTP contract.
+The private v2 server inherits that launch's configuration, avoiding an existing background service with stale settings. The comparison engine is never written as the persistent default, and project files are not rewritten. Existing JSON or JSONC object settings in `OPENCODE_CONFIG_CONTENT` are merged, keeping unrelated fields; malformed values fail explicitly. The on-disk setup and disconnect format remains compatible with v1. This compatibility path covers `locals code`, `locals launch opencode`, and `locals code --run`; the separate `OpenCodeServer` integration used by `swarm` and `solve` supports both server APIs as described below.
 
 The launcher regression tests are in `tests/test_opencode_compat.py`. To test a real binary, including orchestrator delegation, a child shell tool, JSON output, and both engines, run `LOCALS_TEST_OPENCODE=/path/to/opencode python -m pytest tests/test_opencode_cli.py -q`. These opt-in tests use isolated config/data directories and a deterministic loopback provider, without downloading weights.
 
 ### `locals swarm` and `OpenCodeServer`
 
-`OpenCodeServer` starts one `opencode serve --port <free port>` and drives it over HTTP. Every agent is a session inside the one process, because separate `opencode run` processes contend for OpenCode's SQLite database.
+`OpenCodeServer` starts one `opencode serve --port <free port>` and drives it over HTTP. Every agent is a session inside the one process, because separate `opencode run` processes contend for OpenCode's SQLite database. OpenCode 2's API is another one; `new_session`, `prompt`, `abort` and `messages` speak either, and `swarm`, `solve` and `solve --plan` use only them:
 
-- **Startup:** it waits up to 90 s for `/global/health`.
+| | OpenCode 1 | OpenCode 2 |
+|---|---|---|
+| server up | `GET /global/health` | `GET /api/info`, with Basic auth (`opencode`, a password Locals sets in `OPENCODE_PASSWORD`) |
+| `new_session` | `POST /session?directory=` | `POST /api/session` with `location.directory` |
+| `prompt` | `POST /session/{id}/message`, which returns when the turn is over | `POST /api/session/{id}/prompt` returns at once; `POST /api/experimental/session/{id}/wait` until an `idle` message newer than the prompt (an `outcome` of `failed` raises) |
+| `abort` | `POST /session/{id}/abort` | `POST /api/session/{id}/interrupt` |
+| `messages` | `GET /session/{id}/message` | `GET /api/session/{id}/message?order=asc` (paged), turned into version 1's `{"info": {"role": ...}, "parts": [...]}` by `_v1_message` |
+| events | `GET /global/event` | `GET /api/event` |
+
+- **Startup:** it waits up to 90 s for the server.
 - **`run_task`:** creates a session, posts the task, and aborts it after `timeout` seconds with a timer (`solve.abort_after`: an abort OpenCode does not answer is ignored, and whether the timer fired is recorded, so a timeout is always reported as one). It returns the transcript.
-- **`start_approver`:** headless mode. It listens on `/global/event` and answers `permission.asked` / `permission.v2.asked` with `once`. It answers `reject` when a property value is `external_directory` or `doom_loop` (with `refuse_all`, always), and rejects all questions.
+- **`start_approver`:** headless mode. It listens on the event stream and answers `permission.asked` / `permission.v2.asked` with `once` (on OpenCode 2, `{"decision": "once"}` at `/api/session/{id}/permission/{request}/reply`). It answers `reject` when a property value is `external_directory` or `doom_loop` (with `refuse_all`, always), and rejects all questions.
 
 `cmd_swarm` takes tasks from `--tasks FILE` (a JSON list of strings or `{"task": ...}` objects, else one task per line with `#` comments skipped) or from `--task TEXT` repeated `--n` times (default 4). Other options:
 

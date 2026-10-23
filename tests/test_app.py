@@ -232,6 +232,114 @@ def test_code_run_end_to_end_with_stand_ins(tmp_path, monkeypatch, capsys):
     assert json.loads((tmp_path / "locals" / "config.json").read_text())["model"] == args.model
 
 
+def test_opencode_major_reads_both_version_lines(tmp_path):
+    for printed, major in (("1.18.32", 1), ("opencode v2.1.2", 2), ("", 1)):
+        exe = tmp_path / f"oc{major}{len(printed)}"
+        exe.write_text(f"#!/bin/sh\necho '{printed}'\n")
+        exe.chmod(0o755)
+        assert app.opencode_major(str(exe)) == major
+
+
+def test_code_with_opencode_2_gives_the_model_in_its_config_content(tmp_path, monkeypatch, capsys):
+    """OpenCode 2's full-screen interface rejects -m ("Unrecognized flag: -m"): the model, and an agent asked for, go in
+    OPENCODE_CONFIG_CONTENT (over a project's opencode.json, and over the user's own content), with --standalone so
+    OpenCode's server runs with that environment; `--run` keeps -m, which version 2's run takes."""
+    import argparse
+    import json
+    import subprocess
+    import sys
+
+    import pytest
+
+    cfg_path = tmp_path / "oc" / "opencode.json"
+    monkeypatch.setattr(app, "OPENCODE_CONFIG", cfg_path)
+    monkeypatch.setattr(app, "LOCALS_DIR", tmp_path / "locals")
+    monkeypatch.setattr(app, "opencode_bin", lambda: "/bin/echo")
+    monkeypatch.setattr(app, "default_agent", lambda model: "orchestrator")
+    monkeypatch.setattr(app, "model_thinks", lambda model: True)
+    monkeypatch.setattr(app, "agent_context", lambda model, args=None: 65536)
+    monkeypatch.setattr(app, "fetch_model", lambda model: None)
+    monkeypatch.setattr(app, "ensure_server", lambda args: None)
+    monkeypatch.setattr(app, "_space_opencode_starts", lambda: None)
+    monkeypatch.setenv("OPENCODE_CONFIG_CONTENT", '{"theme": "mine", "model": "openai/gpt-5"}')
+    real_run = subprocess.run
+    def run(cmd, **kw):
+        if "--version" in cmd:
+            return real_run(["echo", "opencode v2.1.2"], **kw)
+        return subprocess.CompletedProcess(cmd, 0, "--standalone Run with a private server", "")
+
+    monkeypatch.setattr(app.subprocess, "run", run)
+    launched = []
+    monkeypatch.setattr(app.os, "execve", lambda exe, argv, env: launched.append((argv, env)) or sys.exit(0))
+    runs = []
+    monkeypatch.setattr(app, "_opencode_run", lambda cmd, env: runs.append((cmd, env)) or 0)
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.chdir(tmp_path)
+    args = argparse.Namespace(dir=str(project), model="mlx-community/Qwen3.5-4B-MLX-4bit", port=8321, engine=None, agent="coder",
+                              logs=True, run=None, cont=False)
+    with pytest.raises(SystemExit):
+        app.cmd_code(args)
+    argv, env = launched[0]
+    assert argv == ["/bin/echo", str(project), "--standalone", "--print-logs"] and "-m" not in argv
+    overlay = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    assert overlay["theme"] == "mine" and overlay["default_agent"] == "coder"
+    assert overlay["model"] == {"providerID": "locals", "model": "locals/qwen3.5-4b"}
+    assert overlay["agents"]["coder"]["model"] == overlay["model"]
+    assert env["PWD"] == str(project) and "Shift+Tab the agent" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        app.cmd_code(argparse.Namespace(**{**vars(args), "run": "write primes.py", "cont": True}))
+    cmd, env = runs[0]
+    assert cmd[1:] == ["run", "--standalone", "--format", "json", "-m", "locals/locals/qwen3.5-4b", "-c", "write primes.py"]
+    assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["model"] == {"providerID": "locals", "model": "locals/qwen3.5-4b"}
+
+
+def test_opencode_2_messages_read_as_version_1s():
+    msgs = [{"id": "m1", "type": "user", "text": "fix it"},
+            {"id": "m2", "type": "assistant", "agent": "coder", "model": {"providerID": "locals", "id": "locals/x"},
+             "content": [{"type": "reasoning", "text": "look first"},
+                         {"type": "tool", "id": "c1", "name": "shell", "state": {"status": "completed", "input": {"command": "ls"},
+                                                                                  "content": [{"type": "text", "text": "a.py"}]}},
+                         {"type": "tool", "id": "c2", "name": "read", "state": {"status": "error", "input": {"path": "b"},
+                                                                                 "error": {"message": "no such file"}}}]},
+            {"id": "m3", "type": "assistant", "content": [{"type": "text", "text": "Fixed."}]},
+            {"id": "m4", "type": "idle", "outcome": "succeeded"}]
+    v1 = [m for m in map(app._v1_message, msgs) if m]
+    assert [m["info"]["role"] for m in v1] == ["user", "assistant", "assistant"]
+    assert v1[1]["info"]["agent"] == "coder" and v1[1]["info"]["modelID"] == "locals/x"
+    tools = app._transcript_summary(v1)
+    assert tools["final"] == "Fixed." and tools["steps"] == 2
+    assert [(t["tool"], t["status"], t["output"]) for t in tools["tool_calls"]] == [
+        ("shell", "completed", "a.py"), ("read", "error", '{"message": "no such file"}')]
+
+
+def test_opencode_2_prompt_returns_when_the_turn_is_idle():
+    """Version 2 answers a prompt at once; the turn is over at an "idle" message newer than the prompt (one left by
+    the turn before does not count), and a failed turn raises."""
+    import pytest
+
+    class Fake(app.OpenCodeServer):
+        v2 = True
+
+        def __init__(self, idles):
+            self.idles, self.seen = idles, []
+
+        def call(self, method, path, body=None, directory=None, timeout=3600):
+            self.seen.append((method, path.split("?")[0]))
+            if path.endswith("/prompt"):
+                return {"data": {"id": "u2", "time": {"created": 2000}}}
+            if path.endswith("/wait"):
+                return None
+            return {"data": [self.idles.pop(0)]}
+
+    oc = Fake([{"type": "idle", "time": {"created": 1000}, "outcome": "succeeded"},
+               {"type": "idle", "time": {"created": 2500}, "outcome": "succeeded"}])
+    oc.prompt("s1", "/p", "go", "coder", "locals", "locals/x")
+    assert [p for _, p in oc.seen].count("/api/experimental/session/s1/wait") == 2 and not oc.idles
+    with pytest.raises(RuntimeError, match="failed"):
+        Fake([{"type": "idle", "time": {"created": 2500}, "outcome": "failed"}]).prompt("s1", "/p", "go", "coder", "locals", "locals/x")
+
+
 def test_openclaw_setup_replaces_localss_model_list(tmp_path, monkeypatch, capsys):
     """A setup for another model replaces the locals provider's model list: OpenClaw refuses
     a patch that would drop entries (switching from Qwen3.5 to Gemma 4 failed)."""

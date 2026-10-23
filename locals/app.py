@@ -57,7 +57,8 @@ PROVIDERS = {
 
 # Permissions double as the tool list: a denied tool is not offered to the
 # model. A 2B model does best with few tools and a short, procedural prompt.
-_NO = {"skill": "deny", "todowrite": "deny", "webfetch": "deny", "doom_loop": "deny", "question": "deny", "external_directory": "deny"}
+_NO = {"skill": "deny", "todowrite": "deny", "webfetch": "deny", "doom_loop": "deny", "question": "deny", "external_directory": "deny",
+       "websearch": "deny", "execute": "deny"}  # (OpenCode 2's web search, and its code mode, which calls tools from code)
 
 AGENTS = {
     "orchestrator": {
@@ -153,6 +154,23 @@ def opencode_bin() -> Optional[str]:
     if OPENCODE_BIN.exists():
         return str(OPENCODE_BIN)
     return None
+
+
+_OPENCODE_MAJOR: dict = {}
+
+
+def opencode_major(oc: str) -> int:
+    """OpenCode's major version (1 prints "1.18.32", 2 "opencode v2.1.2"). Version 2 has another command line (no
+    -m for its full-screen interface) and another server API, and replaces version 1 where it is installed, so
+    locals works with whichever is there."""
+    if oc not in _OPENCODE_MAJOR:
+        try:
+            out = subprocess.run([oc, "--version"], capture_output=True, text=True, timeout=60).stdout
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        first = next((w.lstrip("v").split(".")[0] for w in out.split() if w.lstrip("v")[:1].isdigit()), "1")
+        _OPENCODE_MAJOR[oc] = int(first) if first.isdigit() else 1
+    return _OPENCODE_MAJOR[oc]
 
 
 OLLAMA_PORT = 11434
@@ -566,7 +584,7 @@ def setup_opencode(args) -> str:
     if oc is None or getattr(args, "reinstall", False):
         oc = install_opencode(getattr(args, "opencode_version", None) or OPENCODE_VERSION)
     ver = subprocess.run([oc, "--version"], capture_output=True, text=True).stdout.strip()
-    print(f"opencode {ver} at {oc}")
+    print(f"opencode {ver.removeprefix('opencode ').lstrip('v')} at {oc}")
     agent = getattr(args, "agent", None) or default_agent(args.model)
     context = getattr(args, "context", None) or min(32768, agent_context(args.model, args))
     engine = getattr(args, "engine", None) or "locals"
@@ -1894,14 +1912,26 @@ class OpenCodeServer:
     """One ``opencode serve`` process driven through its HTTP API. Every
     session is a separate agent; they run concurrently inside the one process
     (separate ``opencode run`` processes contend for OpenCode's SQLite
-    database)."""
+    database). OpenCode 1 and 2 have different APIs: new_session, prompt, abort
+    and messages speak either, and messages come back in version 1's shape."""
+
+    v2 = False
 
     def __init__(self, oc: str, cwd: Path, log_path: Path, confine: Optional[List[Path]] = None):
         """``confine``: the folders OpenCode (and the commands its agents run) may write in, besides the temporary
         folders and caches (macOS's sandbox-exec; LOCALS_NO_SANDBOX=1: not confined)."""
         self.port = _free_port()
         self.base = f"http://127.0.0.1:{self.port}"
+        self.v2 = opencode_major(oc) >= 2
+        self.headers = {"Content-Type": "application/json"}
         env = dict(os.environ, OPENCODE_DISABLE_AUTOUPDATE="1", PWD=str(cwd))  # OpenCode reads its directory from $PWD
+        if self.v2:  # version 2's server asks for a password: one of ours (OpenCode keeps it from the agents' commands)
+            import base64
+            import secrets
+
+            password = secrets.token_urlsafe(24)
+            env["OPENCODE_PASSWORD"] = password
+            self.headers["Authorization"] = "Basic " + base64.b64encode(f"opencode:{password}".encode()).decode()
         _space_opencode_starts()
         argv = [oc, "serve", "--port", str(self.port)]
         if confine and not os.environ.get("LOCALS_NO_SANDBOX") and shutil.which("sandbox-exec"):
@@ -1914,7 +1944,9 @@ class OpenCodeServer:
             if self.proc.poll() is not None:
                 sys.exit(f"opencode serve exited with {self.proc.returncode}; see {log_path}")
             try:  # a short timeout: a request sent while OpenCode starts can go unanswered, and is sent again
-                if self.call("GET", "/global/health", timeout=5).get("healthy"):
+                if self.v2 and self.call("GET", "/api/info", timeout=5).get("version"):
+                    return
+                if not self.v2 and self.call("GET", "/global/health", timeout=5).get("healthy"):
                     return
             except Exception:
                 time.sleep(0.5)
@@ -1926,10 +1958,66 @@ class OpenCodeServer:
 
         url = self.base + path + (("?" + urllib.parse.urlencode({"directory": directory})) if directory else "")
         req = urllib.request.Request(url, method=method, data=json.dumps(body).encode() if body is not None else None,
-                                     headers={"Content-Type": "application/json"})
+                                     headers=getattr(self, "headers", {"Content-Type": "application/json"}))
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
             return json.loads(raw) if raw else None
+
+    def new_session(self, directory: str, title: str, agent: str, provider: str, model: str) -> str:
+        """A new session (an agent) working in ``directory``; its id."""
+        body = {"title": title, "agent": agent, "model": {"providerID": provider, "id": model}}
+        if self.v2:
+            return self.call("POST", "/api/session", {**body, "location": {"directory": directory}}, timeout=60)["data"]["id"]
+        return self.call("POST", "/session", body, directory, timeout=60)["id"]
+
+    def prompt(self, sid: str, directory: str, text: str, agent: str, provider: str, model: str, timeout: float = 3600) -> None:
+        """Send ``text`` to session ``sid`` and return once its agent has finished (or was aborted). An HTTP error, or
+        a turn OpenCode 2 reports as failed, raises."""
+        if not self.v2:
+            self.call("POST", f"/session/{sid}/message", {"model": {"providerID": provider, "modelID": model}, "agent": agent,
+                                                          "parts": [{"type": "text", "text": text}]}, directory, timeout=timeout)
+            return
+        # Version 2 answers a prompt at once (the session keeps its agent and model) and has a call that waits until the
+        # session is idle; the turn is over when an "idle" message newer than the prompt is there
+        sent = self.call("POST", f"/api/session/{sid}/prompt", {"text": text}, timeout=60)["data"]
+        t0, after = time.time(), (sent.get("time") or {}).get("created") or 0
+        while True:
+            left = timeout - (time.time() - t0)
+            if left <= 0:
+                raise TimeoutError(f"no answer in {timeout:.0f} s")
+            try:
+                self.call("POST", f"/api/experimental/session/{sid}/wait", timeout=left)
+            except urllib.error.HTTPError as e:
+                if e.code != 503:  # (busy: asked again)
+                    raise
+            idle = (self.call("GET", f"/api/session/{sid}/message?type=idle&order=desc&limit=1", timeout=60) or {}).get("data") or []
+            if idle and ((idle[0].get("time") or {}).get("created") or 0) >= after:
+                if idle[0].get("outcome") == "failed":
+                    raise RuntimeError("the agent's turn failed" + (f": {idle[0]['error']}" if idle[0].get("error") else ""))
+                return
+            time.sleep(0.2)
+
+    def abort(self, sid: str, directory: str) -> None:
+        if self.v2:
+            self.call("POST", f"/api/session/{sid}/interrupt", timeout=10)
+        else:
+            self.call("POST", f"/session/{sid}/abort", None, directory, timeout=10)
+
+    def messages(self, sid: str, directory: str) -> List[dict]:
+        """The session's messages, oldest first, as OpenCode 1 gives them: {"info": {"role": ...}, "parts": [...]}."""
+        if not self.v2:
+            return self.call("GET", f"/session/{sid}/message", directory=directory, timeout=60) or []
+        import urllib.parse
+
+        out: List[dict] = []
+        query = "order=asc&limit=200"
+        while True:
+            page = self.call("GET", f"/api/session/{sid}/message?{query}", timeout=60) or {}
+            out += [m for m in map(_v1_message, page.get("data") or []) if m]
+            cursor = (page.get("cursor") or {}).get("next")
+            if not cursor or not page.get("data"):
+                return out
+            query = "cursor=" + urllib.parse.quote(cursor)
 
     def start_approver(self, refuse_all: bool = False) -> None:
         """Headless mode: answer permission requests with "once" (``refuse_all``: "reject") and reject
@@ -1937,10 +2025,29 @@ class OpenCodeServer:
         agent config never reach here). With nothing answering, a request stayed
         pending and its agent waited until its time ran out."""
 
+        def answer(t, pr):
+            sid = pr.get("sessionID")
+            # outside the session's own folder, or a loop OpenCode itself flagged: refused, not approved
+            refuse = refuse_all or any(v in ("external_directory", "doom_loop") for v in pr.values() if isinstance(v, str))
+            if self.v2:
+                if t == "permission.asked":
+                    self.call("POST", f"/api/session/{sid}/permission/{pr['id']}/reply",
+                              {"decision": "reject" if refuse else "once"}, timeout=10)
+                elif t in ("form.asked", "form.created"):  # (a question; the agents are not given the tool)
+                    self.call("DELETE", f"/api/session/{sid}/form/{pr['id']}", timeout=10)
+            elif t == "permission.asked":
+                self.call("POST", f"/session/{sid}/permissions/{pr['id']}", {"response": "reject" if refuse else "once"}, timeout=10)
+            elif t == "permission.v2.asked":
+                self.call("POST", f"/api/session/{sid}/permission/{pr['id']}/reply", {"reply": "reject" if refuse else "once"},
+                          timeout=10)
+            elif t in ("question.asked", "question.v2.asked"):
+                self.call("POST", f"/api/session/{sid}/question/{pr['id']}/reject", {}, timeout=10)
+
         def listen():
             while self.proc.poll() is None:
                 try:
-                    req = urllib.request.Request(self.base + "/global/event", headers={"Accept": "text/event-stream"})
+                    req = urllib.request.Request(self.base + ("/api/event" if self.v2 else "/global/event"),
+                                                 headers={**self.headers, "Accept": "text/event-stream"})
                     with urllib.request.urlopen(req, timeout=None) as r:
                         for line in r:
                             line = line.decode(errors="replace").strip()
@@ -1951,19 +2058,8 @@ class OpenCodeServer:
                             except ValueError:
                                 continue
                             ev = ev.get("payload", ev)
-                            t, pr = ev.get("type"), ev.get("properties") or {}
-                            sid = pr.get("sessionID")
-                            # outside the session's own folder, or a loop OpenCode itself flagged: refused, not approved
-                            refuse = refuse_all or any(v in ("external_directory", "doom_loop") for v in pr.values() if isinstance(v, str))
                             try:
-                                if t == "permission.asked":
-                                    self.call("POST", f"/session/{sid}/permissions/{pr['id']}",
-                                              {"response": "reject" if refuse else "once"}, timeout=10)
-                                elif t == "permission.v2.asked":
-                                    self.call("POST", f"/api/session/{sid}/permission/{pr['id']}/reply",
-                                              {"reply": "reject" if refuse else "once"}, timeout=10)
-                                elif t in ("question.asked", "question.v2.asked"):
-                                    self.call("POST", f"/api/session/{sid}/question/{pr['id']}/reject", {}, timeout=10)
+                                answer(ev.get("type"), (ev.get("data") if self.v2 else ev.get("properties")) or {})
                             except Exception:
                                 pass
                 except Exception:
@@ -1974,17 +2070,14 @@ class OpenCodeServer:
     def run_task(self, task: str, directory: str, agent: str, provider: str, model: str, title: str, timeout: float = 900) -> dict:
         """Create a session in ``directory``, send the task, wait for the agent
         to finish (aborting it after ``timeout`` seconds); returns the transcript."""
-        s = self.call("POST", "/session", {"title": title, "agent": agent, "model": {"providerID": provider, "id": model}}, directory,
-                      timeout=60)
-        sid = s["id"]
+        sid = self.new_session(directory, title, agent, provider, model)
         t0 = time.time()
         error = None
         from .solve import abort_after
 
         timer, fired = abort_after(self, sid, directory, timeout)
         try:
-            self.call("POST", f"/session/{sid}/message", {"model": {"providerID": provider, "modelID": model}, "agent": agent,
-                                                          "parts": [{"type": "text", "text": task}]}, directory)
+            self.prompt(sid, directory, task, agent, provider, model)
         except Exception as e:  # noqa: BLE001
             error = f"{type(e).__name__}: {e}"
         finally:
@@ -1992,7 +2085,7 @@ class OpenCodeServer:
             timed_out = fired.is_set()
         if timed_out:
             error = (error or "") + f" aborted after {timeout:.0f}s"
-        msgs = self.call("GET", f"/session/{sid}/message", directory=directory, timeout=60) or []
+        msgs = self.messages(sid, directory)
         return {"session": sid, "wall_s": time.time() - t0, "error": error or None, "messages": msgs}
 
     def close(self):
@@ -2001,6 +2094,33 @@ class OpenCodeServer:
             self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self.proc.kill()
+
+
+def _v1_message(m: dict) -> Optional[dict]:
+    """An OpenCode 2 message in OpenCode 1's shape, or None for the kinds version 1 had no message for (idle, a model
+    switched, ...)."""
+    kind = m.get("type")
+    if kind == "user":
+        return {"info": {"id": m.get("id"), "role": "user", "time": m.get("time")}, "parts": [{"type": "text", "text": m.get("text") or ""}]}
+    if kind != "assistant":
+        return None
+    parts = []
+    for c in m.get("content") or []:
+        if c.get("type") == "tool":
+            st = c.get("state") or {}
+            out = "\n".join(x.get("text", "") for x in st.get("content") or [] if isinstance(x, dict) and x.get("type") == "text")
+            error = st.get("error")
+            parts.append({"type": "tool", "tool": c.get("name"), "callID": c.get("id"),
+                          "state": {"status": st.get("status"), "input": st.get("input"), "output": out,
+                                    "error": error if error is None or isinstance(error, str) else json.dumps(error)}})
+        elif c.get("type") in ("text", "reasoning"):
+            parts.append({"type": c["type"], "text": c.get("text") or ""})
+    model = m.get("model") or {}
+    info = {"id": m.get("id"), "role": "assistant", "agent": m.get("agent"), "providerID": model.get("providerID"),
+            "modelID": model.get("id"), "time": m.get("time"), "tokens": m.get("tokens"), "finish": m.get("finish")}
+    if m.get("error"):
+        info["error"] = m["error"]
+    return {"info": info, "parts": parts}
 
 
 def _transcript_summary(msgs: List[dict]) -> dict:

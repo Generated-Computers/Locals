@@ -7,6 +7,7 @@ import subprocess
 import pytest
 
 from locals import solve
+from locals.app import OpenCodeServer
 
 
 def _git(d, *args):
@@ -101,9 +102,9 @@ def test_prompts():
     assert "assert -1 == 5" in solve.fix_prompt("c", a.check_out)
 
 
-class FakeOpenCode:
-    """OpenCode's session API with scripted agents: agent i (in order of creation) runs
-    ``behaviors[i](workspace, turn, aborted)`` for each message it is sent."""
+class FakeOpenCode(OpenCodeServer):
+    """OpenCode's session API (version 1's, under OpenCodeServer's methods) with scripted agents: agent i (in order of
+    creation) runs ``behaviors[i](workspace, turn, aborted)`` for each message it is sent."""
 
     def __init__(self, behaviors):
         import threading
@@ -340,7 +341,10 @@ def test_an_abort_that_fails_prints_no_traceback_and_still_counts():
 
     entered, release = threading.Event(), threading.Event()
 
-    class Gone:
+    class Gone(OpenCodeServer):
+        def __init__(self):
+            pass
+
         def call(self, *a, **k):
             entered.set()
             release.wait(5)

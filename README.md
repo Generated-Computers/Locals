@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://pypi.org/project/locals/"><img src="https://img.shields.io/pypi/v/locals.svg" alt="PyPI"></a>
-  <a href="https://github.com/Generated-Computers/Locals/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="https://github.com/Generated-Computers/Locals/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License: Apache 2.0"></a>
   <a href="#getting-started"><img src="https://img.shields.io/badge/macOS-Apple%20silicon-lightgrey.svg" alt="macOS on Apple silicon"></a>
 </p>
 
@@ -491,5 +491,14 @@ If you use Locals in your research, please cite the paper:
 
 ## License
 
-Locals is released under the MIT license. It is made by
+Locals is released under the Apache License 2.0. It is made by
 [Generated Computers](https://github.com/Generated-Computers).
+
+## Star history
+
+<a href="https://github.com/Generated-Computers/Locals/stargazers">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Generated-Computers/Locals/charts/stars-dark.svg">
+    <img alt="Locals' GitHub stars from its first day" src="https://raw.githubusercontent.com/Generated-Computers/Locals/charts/stars.svg" width="480">
+  </picture>
+</a>
