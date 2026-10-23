@@ -10,6 +10,9 @@ MODELS = {
     "gemma-4-e4b": "mlx-community/gemma-4-e4b-it-4bit",
     "lfm2.5-2.6b": "LiquidAI/LFM2.5-2.6B-MLX-4bit",  # 1.6 GB: 8 GB Macs
     "minicpm5-2b": "mlx-community/MiniCPM5-2B-mlx-4Bit",  # 1.4 GB
+    # Recursive's 40B mixture of experts (2.5B active), experts at 3 bits: 17.8 GB, a 24 GB Mac with the GPU limit
+    # raised (too_big says how); Recursive's own 4-bit build (RecursiveSI/flint-int4, 22.6 GB) wants 32 GB or more
+    "flint": "mlx-community/flint-mixed-3-4bit",
 }
 
 
@@ -22,8 +25,12 @@ MEASURED_M2_PRO = {
     "lfm2.5-2.6b": {"weights_gb": 1.5, "mlx": 144, "locals": 404},
     "minicpm5-2b": {"weights_gb": 1.3, "mlx": 160, "locals": 478},
 }
+# Models the M2 Pro's 16 GB cannot hold, measured as above on the Mac named ("on")
+MEASURED_ELSEWHERE = {
+    "flint": {"weights_gb": 16.6, "mlx": 201, "locals": 203, "on": "an M4 Pro (24 GB)"},
+}
 SHORT = {"qwen3.5-4b": "qwen", "qwen3.5-2b": "qwen3.5-2b", "gemma-4-e4b": "gemma", "lfm2.5-2.6b": "lfm",
-         "minicpm5-2b": "minicpm"}
+         "minicpm5-2b": "minicpm", "flint": "flint"}
 # Agent tasks done in the end-to-end suite (tests/e2e: real agent tools on real coding tasks, an M2 Pro), the same
 # eight for both (OpenCode's four, Hermes's and OpenClaw's two; Qwen3.5-4B also did all 18 with eight tools):
 # Gemma 4 E4B repeats itself on the longer ones (the server's loop guard cuts it) and gives up early (2 to 3 of 8).
@@ -127,9 +134,32 @@ def too_big(model: str, remote: bool = False) -> "str | None":
     w, limit = weights_gb(model, remote), gpu_limit_gb()
     if not w or not limit or w + HEADROOM_GB <= limit:
         return None
+    raise_to = wired_limit_hint(w)
+    if raise_to:
+        return (f"{model} has {w:.1f} GB of weights; this Mac's GPU may use {limit:.1f} GB of its {memory_gb():.0f} GB, macOS's "
+                f"default, and the model needs about {HEADROOM_GB:.0f} GB more to run. This Mac has the memory: let the GPU use "
+                f"more until the next restart with\n  sudo sysctl iogpu.wired_limit_mb={raise_to}\nand quit large apps first "
+                f"(browsers with many tabs). Or choose a smaller model (--model {_smaller(model)}), or set LOCALS_IGNORE_MEMORY=1 "
+                f"to try anyway (macOS may swap, or stop the server).")
     return (f"{model} has {w:.1f} GB of weights; this Mac's GPU can use {limit:.1f} GB ({memory_gb():.0f} GB of memory), "
             f"and the model needs about {HEADROOM_GB:.0f} GB more to run. Choose a smaller model (--model {_smaller(model)}), or set "
             f"LOCALS_IGNORE_MEMORY=1 to try anyway (macOS may swap, or stop the server).")
+
+
+MACOS_GB = 4.0  # memory to leave macOS and the apps a Mac keeps open when the GPU limit is raised
+
+
+def wired_limit_hint(weights: float) -> int:
+    """The GPU limit in MB (``sudo sysctl iogpu.wired_limit_mb=...``) at which a model of ``weights`` GB fits on
+    this Mac, when it fits under macOS's default limit only with that raised; 0 if raising it does not help, or
+    if it is raised already. macOS gives the GPU about two thirds of a 24 GB Mac (16 GB), and Flint needs 19."""
+    import math
+
+    need = weights + HEADROOM_GB + 0.5
+    mem, limit = memory_gb(), gpu_limit_gb()
+    if not mem or need > mem - MACOS_GB or need <= limit:
+        return 0
+    return int(math.ceil(need)) * 1024
 
 
 def _smaller(model: str) -> str:
@@ -226,9 +256,10 @@ def default_model() -> str:
 DEFAULT_MODEL = default_model()
 ALIASES = {"qwen": "qwen3.5-4b", "qwen3.5": "qwen3.5-4b", "gemma": "gemma-4-e4b", "gemma4": "gemma-4-e4b",
            "gemma-4": "gemma-4-e4b", "gemma4-e4b": "gemma-4-e4b", "gemma-4-e4b-it": "gemma-4-e4b",
-           "lfm": "lfm2.5-2.6b", "lfm2.5": "lfm2.5-2.6b", "minicpm": "minicpm5-2b", "minicpm5": "minicpm5-2b"}
+           "lfm": "lfm2.5-2.6b", "lfm2.5": "lfm2.5-2.6b", "minicpm": "minicpm5-2b", "minicpm5": "minicpm5-2b",
+           "flint-40b": "flint", "flint-3bit": "flint"}
 MODEL_HELP = ("model: qwen (Qwen3.5-4B, the default from 16 GB of memory), qwen3.5-2b (the default below), gemma (Gemma 4 "
-              "E4B), lfm (LFM2.5-2.6B), minicpm (MiniCPM5-2B), or any "
+              "E4B), lfm (LFM2.5-2.6B), minicpm (MiniCPM5-2B), flint (Recursive's Flint, 24 GB Macs and up), or any "
               "mlx-lm model id or local path")
 
 
@@ -237,7 +268,8 @@ def short_name(model: str) -> str:
     4-bit suffix, in any capitalization ("MiniCPM5-2B-mlx-4Bit" -> "minicpm5-2b"), lower case."""
     import re
 
-    return re.sub(r"(-mlx)?-4bit$", "", str(model).rstrip("/").split("/")[-1], flags=re.I).lower()
+    # (and a mixed recipe's bits: flint-mixed-3-4bit is "flint")
+    return re.sub(r"(-mlx)?(-mixed-\d+)?-4bit$", "", str(model).rstrip("/").split("/")[-1], flags=re.I).lower()
 
 
 def model_id(name: str) -> str:
@@ -266,7 +298,7 @@ def build_id() -> str:
 
     here = Path(__file__).resolve().parent
     h = hashlib.sha1()
-    for f in sorted(here.glob("*.py")):
+    for f in sorted(here.glob("*.py")) + sorted(here.glob("models/*.py")):
         if f.name in ("plan.py", "solve.py"):  # the client side of locals solve: the server does not run them
             continue
         st = f.stat()

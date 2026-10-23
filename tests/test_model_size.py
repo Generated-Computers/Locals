@@ -15,6 +15,22 @@ def test_too_big_names_the_sizes(monkeypatch, tmp_path):
     assert d.too_big("mlx-community/Qwen3.5-4B-MLX-4bit") is None
 
 
+def test_too_big_tells_how_to_raise_the_gpu_limit_where_the_memory_is_there(monkeypatch):
+    """A 24 GB Mac gives the GPU 16 GB by default; Flint (16.6 GB) runs once that is raised, so the message says
+    how, instead of only naming a smaller model. Where raising it would leave macOS too little, it does not."""
+    monkeypatch.delenv("LOCALS_IGNORE_MEMORY", raising=False)
+    monkeypatch.setattr(d, "weights_gb", lambda m, remote=False: 16.6)
+    monkeypatch.setattr(d, "gpu_limit_gb", lambda: 16.0)
+    monkeypatch.setattr(d, "memory_gb", lambda: 24.0)
+    msg = d.too_big("mlx-community/flint-mixed-3-4bit")
+    assert "sudo sysctl iogpu.wired_limit_mb=20480" in msg and "LOCALS_IGNORE_MEMORY" in msg
+    monkeypatch.setattr(d, "gpu_limit_gb", lambda: 20.0)  # raised already
+    assert d.too_big("mlx-community/flint-mixed-3-4bit") is None
+    monkeypatch.setattr(d, "gpu_limit_gb", lambda: 10.7)
+    monkeypatch.setattr(d, "memory_gb", lambda: 16.0)
+    assert "sysctl" not in d.too_big("mlx-community/flint-mixed-3-4bit")
+
+
 def test_unknown_size_or_override_is_not_refused(monkeypatch):
     monkeypatch.setattr(d, "gpu_limit_gb", lambda: 10.7)
     monkeypatch.setattr(d, "weights_gb", lambda m, remote=False: None)

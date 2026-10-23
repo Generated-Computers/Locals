@@ -2298,15 +2298,15 @@ def _bench_agents(args) -> None:
 def cmd_models(args) -> None:
     """The tested models: their size, the memory they need, whether they fit this Mac, and their speed with
     8 requests at once (measured here by locals bench, else on an M2 Pro)."""
-    from .defaults import (DEFAULT_MODEL, HEADROOM_GB, MEASURED_M2_PRO, MODELS, SHORT, cached_snapshot, chip,
-                           gpu_limit_gb, memory_gb)
+    from .defaults import (DEFAULT_MODEL, HEADROOM_GB, MEASURED_ELSEWHERE, MEASURED_M2_PRO, MODELS, SHORT,
+                           cached_snapshot, chip, gpu_limit_gb, memory_gb)
 
     limit, here = gpu_limit_gb(), load_bench()
     print(f"Models for {chip() or 'this Mac'} with {memory_gb():.0f} GB of memory"
           + (f" (the GPU can use {limit:.1f} GB)" if limit else "") + ":\n")
     print(f"  {'name':12s} {'download':>8s} {'needs':>7s}  {'on this Mac':30s} speed with 8 requests at once")
     for key, mid in MODELS.items():
-        m = MEASURED_M2_PRO[key]
+        m = MEASURED_M2_PRO.get(key) or MEASURED_ELSEWHERE[key]
         local = cached_snapshot(mid, ["*.json", "*.safetensors"])
         w = sum(f.stat().st_size for f in local.glob("*.safetensors")) / 2**30 if local is not None and any(local.glob("*.safetensors")) else m["weights_gb"]
         need = w + HEADROOM_GB
@@ -2316,7 +2316,7 @@ def cmd_models(args) -> None:
         if "8" in (mine.get("locals") or {}):
             speed = f"{mine['locals']['8']:.0f} tps, measured here" + (f" (mlx-lm {mine['mlx']['8']:.0f})" if "8" in (mine.get("mlx") or {}) else "")
         else:
-            speed = f"{m['locals']} tps on an M2 Pro (mlx-lm {m['mlx']})"
+            speed = f"{m['locals']} tps on {m.get('on', 'an M2 Pro')} (mlx-lm {m['mlx']})"
         print(f"  {SHORT[key]:12s} {w:>5.1f} GB {need:>4.1f} GB  {', '.join(notes):30s} {speed}")
     from .defaults import AGENT_TASKS
 
