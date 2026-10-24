@@ -76,8 +76,10 @@ def test_router_logits_are_float32_sums():
         assert float(mx.abs(got - ref).max()) <= 1e-5 * float(mx.abs(ref).max())
 
 
-@pytest.mark.parametrize("bits", [3, 4])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
 def test_expert_kernels_compute_what_switch_glu_does(bits):
+    """At each of MLX's affine widths, against the float32 product of the dequantized weights (MLX's own gather_qmm
+    is less exact in some versions: 1.1% of the largest value in mlx 0.32.3, 0.4% in 0.32.4)."""
     from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 
     def qsw(shape, key):
@@ -88,21 +90,44 @@ def test_expert_kernels_compute_what_switch_glu_does(bits):
         m.weight, m.scales, m.biases = w, s.astype(mx.bfloat16), b.astype(mx.bfloat16)
         return m
 
+    def deq(m):
+        return mx.dequantize(m.weight, m.scales.astype(mx.float32), m.biases.astype(mx.float32), 64, bits)
+
     E, D, I, K = 32, 512, 256, 4
     gu, dn = qsw((E, 2 * I, D), mx.random.key(2)), qsw((E, D, I), mx.random.key(3))
+    gu_w, dn_w = deq(gu), deq(dn)
     for T in (1, 3, 16):
         x = mx.random.normal((T, D), key=mx.random.key(T)).astype(mx.bfloat16)
+        assert moe.experts_fit(x, gu, dn)
         inds, w = moe.route_topk(mx.random.normal((T, E), key=mx.random.key(10 + T)), K)
         shared = (mx.random.normal((T, D), key=mx.random.key(20 + T)) * 0.1).astype(mx.bfloat16)
-        g_u = gu(mx.expand_dims(x, (-2, -3)), inds)
+        g_u = mx.einsum("td,tkid->tki", x.astype(mx.float32), gu_w[inds])
         h_ref = nn.silu(g_u[..., :I]) * g_u[..., I:]
-        y_ref = (dn(h_ref, inds).squeeze(-2) * w[..., None]).sum(axis=-2).astype(mx.bfloat16) + shared
+        y_ref = (mx.einsum("tki,tkdi->tkd", h_ref, dn_w[inds]) * w[..., None]).sum(axis=1) + shared.astype(mx.float32)
         h = moe.experts_up(x, inds, gu)
         y = moe.experts_down(h, inds, w, dn, shared)
-        # the same up to summation order: a last-bit difference where the stock kernel adds in another order
-        assert float(mx.abs(h.astype(mx.float32) - h_ref.reshape(T * K, I).astype(mx.float32)).max()) <= \
-            2 ** -6 * float(mx.abs(h_ref).max())
-        assert float(mx.abs(y.astype(mx.float32) - y_ref.astype(mx.float32)).max()) <= 2 ** -6 * float(mx.abs(y_ref).max())
+        # the same up to the kernels' rounding, where the stock graph rounds (bf16 projections, swiglu's steps)
+        assert float(mx.abs(h.astype(mx.float32) - h_ref.reshape(T * K, I)).max()) <= 2 ** -6 * float(mx.abs(h_ref).max())
+        assert float(mx.abs(y.astype(mx.float32) - y_ref).max()) <= 2 ** -6 * float(mx.abs(y_ref).max())
+
+
+def test_route_topk_names_real_experts_for_nan_logits_and_any_dtype():
+    """A row of NaN logits (an overflow upstream) still names k different experts below E, as argpartition does: the
+    expert kernels read the expert an index names, and one past the last is past the weights. And the kernel,
+    whose template leaves the logits' dtype out, gives the same experts for float32, bfloat16 and float16 logits."""
+    E, K = 256, 8
+    logits = mx.random.normal((3, E), key=mx.random.key(5))
+    nan = mx.where(mx.arange(E) % 3 == 0, mx.array(float("nan")), logits[1])
+    rows = mx.stack([mx.full((E,), float("nan")), nan, logits[2]])
+    inds, w = moe.route_topk(rows, K)
+    got = inds.tolist()
+    assert all(0 <= e < E for row in got for e in row) and all(len(set(row)) == K for row in got)
+    want = mx.argsort(-logits[2])[:K].tolist()
+    assert sorted(got[2]) == sorted(want)
+    for dtype in (mx.float32, mx.bfloat16, mx.float16, mx.float32):
+        i2, _ = moe.route_topk(logits.astype(dtype), K)
+        ref = mx.argsort(-logits.astype(dtype).astype(mx.float32), axis=-1)[:, :K]
+        assert [sorted(r) for r in i2.tolist()] == [sorted(r) for r in ref.tolist()], dtype
 
 
 def test_qk_norm_rope_is_mlx_norm_then_rope():
@@ -251,9 +276,43 @@ def test_patched_flint_decodes_as_the_stock_one():
     for _ in range(12):  # past the sliding window of 9
         a, b = (m(y, cache=c) for m, y, c in zip((stock, fused), ys, caches))
         assert float(mx.abs(a - b).max()) <= 0.05 * float(mx.abs(a).max()) + 0.05
+        same += int(mx.argmax(a[0, -1]).item() == mx.argmax(b[0, -1]).item())
         ys = [mx.argmax(a[:, -1:], axis=-1)] * 2  # both go on from the stock token
-        same += 1
-    assert same == 12
+    assert same >= 11  # (a random model's near-ties may differ once)
+
+
+def test_a_left_padded_sliding_window_row_takes_its_spans_a_token_at_a_time():
+    """A ring that has wrapped masks a multi-token pass from its index before the ring is back in order, so a row still
+    left-padded (it joined a longer request) would lose its oldest key in the window: no one-pass spans for it."""
+    from mlx_lm.models.cache import ArraysCache, BatchKVCache, BatchRotatingKVCache
+
+    from locals.hybrid_batch import HybridBatchEngine
+
+    def body(module):
+        return type("FlintModel", (), {"__module__": module})()
+
+    class Engine:
+        _walk = None
+
+        def __init__(self, module):
+            self.lm = type("Model", (), {"model": body(module)})()
+
+        def _solo_drafts_ok(self, cache):
+            return False
+
+    class Controller:
+        pass
+
+    r = type("R", (), {"controller": Controller()})()
+    ok = lambda cache, module="locals.models.flint": HybridBatchEngine._solo_ok(Engine(module), r, cache)  # noqa: E731
+    assert ok([BatchKVCache([0]), BatchRotatingKVCache(8, [0]), ArraysCache(2)])
+    assert not ok([BatchKVCache([0]), BatchRotatingKVCache(8, [3])])
+    rot = BatchRotatingKVCache(8, [0])
+    rot.left_padding = None
+    assert ok([rot])
+    # another model's sliding-window layers (Gemma's) keep their spans a token at a time, as before Flint
+    assert not ok([BatchKVCache([0]), BatchRotatingKVCache(8, [0])], "mlx_lm.models.gemma4_text")
+    assert ok([BatchKVCache([0]), ArraysCache(2)], "mlx_lm.models.qwen3_5")
 
 
 @pytest.mark.parametrize("kv_bits", ["16", "8"])

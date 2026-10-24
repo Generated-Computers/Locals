@@ -38,7 +38,8 @@ _ROUTE_SRC = """
     float s[PER];
     for (int j = 0; j < PER; j++) {
         const int e = lane + 32 * j;
-        s[j] = e < E ? 1.0f / (1.0f + metal::precise::exp(-float(logits[t * E + e]))) : -1.0f;
+        const float v = 1.0f / (1.0f + metal::precise::exp(-float(logits[t * E + e])));
+        s[j] = e < E ? (isnan(v) ? 0.0f : v) : -1.0f;  // (a NaN logit never beat -1: no expert won, and expert E was named)
     }
     float picked[K];
     uint which[K];
@@ -50,7 +51,7 @@ _ROUTE_SRC = """
             if (s[j] > best) { best = s[j]; best_e = e; }
         }
         const float top = simd_max(best);
-        const uint win = simd_min(best == top ? best_e : uint(E));
+        const uint win = min(simd_min(best == top ? best_e : uint(E)), uint(E - 1));
         if (win % 32 == lane) s[win / 32] = -1.0f;
         picked[r] = top;
         which[r] = win;
@@ -151,7 +152,7 @@ def route_topk(logits: mx.array, k: int):
 _QDOT_HEADER = """
 // Values 8c..8c+7 of a group as one integer: value i at bits BITS*i (3 bits: four 24-bit chunks in three words).
 template <int BITS>
-inline uint chunk8(const device uint32_t* wp, int c) {
+inline ulong chunk8(const device uint32_t* wp, int c) {
     if (BITS == 4) return wp[c];
     if (BITS == 3) {
         const device uint32_t* b = wp + (c / 4) * 3;
@@ -165,19 +166,20 @@ inline uint chunk8(const device uint32_t* wp, int c) {
     const uint bit = 8 * BITS * c, wi = bit / 32, sh = bit % 32;  // any other width: a 64-bit window
     ulong v = ulong(wp[wi]) >> sh;
     if (sh + 8 * BITS > 32) v |= ulong(wp[wi + 1]) << (32 - sh);
-    return uint(v);
+    return v;  // (5 to 8 bits: 40 to 64 bits, which a uint cut short)
 }
 
 // The 8 inputs of a chunk divided by 2^(BITS*i), so a value is masked in place, not shifted (as MLX's qmv does);
 // a power of two scales a float exactly. BITS * 8 > 32 (5 to 8 bits) does not fit a uint: shifted there.
 template <int BITS>
-inline float qdot8(uint v, thread const float* xs) {
+inline float qdot8(ulong v, thread const float* xs) {
     constexpr uint mask = (1u << BITS) - 1;
     float s = 0.0f;
     if (BITS * 8 <= 32) {
-        for (int i = 0; i < 8; i++) s += float(v & (mask << (BITS * i))) * xs[i];
+        const uint w = uint(v);
+        for (int i = 0; i < 8; i++) s += float(w & (mask << (BITS * i))) * xs[i];
     } else {
-        for (int i = 0; i < 8; i++) s += float((v >> (BITS * i)) & mask) * xs[i];
+        for (int i = 0; i < 8; i++) s += float(uint(v >> (BITS * i)) & mask) * xs[i];
     }
     return s;
 }
@@ -274,7 +276,7 @@ def experts_fit(x: mx.array, gate_up, down) -> bool:
     D, I = x.shape[-1], down.input_dims
     ng = I // 64
     return (x.size // D <= EXPERT_MAX_ROWS and x.dtype in (mx.bfloat16, mx.float16)
-            and all(m.group_size == 64 and m.mode == "affine" and m.get("biases") is not None and 2 <= m.bits <= 8
+            and all(m.group_size == 64 and m.mode == "affine" and m.get("biases") is not None and m.bits in (2, 3, 4, 5, 6, 8)
                     for m in (gate_up, down))
             and D % 64 == 0 and I % 64 == 0 and 0 < ng <= 32 and ng & (ng - 1) == 0 and I % 2 == 0
             and gate_up["scales"].dtype == x.dtype and down["scales"].dtype == x.dtype)

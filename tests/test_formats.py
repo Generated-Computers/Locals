@@ -381,6 +381,8 @@ def test_flint_calls():
 
     tpl = ("For each function call, output the function name and arguments within the following XML format:\n"
            "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>")
+    assert detect_from_template(tpl) is FORMATS["hermes"]  # (GLM's template says the same: it stays as it was)
+    tpl = "{%- macro flint_text(t) -%}{{ t }}{%- endmacro -%}" + tpl
     f = detect_from_template(tpl)
     assert f is FORMATS["flint_xml"]
     d = trim_and_minimize(determinize(compile_nfa(f.reply_regex(["get_weather", "write"], "auto"))))

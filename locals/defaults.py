@@ -268,8 +268,8 @@ def short_name(model: str) -> str:
     4-bit suffix, in any capitalization ("MiniCPM5-2B-mlx-4Bit" -> "minicpm5-2b"), lower case."""
     import re
 
-    # (and a mixed recipe's bits: flint-mixed-3-4bit is "flint")
-    return re.sub(r"(-mlx)?(-mixed-\d+)?-4bit$", "", str(model).rstrip("/").split("/")[-1], flags=re.I).lower()
+    # (and Flint's mixed recipe's bits: flint-mixed-3-4bit is "flint")
+    return re.sub(r"(-mlx)?(?<=flint)(-mixed-\d+)?-4bit$|(-mlx)?-4bit$", "", str(model).rstrip("/").split("/")[-1], flags=re.I).lower()
 
 
 def model_id(name: str) -> str:

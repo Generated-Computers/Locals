@@ -17,20 +17,20 @@
   (docs/benchmarks, section 11).
 - On a Mac with the memory for a model but macOS's default GPU limit below what it needs (Flint on 24 GB), the memory
   check says how to raise the limit (`sudo sysctl iogpu.wired_limit_mb=...`) instead of only naming a smaller model.
-- A matrix product tuned to MLX's own kernel skips Locals's routing: 4 us of Python a call, which a one-token step
-  of a model with many layers felt (0.8 ms of Flint's).
+- Flint's matrix products tuned to MLX's own kernel skip Locals's routing: 4 us of Python a call, 0.8 ms of a
+  one-token step.
 - Decode rows and a prompt chunk in one pass for Flint too: replies streaming while an 8,000-token prompt is read
   stall for at most 2.8 s instead of 9.7.
-- The projections `locals.patch` fuses away no longer stay in MLX's buffer cache (2.5 GB of Flint's, which a 24 GB Mac
-  swapped for).
+- The projections `locals.patch` fuses away from Flint no longer stay in MLX's buffer cache (2.5 GB, which a 24 GB
+  Mac swapped for).
 - `LOCALS_KV_BITS=8`: Flint's full-attention keys and values in 8 bits, as its config asks, read by a kernel of
   their own on the GPU's matrix units with Flint's attention sinks; a 24 GB Mac takes 67,584-token requests instead
   of about 35,800, for 4 to 13% of the writing speed.
 - `--typed-tools` types Flint's tool calls too: the grammar writes each call's parameter names in the schema's order,
   required ones present, values of their types. On 12 OpenCode-like tasks Flint broke 4 of 12 greedy calls and 11 of
   39 sampled ones without it (`path` for `filePath`, `bash` without its `description`), none with it.
-- One request alone gets its forced spans in one pass on models with sliding-window or 8-bit caches too (Flint,
-  Gemma): those caches cannot be rewound, which drafts need and forced spans do not. Flint's typed calls take 10%
+- One request alone gets its forced spans in one pass over Flint's sliding-window and 8-bit caches too: those
+  caches cannot be rewound, which drafts need and forced spans do not. Flint's typed calls take 10%
   fewer passes (about the same time: a pass of several tokens reads each token's experts).
 - Flint's expert kernels no longer end a command buffer each: MLX ends one once its inputs pass 50 MB, counted at
   their whole size, and the kernels were handed a layer's whole expert tensors (350 MB). Handed one-expert views of
@@ -42,10 +42,12 @@
 - Flint reads prompts in 2,048-token chunks to about 30k tokens (a model's `prefill_chunk_tokens` and
   `prefill_scores`, set where its attention holds no chunk's scores): a 30k prompt's first token after 54 s instead
   of 58, a 60k one with `LOCALS_KV_BITS=8` after 159 s instead of 177.
-- One request through the engine attends without the batch caches' mask when no row is padded (all true, and 40% of
+- Flint's full-attention layers attend without the batch caches' mask when no row is padded (all true, and 40% of
   MLX's attention at 30k keys): after a 30k-token prompt Flint writes 63.7 tokens/s instead of 55.9, after 13k 74.5
   instead of 70.1.
-- MLX 0.32.4 and mlx-lm 0.32.2 in the lock file, as a fresh install gets them.
+- Flint's expert kernels take experts of 2, 3, 4, 5, 6 and 8 bits (mlx-lm's mixed recipes put some layers at 6), and
+  its router kernel names real experts even for a row of NaN logits. A Flint request alone gets its forced spans in
+  one pass once it is no longer left-padded.
 
 ## 0.2.1 (2026-10-21)
 

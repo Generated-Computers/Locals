@@ -335,7 +335,7 @@ These are found with a Bellman-Ford fixpoint over the token-step graph.
                 with "tool_results"            -> mistral_legacy
                 otherwise                      -> mistral
 "<|tool_call>call:"                            -> gemma4
-"<arg_key>" and "<arg_value>"                  -> flint_xml
+"<arg_key>", "<arg_value>" and Flint's own markers ("flint_text" or "<|developer|>") -> flint_xml (GLM's template, without them, stays hermes)
 "<tool_call>"                                  -> hermes
 '"parameters"' and ("ipython" or "<|python_tag|>") -> llama3_json
 anything else                                  -> fallback

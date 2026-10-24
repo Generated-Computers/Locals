@@ -440,16 +440,21 @@ def fuse_model(model) -> int:
                 and _fusable([mlp.gate_proj, mlp.up_proj]) and _swiglu_mlp(mlp)):
             _fuse_mlp(mlp)
         n += 1
-    if type(model).__module__.split(".")[-1] == "flint" and hasattr(model, "make_cache"):
+    flint = type(model).__module__.split(".")[-1] == "flint" and hasattr(model, "make_cache")
+    if flint:
         from .qkv import opt_in
 
         opt_in(model)  # full-attention keys and values in 8 bits, as Flint's config asks (locals/qkv.py)
         # no chunk's scores held (hybrid_batch.PREFILL_SCORES), and 2,048-token chunks read 5% faster than 1,024: a
         # prompt goes in 2,048-token chunks to about 30k tokens, 1,024 to about 63k
         model.prefill_scores, model.prefill_chunk_tokens = 1 << 26, 2048
+        for _, m in model.named_modules():  # (kernels._linear_call_inner: MLX's own kernel without the routing)
+            if isinstance(m, (nn.Linear, nn.QuantizedLinear)):
+                object.__setattr__(m, "_locals_direct", True)
     mx.eval(model.parameters())
-    # the projections fused away stay in MLX's buffer cache, which keeps freed buffers for reuse: 2.5 GB of Flint's
-    # (its experts' gate and up), which a 24 GB Mac then swapped for
-    mx.clear_cache()
+    if flint:
+        # the projections fused away stay in MLX's buffer cache, which keeps freed buffers for reuse: 2.5 GB of
+        # Flint's (its experts' gate and up), which a 24 GB Mac then swapped for
+        mx.clear_cache()
     return n
 

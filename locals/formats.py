@@ -1044,7 +1044,7 @@ def detect_from_template(template: Optional[str]) -> ToolFormat:
         return FORMATS["mistral_legacy"] if "tool_results" in t else FORMATS["mistral"]
     if "<|tool_call>call:" in t:
         return FORMATS["gemma4"]
-    if "<arg_key>" in t and "<arg_value>" in t:
+    if "<arg_key>" in t and "<arg_value>" in t and ("flint_text" in t or "<|developer|>" in t):  # (Flint's, not GLM's)
         return FORMATS["flint_xml"]
     if "<tool_call>" in t:
         return FORMATS["hermes"]

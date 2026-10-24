@@ -927,7 +927,15 @@ class HybridBatchEngine(BatchEngine):
             # and a forced span does not: those get their spans in one pass, and no drafts (_solo_drafts_ok)
             from .qkv import BatchQuantizedKVCache
 
+            if type(getattr(self.lm, "model", None)).__module__.rsplit(".", 1)[-1] != "flint":
+                return False  # (Flint's only: Gemma's sliding-window layers keep their spans a token at a time)
             if any(type(c) not in (BatchKVCache, ArraysCache, BatchRotatingKVCache, BatchQuantizedKVCache) for c in cache):
+                return False
+            # a ring that has wrapped masks a span's keys from its index, before the ring is put back in order: a row
+            # still left-padded (it joined a longer one) would lose its oldest key in the window. Its spans go a token
+            # at a time until the padding is gone
+            if any(type(c) is BatchRotatingKVCache and c.left_padding is not None and int(mx.max(c.left_padding).item()) > 0
+                   for c in cache):
                 return False
             if self._solo_drafts_ok(cache):
                 return False

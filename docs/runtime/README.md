@@ -182,7 +182,7 @@ for one request, but a command buffer then keeps more of a prompt's temporaries 
 32k prompt, ran out of GPU memory on 24 GB.
 
 **Memory.** Two things held memory that stock mlx-lm does not: the projections fused away stayed in MLX's buffer cache
-(2.5 GB of Flint's; `fuse_model` now ends with `mx.clear_cache()`), and v, a view of the fused projection, kept the
+(2.5 GB of Flint's; for Flint, `fuse_model` now ends with `mx.clear_cache()`), and v, a view of the fused projection, kept the
 whole projection of each sliding-window layer alive in the ring that keeps a prompt's first chunk as it is handed it
 (0.7 GB for a 2k chunk; `qk_norm_rope` writes v as its own array). After a 2,048-token chunk the patched model holds
 what stock mlx-lm holds, 18.04 GB.
@@ -338,7 +338,7 @@ _linear_switch
   not enabled -> _linear_call_plain -> _maybe_packed -> mlx-lm's original __call__
 ```
 
-The first line is a fast path: where `_CHOICE` (final choices only; a deferred one is not stored there) holds MLX's own kernel for the shape at these rows and `_PAD` keeps the rows as they are, the call goes straight to MLX. The routing after it cost 4 us of Python a call against 0.6 for MLX's (two reshapes, `_tunable` twice, a dtype's name, three lookups), 0.8 ms of a one-token Flint step, which building and encoding its graph bounds; with the fast path, 1.4 us.
+The first line is a fast path, for Flint's layers only (`fuse_model` marks them `_locals_direct`; other models route as before): where `_CHOICE` (final choices only; a deferred one is not stored there) holds MLX's own kernel for the shape at these rows and `_PAD` keeps the rows as they are, the call goes straight to MLX. The routing after it cost 4 us of Python a call against 0.6 for MLX's (two reshapes, `_tunable` twice, a dtype's name, three lookups), 0.8 ms of a one-token Flint step, which building and encoding its graph bounds; with the fast path, 1.4 us.
 
 A tied embedding head goes through `QuantizedEmbedding.as_linear` -> `_embed_switch`. It takes only the small-row path, with no dense path and no packing (`kernels._embed_as_linear`).
 
