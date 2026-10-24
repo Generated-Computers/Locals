@@ -368,3 +368,24 @@ def test_batch_rows_decode_as_alone_with_and_without_padding():
     assert fuse._unpadded(full[0])
     for i in range(2, 4):
         assert close(m(mx.array([[steps[i]]]), cache=batch)[0, -1].astype(mx.float32), refs[1][i])
+
+
+@pytest.mark.parametrize("L", [5, 6, 7, 8])
+def test_a_pass_of_5_to_8_queries_padded_to_9_attends_as_unpadded(L):
+    """fuse.attend_few pads 5 to 8 queries in front to 9 (MLX's slow path for 5 to 8): the real queries get what
+    MLX's attention gives them unpadded, under the causal mask, a window's array mask (2-D and per row), or none."""
+    from mlx_lm.models.base import create_causal_mask
+
+    from locals.fuse import attend_few
+
+    B, H, KVH, D, n = 2, 8, 2, 128, 40
+    q = mx.random.normal((B, H, L, D), key=mx.random.key(L)).astype(mx.bfloat16)
+    k = mx.random.normal((B, KVH, n, D), key=mx.random.key(10 + L)).astype(mx.bfloat16)
+    v = mx.random.normal((B, KVH, n, D), key=mx.random.key(20 + L)).astype(mx.bfloat16)
+    sinks = mx.random.normal((H,), key=mx.random.key(30)).astype(mx.bfloat16)
+    window = create_causal_mask(L, n - L, window_size=9)
+    for mask in ("causal", None, window, mx.broadcast_to(window[None, None], (B, 1, L, n))):
+        ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=0.09, mask=mask, sinks=sinks).astype(mx.float32)
+        got = attend_few(q, k, v, 0.09, mask, sinks).astype(mx.float32)
+        assert got.shape == ref.shape
+        assert float(mx.abs(got - ref).max()) <= 1e-2 * (1 + float(mx.abs(ref).max()))

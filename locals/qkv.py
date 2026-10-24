@@ -265,8 +265,9 @@ def attention(q, k, v, cache, scale: float, mask, sinks) -> mx.array:
             start = mx.zeros((q.shape[0],), dtype=mx.int32)
         n = cache._idx if hasattr(cache, "_idx") else cache.offset
         return attend(q, cache.keys, cache.values, n, sinks, scale, start)
-    return mx.fast.scaled_dot_product_attention(q, dequantized(keys), dequantized(values), scale=scale, mask=mask,
-                                                sinks=sinks.astype(q.dtype))
+    from .fuse import attend_few
+
+    return attend_few(q, dequantized(keys), dequantized(values), scale, mask, sinks.astype(q.dtype))
 
 
 def _zeros(B, H, n, D, dtype):
