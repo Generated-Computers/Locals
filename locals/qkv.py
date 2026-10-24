@@ -118,16 +118,17 @@ _PASS1_MMA = """
     // the next chunk's words are loaded while this chunk is computed (software pipelining)
     uint4 na, nb, nv0, nv1;
     float nsca, nbia, nscb, nbib, nvsc, nvbi;
-    auto fetch = [&](uint c0) {
-        const uint ka = c0 + fc, kb2 = c0 + fc + 1, kv = c0 + fr;
-        const size_t ra = row0 + (ka < hi ? ka : lo), rb = row0 + (kb2 < hi ? kb2 : lo), rv = row0 + (kv < hi ? kv : lo);
-        na = k4[ra * (WPR / 4) + fr]; nb = k4[rb * (WPR / 4) + fr];
-        nv0 = v4[rv * (WPR / 4) + fc]; nv1 = v4[rv * (WPR / 4) + fc + 1];
-        nsca = float(ks[ra * GPR + kg]); nbia = float(kb[ra * GPR + kg]);
-        nscb = float(ks[rb * GPR + kg]); nbib = float(kb[rb * GPR + kg]);
-        nvsc = float(vs[rv * GPR + vg]); nvbi = float(vb[rv * GPR + vg]);
-    };
-    if (lo < hi) fetch(lo);
+    // (a macro: Metal before 3.2, macOS 14's, has no lambdas)
+#define LOCALS_FETCH(c0) { \
+        const uint ka = (c0) + fc, kb2 = (c0) + fc + 1, kv = (c0) + fr; \
+        const size_t ra = row0 + (ka < hi ? ka : lo), rb = row0 + (kb2 < hi ? kb2 : lo), rv = row0 + (kv < hi ? kv : lo); \
+        na = k4[ra * (WPR / 4) + fr]; nb = k4[rb * (WPR / 4) + fr]; \
+        nv0 = v4[rv * (WPR / 4) + fc]; nv1 = v4[rv * (WPR / 4) + fc + 1]; \
+        nsca = float(ks[ra * GPR + kg]); nbia = float(kb[ra * GPR + kg]); \
+        nscb = float(ks[rb * GPR + kg]); nbib = float(kb[rb * GPR + kg]); \
+        nvsc = float(vs[rv * GPR + vg]); nvbi = float(vb[rv * GPR + vg]); \
+    }
+    if (lo < hi) LOCALS_FETCH(lo);
     for (uint t0 = lo; t0 < hi; t0 += 8) {
         const uint ka = t0 + fc, kb2 = t0 + fc + 1, kv = t0 + fr;
         const bool va = ka < hi, vb2 = kb2 < hi, vv = kv < hi;
@@ -135,7 +136,7 @@ _PASS1_MMA = """
         const uint wv[8] = {nv0.x, nv0.y, nv0.z, nv0.w, nv1.x, nv1.y, nv1.z, nv1.w};
         const float sca = va ? nsca : 0.0f, bia = va ? nbia : 0.0f, scb = vb2 ? nscb : 0.0f, bib = vb2 ? nbib : 0.0f;
         const float vsc = vv ? nvsc : 0.0f, vbi = vv ? nvbi : 0.0f;
-        if (t0 + 8 < hi) fetch(t0 + 8);
+        if (t0 + 8 < hi) LOCALS_FETCH(t0 + 8);
         simdgroup_float8x8 S(0.0f);
         for (uint t = 0; t < NT; t++) {  // dim 16 fr + t: word t / 4, byte t % 4
             simdgroup_float8x8 Kt;
@@ -172,6 +173,7 @@ _PASS1_MMA = """
         po[part * HD + 16 * fc + t] = O[t].thread_elements()[0];
         po[part * HD + 16 * (fc + 1) + t] = O[t].thread_elements()[1];
     }
+#undef LOCALS_FETCH
 """
 
 _PASS2 = """
