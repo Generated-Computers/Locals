@@ -28,7 +28,7 @@ After these steps, `mx.set_wired_limit` is set to the GPU's `max_recommended_wor
 | `mma_kernel.py` | `qmm_mma`: MLX's tiled quantized GEMM rebuilt with 8- or 16-row tiles |
 | `nax_kernel.py` | The `nax` kernels: 4-bit matmuls of 1 to 32 rows on the M5's neural accelerators (Metal 4 tensor operations) |
 | `gdn_kernel.py` | One Metal kernel for a Gated DeltaNet decode step |
-| `norm_kernel.py` | Fused residual add + RMS norm (present, switched off) |
+| `norm_kernel.py` | Fused residual add + RMS norm, the bits of MLX's add and norm (Flint's layers; switched off for Qwen3.5) |
 | `attention.py` | Ragged batch decode attention (present, switched off) |
 | `defaults.py` | Model short names, the default model for this Mac, and checks run before a download |
 | `presets/` | Shipped tuning results for each GPU architecture |
@@ -203,6 +203,43 @@ rows instead of 265, 313 at 16 instead of 288, 117 at one instead of 115; throug
 276 at 8 clients instead of 256 and 305 at 16 instead of 281. MLX's sorted gather (each expert once) was slower at
 8 and 16 rows than either: 233 and 277.
 
+**Several rows: the arithmetic, and fewer kernels a layer.** In the paper's terms (Breaking the Space Barrier,
+section 3) a step costs a weight stream, one read of the weights it needs; for a mixture of experts that is the dense
+weights plus the union of the experts the batch chose: at 8 rows of Flint's routing 40 of 256 a layer, 2.6 GB a step,
+12 ms at 218 GB/s, against 0.4 GB at one row. The paper notes that its GPU's step is bound by arithmetic from four
+rows, and Flint's expert kernels are: at 8 rows
+they took 15.7 ms a step, with the loads alone (the dot products made trivial) 11.8 and the arithmetic alone (no
+weight loads) 13.7. Two changes cut the arithmetic, each row's sums in the same order (the same bits):
+
+- From `EXPERT_ROWS_FROM` (4) tokens a simdgroup of `experts_up` takes 2 hidden units, so each chunk of the input is
+  converted and prescaled once for 4 weight rows, and a lane of `experts_down` 4 output rows (3 or 4 units, or 8
+  rows, spill registers: 18.7 ms).
+- A 3-bit value becomes a float without an int-to-float conversion (`qdot8`): masked in place, ORed into the mantissa
+  of 2^23 and 2^23 subtracted, exact below 2^23; the value in bits 21 to 23 is shifted down 3 and its input divided by
+  2^18 instead of 2^21, the same product.
+
+The experts then take 14.2 ms a step at 8 rows, 8.1 instead of 8.6 at 4, 26.2 instead of 29.3 at 16, the same at
+one. Then the kernels between them, each a launch and a wait on the one before (about 2 us a dependent kernel at 8
+rows), all with the same bits:
+
+- `route_topk(order=True)` also orders the slots by expert: one threadgroup holds every token (up to
+  `ORDER_MAX_ROWS`, 16), and its threads rank the slots, so no sort kernel a layer.
+- The MoE layer's residual add is the combine's last step (`experts_down(residual=...)`, `FusedFlintLayer`).
+- The attention's residual add and the post-attention norm are one kernel (`norm_kernel.add_rms`), laid out as MLX's
+  own RMS norm (4 values a thread, a simdgroup sum, the partial sums summed by one simdgroup, a precise rsqrt):
+  the bits of `x + r` and `mx.fast.rms_norm`, checked on 42M values.
+- Each layer's input norm is computed by the kernel that ends the layer before it (`FusedFlintBody`): the combine,
+  laid out the same way, writes the layer's output and the next layer's norm of it; after the two dense layers,
+  `add_rms`.
+
+An 8-row step went from 926 kernels to 733. Decoding in the process (the package's source as 256-token prompts, 48
+steps): 305 tokens/s at 8 rows instead of 284, 225 at 4 instead of 211, 179 at 2 instead of 170, 340 at 16 instead
+of 314, 117 at one as before; the same tokens and logits at 1 to 16 rows over 41 steps. The batch engine alone
+writes 300 at 8 rows (224 at 4). Through the server, with the clients on the same Mac and every reply streaming, 289
+to 293 at 8 clients (276 before), 216 at 4 (204), 320 to 324 at 16 (305): a busy CPU slows the GPU here (the engine
+alone at 8 rows: 293 with four processes parsing JSON beside it, 299 without), and the server's steps are 1% longer
+than the engine's alone, not more.
+
 **Prompts in bands** (`FusedFlintAttention._banded`). A 2,048-token chunk in a sliding-window layer was one attention
 of 2,048 queries against the ring's 512 keys and the chunk's 2,048 under a mask, four in five of the scores masked.
 In bands of `FLINT_BAND` (512) queries against the keys their window reaches (slices of the keys and of the mask), the
@@ -300,15 +337,33 @@ Tried and left out:
   faster and a quoted document 1.67x (1.86x sampled), prose unchanged; under Qwen3.5's own width rule an agent's
   thinking was 6% slower. A pass of several tokens rounds differently from one-token steps, so a greedy reply with
   drafts left the one without them at a near tie.
-- A fused residual add + RMS norm body (`norm_kernel.add_rms`): no faster here either (8.84 against 8.70 ms a step);
-  a custom kernel's call costs the CPU more than MLX's two, and the step is as much the CPU's as the GPU's.
+- A fused residual add + RMS norm body (`norm_kernel.add_rms`) for one row: no faster here either (8.84 against 8.70
+  ms a step); a custom kernel's call costs the CPU more than MLX's two, and the step is as much the CPU's as the
+  GPU's. With several rows the GPU bounds the step, and `FusedFlintBody` (above) is in: unchanged at one row.
 - **The choice inside the expert kernels**, each simdgroup computing its token's top 6 from the logits (one launch a
   layer fewer): 9.23 ms against 8.80. Every simdgroup waits on the choice before its first weight load.
 - **Four barrier stages instead of six** (the shared expert's kernels ordered with `mx.depends` next to the router,
   the choice and the experts' gate/up, so MLX's encoder needs fewer barriers): no change (8.75 / 8.81 against 8.68 /
   8.84 ms), nor with each layer's MoE half under `mx.compile`, which cut the CPU's graph building from 3.1 to 1.7 ms a
   step: the GPU then bounds the step at about 8.7 ms. Through the server, whose engine adds its own work on the CPU,
-  one reply wrote 107.9 and 106.9 tokens/s with it against 108.1 and 107.4 without.
+  one reply wrote 107.9 and 106.9 tokens/s with it against 108.1 and 107.4 without. At 8 rows, where the GPU bounds
+  the step, the shared expert's kernels beside the router, the choice and the experts' gate/up (5 barrier stages a
+  layer instead of 7) were slower: 294.6 tokens/s against 302.0.
+- **For the expert kernels at 8 rows** (14.4 ms a step as kept): a run table from `route_topk` (at a run's first
+  slot its expert and end, so a simdgroup reads one word instead of following the order and the choices), 15.9 against
+  15.2 ms for the choice and the experts together, every simdgroup's weight loads then starting at once; the input
+  prescaled once a layer by a kernel of its own (14.8); each row's raw weight words kept and unpacked in the loop
+  (16.2); vector loads of the weights and the input (14.6); Metal's fast or relaxed math (14.6 and 14.7, other bits).
+- **For `qmv_frag` at 8 rows**: the nibbles masked in place against scales prescaled for each position (within 5%
+  either way), converted without int-to-float (3 to 6% slower), the next chunk's inputs loaded ahead (2 to 18% slower:
+  registers); for the shared expert's shapes other tiles and split-K, within 5%. Its time is set by the matrix units
+  and the dequantization they share an ALU with.
+- **A few-row kernel of Locals's own for 2 to 6 rows** (a lane one weight word of each of R rows, consecutive lanes
+  consecutive words, the inputs prescaled once a word for every row): as fast as MLX's at 2 rows, slower from 4
+  (registers). From 5 rows `qmv_frag` wins, from 2 to 4 MLX's own: an attention projection at 4 rows takes 57 to 60
+  us either way, twice what its weights take to read.
+- `MLX_MAX_OPS_PER_BUFFER` at 100 and 400: at 4 and 8 rows slower than the default (211 and 299 against 222 and
+  303 tokens/s).
 - **Experts shared by rows read once**: the grid ordered so the simdgroups of one weight row for every token run side
   by side (262 against 265 tokens/s at 8 rows), and a down kernel that reads each distinct expert once for all its
   tokens (the same output; 155 against 142 us at 8 rows, 324 against 260 at 16: finding the shared experts in each
@@ -369,7 +424,7 @@ score within rounding of each other routes differently.
 
 ## Switched-off kernels
 
-- **Fused add + RMS norm** (`norm_kernel.add_rms`). It computes `h = x + r` and `rms_norm(h) * w` in one kernel, which would halve the norm launches of a pre-norm layer (`norm_kernel.py`). It needs a hidden size divisible by 256 and uses 256 threads per row (`norm_kernel.supported`). `FusedHybridBody` would use it, but `USE_ADD_RMS = False`: measured, it was no faster than MLX's two kernels. With the flag off, the body calls the stock `__call__` (`fuse.py`, `fuse.py`).
+- **Fused add + RMS norm** (`norm_kernel.add_rms`). It computes `h = x + r` and `rms_norm(h) * w` in one kernel, which halves the norm launches of a pre-norm layer (`norm_kernel.py`), laid out as MLX's own norm for one row so that both outputs are MLX's bits. It needs a hidden size divisible by 128, at most 4,096, and uses a quarter of it in threads per row (`norm_kernel.supported`). Flint's layers use it (`moe.FusedFlintLayer`, `moe.FusedFlintBody`). `FusedHybridBody` would use it for Qwen3.5, but `USE_ADD_RMS = False`: measured at one row, it was no faster than MLX's two kernels. With the flag off, the body calls the stock `__call__` (`fuse.py`, `fuse.py`).
 - **Ragged batch attention** (`attention.ragged_attention`). Adapted from MLX's `sdpa_vector`, it handles all rows of all requests in one launch. Row r sees the first `nkeys[r]` keys of KV slot `slots[r]`, and K/V are stored slot-major as `(n_slots, n_kv_heads, cap, D)` (`attention.py`). A GQA variant processes one (row, kv head) per threadgroup, so each K/V vector is read once (`attention.py`, `attention.ragged_attention`). `packed.py` calls it only when `USE_RAGGED` is set, no segment is a tree, and every segment has at most 64 tokens. The flag is False because per-request MLX SDPA keeps outputs identical to single-stream decoding (`packed.py`, `packed.packed_forward`).
 
 ## Quantized matmul routing (`kernels.py`)

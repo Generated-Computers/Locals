@@ -13,7 +13,7 @@
   (`<tool_call>NAME<arg_key>...</arg_key><arg_value>...</arg_value></tool_call>`; it was taken for the hermes form,
   whose grammar held Flint to JSON calls), and its reasoning, which it opens itself, comes back as reasoning. Kernels
   for its router, experts and q/k norms: on an M4 Pro with 24 GB, 117 tokens/s for one request where mlx-lm gives 85,
-  284 for eight at once where it gives 202; prompts are read 7 to 12% faster than mlx-lm reads them from 4,096 tokens
+  305 for eight at once where it gives 202; prompts are read 7 to 12% faster than mlx-lm reads them from 4,096 tokens
   (docs/benchmarks, section 11).
 - On a Mac with the memory for a model but macOS's default GPU limit below what it needs (Flint on 24 GB), the memory
   check says how to raise the limit (`sudo sysctl iogpu.wired_limit_mb=...`) instead of only naming a smaller model.
@@ -52,6 +52,11 @@
   MLX's attention takes a path twice as slow from 5 to 8 queries (2.1 ms a full layer at 8k keys for 8, 1.2 for 9).
 - Flint's expert kernels read an expert once for every row of a batch that chose it, the same outputs bit for bit:
   284 tokens/s at 8 requests at once instead of 265, 313 at 16 instead of 288 (305 instead of 281 through the server).
+- Flint with several requests at once, the same tokens: from 4 rows the expert kernels, bound by their arithmetic as
+  much as by the weights they read, convert each input chunk once for several weight rows and turn 3-bit values into
+  floats without an int-to-float conversion; the expert choice also orders the experts' rows (no sort kernel), and
+  each layer's residual adds and next norm are inside its kernels (an add and RMS norm kernel laid out as MLX's,
+  the same bits). 305 tokens/s at 8 at once instead of 284, 225 at 4 instead of 212, 340 at 16 instead of 313.
 
 ## 0.2.1 (2026-10-21)
 

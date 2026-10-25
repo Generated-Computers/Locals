@@ -22,6 +22,7 @@ up to the order the k experts are summed in.
 from __future__ import annotations
 
 import os
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -30,10 +31,13 @@ from mlx_lm.models.activations import swiglu
 
 # One simdgroup per token: lane i holds experts i, i+32, ...; k rounds of a simdgroup argmax pick the experts in
 # order of score (ties to the lower index, as a stable sort), then the chosen scores are renormalized to sum to 1.
+# With ORDER, one threadgroup holds every token, and its threads then rank the slots (token, k) by expert: the
+# expert kernels' order (expert_order) without a sort kernel of its own.
 _ROUTE_SRC = """
     const uint t = thread_position_in_grid.x / 32;
     const uint lane = thread_index_in_simdgroup;
-    if (t >= nrows[0]) return;
+    threadgroup uint chosen[ORDER ? ORDER_ROWS * K : 1];
+    if (!ORDER && t >= nrows[0]) return;
     constexpr int PER = (E + 31) / 32;
     float s[PER];
     for (int j = 0; j < PER; j++) {
@@ -62,6 +66,17 @@ _ROUTE_SRC = """
         for (int r = 0; r < K; r++) {
             inds[t * K + r] = which[r];
             weights[t * K + r] = picked[r] / total;
+            if (ORDER) chosen[t * K + r] = which[r];
+        }
+    }
+    if (ORDER) {  // (the grid is exactly the tokens' simdgroups: every thread reaches the barrier)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint S = nrows[0] * K, i = thread_position_in_threadgroup.x;
+        if (i < S) {
+            const uint e = chosen[i];
+            uint rank = 0;
+            for (uint j = 0; j < S; j++) rank += (chosen[j] < e || (chosen[j] == e && j < i)) ? 1u : 0u;
+            order[rank] = i;
         }
     }
 """
@@ -124,20 +139,30 @@ def router(x: mx.array, w: mx.array) -> mx.array:
     return x.astype(mx.float32) @ w.astype(mx.float32).T
 
 
-def route_topk(logits: mx.array, k: int):
+ORDER_MAX_ROWS = 16  # tokens whose slots route_topk orders itself (one threadgroup of a simdgroup a token)
+
+
+def route_topk(logits: mx.array, k: int, order: bool = False):
     """(experts, weights) of each row of router ``logits`` (..., E): the ``k`` largest sigmoid scores, as uint32
-    expert indices and float32 weights that sum to 1. ``flint.route`` in one kernel."""
+    expert indices and float32 weights that sum to 1. ``flint.route`` in one kernel. With ``order`` also the slots in
+    the order of their experts, for experts_up/experts_down (as expert_order, up to the order of one expert's slots,
+    which the kernels do not depend on)."""
     global _route_kernel
     if _route_kernel is None:
         _route_kernel = mx.fast.metal_kernel(name="locals_route_topk", input_names=["logits", "nrows"],
-                                             output_names=["inds", "weights"], source=_ROUTE_SRC)
+                                             output_names=["inds", "weights", "order"], source=_ROUTE_SRC)
     E = logits.shape[-1]
     T = logits.size // E
-    inds, weights = _route_kernel(
-        inputs=[logits, mx.array([T], dtype=mx.uint32)], template=[("E", E), ("K", k)], grid=(T * 32, 1, 1),
-        threadgroup=(min(256, T * 32), 1, 1),
-        output_shapes=[(*logits.shape[:-1], k)] * 2, output_dtypes=[mx.uint32, mx.float32])
-    return inds, weights
+    fused = order and T <= ORDER_MAX_ROWS
+    inds, weights, slots = _route_kernel(
+        inputs=[logits, mx.array([T], dtype=mx.uint32)],
+        template=[("E", E), ("K", k), ("ORDER", int(fused)), ("ORDER_ROWS", ORDER_MAX_ROWS)], grid=(T * 32, 1, 1),
+        threadgroup=(T * 32 if fused else min(256, T * 32), 1, 1),
+        output_shapes=[(*logits.shape[:-1], k)] * 2 + [(T * k if fused else 1,)],
+        output_dtypes=[mx.uint32, mx.float32, mx.uint32])
+    if not order:
+        return inds, weights
+    return inds, weights, slots if fused else expert_order(inds.reshape(-1, k))
 
 
 # --- the routed experts of a few tokens -----------------------------------------------------------------------------
@@ -147,8 +172,12 @@ def route_topk(logits: mx.array, k: int):
 # dependent launch costs about 5 us on an M4 Pro. ``experts_up`` writes swiglu(gate, up) of each (token, expert)
 # pair, ``experts_down`` each pair's down projection, then their sum with the routing weights plus the shared expert.
 # Both take the pairs in the order of their experts (expert_order), so rows of a batch that chose one expert read it
-# once: 8 rows of Flint wrote 287 tokens/s instead of 265, 16 rows 315 instead of 288. Rounding is where the stock
-# graph rounds: each projection to the activation dtype, swiglu's steps, the float32 weighted sum.
+# once: 8 rows of Flint wrote 287 tokens/s instead of 265, 16 rows 315 instead of 288. From 4 rows the kernels are
+# bound by their arithmetic as much as by the weights they read (8 rows: 15.7 ms a step, the loads alone 11.8, the
+# arithmetic alone 13.7), so a simdgroup of experts_up takes 2 hidden units and a lane of experts_down 4 rows, each
+# input chunk converted once for all of them, and 3-bit values become floats without int-to-float (qdot8): 14.2 ms,
+# the same bits. Rounding is where the stock graph rounds: each projection to the activation dtype, swiglu's steps,
+# the float32 weighted sum.
 # Weights are MLX's affine format with groups of 64: a group is a little-endian bit stream of 2 * BITS 32-bit words.
 
 _QDOT_HEADER = """
@@ -176,11 +205,18 @@ inline ulong chunk8(const device uint32_t* wp, int c) {
 
 // The 8 inputs of a chunk divided by 2^(BITS*i), so a value is masked in place, not shifted (as MLX's qmv does);
 // a power of two scales a float exactly. BITS * 8 > 32 (5 to 8 bits) does not fit a uint: shifted there.
+// 3 bits: a masked value (below 2^23) becomes a float without an int-to-float conversion, ORed into the mantissa of
+// 2^23 and 2^23 subtracted (exact); value 7 (bits 21 to 23) is shifted down 3 first and its input divided by 2^18
+// instead of 2^21, the same product.
 template <int BITS>
 inline float qdot8(ulong v, thread const float* xs) {
     constexpr uint mask = (1u << BITS) - 1;
     float s = 0.0f;
-    if (BITS * 8 <= 32) {
+    if (BITS == 3) {
+        const uint w = uint(v);
+        for (int i = 0; i < 7; i++) s += (as_type<float>((w & (7u << (3 * i))) | 0x4B000000u) - 8388608.0f) * xs[i];
+        s += (as_type<float>(((w >> 3) & (7u << 18)) | 0x4B000000u) - 8388608.0f) * xs[7];
+    } else if (BITS * 8 <= 32) {
         const uint w = uint(v);
         for (int i = 0; i < 8; i++) s += float(w & (mask << (BITS * i))) * xs[i];
     } else {
@@ -191,7 +227,10 @@ inline float qdot8(ulong v, thread const float* xs) {
 
 template <int BITS>
 inline void prescale8(thread float* xs) {
-    if (BITS * 8 <= 32) {
+    if (BITS == 3) {
+        for (int i = 1; i < 7; i++) xs[i] *= 1.0f / float(1u << (3 * i));
+        xs[7] *= 1.0f / float(1u << 18);
+    } else if (BITS * 8 <= 32) {
         for (int i = 1; i < 8; i++) xs[i] *= 1.0f / float(1u << (BITS * i));
     }
 }
@@ -199,84 +238,101 @@ inline void prescale8(thread float* xs) {
 
 # The slots (token, k) sorted by expert (expert_order): the simdgroup at the start of each run of one expert loads its
 # weight words once and serves every slot of the run (rows sharing an expert read it once); the others return at
-# once. One simdgroup per (slot in that order, hidden unit); lanes take the input's groups of 64.
+# once. One simdgroup per (slot in that order, R hidden units), a lane per group of 64 inputs (D <= 2048): each chunk
+# of the input is converted and prescaled once for the R units' gate and up rows.
 _UP_SRC = """
     constexpr int NG = D / 64, WPG = 2 * BITS;
-    constexpr uint ROWW = NG * WPG;
+    constexpr uint ROWW = NG * WPG, NB = I / R;
     const uint sgid = thread_position_in_grid.x / 32;  // (a partial last threadgroup is smaller: not its size times its index)
     const uint lane = thread_index_in_simdgroup;
     const uint S = nslots[0];
-    const uint jb = sgid % I, p = sgid / I;
-    if (p >= S) return;
+    const uint j0 = (sgid % NB) * R, p = sgid / NB;
+    if (p >= S || lane >= NG) return;
     const uint e = inds[order[p]];
     if (p > 0 && inds[order[p - 1]] == e) return;  // not its run's first slot: that one's simdgroup serves it
     uint q_end = p + 1;
     while (q_end < S && inds[order[q_end]] == e) q_end++;
-    const size_t gate_row = size_t(e) * 2 * I + jb;
-    for (uint g = lane; g < NG; g += 32) {
-        typename chunk_type<(BITS * 8 > 32)>::type wg[8], wu[8];
+    const uint g = lane;
+    const size_t row0 = size_t(e) * 2 * I + j0;  // the units' gate rows; their up rows are I further
+    typename chunk_type<(BITS * 8 > 32)>::type wg[R][8], wu[R][8];
+    float sg[R], bg[R], su[R], bu[R];
+    for (int r = 0; r < R; r++) {
         for (int c = 0; c < 8; c++) {
-            wg[c] = chunk8<BITS>(w + gate_row * ROWW + g * WPG, c);
-            wu[c] = chunk8<BITS>(w + (gate_row + I) * ROWW + g * WPG, c);
+            wg[r][c] = chunk8<BITS>(w + (row0 + r) * ROWW + g * WPG, c);
+            wu[r][c] = chunk8<BITS>(w + (row0 + r + I) * ROWW + g * WPG, c);
         }
-        const float sgt = float(scales[gate_row * NG + g]), bgt = float(biases[gate_row * NG + g]);
-        const float sup = float(scales[(gate_row + I) * NG + g]), bup = float(biases[(gate_row + I) * NG + g]);
-        for (uint q = p; q < q_end; q++) {
-            const uint slot = order[q], t = slot / K;
-            const device T* xr = x + size_t(t) * D + g * 64;
-            float qg = 0.0f, qu = 0.0f, xs = 0.0f;
-            for (int c = 0; c < 8; c++) {
-                float xv[8];
-                for (int i = 0; i < 8; i++) { xv[i] = float(xr[c * 8 + i]); xs += xv[i]; }
-                prescale8<BITS>(xv);
-                qg += qdot8<BITS>(wg[c], xv);
-                qu += qdot8<BITS>(wu[c], xv);
+        sg[r] = float(scales[(row0 + r) * NG + g]);
+        bg[r] = float(biases[(row0 + r) * NG + g]);
+        su[r] = float(scales[(row0 + r + I) * NG + g]);
+        bu[r] = float(biases[(row0 + r + I) * NG + g]);
+    }
+    for (uint q = p; q < q_end; q++) {
+        const uint slot = order[q], t = slot / K;
+        const device T* xr = x + size_t(t) * D + g * 64;
+        float qg[R], qu[R], xs = 0.0f;
+        for (int r = 0; r < R; r++) { qg[r] = 0.0f; qu[r] = 0.0f; }
+        for (int c = 0; c < 8; c++) {
+            float xv[8];
+            for (int i = 0; i < 8; i++) { xv[i] = float(xr[c * 8 + i]); xs += xv[i]; }
+            prescale8<BITS>(xv);
+            for (int r = 0; r < R; r++) {
+                qg[r] += qdot8<BITS>(wg[r][c], xv);
+                qu[r] += qdot8<BITS>(wu[r][c], xv);
             }
-            // (Flint's D = 2048: one group a lane, so this is each row's whole sum)
-            const T gt = T(simd_sum(sgt * qg + bgt * xs)), ut = T(simd_sum(sup * qu + bup * xs));
+        }
+        for (int r = 0; r < R; r++) {  // (one group a lane: the simd_sum is each row's whole sum)
+            const T gt = T(simd_sum(sg[r] * qg[r] + bg[r] * xs)), ut = T(simd_sum(su[r] * qu[r] + bu[r] * xs));
             if (lane == 0) {
                 const T sig = T(1.0f / (1.0f + metal::exp(-float(gt))));
                 const T act = T(float(gt) * float(sig));
-                h[size_t(slot) * I + jb] = T(float(act) * float(ut));
+                h[size_t(slot) * I + j0 + r] = T(float(act) * float(ut));
             }
         }
     }
 """
 
-# One simdgroup per (slot in expert order, 32 / (I / 64) output rows), a row's I / 64 groups to as many lanes, the run's
-# weight words loaded once; each slot's down projection, rounded to T as gather_qmm rounds it, goes to ``ys``, and
-# _COMBINE_SRC sums each token's slots in their order with the routing weights (float32), plus the shared expert.
+# One simdgroup per (slot in expert order, 32 / (I / 64) * R output rows): a lane takes one of a row's I / 64 groups in
+# R rows, the run's weight words loaded once, each chunk of h converted and prescaled once for the R rows. Each slot's
+# down projection, rounded to T as gather_qmm rounds it, goes to ``ys``, and _COMBINE_SRC sums each token's slots in
+# their order with the routing weights (float32), plus the shared expert.
 _DOWN_SRC = """
     constexpr int NG = I / 64, WPG = 2 * BITS, RPS = 32 / NG;
-    constexpr uint ROWW = NG * WPG;
+    constexpr uint ROWW = NG * WPG, ROWS = RPS * R;
     const uint sgid = thread_position_in_grid.x / 32;
     const uint lane = thread_index_in_simdgroup;
     const uint S = nslots[0];
-    const uint rb = sgid % (D / RPS), p = sgid / (D / RPS);
-    const uint row = rb * RPS + lane / NG, g = lane % NG;
+    const uint rb = sgid % (D / ROWS), p = sgid / (D / ROWS);
+    const uint g = lane % NG, row0 = rb * ROWS + lane / NG;  // this lane's rows: row0 + r * RPS
     if (p >= S) return;
     const uint e = inds[order[p]];
     if (p > 0 && inds[order[p - 1]] == e) return;
     uint q_end = p + 1;
     while (q_end < S && inds[order[q_end]] == e) q_end++;
-    const size_t wrow = size_t(e) * D + row;
-    const device uint32_t* wp = w + wrow * ROWW + g * WPG;
-    typename chunk_type<(BITS * 8 > 32)>::type wd[8];
-    for (int c = 0; c < 8; c++) wd[c] = chunk8<BITS>(wp, c);
-    const float sc = float(scales[wrow * NG + g]), bi = float(biases[wrow * NG + g]);
+    typename chunk_type<(BITS * 8 > 32)>::type wd[R][8];
+    float sc[R], bi[R];
+    for (int r = 0; r < R; r++) {
+        const size_t wrow = size_t(e) * D + row0 + r * RPS;
+        const device uint32_t* wp = w + wrow * ROWW + g * WPG;
+        for (int c = 0; c < 8; c++) wd[r][c] = chunk8<BITS>(wp, c);
+        sc[r] = float(scales[wrow * NG + g]);
+        bi[r] = float(biases[wrow * NG + g]);
+    }
     for (uint q = p; q < q_end; q++) {
         const uint slot = order[q];
         const device T* hr = h + size_t(slot) * I + g * 64;
-        float qv = 0.0f, xs = 0.0f;
+        float qv[R], xs = 0.0f;
+        for (int r = 0; r < R; r++) qv[r] = 0.0f;
         for (int c = 0; c < 8; c++) {
             float xv[8];
             for (int i = 0; i < 8; i++) { xv[i] = float(hr[c * 8 + i]); xs += xv[i]; }
             prescale8<BITS>(xv);
-            qv += qdot8<BITS>(wd[c], xv);
+            for (int r = 0; r < R; r++) qv[r] += qdot8<BITS>(wd[r][c], xv);
         }
-        float pv = sc * qv + bi * xs;
-        for (uint off = NG / 2; off > 0; off /= 2) pv += simd_shuffle_xor(pv, off);
-        if (g == 0) ys[size_t(slot) * D + row] = T(pv);
+        for (int r = 0; r < R; r++) {
+            float pv = sc[r] * qv[r] + bi[r] * xs;
+            for (uint off = NG / 2; off > 0; off /= 2) pv += simd_shuffle_xor(pv, off);
+            if (g == 0) ys[size_t(slot) * D + row0 + r * RPS] = T(pv);
+        }
     }
 """
 
@@ -288,23 +344,70 @@ _COMBINE_SRC = """
     for (int k = 0; k < K; k++) acc += float(ys[size_t(t * K + k) * D + row]) * weights[t * K + k];
     T yv = T(acc);
     if (HAS_SHARED) yv = T(float(yv) + float(shared[size_t(t) * D + row]));
+    if (HAS_RES) yv = T(float(res[size_t(t) * D + row]) + float(yv));  // the layer's residual add, as h + mlp(...)
     y[size_t(t) * D + row] = yv;
 """
 
+# The combine, the layer's residual add and the next layer's input norm in one kernel: a threadgroup per token, laid
+# out as norm_kernel.add_rms (MLX's RMS norm), so its two outputs are the bits of the combine and of rms_norm.
+_COMBINE_NORM_SRC = """
+    constexpr int N_READS = 4;
+    threadgroup float local_inv_mean[1];
+    threadgroup float local_sums[32];
+    const uint t = threadgroup_position_in_grid.x;
+    const uint lid = thread_position_in_threadgroup.x;
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    T hv[N_READS];
+    float sq = 0;
+    for (int i = 0; i < N_READS; i++) {
+        const uint row = lid * N_READS + i;
+        float acc = 0.0f;
+        for (int k = 0; k < K; k++) acc += float(ys[size_t(t * K + k) * D + row]) * weights[t * K + k];
+        T yv = T(acc);
+        if (HAS_SHARED) yv = T(float(yv) + float(shared[size_t(t) * D + row]));
+        yv = T(float(res[size_t(t) * D + row]) + float(yv));
+        y[size_t(t) * D + row] = yv;
+        hv[i] = yv;
+        float xi = hv[i];
+        sq += xi * xi;
+    }
+    sq = simd_sum(sq);
+    if (sg == 0) local_sums[lane] = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) local_sums[sg] = sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        sq = simd_sum(local_sums[lane]);
+        if (lane == 0) local_inv_mean[0] = metal::precise::rsqrt(sq / D + __EPS__);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = 0; i < N_READS; i++) {
+        const uint row = lid * N_READS + i;
+        n[size_t(t) * D + row] = nw[row] * static_cast<T>(hv[i] * local_inv_mean[0]);
+    }
+"""
+
 _up_kernel = _down_kernel = _combine_kernel = None
+_combine_norm_kernels: dict = {}
 USE_EXPERT_KERNELS = os.environ.get("LOCALS_EXPERT_KERNELS", "1") != "0"
 EXPERT_MAX_ROWS = 16  # more tokens (a prompt): gather_qmm, sorted, reads each expert once for all its tokens
+# From this many tokens a simdgroup of experts_up takes 2 hidden units and a lane of experts_down 4 output rows; fewer
+# tokens have too few simdgroups to spread over the GPU that way.
+EXPERT_ROWS_FROM = 4
 
 
 def experts_fit(x: mx.array, gate_up, down) -> bool:
     """Whether experts_up/experts_down take these: few rows of a 16-bit dtype, affine groups of 64, input sizes the
-    kernels split evenly (the down projection's input in at most 32 groups, a power of 2)."""
+    kernels split evenly (the input in at most 32 groups, one a lane; the down projection's in at most 32, a power
+    of 2)."""
     D, I = x.shape[-1], down.input_dims
     ng = I // 64
     return (x.size // D <= EXPERT_MAX_ROWS and x.dtype in (mx.bfloat16, mx.float16)
             and all(m.group_size == 64 and m.mode == "affine" and m.get("biases") is not None and m.bits in (2, 3, 4, 5, 6, 8)
                     for m in (gate_up, down))
-            and D % 64 == 0 and I % 64 == 0 and 0 < ng <= 32 and ng & (ng - 1) == 0 and I % 2 == 0
+            and D % 64 == 0 and D // 64 <= 32 and I % 64 == 0 and 0 < ng <= 32 and ng & (ng - 1) == 0
+            and D % (32 // ng) == 0 and I % 2 == 0
             and gate_up["scales"].dtype == x.dtype and down["scales"].dtype == x.dtype)
 
 
@@ -336,53 +439,77 @@ def expert_order(inds: mx.array) -> mx.array:
     return mx.argsort(flat).astype(mx.uint32)
 
 
-def experts_up(x: mx.array, inds: mx.array, gate_up, order: Optional[mx.array] = None, tg: int = 128) -> mx.array:
+def experts_up(x: mx.array, inds: mx.array, gate_up, order: Optional[mx.array] = None, r: Optional[int] = None) -> mx.array:
     """swiglu(gate, up) of each token for each of its experts: ``x`` (T, D), ``inds`` (T, K) -> (T * K, I). Rows that
     share an expert read it once (``order``: expert_order(inds)): at 8 and 16 rows of Flint's routing 10 to 12% faster
-    than a simdgroup a slot, at one row 2%."""
+    than a simdgroup a slot, at one row 2%. ``r`` hidden units a simdgroup (default: 2 from EXPERT_ROWS_FROM tokens)
+    give the same bits."""
     global _up_kernel
     if _up_kernel is None:
-        _up_kernel = mx.fast.metal_kernel(name="locals_experts_up_runs",
+        _up_kernel = mx.fast.metal_kernel(name="locals_experts_up_units",
                                           input_names=["x", "inds", "order", "w", "scales", "biases", "nslots"],
                                           output_names=["h"], source=_UP_SRC, header=_QDOT_HEADER)
     T_, D = x.shape
     K = inds.shape[-1]
     I = gate_up["weight"].shape[1] // 2
     S = T_ * K
+    r = r or (2 if T_ >= EXPERT_ROWS_FROM else 1)
     order = expert_order(inds) if order is None else order
     w, sc, bi = _experts_buffers(gate_up)
     (h,) = _up_kernel(inputs=[x, inds.reshape(-1), order, w, sc, bi, mx.array([S], dtype=mx.uint32)],
-                      template=[("T", x.dtype), ("BITS", gate_up.bits), ("D", D), ("I", I), ("K", K)],
-                      grid=(S * I * 32, 1, 1), threadgroup=(tg, 1, 1), output_shapes=[(S, I)], output_dtypes=[x.dtype])
+                      template=[("T", x.dtype), ("BITS", gate_up.bits), ("D", D), ("I", I), ("K", K), ("R", r)],
+                      grid=(S * (I // r) * 32, 1, 1), threadgroup=(64, 1, 1), output_shapes=[(S, I)], output_dtypes=[x.dtype])
     return h
 
 
 def experts_down(h: mx.array, inds: mx.array, weights: mx.array, down, shared=None, order: Optional[mx.array] = None,
-                 tg: int = 256) -> mx.array:
-    """sum_k weights[t, k] * down_{inds[t, k]}(h[t, k]) (+ ``shared``): ``h`` (T * K, I) -> (T, D). Each slot's projection
-    (rows sharing an expert read it once), then a combine that sums a token's slots in their order."""
+                 r: Optional[int] = None, residual=None, norm=None):
+    """sum_k weights[t, k] * down_{inds[t, k]}(h[t, k]) (+ ``shared``) (+ ``residual``, added last as the decoder layer
+    adds it): ``h`` (T * K, I) -> (T, D). Each slot's projection (rows sharing an expert read it once), then a combine
+    that sums a token's slots in their order. ``r`` output rows a lane (default: 4 from EXPERT_ROWS_FROM tokens) give
+    the same bits. With ``residual`` and ``norm`` (an RMSNorm, the next layer's input norm): (that sum, its norm)."""
     global _down_kernel, _combine_kernel
     if _down_kernel is None:
-        _down_kernel = mx.fast.metal_kernel(name="locals_experts_down_runs",
+        _down_kernel = mx.fast.metal_kernel(name="locals_experts_down_rows",
                                             input_names=["h", "inds", "order", "w", "scales", "biases", "nslots"],
                                             output_names=["ys"], source=_DOWN_SRC, header=_QDOT_HEADER)
-        _combine_kernel = mx.fast.metal_kernel(name="locals_experts_combine", input_names=["ys", "weights", "shared", "ntok"],
+        _combine_kernel = mx.fast.metal_kernel(name="locals_experts_combine",
+                                               input_names=["ys", "weights", "shared", "res", "ntok"],
                                                output_names=["y"], source=_COMBINE_SRC)
     NT, K = inds.shape
     D, I = down["weight"].shape[1], h.shape[-1]
     S = NT * K
     rps = 32 // (I // 64)
+    r = r or (4 if NT >= EXPERT_ROWS_FROM and D % (4 * rps) == 0 else 1)
     order = expert_order(inds) if order is None else order
     w, sc, bi = _experts_buffers(down)
     (ys,) = _down_kernel(inputs=[h, inds.reshape(-1), order, w, sc, bi, mx.array([S], dtype=mx.uint32)],
-                         template=[("T", h.dtype), ("BITS", down.bits), ("D", D), ("I", I), ("K", K)],
-                         grid=(S * (D // rps) * 32, 1, 1), threadgroup=(tg, 1, 1), output_shapes=[(S, D)], output_dtypes=[h.dtype])
-    has = shared is not None
-    (y,) = _combine_kernel(inputs=[ys, weights.astype(mx.float32), shared if has else mx.zeros((1,), dtype=h.dtype),
+                         template=[("T", h.dtype), ("BITS", down.bits), ("D", D), ("I", I), ("K", K), ("R", r)],
+                         grid=(S * (D // (rps * r)) * 32, 1, 1), threadgroup=(128, 1, 1), output_shapes=[(S, D)],
+                         output_dtypes=[h.dtype])
+    has, res = shared is not None, residual is not None
+    none = mx.zeros((1,), dtype=h.dtype)
+    if res and norm is not None:
+        from .norm_kernel import supported
+
+        if supported(D):
+            eps = float(norm.eps)
+            kern = _combine_norm_kernels.get(eps)
+            if kern is None:
+                kern = _combine_norm_kernels[eps] = mx.fast.metal_kernel(
+                    name="locals_experts_combine_norm_%d" % len(_combine_norm_kernels),
+                    input_names=["ys", "weights", "shared", "res", "nw"], output_names=["y", "n"],
+                    source=_COMBINE_NORM_SRC.replace("__EPS__", "%.9ef" % eps))
+            y, n = kern(inputs=[ys, weights.astype(mx.float32), shared if has else none, residual, norm.weight],
+                        template=[("T", h.dtype), ("D", D), ("K", K), ("HAS_SHARED", int(has))],
+                        grid=(NT * (D // 4), 1, 1), threadgroup=(D // 4, 1, 1), output_shapes=[(NT, D)] * 2,
+                        output_dtypes=[h.dtype] * 2)
+            return y, n
+    (y,) = _combine_kernel(inputs=[ys, weights.astype(mx.float32), shared if has else none, residual if res else none,
                                    mx.array([NT], dtype=mx.uint32)],
-                           template=[("T", h.dtype), ("D", D), ("K", K), ("HAS_SHARED", int(has))],
+                           template=[("T", h.dtype), ("D", D), ("K", K), ("HAS_SHARED", int(has)), ("HAS_RES", int(res))],
                            grid=(NT * D, 1, 1), threadgroup=(256, 1, 1), output_shapes=[(NT, D)], output_dtypes=[h.dtype])
-    return y
+    return y if norm is None else (y, norm(y))
 
 
 def _concat_switch(mods):
@@ -443,20 +570,79 @@ def fuse_switch_glu(sw) -> bool:
 
 
 class FusedFlintMoe(nn.Module):
-    """Flint's SparseMoeBlock: the router's float32 logits from its bf16 weight in one kernel, the choice in another."""
+    """Flint's SparseMoeBlock: the router's float32 logits from its bf16 weight in one kernel, the choice (and the
+    slots' order for the expert kernels) in another. With ``residual``, returns ``residual`` + the block's output, the
+    add inside the last kernel (FusedFlintLayer)."""
 
-    def __call__(self, x: mx.array) -> mx.array:
-        inds, weights = route_topk(router(x, self.gate.weight), self.top_k)
+    def __call__(self, x: mx.array, residual: Optional[mx.array] = None, norm=None):
+        """With ``norm`` (and ``residual``): (residual + the block's output, ``norm`` of it)."""
         sw, D, k = self.switch_mlp, x.shape[-1], self.top_k
         if USE_EXPERT_KERNELS and hasattr(sw, "gate_up_proj") and experts_fit(x, sw.gate_up_proj, sw.down_proj):
+            inds, weights, order = route_topk(router(x, self.gate.weight), k, order=True)
             inds2 = inds.reshape(-1, k)
-            order = expert_order(inds2)
             h = experts_up(x.reshape(-1, D), inds2, sw.gate_up_proj, order)
-            y = experts_down(h, inds2, weights.reshape(-1, k), sw.down_proj, self.shared_expert(x).reshape(-1, D), order)
-            return y.reshape(x.shape)
+            out = experts_down(h, inds2, weights.reshape(-1, k), sw.down_proj, self.shared_expert(x).reshape(-1, D), order,
+                               residual=None if residual is None else residual.reshape(-1, D), norm=norm)
+            if norm is None:
+                return out.reshape(x.shape)
+            return out[0].reshape(x.shape), out[1].reshape(x.shape)
+        inds, weights = route_topk(router(x, self.gate.weight), k)
         y = self.switch_mlp(x, inds)
         y = (y * weights[..., None]).sum(axis=-2).astype(y.dtype)
-        return y + self.shared_expert(x)
+        y = y + self.shared_expert(x)
+        if norm is not None:
+            return _add_norm(residual, y, norm)
+        return y if residual is None else residual + y
+
+
+FLINT_ADD_RMS = os.environ.get("LOCALS_FLINT_ADD_RMS", "1") != "0"
+
+
+def _add_norm(x: mx.array, r: mx.array, norm):
+    """(x + r, norm(x + r)): one kernel where norm_kernel.add_rms takes them (the same bits as MLX's add and norm)."""
+    from .norm_kernel import add_rms, supported
+
+    if FLINT_ADD_RMS and supported(x.shape[-1]) and x.dtype in (mx.bfloat16, mx.float16) and r.dtype == x.dtype:
+        return add_rms(x, r, norm.weight, norm.eps)
+    h = x + r
+    return h, norm(h)
+
+
+class FusedFlintLayer(nn.Module):
+    """Flint's decoder layer with the attention's residual add in the post-attention norm's kernel (_add_norm), and a
+    MoE block whose residual add is the expert combine's (FusedFlintMoe). ``step`` also computes the next layer's
+    input norm with the layer's last kernel (FusedFlintBody)."""
+
+    def __call__(self, x: mx.array, mask: Optional[mx.array] = None, cache=None) -> mx.array:
+        h, n = _add_norm(x, self.self_attn(self.input_layernorm(x), mask, cache), self.post_attention_layernorm)
+        return self.mlp(n, residual=h) if isinstance(self.mlp, FusedFlintMoe) else h + self.mlp(n)
+
+    def step(self, x: mx.array, nx: mx.array, mask, cache, norm):
+        """(this layer's output, ``norm`` of it), from its input ``x`` and its input norm ``nx``."""
+        h, n = _add_norm(x, self.self_attn(nx, mask, cache), self.post_attention_layernorm)
+        if isinstance(self.mlp, FusedFlintMoe):
+            return self.mlp(n, residual=h, norm=norm)
+        return _add_norm(h, self.mlp(n), norm)
+
+
+class FusedFlintBody(nn.Module):
+    """Flint's layer stack with each layer's input norm computed by the last kernel of the layer before it (the expert
+    combine, or the add after a dense MLP): one kernel a layer fewer, the same bits."""
+
+    def __call__(self, inputs: mx.array, cache=None, input_embeddings: Optional[mx.array] = None) -> mx.array:
+        from mlx_lm.models.base import create_attention_mask
+
+        h = input_embeddings if input_embeddings is not None else self.embed_tokens(inputs)
+        if cache is None:
+            cache = [None] * len(self.layers)
+        fa_mask = create_attention_mask(h, cache[self.fa_idx])
+        swa_mask = create_attention_mask(h, cache[self.swa_idx], window_size=self.args.sliding_window)
+        layers = self.layers
+        n = layers[0].input_layernorm(h)
+        for i, (layer, c) in enumerate(zip(layers, cache)):
+            nxt = layers[i + 1].input_layernorm if i + 1 < len(layers) else self.norm
+            h, n = layer.step(h, n, swa_mask if layer.use_sliding else fa_mask, c, nxt)
+        return n
 
 
 def fuse_flint_moe(block) -> bool:

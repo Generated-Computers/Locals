@@ -2,9 +2,11 @@
 
 A pre-norm decoder layer adds a residual and immediately normalizes the sum,
 twice per layer (after the mixer, and after the MLP into the next layer's
-input norm). Doing both in one kernel halves those launches. Rounding follows
-mlx: h is rounded to the activation dtype, and the normalized value is rounded
-before the weight multiply, as in mx.fast.rms_norm.
+input norm). Doing both in one kernel halves those launches. The kernel is
+laid out as MLX's own RMS norm for one row (4 values a thread, a simdgroup
+sum, the threadgroup's partial sums summed by one simdgroup, a precise
+rsqrt), and h is added as MLX's add adds: its outputs are the same bits as
+``x + r`` and ``mx.fast.rms_norm(x + r, w, eps)`` (checked on 42M values).
 """
 
 from __future__ import annotations
@@ -12,41 +14,37 @@ from __future__ import annotations
 import mlx.core as mx
 
 _SOURCE = r"""
+    constexpr int N_READS = 4;
+    threadgroup float local_inv_mean[1];
+    threadgroup float local_sums[32];
     const uint row = threadgroup_position_in_grid.x;
-    const uint tid = thread_position_in_threadgroup.x;
+    const uint lid = thread_position_in_threadgroup.x;
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
-    constexpr int PER = D / NT;
-    threadgroup float partial[NT / 32];
-
-    const device T* xr = x + row * D;
-    const device T* rr = r + row * D;
-    device T* hr = h + row * D;
-    device T* nr = n + row * D;
-
-    float hv[PER];
-    float ss = 0.0f;
-    for (int i = 0; i < PER; i++) {
-        const int d = i * NT + tid;
-        const T s = static_cast<T>(float(xr[d]) + float(rr[d]));
-        hr[d] = s;
-        hv[i] = float(s);
-        ss += hv[i] * hv[i];
+    const device T* xr = x + row * size_t(D) + lid * N_READS;
+    const device T* rr = r + row * size_t(D) + lid * N_READS;
+    device T* hr = h + row * size_t(D) + lid * N_READS;
+    T hv[N_READS];
+    float acc = 0;
+    for (int i = 0; i < N_READS; i++) {
+        hv[i] = xr[i] + rr[i];
+        hr[i] = hv[i];
+        float xi = hv[i];
+        acc += xi * xi;
     }
-    ss = simd_sum(ss);
-    if (lane == 0) {
-        partial[sg] = ss;
+    acc = simd_sum(acc);
+    if (sg == 0) local_sums[lane] = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) local_sums[sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        acc = simd_sum(local_sums[lane]);
+        if (lane == 0) local_inv_mean[0] = metal::precise::rsqrt(acc / D + __EPS__);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float tot = 0.0f;
-    for (int i = 0; i < NT / 32; i++) {
-        tot += partial[i];
-    }
-    const float inv = metal::rsqrt(tot / float(D) + __EPS__);
-    for (int i = 0; i < PER; i++) {
-        const int d = i * NT + tid;
-        nr[d] = static_cast<T>(float(w[d]) * float(static_cast<T>(hv[i] * inv)));
-    }
+    device T* nr = n + row * size_t(D) + lid * N_READS;
+    const device T* wr = w + lid * N_READS;
+    for (int i = 0; i < N_READS; i++) nr[i] = wr[i] * static_cast<T>(hv[i] * local_inv_mean[0]);
 """
 
 _KERNELS = {}
@@ -65,7 +63,8 @@ def _kernel(eps: float):
 
 
 def supported(D: int) -> bool:
-    return D % 256 == 0
+    """A row in one threadgroup of D / 4 threads, whole simdgroups (MLX's single-row norm goes to 4,096)."""
+    return D % 128 == 0 and D <= 4096
 
 
 def add_rms(x: mx.array, r: mx.array, w: mx.array, eps: float) -> tuple:
@@ -73,9 +72,9 @@ def add_rms(x: mx.array, r: mx.array, w: mx.array, eps: float) -> tuple:
     rows = x.size // D
     h, n = _kernel(float(eps))(
         inputs=[x, r, w],
-        template=[("T", x.dtype), ("D", D), ("NT", 256)],
-        grid=(rows * 256, 1, 1),
-        threadgroup=(256, 1, 1),
+        template=[("T", x.dtype), ("D", D)],
+        grid=(rows * (D // 4), 1, 1),
+        threadgroup=(D // 4, 1, 1),
         output_shapes=[x.shape, x.shape],
         output_dtypes=[x.dtype, x.dtype],
     )

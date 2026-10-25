@@ -130,6 +130,94 @@ def test_route_topk_names_real_experts_for_nan_logits_and_any_dtype():
         assert [sorted(r) for r in i2.tolist()] == [sorted(r) for r in ref.tolist()], dtype
 
 
+def _qswitch(shape, key, bits):
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+
+    m = QuantizedSwitchLinear.__new__(QuantizedSwitchLinear)
+    nn.Module.__init__(m)
+    m.group_size, m.bits, m.mode, m.global_scale = 64, bits, "affine", None
+    w, s, b = mx.quantize(mx.random.normal(shape, key=key) * 0.03, 64, bits)
+    m.weight, m.scales, m.biases = w, s.astype(mx.bfloat16), b.astype(mx.bfloat16)
+    return m
+
+
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
+def test_expert_kernels_give_the_same_bits_a_row_or_several_a_simdgroup(bits):
+    """From 4 tokens experts_up takes 2 hidden units a simdgroup and experts_down 4 rows a lane: each row's sums in
+    the same order as one row a simdgroup, so the same bits; and the order route_topk makes gives what expert_order's
+    does."""
+    E, D, I, K = 32, 512, 256, 4
+    gu, dn = _qswitch((E, 2 * I, D), mx.random.key(2), bits), _qswitch((E, D, I), mx.random.key(3), bits)
+    for T in (4, 7, 16):
+        x = mx.random.normal((T, D), key=mx.random.key(T)).astype(mx.bfloat16)
+        inds, w, order = moe.route_topk(mx.random.normal((T, E), key=mx.random.key(10 + T)), K, order=True)
+        flat = inds.reshape(-1)[order]
+        assert sorted(order.tolist()) == list(range(T * K)) and all(a <= b for a, b in zip(flat.tolist(), flat.tolist()[1:]))
+        shared = (mx.random.normal((T, D), key=mx.random.key(20 + T)) * 0.1).astype(mx.bfloat16)
+        h1 = moe.experts_up(x, inds, gu, moe.expert_order(inds), r=1)
+        h = moe.experts_up(x, inds, gu, order)
+        assert mx.array_equal(h, h1)
+        y1 = moe.experts_down(h, inds, w, dn, shared, moe.expert_order(inds), r=1)
+        assert mx.array_equal(moe.experts_down(h, inds, w, dn, shared, order), y1)
+    logits = mx.random.normal((17, E), key=mx.random.key(5))  # more tokens than one threadgroup orders: a sort
+    inds, _, order = moe.route_topk(logits, K, order=True)
+    assert mx.array_equal(order, moe.expert_order(inds))
+
+
+def test_expert_combine_adds_the_residual_and_norms_as_mlx_does():
+    """experts_down with the layer's residual and the next layer's norm: the bits of residual + the block's output
+    and of mx.fast.rms_norm of that sum."""
+    E, D, I, K = 32, 512, 256, 4
+    gu, dn = _qswitch((E, 2 * I, D), mx.random.key(4), 3), _qswitch((E, D, I), mx.random.key(5), 3)
+    norm = nn.RMSNorm(D, eps=1e-6)
+    norm.weight = (1 + 0.2 * mx.random.normal((D,), key=mx.random.key(6))).astype(mx.bfloat16)
+    for T in (1, 4, 8):
+        x = mx.random.normal((T, D), key=mx.random.key(T)).astype(mx.bfloat16)
+        res = (mx.random.normal((T, D), key=mx.random.key(30 + T)) * 4).astype(mx.bfloat16)
+        inds, w, order = moe.route_topk(mx.random.normal((T, E), key=mx.random.key(10 + T)), K, order=True)
+        shared = (mx.random.normal((T, D), key=mx.random.key(20 + T)) * 0.1).astype(mx.bfloat16)
+        h = moe.experts_up(x, inds, gu, order)
+        y = moe.experts_down(h, inds, w, dn, shared, order)
+        out = moe.experts_down(h, inds, w, dn, shared, order, residual=res)
+        assert mx.array_equal(out, res + y)
+        out2, n = moe.experts_down(h, inds, w, dn, shared, order, residual=res, norm=norm)
+        assert mx.array_equal(out2, out) and mx.array_equal(n, mx.fast.rms_norm(out, norm.weight, 1e-6))
+
+
+def test_add_rms_is_mlx_add_then_norm():
+    from locals.norm_kernel import add_rms
+
+    for D in (256, 2048):
+        for scale in (0.01, 1, 300):
+            x = (mx.random.normal((9, D), key=mx.random.key(D)) * scale).astype(mx.bfloat16)
+            r = mx.random.normal((9, D), key=mx.random.key(D + 1)).astype(mx.bfloat16)
+            w = (1 + 0.3 * mx.random.normal((D,), key=mx.random.key(D + 2))).astype(mx.bfloat16)
+            h, n = add_rms(x, r, w, 1e-6)
+            assert mx.array_equal(h, x + r) and mx.array_equal(n, mx.fast.rms_norm(x + r, w, 1e-6))
+
+
+def test_fused_body_is_the_layers_one_by_one():
+    """The patched body, which norms each layer's input in the kernel ending the layer before, against the stock
+    body's loop over the same patched layers: the same logits, bit for bit, on a prompt and on decode steps."""
+    from mlx_lm.models.cache import make_prompt_cache
+
+    import locals
+
+    m = _model(seed=6)
+    locals.patch(m, tune="off", kernels=False)
+    assert type(m.model).__name__ == "FusedFlintModel" and all(type(l).__name__ == "FusedDecoderLayer" for l in m.layers)
+    stock_body = next(c for c in type(m.model).__mro__ if c.__name__ == "FlintModel")
+    prompt = mx.array([[5, 17, 300, 2, 9, 44, 120, 7, 7, 1, 499, 3]])
+    caches = [make_prompt_cache(m), make_prompt_cache(m)]
+    outs = [m.lm_head(stock_body.__call__(m.model, prompt, caches[0])), m(prompt, cache=caches[1])]
+    assert mx.array_equal(*outs)
+    y = mx.argmax(outs[0][:, -1:], axis=-1)
+    for _ in range(12):  # past the sliding window of 9
+        outs = [m.lm_head(stock_body.__call__(m.model, y, caches[0])), m(y, cache=caches[1])]
+        assert mx.array_equal(*outs)
+        y = mx.argmax(outs[0][:, -1:], axis=-1)
+
+
 def test_qk_norm_rope_is_mlx_norm_then_rope():
     from locals.qk_kernel import qk_norm_rope
 

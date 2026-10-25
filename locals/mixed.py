@@ -24,7 +24,8 @@ def _flint(body) -> bool:
     from .fuse import FusedFlintAttention
 
     layers = getattr(body, "layers", None)
-    return (type(body).__name__ == "FlintModel" and type(body).__module__.rsplit(".", 1)[-1] == "flint" and bool(layers)
+    stock = next((c for c in type(body).__mro__ if c.__name__ == "FlintModel"), None)  # (or locals's FusedFlintModel)
+    return (stock is not None and stock.__module__.rsplit(".", 1)[-1] == "flint" and bool(layers)
             and all(isinstance(getattr(l, "self_attn", None), FusedFlintAttention) and hasattr(l, "use_sliding")
                     for l in layers))
 

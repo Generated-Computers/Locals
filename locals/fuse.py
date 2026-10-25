@@ -440,6 +440,18 @@ def fuse_model(model) -> int:
                 and _fusable([mlp.gate_proj, mlp.up_proj]) and _swiglu_mlp(mlp)):
             _fuse_mlp(mlp)
         n += 1
+    if type(body).__name__ == "FlintModel" and type(body).__module__.split(".")[-1] == "flint":
+        from .moe import FusedFlintBody, FusedFlintLayer, FusedFlintMoe
+
+        # each layer's residual adds in its norms' and experts' kernels, and its input norm in the layer before it
+        layers = body.layers
+        if (all(hasattr(body, a) for a in ("fa_idx", "swa_idx", "args", "norm", "embed_tokens"))
+                and all(type(l).__name__ == "DecoderLayer" and type(l).__module__.split(".")[-1] == "flint"
+                        and isinstance(l.self_attn, FusedFlintAttention) for l in layers)
+                and any(isinstance(l.mlp, FusedFlintMoe) for l in layers)):
+            for l in layers:
+                l.__class__ = type("Fused" + type(l).__name__, (FusedFlintLayer, type(l)), {})
+            body.__class__ = type("Fused" + type(body).__name__, (FusedFlintBody, type(body)), {})
     flint = type(model).__module__.split(".")[-1] == "flint" and hasattr(model, "make_cache")
     if flint:
         from .qkv import opt_in
