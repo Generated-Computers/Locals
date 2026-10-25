@@ -327,6 +327,24 @@ Tried and left out:
 - The router at 8 and 16 rows split among 2 to 8 simdgroups an expert: slower (37 against 35 us at 8 rows).
 - Experts' input prescaled once a threadgroup instead of in every simdgroup: the same output, slower (66.6 against
   50.9 us): the arithmetic it saved was hidden behind the loads, the barrier it added is not.
+- **Faster prompt reading.** Where a 2,048-token chunk's time goes (the body, each part swapped for zeros):
+
+  | Context before it | Chunk | Routed experts | Shared expert | Full-attention layers' attention | Window layers' attention |
+  |---|---|---|---|---|---|
+  | 0 | 2.41 s | 1.05 s | 0.23 | 0.08 | 0.25 |
+  | 8,192 | 3.13 | 1.05 | 0.23 | 0.78 | 0.24 |
+  | 16,384 | 3.88 | 1.06 | 0.23 | 1.54 | 0.26 |
+  | 28,672 | 5.17 | 1.01 | 0.24 | 2.83 | 0.33 |
+
+  The full-attention layers at 28k do 10^12 operations a layer in 202 ms, 4.9 TFLOPS, about 85% of what this GPU's
+  matrix units do at most (2.85 T multiply-adds/s measured; a bf16 GEMM, 5.9 TFLOPS): no exact kernel gains much there.
+  The routed experts go through MLX's sorted gather_qmm, whose tiles are 16 rows of one expert (its time steps with
+  every 16 rows an expert: 8 rows cost what 16 do, 40 what 48 do; 4.8 TFLOPS in whole tiles, against 5.3 for one
+  quantized GEMM of the same arithmetic): Flint's routing gives an expert 1 to 675 rows of a chunk (median 35), so
+  15.7% of the rows it computes are padding, at most 0.15 s of a chunk, which only a grouped GEMM of its own could
+  take back. Projections dequantized once a chunk for a bf16 GEMM are 6 to 7% faster alone (q/k/v 7.58 against 8.16
+  ms at 2,048 rows), within noise in the model (831 tokens/s at 4k against 844); 4,096-token chunks 2.5% faster for
+  0.4 GB more at the peak.
 
 Measured on an M4 Pro (24 GB, the GPU limit raised to 20 GB), mlx-community/flint-mixed-3-4bit, 256-token prompts,
 decode steps pipelined as the engines run them (all of it, and through the servers: docs/benchmarks, section 11):
