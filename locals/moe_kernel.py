@@ -280,8 +280,9 @@ class GroupedSwitchGLU:
 
 
 def enable(model) -> int:
-    """Give every SwitchGLU of ``model`` the grouped kernels for decode steps; returns how many."""
-    if not ENABLED:
+    """Give every SwitchGLU of ``model`` the grouped kernels for decode steps; returns how many. Flint
+    (locals/models/flint.py, or mlx-lm's) keeps its own expert kernels (locals/moe.py), fused or not."""
+    if not ENABLED or type(model).__module__.rsplit(".", 1)[-1] == "flint":
         return 0
     from mlx_lm.models.switch_layers import SwitchGLU
 

@@ -74,3 +74,20 @@ def test_the_runtime_patch_uses_the_kernels_for_decode_steps_only(monkeypatch):
     assert calls == [4]  # the decode step only; a long pass keeps MLX's kernels
     assert got_small.shape == want_small.shape and mx.allclose(got_small, want_small, atol=2e-3).item()
     assert mx.array_equal(got_big, want_big).item()
+
+
+def test_flints_experts_keep_their_own_kernels():
+    """Flint (locals/models/flint.py) has its own expert kernels (locals/moe.py): its SwitchGLUs stay as they are,
+    even unfused."""
+    from locals.models import flint
+
+    args = flint.ModelArgs(model_type="flint", hidden_size=512, num_hidden_layers=2, intermediate_size=512,
+                           num_attention_heads=4, num_key_value_heads=2, head_dim=128, num_experts=8, num_experts_per_tok=2,
+                           moe_intermediate_size=256, shared_expert_intermediate_size=256, mlp_only_layers=[0],
+                           layer_types=["full_attention", "sliding_attention"], sliding_window=9, rms_norm_eps=1e-6,
+                           vocab_size=64)
+    model = flint.Model(args)
+    nn.quantize(model, group_size=64, bits=4, class_predicate=lambda p, l: hasattr(l, "to_quantized") and not p.endswith("mlp.gate"))
+    sw = model.layers[1].mlp.switch_mlp
+    assert mk._mats(sw) is not None  # (a SwitchGLU the kernels could compute)
+    assert mk.enable(model) == 0 and type(sw) is SwitchGLU
