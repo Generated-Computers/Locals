@@ -188,9 +188,10 @@ def test_bench_measures_requests_at_once(stream_server):
 def test_bench_does_not_credit_a_server_that_answers_one_at_a_time(stream_server):
     """Four requests a server answers one after another write no faster than one: adding up each
     request's own rate (the first version) counted them as four times as fast."""
+    bench.measure(stream_server, "serial", 1, 12)  # (a cold CI runner's first request was slow: four read as 1.33x one)
     one = bench.measure(stream_server, "serial", 1, 12)
     four = bench.measure(stream_server, "serial", 4, 12)
-    assert four["tokens_per_s"] < 1.3 * one["tokens_per_s"]
+    assert four["tokens_per_s"] < 1.5 * one["tokens_per_s"]  # (the first version: about 4x; at once, 1.8x and more)
     assert four["ttft_max_s"] > 0.25  # the last one waited for the three before it
 
 
