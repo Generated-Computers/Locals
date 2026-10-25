@@ -330,7 +330,7 @@ def test_chat_files_streams_and_stops(tmp_path):
                     d = {"choices": [{"delta": {"content": text[i:i + 4]}}]}
                     self.wfile.write(("data: " + _json.dumps(d) + "\n\n").encode())
                     self.wfile.flush()
-                    time.sleep(0.02)
+                    time.sleep(getattr(H, "delay", 0.02))
                 self.wfile.write(b'data: {"choices": [], "usage": {"completion_tokens": 9}}\n\ndata: [DONE]\n\n')
             except (BrokenPipeError, ConnectionResetError):
                 pass
@@ -345,9 +345,11 @@ def test_chat_files_streams_and_stops(tmp_path):
         out = plan.chat_files(url, "m", [{"role": "user", "content": "x"}], ["a.py"])
         assert out["files"] == {"a.py": "A = 1\n"} and out["usage"]["completion_tokens"] == 9 and not out["stopped"]
         stop = threading.Event()
+        H.delay = 0.25  # (the stop comes mid-stream: a slow CI runner had finished a 0.14 s stream before 0.1 s)
         threading.Timer(0.1, stop.set).start()
         out = plan.chat_files(url, "m", [{"role": "user", "content": "x"}], ["a.py"], stop=stop)
         assert out["stopped"] and out["files"] == {}
+        H.delay = 0.02
         H.fail = True  # an error mid-stream (out of GPU memory) is an error, not an empty reply
         try:
             plan.chat_files(url, "m", [{"role": "user", "content": "x"}], ["a.py"])

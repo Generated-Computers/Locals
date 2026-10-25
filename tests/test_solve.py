@@ -169,7 +169,9 @@ def test_hedge_starts_a_second_agent_that_outruns_the_first(tmp_path):
 
 
 def test_a_failed_attempt_is_replaced_by_one_told_what_failed(tmp_path):
-    race, oc = _race(tmp_path, [_agent(BAD, 0.1), _agent(BAD, 0.2), _agent(GOOD, 0.1)], parallel=2, max_attempts=3, hedge=0)
+    # (the third, told what failed, takes 1.5 s: the second fails both its turns first, also on a slow CI runner,
+    # where it was outrun)
+    race, oc = _race(tmp_path, [_agent(BAD, 0.1), _agent(BAD, 0.2), _agent(GOOD, 1.5)], parallel=2, max_attempts=3, hedge=0)
     assert [a.state for a in race.attempts] == ["failed", "failed", "passed"]
     assert race.attempts[0].turns == 2  # the failed check was shown to it once (--fixes 1)
     assert "The check failed" in oc.prompts[0][1] and "assert" in oc.prompts[0][1]
