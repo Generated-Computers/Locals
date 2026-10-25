@@ -153,7 +153,7 @@ def route_topk(logits: mx.array, k: int, order: bool = False):
                                              output_names=["inds", "weights", "order"], source=_ROUTE_SRC)
     E = logits.shape[-1]
     T = logits.size // E
-    fused = order and T <= ORDER_MAX_ROWS
+    fused = order and T <= ORDER_MAX_ROWS and k <= 32  # (the sort's ranks: a thread a slot, 32 a row)
     inds, weights, slots = _route_kernel(
         inputs=[logits, mx.array([T], dtype=mx.uint32)],
         template=[("E", E), ("K", k), ("ORDER", int(fused)), ("ORDER_ROWS", ORDER_MAX_ROWS)], grid=(T * 32, 1, 1),

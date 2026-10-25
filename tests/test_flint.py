@@ -436,7 +436,7 @@ def test_a_span_in_one_pass_is_its_tokens_one_at_a_time(kv_bits, monkeypatch):
         a, b = (m(mx.array([[t]]), cache=c)[0, -1].astype(mx.float32) for c in (drip, one))
         assert float(mx.abs(a - b).max()) <= 0.05 * (1 + float(mx.abs(a).max()))
     eng = HybridBatchEngine.__new__(HybridBatchEngine)
-    eng.lm = SimpleNamespace(model=m)
+    eng.lm = m  # (as the engine has it: text_model(model), whose .model is the fused body)
     r = SimpleNamespace(controller=SimpleNamespace())
     assert eng._solo_ok(r, one) and not eng._solo_drafts_ok(one)
 

@@ -57,11 +57,13 @@
   floats without an int-to-float conversion; the expert choice also orders the experts' rows (no sort kernel), and
   each layer's residual adds and next norm are inside its kernels (an add and RMS norm kernel laid out as MLX's,
   the same bits). 305 tokens/s at 8 at once instead of 284, 225 at 4 instead of 212, 340 at 16 instead of 313.
-- A kernel family for matmuls of up to 16 rows, `fragq`: the weights go into the GPU's matrix units as 1 + q/16 in
-  the activations' 16-bit type (two by one shift, mask and or), the scale and bias per group on a float accumulator,
-  a quarter of the matrix product's arithmetic spent on dequantizing instead of a half. The tuner times each kernel in
-  a chain of calls that wait on each other, as a model runs them (back to back without waiting it chose kernels that
-  made Flint 2% slower), and times again the shapes timed before the family. Flint: 317 tokens/s at 8 at once instead
+- A kernel family for Flint's matmuls of up to 16 rows, `fragq`: the weights go into the GPU's matrix units as
+  1 + q/16 in the activations' 16-bit type (two by one shift, mask and or), the scale and bias per group on a float
+  accumulator, a quarter of the matrix product's arithmetic spent on dequantizing instead of a half. The tuner times
+  Flint's layers in a chain of calls that wait on each other, as a model runs them (back to back without waiting it
+  chose kernels that made Flint 2% slower), and times again its shapes timed before the family. Flint's layers have
+  tuning entries of their own (`…xbfloat16flint`): every other model's layers, of the same shapes too, keep their
+  kernels, timings and choices. Flint: 317 tokens/s at 8 at once instead
   of 302, 352 at 16 instead of 339, 227 at 4 instead of 224; through the server, 305 at 8 clients.
 
 ## 0.2.1 (2026-10-21)
