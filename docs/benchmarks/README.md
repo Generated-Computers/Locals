@@ -542,9 +542,9 @@ after 4 warm-up steps; tokens per second all rows write together:
 |---|---|---|---|---|
 | 1 | 85.3 | 78.6 | 116.8 | 1.37x |
 | 2 | 123.3 | 127.0 | 179.3 | 1.45x |
-| 4 | 176.9 | 173.5 | 224.7 | 1.27x |
-| 8 | 201.6 | 223.3 | 304.8 | 1.51x |
-| 16 | 244.5 | 278.8 | 339.8 | 1.39x |
+| 4 | 176.9 | 173.5 | 227.4 | 1.29x |
+| 8 | 201.6 | 223.3 | 319.1 | 1.58x |
+| 16 | 244.5 | 278.8 | 353.5 | 1.45x |
 
 Before, Locals was slower than mlx-lm for one request (its kernel routing cost 4 us of Python a matrix product, and
 it fused nothing of Flint's) and gained only from its batching at 8 and 16. Of the 1.38x at one request, 0.14x is
@@ -552,8 +552,10 @@ MLX's command buffers: handed a layer's whole expert tensors, the expert kernels
 they were given one-expert views, docs/runtime, "Flint"). At 8 and 16 rows the expert kernels read an expert once for
 all the rows that chose it (265 and 288 tokens/s before); from 4 rows they convert each input chunk once for several
 weight rows, and the layers end in fewer kernels (284 and 313 at 8 and 16 before, 212 at 4: docs/runtime, "Flint",
-"Several rows"). Past 16 rows the experts go back to MLX's sorted gather, which reads each expert once for all the
-tokens that chose it.
+"Several rows"); from 4 rows the dense matmuls take the weights as 1 + q/16 into the matrix units (`fragq`), with the
+tuner timing chains of calls as the model runs them (302, 339 and 224 at 8, 16 and 4 rows before, in interleaved
+rounds: docs/runtime, "Few-row matmuls"). Past 16 rows the experts go back to MLX's sorted gather, which reads each
+expert once for all the tokens that chose it.
 
 **In the process: prompt length.** One request: a prompt read from nothing in 2,048-token chunks, then 64 greedy
 steps written after it (4 warm-up steps first; a warm-up prompt before all of it, so no kernel compiles in a timing):
@@ -596,9 +598,9 @@ longer under way: counted from the first reply's first token, mlx-lm's server wr
 Locals 139.
 Replies stream without a stall while another long prompt is read: at most 2.8 s, against 9.7 without mixed passes
 (docs/runtime, "Flint"). Decoding alone, clients with short prompts and 512-token replies, counted while every reply
-streams: 289 to 293 tokens/s at 8 at once, 216 at 4 and 320 to 324 at 16, by how busy the Mac's CPU is besides
-(275.7 and 305.3 at 8 and 16 before the changes for several rows, 256.1 and 280.7 before the expert kernels read
-each expert once for the rows that chose it).
+streams: 305 tokens/s at 8 at once, 221 at 4 and 338 at 16 (289 to 293, 216 and 320 to 324 before the dense
+matmuls' `fragq`, by how busy the Mac's CPU was besides; 275.7 and 305.3 at 8 and 16 before the changes for several
+rows, 256.1 and 280.7 before the expert kernels read each expert once for the rows that chose it).
 
 **Agent tool calls.** Flint as a coding agent's model in the batch engine, one request at a time: six tools shaped
 as OpenCode's (`read` with `filePath`, `offset`, `limit`; `write`; `edit`; `bash` with a required `description`;

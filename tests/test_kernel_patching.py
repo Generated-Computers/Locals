@@ -149,3 +149,52 @@ def test_a_cached_nax_choice_where_nax_does_not_run_is_mlxs(tmp_path, monkeypatc
     dt = str(layer["scales"].dtype).split(".")[-1]
     monkeypatch.setattr(kernels, "_TUNE", {"128x256x20" + ("" if dt == "float16" else f"x{dt}"): ("nax", "r", 32, 1, 4, 8, 1)})
     assert kernels._choose(mx.zeros((20, 256), layer["scales"].dtype), layer) == ("mlx",)
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_fragq_is_the_exact_sum_as_closely_as_mlxs_kernel(dtype):
+    """qmv_frag.launch_q (the weights as 1 + q/16, the scale and bias per group in float) against the exact float32
+    product of the inputs and the dequantized weights: no further from it than MLX's own kernel is, give or take a
+    rounding of the output, at 1 to 16 rows, with and without whole tiles of rows."""
+    from locals import qmv_frag
+
+    dt = getattr(mx, dtype)
+    for N, K in [(256, 512), (1040, 2048)]:
+        w, s, b = mx.quantize((mx.random.normal((N, K), key=mx.random.key(N)) * 0.02).astype(dt), group_size=64, bits=4)
+        s, b = s.astype(dt), b.astype(dt)
+        deq = mx.dequantize(w, s, b, group_size=64, bits=4).astype(mx.float32)
+        for M in (1, 3, 8, 9, 16):
+            x = (mx.random.normal((M, K), key=mx.random.key(M)) * 0.5).astype(dt)
+            exact = x.astype(mx.float32) @ deq.T
+            ref = mx.quantized_matmul(x, w, s, b, transpose=True, group_size=64, bits=4).astype(mx.float32)
+            room = float(mx.abs(ref - exact).max()) + 2 ** -7 * float(mx.abs(exact).max())
+            for TN, NSG in [(1, 4), (2, 8)]:
+                assert qmv_frag.supported_q(M, K, N, TN)
+                y = qmv_frag.launch_q(M, K, N, dt, TN, NSG)(x, w, s, b)
+                assert y.shape == (M, N) and y.dtype == dt
+                assert float(mx.abs(y.astype(mx.float32) - exact).max()) <= room
+
+
+def test_a_shape_timed_before_a_kernel_family_is_timed_again(tmp_path, monkeypatch):
+    """A shape whose timings have no fragq (timed before it existed) keeps its choice in requests, and the idle
+    tuner times it again; once timed with it, it is not pending."""
+    monkeypatch.setattr(kernels, "_TUNE_PATH", str(tmp_path / "tune.json"))
+    monkeypatch.setattr(kernels, "_preset_path", lambda: None)
+    monkeypatch.setattr(kernels, "_TUNE", None)
+    monkeypatch.setattr(kernels, "_CHOICE", {})
+    monkeypatch.setattr(kernels, "_DEFER", True)
+    layer = nn.QuantizedLinear(512, 1024, bits=4, group_size=64)
+    layer.set_dtype(mx.bfloat16)
+    key = "1024x512x8xbfloat16"
+    f32 = "1024x512x8xfloat32"  # (activations fragq does not take: never stale for it)
+    assert not kernels._missing_family({"__times__": {f32: {"mlx": 1.0}}}, f32)
+    (tmp_path / "tune.json").write_text(json.dumps({"__mlx__": mx.__version__, key: ["frag", 2, 4, 1],
+                                                    "__times__": {key: {"frag": 9.0, "mlx": 20.0}}}))
+    tune = kernels._load_tune()
+    assert not tune.get("__stale__") and kernels._missing_family(tune, key)
+    assert kernels._choose(mx.zeros((8, 512), layer["scales"].dtype), layer) == ("frag", 2, 4, 1)  # kept in requests
+    work = kernels.pending_work(nn.Sequential(layer), max_m=8)
+    assert 8 in [m for _, m in work]
+    kernels.tune_one(layer, 8)
+    assert "fragq" in kernels._load_tune()["__times__"][key] and not kernels._missing_family(kernels._load_tune(), key)
+    assert 8 not in [m for _, m in kernels.pending_work(nn.Sequential(layer), max_m=8)]

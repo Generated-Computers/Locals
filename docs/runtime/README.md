@@ -24,7 +24,7 @@ After these steps, `mx.set_wired_limit` is set to the GPU's `max_recommended_wor
 | `qkv.py` | 8-bit keys and values for full-attention layers (`LOCALS_KV_BITS=8`): the attention kernels and the batch cache |
 | `kernels.py` | Matmul routing (`enable_small_m`, `_linear_switch`), the dense prefill path, row packing, `qmm_small`, the autotuner and its cache, and output-layer helpers |
 | `qmv_multi.py` | The `multi` and `v3` multi-row matrix-vector kernels |
-| `qmv_frag.py` | The `frag` and `fragh` kernels, which dequantize straight into 8x8 MMA fragments |
+| `qmv_frag.py` | The `frag` and `fragh` kernels, which dequantize straight into 8x8 MMA fragments, and `fragq`, which feeds them the weights as 1 + q/16 and applies the scales per group |
 | `mma_kernel.py` | `qmm_mma`: MLX's tiled quantized GEMM rebuilt with 8- or 16-row tiles |
 | `nax_kernel.py` | The `nax` kernels: 4-bit matmuls of 1 to 32 rows on the M5's neural accelerators (Metal 4 tensor operations) |
 | `gdn_kernel.py` | One Metal kernel for a Gated DeltaNet decode step |
@@ -240,6 +240,24 @@ to 293 at 8 clients (276 before), 216 at 4 (204), 320 to 324 at 16 (305): a busy
 alone at 8 rows: 293 with four processes parsing JSON beside it, 299 without), and the server's steps are 1% longer
 than the engine's alone, not more.
 
+**Few-row matmuls: the weights as 1 + q/16** (`qmv_frag.launch_q`, the `fragq` family). At 8 rows the dense matmuls
+(the attention's projections, the shared expert, the output layer) took 8.5 ms of a 26.4 ms step, twice what their
+weights take to read. Each weight serves one 8 x 8 matrix product there, and `qmv_frag` spends half again the
+product's own arithmetic dequantizing its two weights a lane (shift, mask, int-to-float, the scale's fma, twice): this
+GPU's matrix units run at its scalar rate (2.85 T multiply-adds/s), from the same ALUs. All of Metal's mixed products
+run at that rate (bf16 x bf16 into float among them), so `fragq` feeds the matrix units a nibble as it is: in the top
+of a bf16 (or fp16) mantissa it is 1 + q/16, exact, and two of them 16 bits apart in one word take one shift, one
+mask and one or; a k-order in which each lane's two weights are such a pair (no copy of the weights in another
+layout: there is no room for one); the activations as they are; and a group's scale and bias on a float accumulator,
+as MLX's qmv factors them. A quarter of the product's arithmetic instead of a half. Timed as the model runs them, each
+call waiting on the one before, at 8 rows: q/k/v 44.4 us against `qmv_frag`'s 51.1, the attention's output 41.1
+against 45.5, the shared expert's down projection 13.0 against 14.3, the output layer 968 against 1,124. Timed the
+tuner's old way, back to back, the kernel was 5 to 15% faster on every shape and the model 2% slower at 8 rows (it
+chose 4 tiles a simdgroup, which overlap well and wait badly), so the tuner now times chains (below,
+"Autotuning"). With its choices, decoding at 8 rows went from 302 to 317 tokens/s, at 16 from 339 to 352, at 4 from
+224 to 227 (three interleaved rounds each); one row is MLX's kernel as before. Through the server, 8 clients 305
+tokens/s instead of 289 to 293, 4 clients 221, 16 clients 338.
+
 **Prompts in bands** (`FusedFlintAttention._banded`). A 2,048-token chunk in a sliding-window layer was one attention
 of 2,048 queries against the ring's 512 keys and the chunk's 2,048 under a mask, four in five of the scores masked.
 In bands of `FLINT_BAND` (512) queries against the keys their window reaches (slices of the keys and of the mask), the
@@ -357,11 +375,12 @@ Tried and left out:
 - **For `qmv_frag` at 8 rows**: the nibbles masked in place against scales prescaled for each position (within 5%
   either way), converted without int-to-float (3 to 6% slower), the next chunk's inputs loaded ahead (2 to 18% slower:
   registers); for the shared expert's shapes other tiles and split-K, within 5%. Its time is set by the matrix units
-  and the dequantization they share an ALU with.
+  and the dequantization they share an ALU with, which `fragq` cuts (above, "Few-row matmuls").
+- **For `fragq`**: the next group's inputs, scales and biases loaded ahead (2 to 26% slower), 32-bit offsets instead
+  of a pointer a tile (the same). Its threadgroup's input sums cost it 0 to 3 us in a chain.
 - **A few-row kernel of Locals's own for 2 to 6 rows** (a lane one weight word of each of R rows, consecutive lanes
   consecutive words, the inputs prescaled once a word for every row): as fast as MLX's at 2 rows, slower from 4
-  (registers). From 5 rows `qmv_frag` wins, from 2 to 4 MLX's own: an attention projection at 4 rows takes 57 to 60
-  us either way, twice what its weights take to read.
+  (registers). From 5 rows `fragq` wins, from 2 to 4 mostly MLX's own.
 - `MLX_MAX_OPS_PER_BUFFER` at 100 and 400: at 4 and 8 rows slower than the default (211 and 299 against 222 and
   303 tokens/s).
 - **Experts shared by rows read once**: the grid ordered so the simdgroups of one weight row for every token run side
@@ -377,8 +396,8 @@ Tried and left out:
   best, against `qmv_frag`'s 106): `qmv_frag`'s tiles and splits swept again (within 10% of the tuner's), its half
   fragments (`launch_h`: 73 against 75 us at 8 rows, 117 against 106 at 16), the activations staged once a
   threadgroup in fragment order (no faster), two accumulators a tile (88 against 74), the input split among a
-  threadgroup's simdgroups (68 to 73 against 76 to 78 at 8 rows, slower at 16). At 8 rows the best would be 3% of a
-  step.
+  threadgroup's simdgroups (68 to 73 against 76 to 78 at 8 rows, slower at 16). A kernel of another design,
+  `fragq` (above, "Few-row matmuls"), took 5% off an 8-row step.
 - The router at 8 and 16 rows split among 2 to 8 simdgroups an expert: slower (37 against 35 us at 8 rows).
 - Experts' input prescaled once a threadgroup instead of in every simdgroup: the same output, slower (66.6 against
   50.9 us): the arithmetic it saved was hidden behind the loads, the barrier it added is not.
@@ -466,13 +485,15 @@ The autotuner chooses among these for each (N, K, M, dtype). A choice is a tuple
 | `v3` | `("v3", VPT, R, NSG)` | `qmv_multi.py` | No int-to-float conversions, which are slow on Apple GPUs. A masked nibble OR-ed into the mantissa of 2^23 gives `2^23 + q * 16^p` exactly, and a subtraction leaves the value, using full-rate instructions only (`qmv_multi.py`) |
 | `frag` | `("frag", TN, NSG, SPLIT)` | `qmv_frag.py` | Computes `Y^T = W X^T` with simdgroup 8x8 matrices, dequantizing into the A-fragments in registers. No threadgroup memory and no barriers. The order of k is permuted so that each lane finds its 32 weights for a 128-wide chunk in one `uint4`, and every weight is read once (`qmv_frag.py`) |
 | `fragh` | `("fragh", TN, NSG, SPLIT)` | `qmv_frag.py` | `frag` with half-precision fragments. Two nibbles become a `half2` through the exponent of 1024 (`v \| 0x64006400`), and one `half2` fma applies scale and bias. Activations are clamped to +/-65504 (`qmv_frag.py`, `qmv_frag.py`) |
+| `fragq` | `("fragq", TN, NSG)` | `qmv_frag.py` (`launch_q`) | 8x8 matrices whose A side is the weights as 1 + q/16 in the activations' 16-bit type: a nibble in the top of the mantissa, exact, two of them (16 bits apart in one word) by one shift, one mask and one or. The B side is the activations as they are. A group's MMAs accumulate c = xsum + sum q x / 16 in float, and y += 16 s c + (b - 16 s) xsum, MLX's own qmv factoring (each group's input sums are summed once a threadgroup). A lane's two weights of MMA j are nibbles j % 4 and j % 4 + 4 of one word because column c of A stands for k = 8 (c / 2 + 4 (j / 4)) + j % 4 + 4 (c % 2). `launch` spends half again an MMA's arithmetic on dequantizing its two weights; this a quarter (`qmv_frag.py`) |
 | `small` | `("small",)` | `kernels.py` (`qmm_small`) | Scalar FMA kernel that reads and dequantizes each weight once for all M rows. Measured on an M2 Pro, it beats MLX for 3 <= M <= 6 on large matrices and loses at M = 8 (`kernels.py`). Launch shape from `small_config(N)` (`kernels.small_config`) |
 | `mma` | `("mma", BM, BN, BK, WM, WN, split)` | `mma_kernel.py` | MLX's `QuantizedBlockLoader` and `steel::BlockMMA` with BM = 8 (or 16) instead of 32. Every weight tile is dequantized once and applied to up to BM rows. MLX's headers are inlined from the installed wheel because custom kernels get no include path (`mma_kernel.py`) |
 | `nax` | `("nax", "r", SN, WN, WK, TK, SPLIT)` or `("nax", BM, BN, BK, WM, WN, SPLIT)` | `nax_kernel.py` | The M5's neural accelerators (`mpp::tensor_ops::matmul2d`, 16 x 32 x 16 products). The register variant (`locals_qmm_naxr`, the one tuning picks): each simdgroup owns 32 or 64 output columns, reads its weights straight into registers (K renumbered so a thread loads 4·TK consecutive 4-bit weights of a row at once) and dequantizes them into the accelerator's operand, whose accumulators stay in their cooperative tensors for the whole K loop; WK simdgroups split K and add up once. The tile variant is MLX's `qmm_t_nax_tgp_impl` with 16-row tiles. Measured on an M5 Pro (macOS 27, MLX 0.32.3): one decode step's 4-bit matmuls 1.6-3.4x MLX's at 6 to 32 rows, timed per shape (whole decode steps not measured yet). Only where `nax_kernel.available()`: it compiles and checks a small case once; elsewhere (no Metal 4 tensor operations, as on macOS 15), or with `LOCALS_NAX=0`, it is no candidate, and a cached `nax` choice is read as `mlx` (`kernels._choose`) |
 
 Notes on the families:
 
-- In `frag` and `fragh`, M is a runtime input (`mcount`), and only `MT = (M + 7) // 8` is compiled in. One compiled kernel therefore serves eight row counts (`qmv_frag.py`, `qmv_frag.launch`).
+- In `frag`, `fragh` and `fragq`, M is a runtime input (`mcount`), and only `MT = (M + 7) // 8` is compiled in. One compiled kernel therefore serves eight row counts (`qmv_frag.py`, `qmv_frag.launch`).
+- `fragq` takes up to 16 rows of float16 or bfloat16 activations. Its outputs are not `frag`'s bits: it sums `s * sum q x + b * sum x` as MLX's qmv does, as close to the exact sum as MLX's kernel is (`test_fragq_is_the_exact_sum_as_closely_as_mlxs_kernel`).
 - `SPLIT > 1` (split-K, used by `frag`, `fragh` and `mma`) divides K across threadgroups, writes float32 partials and sums them afterwards. This helps small matrices fill the GPU (`mma_kernel.qmm_mma`, `qmv_frag.launch.f`).
 - Because `fragh` clamps activations to the fp16 range, it is a candidate only for fp16 activations. A cached `fragh` choice read back for bf16 activations is replaced by `mlx` (`kernels._choose`, `kernels._tune_shape`).
 
@@ -494,8 +515,9 @@ Notes on the families:
 | `mlx` | all | none | `("mlx",)` |
 | `multi` | M <= 4 | `K % (VPT*32) == 0`, `N % R == 0` | `_MULTI_CANDIDATES` = (8,4,2), (16,4,2), (8,2,2) |
 | `v3` | 3 to 6 | `K % (VPT*32) == 0`, `N % R == 0` | `_V3_CANDIDATES` = (8,8,2), (8,4,2), (16,4,2), (16,4,4), (16,2,2) |
-| `frag` | 1 to 32 | `K % (128*SPLIT) == 0`, `N % (8*TN) == 0`; SPLIT > 1 only when K >= 4096 | `_FRAG_CANDIDATES` = (2,2,1), (4,2,1), (2,4,1), (1,2,2) |
+| `frag` | 1 to 32 | `K % (128*SPLIT) == 0`, `N % (8*TN) == 0`; SPLIT > 1 only when K >= 4096 | `_FRAG_CANDIDATES` = (2,2,1), (4,2,1), (2,4,1), (1,2,2), (2,8,1), (1,4,1) |
 | `fragh` | 1 to 32 | as `frag`, fp16 activations only | same as `frag` |
+| `fragq` | 1 to 16 | `K % 64 == 0`, `N % (8*TN) == 0`, fp16 or bf16 activations (`supported_q`) | `_FRAGQ_CANDIDATES` = (1,2), (1,4), (2,2), (2,4), (2,8), (4,4) |
 | `small` | 3 to 6 (`MIN_M_SMALL`, `MAX_M_SMALL`) | N >= 4096 or K >= 4096 | `("small",)` |
 | `mma` | 2 to 32 | `N % BN`, `K % (BK*split)`, `(K/split) % 64` and `BN % (8*WN)` all zero | `_MMA_CANDIDATES[8]` for M <= 8, `[16]` above |
 | `nax` | 2 to 32, where `nax_kernel.available()` | `nax_kernel.supported(M, K, N, cfg)`: the tile variant needs a 32-wide side per simdgroup (`tile_matmad_nax` computes nothing for one 16 x 16 fragment by one); the register variant N % (SN·WN), K % (16·TK·SPLIT), at most 32 KB of threadgroup memory and 1,024 threads | `nax_kernel.CANDIDATES`: 8 tile and 13 register configurations |
@@ -505,8 +527,8 @@ At M <= 2, `v3` is not a candidate: it wins in isolation there but loses about 1
 The tuning procedure (`kernels._tune_shape`):
 
 1. **Correctness.** Every candidate runs on a random input (fixed key `M * 131 + K`, not the global random state). Its output must be within `0.05 * (1 + max|ref|)` of MLX's. A NaN or an exception removes the candidate.
-2. **Timing.** Candidates are timed on `max(1, min(16, (64 << 20) // nbytes))` copies of the weights. The aim (code comment) is that the weights come from DRAM as inside a model, not from the GPU's system cache. In fact the copies total at most about 64 MB, unless a single copy is already larger, and well below that for layers under 4 MB, where the 16-copy cap applies. Each timing uses `reps = max(1, 8 // ncopy)` and is divided by the copy count. Four interleaved rounds run, and each candidate keeps its best round.
-3. **Decision.** A non-MLX kernel must be at least 10% faster than MLX (`< 0.9 *` MLX's time). Otherwise the choice is `("mlx",)`.
+2. **Timing.** Candidates are timed on `max(1, min(16, (64 << 20) // nbytes))` copies of the weights. The aim (code comment) is that the weights come from DRAM as inside a model, not from the GPU's system cache. In fact the copies total at most about 64 MB, unless a single copy is already larger, and well below that for layers under 4 MB, where the 16-copy cap applies. The calls form a chain: each call's input waits on the last call's output (an add of a zero slice of it), as a model's layers wait on each other, `max(16, 2 * ncopy)` calls, the graph built before the clock starts (`_chain_us`); the chain's own adds, timed alone, are taken off. Calls timed back to back without waiting overlapped one's start with another's end, which rewarded few large threadgroups: at 8 rows of Flint's q/k/v projection, `fragq` with 4 tiles a simdgroup was then the fastest and 14% slower than with 1 inside the model, and choices made that way made Flint's 8-row step 2% slower where those made from chains made it 5% faster. Four interleaved rounds run, and each candidate keeps its best round.
+3. **Decision.** A non-MLX kernel must be at least 10% faster than MLX over the whole chain, its adds included (`< 0.9 *` MLX's time): a small shape's own time is not much more than noise. Otherwise the choice is `("mlx",)`.
 4. **Storage.** The choice is stored under the shape key. The best candidate of each family is also stored under `"{key}|{family}"` for the whole-step tuner. The cache file is rewritten.
 
 ### Whole-step tuning (`model_tune`, full mode only)
@@ -550,7 +572,7 @@ When `tune_model` returns with `_DEFER` set, the service builds `kernels.pending
   3. A user cache that does not parse is renamed to `.bad`, not silently replaced.
   4. If there is no readable user cache (none, or one just renamed to `.bad`) and the preset is non-empty, a user cache is written. Every write leaves out what the preset says (`_beyond_preset`), so the user's file holds only what this Mac measured or changed (a crash pin, for example). A copy of the preset in it overrode later presets: a release that corrected an entry never reached anyone who had run Locals once. (Files written before this keep their copies.)
 - **Writes** (`_save_tune`) merge with the file as it is on disk, under an `fcntl` lock on `<cache>.lock` (another process's results are kept), then replace the whole file atomically, via a temporary file flushed to disk and `os.replace`. Writes and tuning both take `_TUNE_LOCK`, an `RLock`, because the server runs two engines (`kernels.py`, `kernels.py`).
-- **Format:** a JSON object. Shape keys (`"2560x10240x4"`, `"…x4xbfloat16"`) map to choice lists such as `["frag", 2, 2, 1]`. `"…xP"` keys hold the prompt-reading choice (`["dense"]` or `["mlx"]`). `"__times__"` holds what tuning measured, per shape key and family in microseconds, which `locals tune --report` (`tune_report`) sums per batch size. `"…|family"` keys hold per-family winners. `"__model_tuned_pipe__…"` keys hold lists of finished row counts. `"__mlx__"` is the MLX version the file's timings were taken with. When a load finds another one, the shapes this Mac timed (matmul shapes and how prompts are read) are listed in `"__stale__"` (`_mark_stale`, with a log line): they keep their choice, and the idle tuner (`pending_work`, `tune_one`) and `locals tune` (`pretune`) time them again, each leaving the list once timed (`_unstale`; a merge keeps only what both files still list). Choices timed under an older MLX used to stay for good. A file from before this gets the version and nothing stale. Keys that start with `__` are kept as they are, and all others are read as tuples (`kernels._read_tune`).
+- **Format:** a JSON object. Shape keys (`"2560x10240x4"`, `"…x4xbfloat16"`) map to choice lists such as `["frag", 2, 2, 1]`. `"…xP"` keys hold the prompt-reading choice (`["dense"]` or `["mlx"]`). `"__times__"` holds what tuning measured, per shape key and family in microseconds, which `locals tune --report` (`tune_report`) sums per batch size. `"…|family"` keys hold per-family winners. `"__model_tuned_pipe__…"` keys hold lists of finished row counts. `"__mlx__"` is the MLX version the file's timings were taken with. When a load finds another one, the shapes this Mac timed (matmul shapes and how prompts are read) are listed in `"__stale__"` (`_mark_stale`, with a log line): they keep their choice, and the idle tuner (`pending_work`, `tune_one`) and `locals tune` (`pretune`) time them again, each leaving the list once timed (`_unstale`; a merge keeps only what both files still list). Choices timed under an older MLX used to stay for good. A file from before this gets the version and nothing stale. A shape whose timings have no `fragq` (timed before the family existed, where it applies) counts as stale the same way without being listed (`_missing_family`): it keeps its choice until a tuner times it again, and then it has. Keys that start with `__` are kept as they are, and all others are read as tuples (`kernels._read_tune`).
 - **Presets:** `locals/presets/tune_v6_applegpu_g14s.json` (M2 Pro and M2 Max) and `tune_v6_applegpu_g17s.json` (M5 Pro: so far only how prompts are read, measured on one for Qwen3.5-4B and 9B) are shipped. It is packaged through `[tool.setuptools.package-data]` (`pyproject.toml:58-59`). Setting `LOCALS_NO_PRESET=1` hides presets, so a start behaves as on a GPU without one (`kernels._preset_path`).
 
 To re-tune from scratch, stop every Locals server, delete the cache file (or point `LOCALS_TUNE_CACHE` at a new path) and set `LOCALS_NO_PRESET=1`. A server left running writes its copy of the cache back at its next save.

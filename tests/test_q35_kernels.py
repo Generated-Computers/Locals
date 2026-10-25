@@ -77,6 +77,9 @@ def test_kernels_match_mlx(M, dtype):
             if qmv_frag.supported(M, K, N, TN, SP):
                 outs.append(qmv_frag.qmv_frag(x, lin.weight, lin.scales, lin.biases, TN, NSG, SP))
                 outs.append(qmv_frag.launch_h(M, K, N, x.dtype, TN, NSG, SP)(x, lin.weight, lin.scales, lin.biases))
+        for TN, NSG in [(1, 4), (2, 8), (4, 4)]:
+            if qmv_frag.supported_q(M, K, N, TN):
+                outs.append(qmv_frag.launch_q(M, K, N, x.dtype, TN, NSG)(x, lin.weight, lin.scales, lin.biases))
         if M <= 6:
             for VPT, R, NSG in [(8, 8, 2), (16, 4, 2)]:
                 outs.append(qmv_multi.launch_v3(M, K, N, x.dtype, VPT, R, NSG)(x, lin.weight, lin.scales, lin.biases))

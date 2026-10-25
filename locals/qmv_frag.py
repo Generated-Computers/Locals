@@ -342,3 +342,199 @@ def launch_h(M: int, K: int, N: int, dtype, TN: int = 2, NSG: int = 2, SPLIT: in
 
     return f
 
+
+
+# --- weights as 1 + q/16, the scale per group ---------------------------------
+#
+# At 8 rows a weight is used by one MMA: `launch` dequantizes two weights for every
+# MMA of a lane (shift, mask, convert and the scale's fma, twice), half again the
+# MMA's own arithmetic, and the step is bound by both. Here a nibble goes into the
+# top of a 16-bit float's mantissa as it is: 1 + q/16, exact, two of them by one
+# shift, one mask and one or on a 32-bit word, when the lane's two weights are
+# nibbles p and p + 4 of one word (16 bits apart). The activations go in as they
+# are (bf16 or fp16, no conversion), and the MMA accumulates in float a group's
+# c = sum (1 + q/16) x = xsum + sum q x / 16, so y += 16 s c + (b - 16 s) xsum
+# (b - 16 s is exact in float for bf16 or fp16 scale and bias). That is MLX's own
+# qmv's factoring (scale times the dot product, plus bias times the inputs' sum),
+# in float: not launch's bits, as close to the exact sum. Each group's input sums
+# are summed once a threadgroup into threadgroup memory.
+#
+# For MMA j (0..7) of a group of 64 k's, column c of A (the weights, rows n) stands
+# for k = 8 (c / 2 + 4 (j / 4)) + j % 4 + 4 (c % 2): a lane's two elements (columns
+# fn, fn + 1) are nibbles j % 4 and j % 4 + 4 of word fn / 2 + 4 (j / 4) of the
+# group. B's row fm (the inputs) stands for k = 4 fm + j % 4 + 32 (j / 4), so a
+# lane reads four runs of four inputs a group (two rows of x) and pairs them.
+
+_SOURCE_Q = r"""
+    const ushort lane = thread_index_in_simdgroup;
+    const ushort sg = simdgroup_index_in_threadgroup;
+    const short qid = lane / 4;
+    const short fm = (qid & 4) + ((lane / 2) % 4);
+    const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+    const int M = int(mcount[0]);  // rows: a runtime value, so M = 1..8 (9..16) share one compiled kernel
+    constexpr int Kw = K / 8, G = K / 64, MR = 8 * MT;
+    threadgroup float xs[G * MR];  // each group's sum of each input row
+    for (int i = int(thread_position_in_threadgroup.x); i < G * MR; i += NSG * 32) {
+        const int g = i / MR, m = i % MR;
+        float s = 0.0f;
+        if (m < M) {
+            const device uint4* xr = (const device uint4*)(x + m * K + g * 64);
+            UNROLL
+            for (int q = 0; q < 8; q++) {
+                const uint4 u = xr[q];
+                UNROLL
+                for (int e = 0; e < 4; e++) {
+                    const vec<T, 2> v = as_type<vec<T, 2>>(u[e]);
+                    s += float(v[0]) + float(v[1]);
+                }
+            }
+        }
+        xs[i] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int n0 = (int(threadgroup_position_in_grid.x) * NSG + int(sg)) * (8 * TN);
+    if (n0 >= N) {
+        return;
+    }
+
+    simdgroup_matrix<float, 8, 8> acc[TN][MT];
+    UNROLL
+    for (int t = 0; t < TN; t++) {
+        UNROLL
+        for (int mt = 0; mt < MT; mt++) {
+            acc[t][mt] = simdgroup_matrix<float, 8, 8>(0);
+        }
+    }
+    const device uint32_t* wp = w + (n0 + fm) * Kw + fn / 2;  // tile t: + 8 t Kw
+    const decltype(scales) sp = scales + (n0 + fm) * G;       // tile t: + 8 t G
+    const decltype(biases) bp = biases + (n0 + fm) * G;
+    const device T* xa[MT];
+    const device T* xb[MT];
+    UNROLL
+    for (int mt = 0; mt < MT; mt++) {
+        xa[mt] = x + min(mt * 8 + fn, M - 1) * K + 4 * fm;
+        xb[mt] = x + min(mt * 8 + fn + 1, M - 1) * K + 4 * fm;
+    }
+    uint wc[TN][2];
+    UNROLL
+    for (int t = 0; t < TN; t++) {
+        wc[t][0] = wp[t * 8 * Kw];
+        wc[t][1] = wp[t * 8 * Kw + 4];
+    }
+    for (int g = 0; g < G; g++) {
+        simdgroup_matrix<T, 8, 8> bf[MT][8];
+        float xsa[MT], xsb[MT];
+        UNROLL
+        for (int mt = 0; mt < MT; mt++) {
+            const uint2 a0 = *((const device uint2*)(xa[mt] + g * 64)), a1 = *((const device uint2*)(xa[mt] + g * 64 + 32));
+            const uint2 b0 = *((const device uint2*)(xb[mt] + g * 64)), b1 = *((const device uint2*)(xb[mt] + g * 64 + 32));
+            const uint pr[8] = {(a0.x & 0xffffu) | (b0.x << 16), (a0.x >> 16) | (b0.x & 0xffff0000u),
+                                (a0.y & 0xffffu) | (b0.y << 16), (a0.y >> 16) | (b0.y & 0xffff0000u),
+                                (a1.x & 0xffffu) | (b1.x << 16), (a1.x >> 16) | (b1.x & 0xffff0000u),
+                                (a1.y & 0xffffu) | (b1.y << 16), (a1.y >> 16) | (b1.y & 0xffff0000u)};
+            UNROLL
+            for (int j = 0; j < 8; j++) {
+                const vec<T, 2> v = as_type<vec<T, 2>>(pr[j]);
+                bf[mt][j].thread_elements()[0] = v[0];
+                bf[mt][j].thread_elements()[1] = v[1];
+            }
+            xsa[mt] = xs[g * MR + mt * 8 + fn];
+            xsb[mt] = xs[g * MR + mt * 8 + fn + 1];
+        }
+        UNROLL
+        for (int t = 0; t < TN; t++) {
+            const uint w0 = wc[t][0], w1 = wc[t][1];
+            if (g + 1 < G) {
+                wc[t][0] = wp[t * 8 * Kw + (g + 1) * 8];
+                wc[t][1] = wp[t * 8 * Kw + (g + 1) * 8 + 4];
+            }
+            simdgroup_matrix<float, 8, 8> c[MT];
+            UNROLL
+            for (int mt = 0; mt < MT; mt++) {
+                c[mt] = simdgroup_matrix<float, 8, 8>(0);
+            }
+            UNROLL
+            for (int j = 0; j < 8; j++) {
+                const uint word = j < 4 ? w0 : w1;
+                const int p = j % 4;
+                uint u;
+                if (IS_BF16) {  // bf16 1 + q/16: q in mantissa bits 3-6 of each half
+                    u = ((p == 0 ? (word << 3) : (word >> (4 * p - 3))) & 0x00780078u) | 0x3F803F80u;
+                } else {  // fp16 1 + q/16: q in mantissa bits 6-9
+                    u = ((p <= 1 ? (word << (6 - 4 * p)) : (word >> (4 * p - 6))) & 0x03C003C0u) | 0x3C003C00u;
+                }
+                const vec<T, 2> av = as_type<vec<T, 2>>(u);
+                simdgroup_matrix<T, 8, 8> a;
+                a.thread_elements()[0] = av[0];
+                a.thread_elements()[1] = av[1];
+                UNROLL
+                for (int mt = 0; mt < MT; mt++) {
+                    simdgroup_multiply_accumulate(c[mt], a, bf[mt][j], c[mt]);
+                }
+            }
+            const float s16 = 16.0f * float(sp[t * 8 * G + g]), bb = float(bp[t * 8 * G + g]) - s16;
+            UNROLL
+            for (int mt = 0; mt < MT; mt++) {
+                const float c0 = c[mt].thread_elements()[0], c1 = c[mt].thread_elements()[1];
+                const float y0 = acc[t][mt].thread_elements()[0], y1 = acc[t][mt].thread_elements()[1];
+                acc[t][mt].thread_elements()[0] = fma(s16, c0, fma(bb, xsa[mt], y0));
+                acc[t][mt].thread_elements()[1] = fma(s16, c1, fma(bb, xsb[mt], y1));
+            }
+        }
+    }
+
+    UNROLL
+    for (int t = 0; t < TN; t++) {
+        const int row = n0 + t * 8 + fm;
+        UNROLL
+        for (int mt = 0; mt < MT; mt++) {
+            const int m = mt * 8 + fn;
+            const float e0 = acc[t][mt].thread_elements()[0], e1 = acc[t][mt].thread_elements()[1];
+            if (m < M) {
+                y[m * N + row] = static_cast<T>(e0);
+            }
+            if (m + 1 < M) {
+                y[(m + 1) * N + row] = static_cast<T>(e1);
+            }
+        }
+    }
+"""
+
+_KERNEL_Q = None
+
+
+def _kernel_q():
+    global _KERNEL_Q
+    if _KERNEL_Q is None:
+        _KERNEL_Q = mx.fast.metal_kernel(
+            name="locals_qmv_fragq",
+            input_names=["x", "w", "scales", "biases", "mcount"],
+            output_names=["y"],
+            source=_SOURCE_Q,
+            header=_HEADER,
+        )
+    return _KERNEL_Q
+
+
+def supported_q(M: int, K: int, N: int, TN: int = 2) -> bool:
+    """Up to 16 rows, groups of 64 along K, whole tiles of 8 TN rows (the threadgroup's input sums: K / 64 * 8 * MT
+    floats)."""
+    return 1 <= M <= 16 and K % 64 == 0 and N % (8 * TN) == 0 and K // 64 * 8 * ((M + 7) // 8) * 4 <= 16384
+
+
+def launch_q(M: int, K: int, N: int, dtype, TN: int = 2, NSG: int = 4):
+    """A closure (x, w, scales, biases) -> y: the weights as 1 + q/16 in the activations' 16-bit type, the scale per
+    group in float (``_SOURCE_Q``)."""
+    template = [("T", dtype), ("MT", (M + 7) // 8), ("K", K), ("N", N), ("TN", TN), ("NSG", NSG),
+                ("IS_BF16", int(dtype == mx.bfloat16))]
+    mcount = mx.array([M], dtype=mx.int32)
+    n_tg = (N + 8 * TN * NSG - 1) // (8 * TN * NSG)
+    grid, tg = (n_tg * 32 * NSG, 1, 1), (32 * NSG, 1, 1)
+    kern = _kernel_q()
+
+    def f(x, w, scales, biases):
+        (y,) = kern(inputs=[x, w, scales, biases, mcount], template=template, grid=grid, threadgroup=tg,
+                    output_shapes=[(M, N)], output_dtypes=[dtype])
+        return y
+
+    return f

@@ -135,7 +135,8 @@ _TUNE_PATH = _os.environ.get("LOCALS_TUNE_CACHE") or _os.path.expanduser("~/.cac
 _TUNE = None
 _MULTI_CANDIDATES = [(8, 4, 2), (16, 4, 2), (8, 2, 2)]  # (VPT, R, NSG), M <= 4
 _V3_CANDIDATES = [(8, 8, 2), (8, 4, 2), (16, 4, 2), (16, 4, 4), (16, 2, 2)]  # (VPT, R, NSG), 3 <= M <= 6
-_FRAG_CANDIDATES = [(2, 2, 1), (4, 2, 1), (2, 4, 1), (1, 2, 2)]  # (TN, NSG, SPLIT)
+_FRAG_CANDIDATES = [(2, 2, 1), (4, 2, 1), (2, 4, 1), (1, 2, 2), (2, 8, 1), (1, 4, 1)]  # (TN, NSG, SPLIT)
+_FRAGQ_CANDIDATES = [(1, 2), (1, 4), (2, 2), (2, 4), (2, 8), (4, 4)]  # (TN, NSG), M <= 16
 _MMA_CANDIDATES = {
     8: [(8, 32, 64, 1, 2, 1), (8, 32, 64, 1, 4, 1), (8, 64, 64, 1, 8, 1), (8, 32, 32, 1, 2, 1), (8, 32, 64, 1, 2, 2)],
     16: [(16, 32, 64, 2, 2, 1), (16, 64, 64, 2, 2, 1), (16, 32, 64, 1, 4, 1), (16, 64, 64, 1, 8, 1)],
@@ -195,9 +196,23 @@ def _mark_stale(tune: dict, user: Optional[dict]) -> bool:
     return True
 
 
+def _missing_family(tune: dict, key: str) -> bool:
+    """Whether ``key`` (a matmul shape's choice) was timed before a kernel family that applies to it existed (its
+    timings have no ``fragq``): it keeps its choice until it is timed again, as a stale one."""
+    t = (tune.get("__times__") or {}).get(key)
+    parts = key.split("x")
+    if t is None or "fragq" in t or not _SHAPE_KEY.fullmatch(key) or parts[2] == "P" or parts[3:] not in ([], ["bfloat16"]):
+        return False  # (fragq takes float16 and bfloat16 activations)
+    from .qmv_frag import supported_q
+
+    N, K, M = (int(v) for v in key.split("x")[:3])
+    return any(supported_q(M, K, N, c[0]) for c in _FRAGQ_CANDIDATES)
+
+
 def _is_stale(tune: dict, key: str) -> bool:
-    """Whether ``key`` is to be timed again now: stale, and a tuner runs."""
-    return _RETIME and key in (tune.get("__stale__") or ())
+    """Whether ``key`` is to be timed again now: stale (or timed before a kernel family it can take), and a tuner
+    runs."""
+    return _RETIME and (key in (tune.get("__stale__") or ()) or _missing_family(tune, key))
 
 
 def _unstale(tune: dict, key: str) -> None:
@@ -468,6 +483,19 @@ def _time_us(fn, reps=12):
     return (_time.perf_counter() - t0) / reps * 1e6
 
 
+def _chain_us(build, calls, warm: bool = True):
+    """Microseconds a call of the dependent chain ``build()`` makes (``calls`` calls): built (and with ``warm`` run
+    once first, which compiles its kernels), built again and run on the clock."""
+    if warm:
+        mx.eval(build())
+    y = build()
+    mx.synchronize()
+    t0 = _time.perf_counter()
+    mx.eval(y)
+    mx.synchronize()
+    return (_time.perf_counter() - t0) / calls * 1e6
+
+
 _LAUNCH = {}
 
 
@@ -482,6 +510,10 @@ def _launcher(choice, M, K, N, dtype):
         from .qmv_frag import launch, launch_h
 
         f = (launch if kind == "frag" else launch_h)(M, K, N, dtype, *choice[1:])
+    elif kind == "fragq":
+        from .qmv_frag import launch_q
+
+        f = launch_q(M, K, N, dtype, *choice[1:])
     elif kind == "v3":
         from .qmv_multi import launch_v3
 
@@ -609,6 +641,8 @@ def _time_shape(x2, mod, M, K, N, dt, key, tune):
         cands += [("v3", *c) for c in _V3_CANDIDATES if K % (c[0] * 32) == 0 and N % c[1] == 0]
     for kind in ("frag", "fragh") if dt == "float16" else ("frag",):  # fragh clamps to fp16's range
         cands += [(kind, *c) for c in _FRAG_CANDIDATES if qmv_frag.supported(M, K, N, c[0], c[2]) and (c[2] == 1 or K >= 4096)]
+    if dt in ("float16", "bfloat16"):
+        cands += [("fragq", *c) for c in _FRAGQ_CANDIDATES if qmv_frag.supported_q(M, K, N, c[0])]
     if M >= 2:
         if MIN_M_SMALL <= M <= MAX_M_SMALL and (N >= 4096 or K >= 4096):
             cands.append(("small",))
@@ -633,29 +667,43 @@ def _time_shape(x2, mod, M, K, N, dt, key, tune):
         except Exception:
             continue
     # Time over enough weight copies (>= 64 MB) that they come from DRAM, as
-    # inside a model, not from the GPU's system cache; interleaved rounds, best
-    # round per candidate, for robustness to machine noise.
+    # inside a model, not from the GPU's system cache; each call's input waiting
+    # on the call before (a chain, as a model's layers wait on each other), the
+    # graph built before the clock starts and the chain's own add taken off.
+    # Calls that do not wait overlap one's start with another's end, which
+    # rewarded few large threadgroups: at 8 rows of Flint's q/k/v, fragq with 4
+    # tiles a simdgroup was the fastest that way and 14% slower than with 1 in
+    # the model. Interleaved rounds, best round per candidate, for robustness to
+    # machine noise.
     nbytes = sum(mod[k].nbytes for k in ("weight", "scales", "biases"))
     ncopy = max(1, min(16, (64 << 20) // max(nbytes, 1)))
     copies = [{k: mx.array(mod[k]) + 0 if k != "weight" else mx.array(mod[k]) | 0 for k in ("weight", "scales", "biases")}
               for _ in range(ncopy)]
     mx.eval(copies)
+    calls = 16
 
-    def sweep(c):
-        f = _launcher(c, M, K, N, x2.dtype)
-        return [f(xr, cp["weight"], cp["scales"], cp["biases"]) for cp in copies]
+    def chain(f):
+        y = xr
+        for i in range(calls):
+            cp = copies[i % ncopy]
+            o = f(y, cp["weight"], cp["scales"], cp["biases"])
+            y = xr + (o[:, :1] * 0).astype(xr.dtype)
+        return y
 
+    base = min(_chain_us(lambda: chain(lambda y, w, sc, bi: y), calls, warm=r == 0) for r in range(3))
     times = {c: float("inf") for c in ok}
-    for _ in range(4):
+    for r in range(4):
         for c in ok:
-            times[c] = min(times[c], _time_us(lambda: sweep(c), reps=max(1, 8 // ncopy)) / ncopy)
+            f = _launcher(c, M, K, N, x2.dtype)
+            times[c] = min(times[c], max(0.1, _chain_us(lambda: chain(f), calls, warm=r == 0) - base))
     del copies
     mlx_t = times[("mlx",)]
     for fam in {c[0] for c in ok}:
         tune[f"{key}|{fam}"] = min((c for c in ok if c[0] == fam), key=lambda c: times[c])
     tune.setdefault("__times__", {})[key] = {fam: round(min(times[c] for c in ok if c[0] == fam), 1) for fam in {c[0] for c in ok}}
     challenger = min((c for c in ok if c[0] != "mlx"), key=lambda c: times[c], default=None)
-    choice = challenger if challenger is not None and times[challenger] < 0.9 * mlx_t else ("mlx",)
+    # (against the chain's whole time: a small shape's own time is not much more than noise)
+    choice = challenger if challenger is not None and times[challenger] + base < 0.9 * (mlx_t + base) else ("mlx",)
     best = (times[choice], choice)
     tune[key] = best[1]
     _CHOICE[(N, K, M, dt)] = best[1]
@@ -1135,7 +1183,7 @@ def forward_last(model, tokens: mx.array, cache) -> mx.array:
     return head_logits(model, h)[:, -1, :]
 
 
-def model_tune(model, ms=range(2, MAX_M + 1), families=("v3", "multi", "fragh", "frag", "mma", "nax"), steps: int = 16, rounds: int = 5, verbose: bool = False) -> dict:
+def model_tune(model, ms=range(2, MAX_M + 1), families=("v3", "multi", "fragh", "frag", "fragq", "mma", "nax"), steps: int = 16, rounds: int = 5, verbose: bool = False) -> dict:
     """Pick one kernel family per row count M by timing the real decode step.
 
     Per-shape timings in isolation miss interactions inside a model (cache
@@ -1229,7 +1277,7 @@ def warmup(model, ms=range(1, 9)) -> int:
         for M in ms:
             x = mx.zeros((M, K), dt)
             c = _choose(x, mod)
-            key = (c, M if c[0] not in ("frag", "fragh") else (M + 7) // 8, K, N, dt)
+            key = (c, M if c[0] not in ("frag", "fragh", "fragq") else (M + 7) // 8, K, N, dt)
             if key in failed:  # the same kernel instance as one that failed (frag shares one across 8 row counts)
                 _CHOICE[(N, K, M, str(dt).split(".")[-1])] = ("mlx",)
                 continue
@@ -1262,7 +1310,7 @@ def pretune(model, max_m: int = MAX_M, log=None) -> int:
             stale = set(tune.get("__stale__") or ())
             for M in range(MIN_M, max_m + 1):
                 key = f"{N}x{K}x{M}" + ("" if name == "float16" else f"x{name}")
-                work.append((mod, M, K, dt, key not in tune or key in stale))
+                work.append((mod, M, K, dt, key not in tune or key in stale or _missing_family(tune, key)))
             if N * K <= DENSE_MAX:  # how prompts are read through it (_dense_prefill)
                 key = _prefill_key(N, K, name)
                 work.append((mod, PREFILL_TUNE_M, K, dt, key not in tune or key in stale))
@@ -1301,7 +1349,7 @@ def pending_work(model, max_m: int = 16) -> list:
             stale = set(tune.get("__stale__") or ())
             for M in range(MIN_M, max_m + 1):
                 key = f"{N}x{K}x{M}" + ("" if name == "float16" else f"x{name}")
-                if key not in tune or key in stale:
+                if key not in tune or key in stale or _missing_family(tune, key):
                     work.append((mod, M))
             if N * K <= DENSE_MAX and (_prefill_key(N, K, name) not in tune or _prefill_key(N, K, name) in stale):
                 work.append((mod, PREFILL_TUNE_M))  # how prompts are read through it, after the batch sizes

@@ -403,7 +403,7 @@ On a Mac with less than 12 GB of memory, the default is Qwen3.5-2B instead
 
 On a Mac with 24 GB or more, Recursive's Flint (40B, 2.5B active per token) runs
 with `--model flint` (`locals/flint` in your editor; 17.8 GB). On an M4 Pro with
-24 GB: 117 tps for one request and 305 with 8 at once, where mlx-lm gives 85 and
+24 GB: 117 tps for one request and 319 with 8 at once, where mlx-lm gives 85 and
 202. A 24 GB Mac gives the GPU 16 GB unless told otherwise; `locals start` says
 how to raise that, until the next restart. For long work, `LOCALS_KV_BITS=8`
 keeps Flint's keys and values in 8 bits: requests up to 67,584 tokens instead of
