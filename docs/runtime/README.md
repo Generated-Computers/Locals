@@ -341,8 +341,13 @@ Tried and left out:
   The routed experts go through MLX's sorted gather_qmm, whose tiles are 16 rows of one expert (its time steps with
   every 16 rows an expert: 8 rows cost what 16 do, 40 what 48 do; 4.8 TFLOPS in whole tiles, against 5.3 for one
   quantized GEMM of the same arithmetic): Flint's routing gives an expert 1 to 675 rows of a chunk (median 35), so
-  15.7% of the rows it computes are padding, at most 0.15 s of a chunk, which only a grouped GEMM of its own could
-  take back. Projections dequantized once a chunk for a bf16 GEMM are 6 to 7% faster alone (q/k/v 7.58 against 8.16
+  15.7% of the rows it computes are padding, at most 0.15 s of a chunk. A grouped GEMM of Locals's own cannot take it
+  back: `qmv_frag`, its best few-row kernel, at its best case (4-bit weights, cheaper to unpack than Flint's 3-bit;
+  whole tiles; no gather; 256 experts' gate/up stacked into one 262,144 x 2,048 matrix) does 4.08 TFLOPS on 8-row
+  tiles and 4.55 on 16-row ones, so 8-row tiles (padding down to about 7%) would give at most 3.8 and 16-row tiles
+  for full experts with 8-row ones for the rest at most 4.2, against MLX's 4.0 to 4.2 with the padding; 3-bit
+  unpacking, the gather and the tile schedule only take from that. An 8-row tile in MLX's own kernel for an expert's
+  last rows is the change that would. Projections dequantized once a chunk for a bf16 GEMM are 6 to 7% faster alone (q/k/v 7.58 against 8.16
   ms at 2,048 rows), within noise in the model (831 tokens/s at 4k against 844); 4,096-token chunks 2.5% faster for
   0.4 GB more at the peak.
 
