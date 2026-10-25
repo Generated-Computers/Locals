@@ -192,6 +192,17 @@ server, three replies streaming while an 8,000-token prompt arrived stalled for 
 prompt) with `LOCALS_MIX_CHUNK=0`; the prompt's first token came after 10.4 s against 9.8, the three wrote 104 tokens/s
 together against 107.
 
+**A batch's experts read once** (`moe.expert_order`). The expert kernels took a simdgroup per (token, expert) pair,
+so rows that chose the same expert (16% of a batch's choices at 8 rows of Flint's routing, 27% at 16) each read it.
+They now take the pairs in the order of their experts (one argsort a layer, none for one token): the simdgroup at the
+start of each run of one expert loads its weight words once and serves the run, the others return; the down
+projection writes each pair's output and a combine sums a token's pairs in their order, so the outputs are bit for
+bit the same. Alone, at Flint's shapes, up and down take 334 us a layer at 8 rows instead of 367 and 620 at 16
+instead of 700; even at one row 2% less (the down projection's pairs run side by side). Decoding: 284 tokens/s at 8
+rows instead of 265, 313 at 16 instead of 288, 117 at one instead of 115; through the server, every reply streaming,
+276 at 8 clients instead of 256 and 305 at 16 instead of 281. MLX's sorted gather (each expert once) was slower at
+8 and 16 rows than either: 233 and 277.
+
 **Prompts in bands** (`FusedFlintAttention._banded`). A 2,048-token chunk in a sliding-window layer was one attention
 of 2,048 queries against the ring's 512 keys and the chunk's 2,048 under a mask, four in five of the scores masked.
 In bands of `FLINT_BAND` (512) queries against the keys their window reaches (slices of the keys and of the mask), the
@@ -306,16 +317,26 @@ Tried and left out:
   with the scale and bias folded into the dot products (553), keys on lanes with one reduction per 32 keys (461), and
   the matrix-unit kernel on bf16 keys (520 against MLX's 394). All are bound by arithmetic, not by the bytes read.
 - `MLX_MAX_OPS_PER_BUFFER` from 20 to 1,000: within noise once the expert kernels stopped ending command buffers.
+- **Faster few-row matmuls** for a batch's attention projections, shared expert and output layer, which run near
+  this GPU's matrix-unit rate (2.85 T multiply-adds/s, float or half alike; q/k/v at 16 rows is 168M of them, 59 us at
+  best, against `qmv_frag`'s 106): `qmv_frag`'s tiles and splits swept again (within 10% of the tuner's), its half
+  fragments (`launch_h`: 73 against 75 us at 8 rows, 117 against 106 at 16), the activations staged once a
+  threadgroup in fragment order (no faster), two accumulators a tile (88 against 74), the input split among a
+  threadgroup's simdgroups (68 to 73 against 76 to 78 at 8 rows, slower at 16). At 8 rows the best would be 3% of a
+  step.
+- The router at 8 and 16 rows split among 2 to 8 simdgroups an expert: slower (37 against 35 us at 8 rows).
+- Experts' input prescaled once a threadgroup instead of in every simdgroup: the same output, slower (66.6 against
+  50.9 us): the arithmetic it saved was hidden behind the loads, the barrier it added is not.
 
 Measured on an M4 Pro (24 GB, the GPU limit raised to 20 GB), mlx-community/flint-mixed-3-4bit, 256-token prompts,
 decode steps pipelined as the engines run them (all of it, and through the servers: docs/benchmarks, section 11):
 
 | Requests at once | stock mlx-lm | Locals before | Locals |
 |---|---|---|---|
-| 1 | 85 tok/s | 79 | 115 |
-| 4 | 177 | 174 | 206 |
-| 8 | 202 | 223 | 264 |
-| 16 | 245 | 279 | 288 |
+| 1 | 85 tok/s | 79 | 118 |
+| 4 | 177 | 174 | 212 |
+| 8 | 202 | 223 | 284 |
+| 16 | 245 | 279 | 313 |
 
 **Accuracy.** Teacher-forced over 256 decode steps of real text, the patched model's choices against stock mlx-lm's
 are as far apart as stock mlx-lm's against itself with the prompt read in two chunks instead of one: top-1 agreement

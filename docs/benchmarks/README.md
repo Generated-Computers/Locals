@@ -540,16 +540,17 @@ after 4 warm-up steps; tokens per second all rows write together:
 
 | Requests at once | mlx-lm | Locals before | Locals | Locals / mlx-lm |
 |---|---|---|---|---|
-| 1 | 85.3 | 78.6 | 114.6 | 1.34x |
-| 2 | 123.3 | 127.0 | 167.3 | 1.36x |
-| 4 | 176.9 | 173.5 | 205.9 | 1.16x |
-| 8 | 201.6 | 223.3 | 264.0 | 1.31x |
-| 16 | 244.5 | 278.8 | 288.1 | 1.18x |
+| 1 | 85.3 | 78.6 | 117.5 | 1.38x |
+| 2 | 123.3 | 127.0 | 169.1 | 1.37x |
+| 4 | 176.9 | 173.5 | 212.0 | 1.20x |
+| 8 | 201.6 | 223.3 | 284.4 | 1.41x |
+| 16 | 244.5 | 278.8 | 312.6 | 1.28x |
 
 Before, Locals was slower than mlx-lm for one request (its kernel routing cost 4 us of Python a matrix product, and
-it fused nothing of Flint's) and gained only from its batching at 8 and 16. Of the 1.34x at one request, 0.14x is
+it fused nothing of Flint's) and gained only from its batching at 8 and 16. Of the 1.38x at one request, 0.14x is
 MLX's command buffers: handed a layer's whole expert tensors, the expert kernels ended one each (102 tokens/s before
-they were given one-expert views, docs/runtime, "Flint"). Past 16 rows the experts go back to
+they were given one-expert views, docs/runtime, "Flint"). At 8 and 16 rows the expert kernels read an expert once for
+all the rows that chose it (265 and 288 tokens/s before). Past 16 rows the experts go back to
 MLX's sorted gather, which reads each expert once for all the tokens that chose it.
 
 **In the process: prompt length.** One request: a prompt read from nothing in 2,048-token chunks, then 64 greedy
@@ -592,7 +593,9 @@ first requests while it reads the others (mixed passes), so its first tokens com
 longer under way: counted from the first reply's first token, mlx-lm's server writes 165 tokens/s at 8 at once,
 Locals 139.
 Replies stream without a stall while another long prompt is read: at most 2.8 s, against 9.7 without mixed passes
-(docs/runtime, "Flint").
+(docs/runtime, "Flint"). Decoding alone, clients with short prompts and 512-token replies, counted while every reply
+streams: 275.7 tokens/s at 8 at once and 305.3 at 16 (256.1 and 280.7 before the expert kernels read each expert once
+for the rows that chose it).
 
 **Agent tool calls.** Flint as a coding agent's model in the batch engine, one request at a time: six tools shaped
 as OpenCode's (`read` with `filePath`, `offset`, `limit`; `write`; `edit`; `bash` with a required `description`;
