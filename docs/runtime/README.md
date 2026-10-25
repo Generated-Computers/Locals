@@ -215,6 +215,14 @@ against 358 a layer at 30k keys): one request wrote 61.7 tokens/s at 30k through
 full-attention layers then attend without the mask: 72.1. A padded batch keeps it. The window layers' masks (513
 keys) cost about 1%, and stay.
 
+**Passes of 5 to 8 tokens** (`fuse.attend_few`). MLX's attention runs a one-query kernel up to 4 queries and its matrix
+kernel from 9; from 5 to 8 it takes a path twice as slow as 9: a full-attention layer at 1,024 keys took 306 us for 8
+queries against 159 for 9, at 8,192 keys 2.1 ms against 1.2, a window layer 173 against 96 us. Forced spans of a
+typed tool call (5 or 6 tokens) hit it in all 49 layers. Such a pass is padded in front to 9 queries: MLX's
+causal mask aligns the last query with the last key, so the real queries keep their keys; an array mask gets copies
+of its first row in front; the padding's outputs are dropped. A pass of 8 tokens after 1,024 takes 38.6 ms instead of
+47.2.
+
 **Long contexts.** One growing prompt (the package's own source), read 2,048 tokens at a time, one request writing:
 
 | Context | Reading, mlx-lm / Locals | Writing, mlx-lm / Locals | Peak GPU memory, mlx-lm / Locals |
@@ -273,14 +281,14 @@ first; with `--walk`, which large tool sets need, spans go a token a step.
 
 Tried and left out:
 
-- **Prompt-lookup drafts** (`hybrid_batch._solo`), which need sliding-window caches that can be rewound (tried: a ring
-  of the window plus 64 slots, and a linear batch cache dropping its oldest slots in chunks). A pass reads the experts
-  of every token in it, so its cost grows with its width as a dense model's does not: 12.4 ms for 1 token, 17.0 for 2,
-  25.0 for 4, 43.2 for 8, against about 10 ms for a pipelined one-token step. On a file rewrite drafts kept 102 tokens
-  of 400 and the reply took 4.4 s against 4.5; through the server at temperature 1, where most drafts were rejected, the
-  output fell to 53 tokens/s from 83. And a pass of several tokens rounds differently from one-token steps, which in
-  Flint changed the greedy reply. A gather that reads each expert once for all the tokens that chose it would make
-  such passes cheap.
+- **Prompt-lookup drafts** (`hybrid_batch._solo`), left out: this work keeps to decoding as it is, not speculative.
+  They need the window layers rewound (built and measured: a ring of the window plus 64 slots per request, a linear
+  batch cache dropping its oldest slots 64 at a time, as fast as mlx-lm's rings) and drafts weighed against their
+  pass, which reads every draft token's experts (16 tokens 61 ms, against 8.7 for a step): by how far back the lookup's
+  match goes (14% of a draft kept at a bare 3-token match, 98% from 40 on), one request then wrote a file rewrite 1.41x
+  faster and a quoted document 1.67x (1.86x sampled), prose unchanged; under Qwen3.5's own width rule an agent's
+  thinking was 6% slower. A pass of several tokens rounds differently from one-token steps, so a greedy reply with
+  drafts left the one without them at a near tie.
 - A fused residual add + RMS norm body (`norm_kernel.add_rms`): no faster here either (8.84 against 8.70 ms a step);
   a custom kernel's call costs the CPU more than MLX's two, and the step is as much the CPU's as the GPU's.
 - **The choice inside the expert kernels**, each simdgroup computing its token's top 6 from the logits (one launch a

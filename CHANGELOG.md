@@ -48,6 +48,8 @@
 - Flint's expert kernels take experts of 2, 3, 4, 5, 6 and 8 bits (mlx-lm's mixed recipes put some layers at 6), and
   its router kernel names real experts even for a row of NaN logits. A Flint request alone gets its forced spans in
   one pass once it is no longer left-padded.
+- Flint's passes of 5 to 8 tokens (a typed tool call's forced spans) are padded to 9 queries in its attention:
+  MLX's attention takes a path twice as slow from 5 to 8 queries (2.1 ms a full layer at 8k keys for 8, 1.2 for 9).
 
 ## 0.2.1 (2026-10-21)
 

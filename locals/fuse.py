@@ -131,8 +131,8 @@ FEW_PAD = os.environ.get("LOCALS_FEW_QUERY_PAD", "1") != "0"
 def attend_few(q: mx.array, k: mx.array, v: mx.array, scale: float, mask, sinks) -> mx.array:
     """MLX's attention, a pass of 5 to 8 queries a row padded in front to 9. MLX runs its one-query kernel up to 4
     queries and its matrix kernel from 9; from 5 to 8 it takes a path twice as slow as 9 (Flint's full layer at 8,192
-    keys: 2.1 ms against 1.2; at 1,024: 306 us against 159), which a draft or a forced span of 5 to 8 tokens hit in
-    all 49 layers. The causal mask aligns the last query with the last key, so the real queries keep their keys; an
+    keys: 2.1 ms against 1.2; at 1,024: 306 us against 159), which a forced span of 5 to 8 tokens hit in all 49
+    layers. The causal mask aligns the last query with the last key, so the real queries keep their keys; an
     array mask gets copies of its first row in front; the padding's outputs are dropped."""
     L = q.shape[2]
     if not FEW_PAD or not 5 <= L <= 8 or k.shape[2] < 9:
