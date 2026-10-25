@@ -1024,7 +1024,11 @@ class SparseMoe(nn.Module):
         ahead = self._ahead(rows)
         if residual is not None and self._fusable(x, rows, ahead):
             return self._fused(x, residual, rows, ahead)
-        scores = mx.sigmoid(self.gate(x).astype(mx.float32))
+        # (on float32 logits, as the decode router kernel selects: bf16 logits tie often, and which way a tie went
+        # changed with MLX's rounding, 0.32.3 to 0.32.4)
+        g = self.gate
+        logits = g(x).astype(mx.float32) if "scales" in g else x.astype(mx.float32) @ g.weight.astype(mx.float32).T
+        scores = mx.sigmoid(logits)
         inds = mx.argpartition(-scores, kth=self.k - 1, axis=-1)[..., : self.k]
         if ahead:  # decoding: the next layers' experts, guessed from this input, read ahead
             guesses = [mx.argpartition(-gate(x), kth=rank - 1, axis=-1)[..., :rank] for gate, _, rank in ahead]
