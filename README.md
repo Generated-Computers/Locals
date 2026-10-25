@@ -26,6 +26,28 @@
   <a href="https://arxiv.org/abs/2610.09139"><b>Paper</b></a>
 </p>
 
+> **New: Recursive's Flint runs in Locals.** Flint is a 40-billion-parameter
+> mixture of experts that uses 2.5 billion per token. Locals runs it with kernels
+> of its own for its router, experts and attention, and in its own tool-call
+> format: `locals code ~/my-project --model flint`. On a MacBook Pro with an
+> M4 Pro and 24 GB, tokens per second that all requests write together (most
+> numbers below are from an M2 Pro with 16 GB):
+>
+> | Requests at once | mlx-lm | Locals | |
+> |---|---|---|---|
+> | 1 | 85 | 117 | 1.37x |
+> | 4 | 177 | 227 | 1.29x |
+> | 8 | 202 | 319 | 1.58x |
+> | 16 | 245 | 354 | 1.45x |
+>
+> Typed tool calls (`--typed-tools`) keep every call to its tool's schema, and
+> 8-bit keys and values (`LOCALS_KV_BITS=8`) take requests of 67,584 tokens on a
+> 24 GB Mac. Recursive's own 4-bit build runs on a 16 GB Mac too, its experts read
+> from disk as tokens need them: `--model RecursiveSI/flint-int4`, 6 to 7 tokens
+> per second on an M2 Pro. [All the measurements](https://github.com/Generated-Computers/Locals/blob/main/docs/benchmarks/README.md#11-recursives-flint-m4-pro-24-gb).
+> It comes to PyPI with the next release; until then, install Locals from GitHub:\
+> `uv tool install --python 3.12 git+https://github.com/Generated-Computers/Locals`
+
 ```bash
 curl -LsSf https://raw.githubusercontent.com/Generated-Computers/Locals/main/install.sh | sh
 ```
