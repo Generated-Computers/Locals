@@ -42,9 +42,7 @@
 >
 > Typed tool calls (`--typed-tools`) keep every call to its tool's schema, and
 > 8-bit keys and values (`LOCALS_KV_BITS=8`) take requests of 67,584 tokens on a
-> 24 GB Mac. Recursive's own 4-bit build runs on a 16 GB Mac too, its experts read
-> from disk as tokens need them: `--model RecursiveSI/flint-int4`, 6 to 7 tokens
-> per second on an M2 Pro. [All the measurements](https://github.com/Generated-Computers/Locals/blob/main/docs/benchmarks/README.md#11-recursives-flint-m4-pro-24-gb).
+> 24 GB Mac. Flint needs 24 GB or more. [All the measurements](https://github.com/Generated-Computers/Locals/blob/main/docs/benchmarks/README.md#11-recursives-flint-m4-pro-24-gb).
 > It comes to PyPI with the next release; until then, install Locals from GitHub:\
 > `uv tool install --python 3.12 git+https://github.com/Generated-Computers/Locals`
 
