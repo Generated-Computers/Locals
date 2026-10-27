@@ -31,6 +31,7 @@ MODELS = [
     "mlx-community/Qwen3-8B-4bit", "mlx-community/Qwen2.5-7B-Instruct-4bit", "mlx-community/Llama-3.2-3B-Instruct-4bit",
     "mlx-community/Llama-3.1-8B-Instruct-4bit", "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
     "mlx-community/Ministral-3-3B-Instruct-2512-4bit", "mlx-community/gemma-3-4b-it-qat-4bit", "mlx-community/gemma-4-e4b-it-4bit",
+    "LiquidAI/LFM3-1.7B-MLX-4bit",
 ]
 
 
@@ -86,8 +87,10 @@ def server(request):
         pytest.skip("model not cached")
     from mlx_lm.utils import load_tokenizer
 
+    from locals.models import register
     from locals.server import Server
 
+    register()  # (LFM3: transformers would ask whether to run Liquid's code)
     srv = Server(request.param, engines=("locals",), preload=(), log=lambda s: None)
     srv._svc["locals"] = _Svc(load_tokenizer(request.param))
     return srv

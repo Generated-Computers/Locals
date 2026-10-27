@@ -10,6 +10,12 @@ weights as bytes: ``defaults.streamed``) loads ``flint_streamed`` instead,
 which reads the experts from the weight files as tokens need them (a 16 GB
 Mac runs it): ``register()`` also has mlx-lm's ``load_model`` take that
 module for such a folder.
+
+LFM3's config.json points transformers' AutoConfig at Liquid's own Python
+code, which transformers 5.19 does not have: loading the tokenizer asked in a
+terminal whether to run it, and went on without after 15 s. ``register()``
+gives transformers a plain config class for such a name instead, so it neither
+asks nor runs that code (the tokenizer needs nothing from it).
 """
 
 from __future__ import annotations
@@ -19,7 +25,9 @@ import importlib.util
 import sys
 from pathlib import Path
 
-_MODULES = ("flint",)  # Recursive's Flint (mlx-lm has it from ml-explore/mlx-lm#1998, unreleased)
+_MODULES = ("flint",  # Recursive's Flint (mlx-lm has it from ml-explore/mlx-lm#1998, unreleased)
+            "lfm3")  # Liquid's LFM3 (no mlx-lm release has it yet)
+_CONFIGS = ("lfm3",)  # model types whose config.json names remote code for AutoConfig
 
 
 def register() -> None:
@@ -34,6 +42,19 @@ def register() -> None:
         if not found:
             sys.modules[target] = importlib.import_module("." + name, __name__)
     _register_streamed()
+    _register_configs()
+
+
+def _register_configs() -> None:
+    try:
+        from transformers import AutoConfig, PretrainedConfig
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    except ImportError:
+        return
+    for name in _CONFIGS:
+        if name not in CONFIG_MAPPING:
+            AutoConfig.register(name, type(name.capitalize() + "Config", (PretrainedConfig,),
+                                           {"model_type": name, "__module__": __name__}))
 
 
 def _register_streamed() -> None:
