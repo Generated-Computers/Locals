@@ -18,7 +18,7 @@ After these steps, `mx.set_wired_limit` is set to the GPU's `max_recommended_wor
 | `runtime.py` | `Runtime` (load, patch, constraint and prompt caches), `set_compute_dtype`, `native_bf16` |
 | `lm.py` | Drop-in replacement for mlx-lm: `load`, `patch`, and mlx-lm's `generate`, `stream_generate`, `batch_generate` and `BatchGenerator` re-exported unchanged |
 | `fuse.py` | Projection fusion, `FusedAttention`, `FusedFlintAttention`, `FusedMLP`, `FusedGatedDeltaNet`, `FusedGatedAttention`, `FusedHybridBody` |
-| `models/` | Architectures the pinned mlx-lm lacks, registered where mlx-lm imports models (`models.register`): Flint |
+| `models/` | Architectures the pinned mlx-lm lacks, registered where mlx-lm imports models (`models.register`): Flint, LFM3 |
 | `moe.py` | Flint's mixture-of-experts block: the router and expert kernels, fused expert gate/up |
 | `qk_kernel.py` | Per-head q/k RMS norms and RoPE in one kernel (Flint's attention) |
 | `qkv.py` | 8-bit keys and values for full-attention layers (`LOCALS_KV_BITS=8`): the attention kernels and the batch cache |
@@ -441,6 +441,34 @@ are as far apart as stock mlx-lm's against itself with the prompt read in two ch
 A 3-bit mixture of experts in bf16 is that sensitive to the order of a sum: a token whose sixth and seventh experts
 score within rounding of each other routes differently.
 
+## LFM3 (`models/lfm3.py`)
+
+Liquid's LFM3-1.7B (`--model lfm3`, `LiquidAI/LFM3-1.7B-MLX-4bit`, 1.0 GB). No mlx-lm release has it yet (Liquid's
+model card: support "in progress"), so `models/lfm3.py` carries the computation of Liquid's `modeling_lfm3.py` in MLX
+operations, and `models.register()` puts it at `mlx_lm.models.lfm3`. It is LFM2 with a third layer type. Of its 24
+layers, 13 are LFM2's gated short convolutions, 7 wide instead of 3 (an `ArraysCache` of the last 6 inputs), 5 attend
+over a 256-token window (a `RotatingKVCache`) and 6 over the whole context (a `KVCache`). The attention is grouped-query
+(16 query heads, 4 key/value heads, head size 128) with q/k RMS norms and a sigmoid gate on each head's output.
+The window layers rotate the whole head (theta 10,000); the full layers rotate the first half of each head's
+frequencies, keeping the whole head's progression (theta 1,000,000), and leave the rest unrotated: `mx.fast.rope`
+with `freqs` whose tail is infinite, since its `dims` would rotate a smaller head instead. Each mixer's and each
+MLP's output is normed again before the residual. Liquid's MLX builds keep the weights under `language_model.`;
+`sanitize` takes that and the original checkpoint's names.
+
+Checked against Liquid's PyTorch code (transformers 5.21, float32, a 759-token prompt past the window): every
+position's top token the same, logits within 0.001, and 40 greedy tokens the same through a cache filled in two chunks.
+In float16, which `set_compute_dtype` picks on an M2, the top token was the same at 99.7% of positions (bfloat16:
+97.4%, like PyTorch's own bfloat16, 97.2%). Locals's engine with MLX's kernels and bfloat16 writes the same tokens as
+mlx-lm. Nothing in `fuse.py` applies to it (its MLP's projections are `w1`/`w3`), and the tuned kernels take its
+4-bit layers.
+
+LFM3's `config.json` names Liquid's Python code for transformers' `AutoConfig`, which transformers 5.19 does not
+have: loading the tokenizer asked in a terminal whether to run that code, and went on without it after 15 s.
+`models.register()` gives transformers a plain config class for `lfm3` (`_CONFIGS`), so it neither asks nor runs it.
+Its chat template is Qwen3.5's calls with two newlines between calls, and a model that thinks with thinking off, so
+its requests think unless they turn it off: see [Decoding](../decoding/README.md) (`formats.call_gap`,
+`formats.thinks_when_off`) and [Prompt cache](../prompt-cache/README.md) (`preserve_thinking`).
+
 ## Switched-off kernels
 
 - **Fused add + RMS norm** (`norm_kernel.add_rms`). It computes `h = x + r` and `rms_norm(h) * w` in one kernel, which halves the norm launches of a pre-norm layer (`norm_kernel.py`), laid out as MLX's own norm for one row so that both outputs are MLX's bits. It needs a hidden size divisible by 128, at most 4,096, and uses a quarter of it in threads per row (`norm_kernel.supported`). Flint's layers use it (`moe.FusedFlintLayer`, `moe.FusedFlintBody`). `FusedHybridBody` would use it for Qwen3.5, but `USE_ADD_RMS = False`: measured at one row, it was no faster than MLX's two kernels. With the flag off, the body calls the stock `__call__` (`fuse.py`, `fuse.py`).
@@ -599,8 +627,9 @@ To re-tune from scratch, stop every Locals server, delete the cache file (or poi
 | `gemma-4-e4b` | `mlx-community/gemma-4-e4b-it-4bit` |
 | `lfm2.5-2.6b` | `LiquidAI/LFM2.5-2.6B-MLX-4bit` (1.6 GB: 8 GB Macs) |
 | `minicpm5-2b` | `mlx-community/MiniCPM5-2B-mlx-4Bit` (1.4 GB) |
+| `lfm3-1.7b` | `LiquidAI/LFM3-1.7B-MLX-4bit` (1.0 GB; its code ships with Locals, `locals/models/lfm3.py`) |
 
-`ALIASES` maps more names onto these: `qwen` and `qwen3.5` to the 4B; `gemma`, `gemma4`, `gemma-4`, `gemma4-e4b` and `gemma-4-e4b-it` to Gemma 4 E4B; `lfm` and `lfm2.5`; `minicpm` and `minicpm5` (`defaults.py`).
+`ALIASES` maps more names onto these: `qwen` and `qwen3.5` to the 4B; `gemma`, `gemma4`, `gemma-4`, `gemma4-e4b` and `gemma-4-e4b-it` to Gemma 4 E4B; `lfm` and `lfm2.5`; `lfm3`; `minicpm` and `minicpm5` (`defaults.py`).
 
 - **`default_model()`** reads the Mac's memory with `sysctl -n hw.memsize`. It picks `qwen3.5-2b` when memory is known and below 12 GB, and `qwen3.5-4b` otherwise, including when memory is unknown (`defaults.memory_gb`, `defaults.default_model`). The 4B (3 GB of weights, 64k context) and its prompt cache do not fit next to macOS in 8 GB. `DEFAULT_MODEL` is computed once, at import (`defaults.py`).
 - **`model_id(name)`** resolves a `--model` value; every command uses it as the argparse `type` (for example `server.main`). Resolution order (`defaults.model_id`):

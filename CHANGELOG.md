@@ -2,6 +2,28 @@
 
 ## 0.2.2 (unreleased)
 
+- **Liquid's LFM3** (`--model lfm3`: LiquidAI/LFM3-1.7B-MLX-4bit, 1.0 GB). No mlx-lm release has LFM3 yet, so its code
+  ships with Locals (`locals/models/lfm3.py`): LFM2's gated convolutions, 7 wide, and attention over a 256-token window
+  or the whole context, with a sigmoid gate on each head, q/k norms, RoPE on half of each full-attention head's
+  frequencies, and sandwich norms. It computes what Liquid's PyTorch code does (float32 logits within 0.001 on a
+  759-token prompt; the same 40 greedy tokens through the cache). On an M2 Pro with 16 GB (`locals bench`), 620
+  tokens/s for eight requests at once where mlx-lm, running the same code, gives 207; 153 for one where it gives 143.
+  Only 6 of its 24 layers keep every token's keys and values (12 KB a token).
+  It thinks by default, as its template does (`"reasoning_effort": "none"` or `enable_thinking: false` turn it off):
+  in the end-to-end suite (eight agent tools, 18 coding tasks, an M2 Pro) it finished 15 thinking and 10 not, and six
+  OpenCode agents at once finished 6 and 3; with thinking off it reasoned in its answers instead.
+- With thinking off, LFM3 still opened a think block of its own, or reasoned, closed a block it never opened and gave
+  its answer twice (4 of 11 replies of the 4-bit build). For a chat template like LFM3's (`<think></think>` closed
+  empty), a reply with thinking off is now kept from think tags by its grammar, for about 1% of the writing speed;
+  other models' replies are as before. LFM3's calls are Qwen3.5's form with two newlines between calls, and the
+  grammar now writes them as its template does.
+- With thinking on, a chat template's `preserve_thinking` switch (LFM3's, LFM2.5's) is turned on unless the client
+  sets it: earlier replies keep their reasoning as written, so the conversation stays a prefix of the cache. Claude
+  Code on LFM3 (thinking on, its tool results followed by text, a user message to the template) read the conversation
+  again from its first reply at every step: 55% of prompt tokens cached and a rename past 15 minutes, now 95% and 86 s.
+- Loading a model whose config.json names its own Python code for transformers (LFM3) no longer stops at
+  transformers' question whether to run it (in a terminal, 15 seconds before it went on without).
+
 - One request on a model with sliding-window layers (Flint) no longer waits for the GPU after every token: the
   check before a forced span's one-pass step read the layers' padding from the GPU each token, 35 reads that waited
   for the step in flight. It now reads it once, only where a span is about to go in one pass. On an M5 Pro, Flint

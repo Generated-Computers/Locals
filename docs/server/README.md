@@ -531,7 +531,7 @@ How the worker runs:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--model` | `DEFAULT_MODEL` | a short name (`qwen`, `qwen3.5-2b`, `gemma`, `lfm`, `minicpm`), any mlx-lm model id, or a local path. The default is Qwen3.5-2B on a Mac with less than 12 GB of memory, and Qwen3.5-4B otherwise |
+| `--model` | `DEFAULT_MODEL` | a short name (`qwen`, `qwen3.5-2b`, `gemma`, `lfm`, `lfm3`, `minicpm`), any mlx-lm model id, or a local path. The default is Qwen3.5-2B on a Mac with less than 12 GB of memory, and Qwen3.5-4B otherwise |
 | `--host` | `127.0.0.1` | IPv6 addresses (`::1`) work |
 | `--port` | `8321` | |
 | `--ollama-port` | `0` (off) | also listen there as Ollama (11434). Must differ from `--port` |

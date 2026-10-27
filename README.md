@@ -26,6 +26,20 @@
   <a href="https://arxiv.org/abs/2610.09139"><b>Paper</b></a>
 </p>
 
+> **New: Liquid's LFM3 runs in Locals.** LFM3-1.7B is a 1 GB model for agents
+> that mixes short convolutions with attention. No mlx-lm release can load it
+> yet; Locals ships its code: `locals code ~/my-project --model lfm3`. With eight agent tools on our
+> 18 coding tasks it finished 15, and six OpenCode agents at once all finished
+> theirs. On a MacBook Pro with an M2 Pro and 16 GB, tokens per second that all
+> requests write together (`locals bench`; mlx-lm runs Locals's LFM3 code):
+>
+> | Requests at once | mlx-lm | Locals | |
+> |---|---|---|---|
+> | 1 | 143 | 153 | 1.07x |
+> | 4 | 204 | 332 | 1.63x |
+> | 8 | 207 | 620 | 2.99x |
+> | 16 | 370 | 864 | 2.33x |
+
 > **New: Recursive's Flint runs in Locals.** Flint is a 40-billion-parameter
 > mixture of experts that uses 2.5 billion per token. Locals runs it with kernels
 > of its own for its router, experts and attention, and in its own tool-call
@@ -416,6 +430,7 @@ M2 Pro with 16 GB above.
 | Qwen3.5-4B (the default) | `--model qwen` | `locals/qwen3.5-4b` | 2.8 GB | 87 tps | 271 tps |
 | LFM2.5-2.6B | `--model lfm` | `locals/lfm2.5-2.6b` | 1.5 GB | 144 tps | 404 tps |
 | MiniCPM5-2B | `--model minicpm` | `locals/minicpm5-2b` | 1.3 GB | 160 tps | 478 tps |
+| LFM3-1.7B | `--model lfm3` | `locals/lfm3-1.7b` | 1.0 GB | 207 tps | 620 tps |
 | Gemma 4 E4B | `--model gemma` | `locals/gemma-4-e4b-it` | 4.8 GB | 80 tps | 224 tps |
 
 On a Mac with less than 12 GB of memory, the default is Qwen3.5-2B instead
@@ -430,7 +445,10 @@ keeps Flint's keys and values in 8 bits: requests up to 67,584 tokens instead of
 about 35,800, writing 4 to 13% slower.
 
 Each model also has a thinking mode, in which it reasons before it answers: add
-`-thinking` to the name, for example `locals/lfm2.5-2.6b-thinking`. The smaller
+`-thinking` to the name, for example `locals/lfm2.5-2.6b-thinking`. LFM3 thinks
+by default, as its own template does: with thinking off it reasoned in its
+answers instead, and finished 10 of our 18 agent tasks where it finished 15
+thinking (a request turns it off with `"reasoning_effort": "none"`). The smaller
 models are good choices for a Mac with 8 GB of memory, and other models made for
 Apple silicon on [Hugging Face](https://huggingface.co/mlx-community) work too.
 
