@@ -337,6 +337,26 @@ engines in one server, the 9B with one engine per server. Later rounds on the sa
 33.0, 49.0, 78.2 and 76.1 tokens per second with 1, 2, 4, 8 and 16 requests at once (commit `9f49cdc`, Locals
 alone).
 
+## Recursive's Flint on an M5 Pro
+
+Flint (`mlx-community/flint-mixed-3-4bit`) on a MacBook Pro with an M5 Pro (16-core GPU, 24 GB, the GPU limit
+raised to 20 GB), 27 October 2026, Locals at commit `01127a8`, MLX 0.32.4, through the HTTP server: n requests at
+once, 256 tokens each, the median of 3 rounds (tokens per second):
+
+| Requests at once | mlx-lm | Locals | Ratio |
+|---|---|---|---|
+| 1 | 101 | 89 | 0.89x |
+| 2 | 152 | 211 | 1.39x |
+| 4 | 216 | 286 | 1.32x |
+| 8 | 257 | 356 | 1.39x |
+| 16 | 313 | 449 | 1.43x |
+
+One request was slower than mlx-lm's because of a bug in the server's loop: after every token it read the
+sliding-window layers' padding from the GPU, which waited for the step in flight. With that check skipped
+(`LOCALS_SOLO=0`) Locals wrote 138 tokens/s, 1.37x mlx-lm's 101; the bug is fixed since. MLX 0.32.3, memory at 16
+requests, the kernels the tuner chose and the script: [M5 Pro Flint measurements](m5-pro-flint.md). The M4 Pro's
+numbers are in [Benchmarks, section 11](../benchmarks/README.md#11-recursives-flint-m4-pro-24-gb).
+
 ## A client-side check of the speed
 
 The numbers above are checked here in a way that trusts nothing Locals reports, with the scripts in

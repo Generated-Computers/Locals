@@ -938,16 +938,20 @@ class HybridBatchEngine(BatchEngine):
                 return False  # (Flint's only: Gemma's sliding-window layers keep their spans a token at a time)
             if any(type(c) not in (BatchKVCache, ArraysCache, BatchRotatingKVCache, BatchQuantizedKVCache) for c in cache):
                 return False
-            # a ring that has wrapped masks a span's keys from its index, before the ring is put back in order: a row
-            # still left-padded (it joined a longer one) would lose its oldest key in the window. Its spans go a token
-            # at a time until the padding is gone
-            if any(type(c) is BatchRotatingKVCache and c.left_padding is not None and int(mx.max(c.left_padding).item()) > 0
-                   for c in cache):
-                return False
             if self._solo_drafts_ok(cache):
                 return False
         name = type(r.controller).__name__
         return name not in ("WalkController", "PDAController")
+
+    def _solo_unpadded(self, cache) -> bool:
+        """Whether no sliding-window ring of the batch is left-padded. A ring that has wrapped masks a span's keys from
+        its index, before the ring is put back in order: a row still left-padded (it joined a longer one) would lose
+        its oldest key in the window, so its spans go a token at a time until the padding is gone. It reads the
+        padding from the GPU (one read for every layer), so it is asked only where a span is about to go in one pass,
+        never after every token (_solo_ok is: there it took 5.3 ms a token of Flint's on an M5 Pro, 35 reads that
+        waited for the step in flight, 138 tokens/s down to 89)."""
+        rings = [c.left_padding for c in cache if type(c) is BatchRotatingKVCache and c.left_padding is not None]
+        return not rings or int(mx.max(mx.concatenate([mx.reshape(p, (-1,)) for p in rings])).item()) <= 0
 
     def _solo_drafts_ok(self, cache) -> bool:
         """Drafts need the per-token recurrent states the fused Gated DeltaNet kernel records (to rewind)."""
@@ -1707,7 +1711,7 @@ class HybridBatchEngine(BatchEngine):
                     continue
                 if g is None:
                     g = mx.array([self._gstate(r) for r in rows], dtype=mx.int32)
-                if len(rows) == 1 and not queue and not filling and self._solo_ok(rows[0], cache):
+                if len(rows) == 1 and not queue and not filling and self._solo_ok(rows[0], cache) and self._solo_unpadded(cache):
                     got, x1, g1 = self._solo(rows[0], cache, xs[0], g, temp, arrive, dead)
                     if x1 is None:  # done: it is retired at the next boundary
                         cur = None
@@ -1757,8 +1761,9 @@ class HybridBatchEngine(BatchEngine):
                     self._after_commit(r, n0, dead)
             cur, g = nxt, g2
             if _SOLO and len(rows) == 1 and not queue and not filling and not dead and self._solo_ok(rows[0], cache):
-                # entering costs about a step (the pipeline drains): a forced span of 3 or more tokens, or a draft
-                solo_next = len(rows[0].pend) >= 3 or bool(self._solo_draft(rows[0], cache))
+                # entering costs about a step (the pipeline drains): a forced span of 3 or more tokens, or a draft (the
+                # padding read, which waits for the GPU, only with a span: the pipeline drains for it anyway)
+                solo_next = (len(rows[0].pend) >= 3 and self._solo_unpadded(cache)) or bool(self._solo_draft(rows[0], cache))
         mx.synchronize()
         self.active = 0
         return BatchStats(time.perf_counter() - t0, prefill_s, steps, nrows, self.tokens_out)

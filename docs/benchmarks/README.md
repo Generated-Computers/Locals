@@ -528,6 +528,8 @@ that ask for them. The same seeded request alone gives the same reply.
 
 ## 11. Recursive's Flint (M4 Pro, 24 GB)
 
+On an M5 Pro (24 GB), through the server: [M5 Pro Flint measurements](../measurements/m5-pro-flint.md).
+
 Flint (40B, 2.5B active per token: 256 routed experts, 6 a token, and a shared expert) on a MacBook Pro with an M4
 Pro and 24 GB, the GPU's limit raised to 20 GB (`sudo sysctl iogpu.wired_limit_mb=20480`),
 `mlx-community/flint-mixed-3-4bit` (17.8 GB: experts at 3 bits), MLX 0.32.4. Three setups, each alone on the GPU

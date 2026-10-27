@@ -2,6 +2,10 @@
 
 ## 0.2.2 (unreleased)
 
+- One request on a model with sliding-window layers (Flint) no longer waits for the GPU after every token: the
+  check before a forced span's one-pass step read the layers' padding from the GPU each token, 35 reads that waited
+  for the step in flight. It now reads it once, only where a span is about to go in one pass. On an M5 Pro, Flint
+  wrote 89 tokens/s for one request with the check and 138 without it (mlx-lm: 101).
 - OpenCode 2 works with Locals as OpenCode 1 does. `locals code` opened OpenCode 2's interface with `-m`, which it
   rejects ("Unrecognized flag: -m"); the model (and the agent `--agent` names) now goes in OPENCODE_CONFIG_CONTENT,
   which wins over a project's own opencode.json, and OpenCode's server runs for that launch (`--standalone`)
