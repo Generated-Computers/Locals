@@ -8,7 +8,8 @@
   frequencies, and sandwich norms. It computes what Liquid's PyTorch code does (float32 logits within 0.001 on a
   759-token prompt; the same 40 greedy tokens through the cache). On an M2 Pro with 16 GB (`locals bench`), 620
   tokens/s for eight requests at once where mlx-lm, running the same code, gives 207; 153 for one where it gives 143.
-  Only 6 of its 24 layers keep every token's keys and values (12 KB a token).
+  Only 6 of its 24 layers keep every token's keys and values (12 KB a token): on the 16 GB M2 Pro a 245,547-token
+  request was read in 10.5 minutes, the one fact hidden in it found, with 4.9 GB of GPU memory at the peak.
   It thinks by default, as its template does (`"reasoning_effort": "none"` or `enable_thinking: false` turn it off):
   in the end-to-end suite (eight agent tools, 18 coding tasks, an M2 Pro) it finished 15 thinking and 10 not, and six
   OpenCode agents at once finished 6 and 3; with thinking off it reasoned in its answers instead.

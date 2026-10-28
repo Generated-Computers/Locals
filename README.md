@@ -28,7 +28,9 @@
 
 > **New: Liquid's LFM3 runs in Locals.** LFM3-1.7B is a 1 GB model for agents
 > that mixes short convolutions with attention. No mlx-lm release can load it
-> yet; Locals ships its code: `locals code ~/my-project --model lfm3`. With eight agent tools on our
+> yet; Locals ships its code: `locals code ~/my-project --model lfm3`. On a
+> 16 GB Mac it read a 245,547-token request in 10.5 minutes and found the one
+> fact hidden in it (4.9 GB of GPU memory). With eight agent tools on our
 > 18 coding tasks it finished 15, and six OpenCode agents at once all finished
 > theirs. On a MacBook Pro with an M2 Pro and 16 GB, tokens per second that all
 > requests write together (`locals bench`; mlx-lm runs Locals's LFM3 code):

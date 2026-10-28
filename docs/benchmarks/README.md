@@ -663,6 +663,12 @@ can ..."), and most renames left the old name in some of the four files. Claude 
 conversation again from its first reply at every step until `preserve_thinking` was turned on (55% of prompt tokens
 cached; [Prompt cache](../prompt-cache/README.md)); with it, the rename took 86 s with 95% cached.
 
+**A long request.** 245,547 tokens of filler with one fact two thirds of the way in, through the server, thinking
+off: read in 631 s (390 tokens/s; 891 tokens/s for the first 64k), the fact found, 4.9 GB of GPU memory at the peak. Only
+6 of the 24 layers keep every token's keys and values (12 KB a token). A first try was stopped 10 minutes in by macOS's
+GPU watchdog and read again from its start; a chunk dropped so is now read again where it began
+([Batch engine](../engine/README.md), "Engine errors and recovery").
+
 **Exactness.** Against Liquid's own PyTorch code (transformers 5.21) in float32, on a 759-token prompt past the
 sliding window: the same top token at every position, logits within 0.001, and the same 40 greedy tokens through a
 cache filled in two chunks. In float16 the top token is the same at 99.7% of positions, in bfloat16 at 97.4% (PyTorch's
