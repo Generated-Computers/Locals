@@ -112,6 +112,77 @@ def _reserve(cache, upto: int) -> None:
         del k, v
 
 
+# A prompt chunk the GPU dropped: macOS ends a Metal command buffer that holds the GPU while the display needs it
+# ("Internal Error (0000000e)", kIOGPUCommandBufferCallbackErrorImpactingInteractivity; MLX leaves it to the OS). It
+# happened 10 minutes into a 245k-token prompt on an M2 Pro while the Mac was in use, and the request was read again
+# from its start; minute-long runs of 1.4 s attention calls on an idle Mac never met it. The chunk is read again from
+# where it began instead (HybridBatchEngine._read_chunk), this many times, each after a pause and in half the tokens.
+GPU_RETRIES = 3
+RETRY_PAUSE = 0.5  # seconds before the first try again, doubling
+
+
+def _dropped(e: BaseException) -> bool:
+    return isinstance(e, RuntimeError) and "Command buffer execution failed" in str(e)
+
+
+def _held(v):
+    """``v`` as it is now: MLX's ``a += b`` and ``a[i] = b`` change the array object itself, and ``mx.array(a)``
+    keeps the value it had."""
+    if isinstance(v, mx.array):
+        return mx.array(v)
+    if isinstance(v, (list, tuple)):
+        return type(v)(_held(x) for x in v)
+    if isinstance(v, dict):
+        return {k: _held(x) for k, x in v.items()}
+    return v
+
+
+def _marks(cache):
+    """What a prompt chunk changes in each cache layer, to put back if the GPU drops the chunk; None if a layer is of
+    a kind not known here. The key and value buffers of full-attention layers are not kept (holding them, MLX would
+    copy a whole buffer at every chunk instead of writing the chunk into it): the chunk writes past their offset, so
+    the offset going back is enough if it wrote into the same buffers (_rewind checks their addresses: a buffer MLX
+    copied, to grow it or because something else held it, was copied in the dropped command buffer, maybe not at all)."""
+    from mlx_lm.models.cache import QuantizedKVCache, RotatingKVCache
+
+    from .qkv import BatchQuantizedKVCache
+
+    out = []
+    for c in cache:
+        if isinstance(c, (KVCache, BatchKVCache, QuantizedKVCache, BatchQuantizedKVCache)):
+            keep = {k: _held(v) for k, v in vars(c).items() if k not in ("keys", "values")}
+            out.append((keep, _buffers(c)))
+        elif isinstance(c, (RotatingKVCache, BatchRotatingKVCache, ArraysCache)):
+            out.append(({k: _held(v) for k, v in vars(c).items()}, None))
+        else:
+            return None
+    return out
+
+
+def _buffers(c) -> tuple:
+    """Where a full-attention layer's key and value buffers are in memory (() before it has any)."""
+    import numpy as np
+
+    arrs = [a for kv in (c.keys, c.values) for a in (kv if isinstance(kv, tuple) else (kv,)) if a is not None]
+    return tuple(np.frombuffer(memoryview(a), dtype=np.uint8, count=1).__array_interface__["data"][0] for a in arrs)
+
+
+def _rewind(cache, marks) -> bool:
+    """Each layer as ``marks`` (_marks) found it; False, and nothing changed, if that cannot be done."""
+    if marks is None:
+        return False
+    try:
+        if any(n and _buffers(c) != n for c, (_, n) in zip(cache, marks)):
+            return False
+    except Exception:  # noqa: BLE001  # (a buffer the dropped command buffer left unreadable)
+        return False
+    for c, (keep, n) in zip(cache, marks):
+        if n == ():  # no buffer before the chunk
+            c.keys = c.values = None
+        vars(c).update(_held(keep))  # (copies again: the chunk read again may change these in place, and fail too)
+    return True
+
+
 def _wrap_one(kv):
     """A single-stream KV cache as a batch-of-one cache layer, sharing its buffers."""
     b = BatchKVCache([0])
@@ -776,8 +847,7 @@ class HybridBatchEngine(BatchEngine):
             n = prefill_chunk(done + i, len(prompts), self.prefill_tokens or chunk, self._prefill_scores, self._prefill_cap)
             a0 = mx.get_active_memory()
             _reset_peak()
-            self.lm.model(x[:, i : i + n], cache)
-            mx.eval([c.state for c in cache])
+            n = self._read_chunk(cache, lambda k: self.lm.model(x[:, i : i + k], cache), n)
             self._note_read(len(prompts) * n, mx.get_peak_memory() - a0)
             if i == 0 and n < L:
                 _reserve(cache, base + L)
@@ -790,6 +860,30 @@ class HybridBatchEngine(BatchEngine):
             mx.eval([c.state for c in cache])
         return cache
 
+    def _read_chunk(self, cache, feed, n: int) -> int:
+        """``feed(n)``: n prompt tokens through the body, into ``cache``; evaluated. Returns the tokens read: fewer if
+        the GPU dropped the chunk (GPU_RETRIES), which is then read again from where it began."""
+        marks = _marks(cache)
+        for attempt in range(GPU_RETRIES + 1):
+            try:
+                feed(n)
+                self._sync(cache)
+                return n
+            except RuntimeError as e:
+                if attempt == GPU_RETRIES or not _dropped(e) or not _rewind(cache, marks):
+                    raise
+                import sys
+
+                print(f"locals: the GPU dropped a prompt chunk ({e}); reading it again", file=sys.stderr, flush=True)
+                mx.clear_cache()
+                time.sleep(RETRY_PAUSE * 2 ** attempt)  # (the display's work first)
+                n = max(16, n // 2)
+        return n
+
+    @staticmethod
+    def _sync(cache) -> None:
+        mx.eval([c.state for c in cache])
+
     def _run(self, cache, toks: List[int], chunk: int = 2048, stop=None) -> bool:
         """Prefill ``toks`` into ``cache``. The body only, without the output
         layer: its logits (chunk x 248k) are not needed and cost ~1 GB at 2048.
@@ -799,8 +893,7 @@ class HybridBatchEngine(BatchEngine):
             n = prefill_chunk(done + i, 1, self.prefill_tokens or chunk, self._prefill_scores, self._prefill_cap)
             a0 = mx.get_active_memory()
             _reset_peak()
-            self.lm.model(mx.array([toks[i : i + n]]), cache)
-            mx.eval([c.state for c in cache])
+            n = self._read_chunk(cache, lambda k: self.lm.model(mx.array([toks[i : i + k]]), cache), n)
             self._note_read(n, mx.get_peak_memory() - a0)
             if i == 0 and n < len(toks):
                 _reserve(cache, done + len(toks))

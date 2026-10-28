@@ -21,6 +21,10 @@
   sets it: earlier replies keep their reasoning as written, so the conversation stays a prefix of the cache. Claude
   Code on LFM3 (thinking on, its tool results followed by text, a user message to the template) read the conversation
   again from its first reply at every step: 55% of prompt tokens cached and a rename past 15 minutes, now 95% and 86 s.
+- A prompt chunk the GPU drops is read again from where it began, instead of the request from its start. macOS ends a
+  Metal command buffer that holds the GPU while the display needs it ("Internal Error (0000000e)", which MLX leaves to
+  the OS): 10 minutes into a 245,547-token prompt, the request was read again from its start (19 minutes in all). The
+  caches go back to where the chunk began, and it is read again after a pause, in half the tokens.
 - Loading a model whose config.json names its own Python code for transformers (LFM3) no longer stops at
   transformers' question whether to run it (in a terminal, 15 seconds before it went on without).
 
