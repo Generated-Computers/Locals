@@ -364,7 +364,9 @@ up to `GPU_RETRIES` (3) times:
   of writing the chunk into it, past the offset that goes back.
 * `_rewind` first checks that each full-attention buffer is where it was in memory: one MLX copied (to grow it, or
   because something else held it) was copied inside the dropped command buffer, maybe not at all. Then, and for a cache
-  kind it does not know, the error goes on as before.
+  kind it does not know, the error goes on as before. A buffer may be a view cut from a longer one (a conversation's
+  next turn starts from the previous reply's start, `_reply_entry`): numpy reads such a view's place only through its
+  first element.
 * MLX clears its stored error once it has raised it (`Error::check`), so the next chunk runs normally.
 
 With drops simulated on chunks of a 6,000-token prompt (the chunk's results spoiled, then the error raised), LFM3 and

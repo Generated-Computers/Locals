@@ -92,6 +92,30 @@ def test_a_chunk_that_grew_a_buffer_is_not_read_again():
         _read(m, make_prompt_cache(m), toks, 100, _Drops([3]))  # 200 positions in a 256 buffer, then 300
 
 
+def test_a_prefix_cut_from_a_longer_buffer_is_read_on():
+    """A conversation's next turn goes on from where the previous reply began: the finished row's key and value
+    buffers cut to that position (hybrid_batch._reply_entry), strided views. The marks find them, and the turn's
+    prompt is read on from them (the marks once failed on such a view: the engine restarted, and every prompt-cache
+    entry was lost)."""
+    from types import SimpleNamespace
+
+    from locals.hybrid_batch import _keep_reply_state, _marks, _reply_entry, _rewind
+
+    m = _model()
+    toks = mx.random.randint(0, 256, (1, 90), key=mx.random.key(9))
+    clean = _read(m, make_prompt_cache(m), toks, 16, _Drops([]))
+    cache, r = make_prompt_cache(m), SimpleNamespace()
+    m.model(toks[:, :40], cache)
+    _keep_reply_state(r, 40, cache)
+    m.model(mx.random.randint(0, 256, (1, 20), key=mx.random.key(10)), cache)  # the reply
+    mx.eval([c.state for c in cache])
+    entry = _reply_entry(r, cache)
+    assert not memoryview(entry[1].keys).c_contiguous
+    assert _rewind(entry, _marks(entry))  # (nothing read in between: the same buffers)
+    got = _read(m, entry, toks[:, 40:], 16, _Drops([]))
+    assert float(mx.abs(got - clean).max()) <= 1e-4 * (1 + float(mx.abs(clean).max()))
+
+
 def test_other_errors_are_not_caught():
     m = _model()
 

@@ -163,8 +163,14 @@ def _buffers(c) -> tuple:
     """Where a full-attention layer's key and value buffers are in memory (() before it has any)."""
     import numpy as np
 
+    def where(a):
+        v = memoryview(a)
+        if not v.c_contiguous:  # a view cut from a longer buffer (a cached reply start, _reply_entry): numpy reads only
+            v = memoryview(a[(slice(0, 1),) * a.ndim])  # a contiguous one as bytes, so its first element (a view too)
+        return np.frombuffer(v, dtype=np.uint8, count=1).__array_interface__["data"][0]
+
     arrs = [a for kv in (c.keys, c.values) for a in (kv if isinstance(kv, tuple) else (kv,)) if a is not None]
-    return tuple(np.frombuffer(memoryview(a), dtype=np.uint8, count=1).__array_interface__["data"][0] for a in arrs)
+    return tuple(where(a) for a in arrs)
 
 
 def _rewind(cache, marks) -> bool:
