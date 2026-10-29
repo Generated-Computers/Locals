@@ -54,13 +54,13 @@ _SOURCE = r"""
     for (int t = 0; t < S; t++) {
         const device T* pr = prb + t * P;
         // 1. conv + silu over the window [conv state | inputs 0..t], and the gates.
-        if (tid == 0) {
-            const float bb = float(pr[C + Hv * Dv + hv]);
+        if (tid == 0) {  // (mlx-lm: beta = sigmoid(b), g = exp(-exp(A_log) * softplus(a + dt_bias)), each op MLX's)
+            const T bb = pr[C + Hv * Dv + hv];
             const float aa = float(pr[C + Hv * Dv + Hv + hv]);
-            const float beta = float(static_cast<T>(1.0f / (1.0f + metal::exp(-bb))));
-            const float x = float(static_cast<T>(aa + float(dt_bias[hv])));
-            const float sp = float(static_cast<T>(x > 20.0f ? x : metal::log(1.0f + metal::exp(x))));
-            gate_s[0] = metal::exp(-metal::exp(float(A_log[hv])) * sp);
+            const float beta = float(mlx_sigmoid<T>(bb));
+            const T x = static_cast<T>(aa + float(dt_bias[hv]));
+            const float sp = float(mlx_softplus<T>(x));
+            gate_s[0] = metal::precise::exp(-metal::precise::exp(float(A_log[hv])) * sp);
             gate_s[1] = beta;
         }
         for (uint i = tid; i < 2 * Dk + Dv; i += NSG * 32) {
@@ -78,8 +78,8 @@ _SOURCE = r"""
                 const float xin = pos < KC - 1 ? float(csb[pos * C + ch]) : float(prb[(pos - (KC - 1)) * P + ch]);
                 acc += float(conv_w[ch * KC + j]) * xin;
             }
-            const float cv = float(static_cast<T>(acc));
-            const float sv = float(static_cast<T>(cv / (1.0f + metal::exp(-cv))));
+            const T cv = static_cast<T>(acc);
+            const float sv = float(static_cast<T>(float(cv) * float(mlx_sigmoid<T>(cv))));  // nn.silu, in T
             if (i < Dk) { q_s[i] = sv; }
             else if (i < 2 * Dk) { k_s[i - Dk] = sv; }
             else { v_s[i - 2 * Dk] = sv; }
@@ -99,7 +99,7 @@ _SOURCE = r"""
             threadgroup float* src = sgi == 0 ? q_s : k_s;
             float4 v4 = float4(src[lane * 4], src[lane * 4 + 1], src[lane * 4 + 2], src[lane * 4 + 3]);
             const float ss = simd_sum(dot(v4, v4));
-            const float r = metal::rsqrt((ss + 1e-6f) / float(Dk));  // reference l2norm eps on sum(x^2)
+            const float r = metal::precise::rsqrt(ss / float(Dk) + 1e-6f / float(Dk));  // l2norm: eps on sum(x^2), as mlx-lm's rms_norm
             const float scale = sgi == 0 ? (1.0f / float(Dk)) : metal::rsqrt(float(Dk));
             for (int i = 0; i < 4; i++) {
                 const float nv = float(static_cast<T>(v4[i] * r));
@@ -138,14 +138,15 @@ _SOURCE = r"""
         if (sgi == 0) {
             float4 o4 = float4(o_s[lane * 4], o_s[lane * 4 + 1], o_s[lane * 4 + 2], o_s[lane * 4 + 3]);
             const float ss = simd_sum(dot(o4, o4));
-            const float r = metal::rsqrt(ss / float(Dv) + 1e-6f);
+            const float r = metal::precise::rsqrt(ss / float(Dv) + 1e-6f);
             device T* yo = y + (b * S + t) * Hv * Dv + hv * Dv;
             const device T* zp = pr + C + hv * Dv;
-            for (int i = 0; i < 4; i++) {
+            for (int i = 0; i < 4; i++) {  // (MLX's rms_norm: w * T(x * r); precise_swiglu: silu(z) in float32 times it)
                 const int d = lane * 4 + i;
-                const float xn = float(static_cast<T>(o4[i] * r * float(norm_w[d])));
+                const float xn = float(static_cast<T>(float(norm_w[d]) * float(static_cast<T>(o4[i] * r))));
                 const float z = float(zp[d]);
-                yo[d] = static_cast<T>((z / (1.0f + metal::exp(-z))) * xn);
+                const float e = 1.0f / (1.0f + metal::precise::exp(metal::abs(z)));
+                yo[d] = static_cast<T>(z * (z < 0.0f ? e : 1.0f - e) * xn);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -155,6 +156,29 @@ _SOURCE = r"""
             *((device float4*)(state_out + (base + sgi * RPS + r) * Dk) + lane) = st[r];
         }
     }
+"""
+
+# MLX's sigmoid and softplus (logaddexp(x, 0)) in the type T, each step rounded as its kernels round it: in bf16
+# 1 / (1 + exp(-x)) and log(1 + exp(x)) rounded once differ from them in 17% and 15% of values.
+_HEADER = r"""
+template <typename T>
+inline T mlx_sigmoid(T x) {
+    const T e = T(metal::precise::exp(metal::abs(float(x))));
+    const T y = T(1.0f / float(T(1.0f + float(e))));
+    return float(x) < 0.0f ? y : T(1.0f - float(y));
+}
+
+template <typename T>
+inline T mlx_softplus(T x) {
+    const float xf = float(x);
+    if (isnan(xf)) return x;
+    const float hi = metal::max(xf, 0.0f), lo = metal::min(xf, 0.0f);
+    if (lo == -INFINITY || hi == INFINITY) return T(hi);
+    const T e = T(metal::precise::exp(float(T(lo - hi))));
+    const float xp1 = 1.0f + float(e);
+    const T l = xp1 == 1.0f ? e : T(float(e) * (metal::precise::log(xp1) / (xp1 - 1.0f)));
+    return T(hi + float(l));
+}
 """
 
 _KERNEL = {}
@@ -167,10 +191,10 @@ def _kernel(states: bool = False):
         # rewinding a partially accepted draft); the line is absent from the plain one
         src = _SOURCE.replace("//STATES//", "" if states else "//")
         k = _KERNEL[states] = mx.fast.metal_kernel(
-            name="locals_gdn_step2" + ("_states" if states else ""),
+            name="locals_gdn_step3" + ("_states" if states else ""),
             input_names=["proj", "conv_state", "conv_w", "A_log", "dt_bias", "state_in", "norm_w"],
             output_names=["y", "conv_state_out", "state_out"] + (["states_out"] if states else []),
-            source=src,
+            source=src, header=_HEADER,
         )
     return k
 

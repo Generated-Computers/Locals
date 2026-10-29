@@ -22,7 +22,7 @@ import time
 
 from mlx_lm.sample_utils import make_sampler
 
-from .defaults import DEFAULT_MODEL, MODEL_HELP, model_id
+from .defaults import DEFAULT_MODEL, MAC_BLOCK, MODEL_HELP, model_id
 from .runtime import Runtime
 
 
@@ -102,10 +102,13 @@ def main(argv=None):
                     help="compute dtype; auto = float16 on M1/M2 GPUs (no native bf16); implies --local")
     ap.add_argument("--local", action="store_true",
                     help="load the model in this process instead of using the background server (stop the server first)")
+    ap.add_argument("--blocks", type=int, nargs="?", const=MAC_BLOCK, default=None,
+                    help=f"a block-diffusion model (Clover) in this process: blocks of N tokens by diffusion (default {MAC_BLOCK}) "
+                    "instead of a token a step; implies --local")
     args = ap.parse_args(argv)
     if args.port:  # (client.connect reads it, as for locals --port N chat)
         os.environ["LOCALS_PORT"] = str(args.port)
-    args.local = args.local or args.dtype != "auto"
+    args.local = args.local or args.dtype != "auto" or bool(args.blocks)
 
     if not args.local:  # on the background server: one copy of the model in memory, kept between commands
         from .client import chat
@@ -115,6 +118,13 @@ def main(argv=None):
     from .app import check_local_load
 
     check_local_load(args.model, "chat")
+    if args.blocks:  # (Clover in blocks: its own decoding, locals/blockdiff.py)
+        from .blockdiff import chat as blockdiff_chat
+        from .blockdiff import is_block_diffusion
+
+        if not is_block_diffusion(args.model):
+            sys.exit(f"locals chat: --blocks: {args.model} is not a block-diffusion model (Clover)")
+        return blockdiff_chat(args)
     print(f"loading {args.model} ...", file=sys.stderr, flush=True)
     rt = Runtime.load(args.model, dtype=args.dtype)
     tok = rt.tokenizer

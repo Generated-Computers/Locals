@@ -165,6 +165,112 @@ def route_topk(logits: mx.array, k: int, order: bool = False):
     return inds, weights, slots if fused else expert_order(inds.reshape(-1, k))
 
 
+# Qwen3-Next/3.5's choice (mlx-lm's Qwen3NextSparseMoeBlock: softmax(precise=True) of the router's logits in their
+# dtype, argpartition's top k, the k renormalized) for a simdgroup a token. Lane i holds experts 128 g + 4 i .. + 3 of
+# each group g of 128, the layout of MLX's softmax kernel (4 a thread, a simdgroup per 128), so the normalizer is summed
+# in its order and each probability is its bits, rounded to T. argpartition is a stable ascending sort here (ties: the
+# higher index ends among the last k), so the k are chosen largest first with ties to the higher index and stored in
+# ascending order, the order the block sums them in; the weights are its running sum in T and its division.
+_ROUTE_SOFTMAX_SRC = """
+    #define UNROLL _Pragma("clang loop unroll(full)")
+    const uint t = thread_position_in_grid.x / 32;
+    const uint lane = thread_index_in_simdgroup;
+    threadgroup uint chosen[ORDER ? ORDER_ROWS * K : 1];
+    if (!ORDER && t >= nrows[0]) return;
+    constexpr int G = (E + 127) / 128, Q = 4 * G;  // a lane's values: q = 4 g + j is expert 128 g + 4 lane + j
+    const uint LS = logits_shape[1];  // (the logits' row: the router's E, then what was fused after them)
+    float p[Q];
+    float vmax = -INFINITY;
+    UNROLL for (int q = 0; q < Q; q++) {
+        const int e = (q / 4) * 128 + int(lane) * 4 + q % 4;
+        const float v = e < E ? float(logits[t * LS + e]) : -INFINITY;
+        p[q] = v;
+        vmax = vmax < v ? v : vmax;
+    }
+    vmax = simd_max(vmax);
+    float mine = 0.0f;
+    UNROLL for (int g = 0; g < G; g++) {
+        float part = 0.0f;
+        UNROLL for (int j = 0; j < 4; j++) {
+            const float ex = metal::fast::exp(p[4 * g + j] - vmax);
+            p[4 * g + j] = ex;
+            part += ex;
+        }
+        part = simd_sum(part);
+        if (int(lane) == g) mine = part;
+    }
+    const float inv = 1.0f / simd_sum(mine);
+    UNROLL for (int q = 0; q < Q; q++) {
+        const int e = (q / 4) * 128 + int(lane) * 4 + q % 4;
+        const float pr = float(T(p[q] * inv));
+        p[q] = e < E ? (isnan(pr) ? -1.0f : pr) : -2.0f;  // (a NaN is never chosen over a number; past E never)
+    }
+    // (every loop unrolled, the arrays indexed by constants: they stay in registers)
+    float picked[K];
+    uint which[K];
+    UNROLL for (int r = 0; r < K; r++) {
+        float best = -3.0f;
+        uint best_e = 0;
+        UNROLL for (int q = 0; q < Q; q++) {  // (ascending experts: >= keeps the higher of a tie)
+            if (p[q] >= best) { best = p[q]; best_e = (q / 4) * 128 + lane * 4 + q % 4; }
+        }
+        const float top = simd_max(best);
+        const uint win = min(simd_max(best == top ? best_e : 0u), uint(E - 1));
+        UNROLL for (int q = 0; q < Q; q++) {
+            if ((q / 4) * 128 + lane * 4 + q % 4 == win) p[q] = -3.0f;
+        }
+        picked[r] = top;
+        which[r] = win;
+    }
+    if (lane == 0) {
+        T total = T(picked[K - 1]);
+        UNROLL for (int j = 1; j < K; j++) total = T(float(total) + picked[K - 1 - j]);
+        UNROLL for (int j = 0; j < K; j++) {
+            const float s = picked[K - 1 - j];
+            inds[t * K + j] = which[K - 1 - j];
+            weights[t * K + j] = NORM ? float(T(s / float(total))) : s;
+            if (ORDER) chosen[t * K + j] = which[K - 1 - j];
+        }
+    }
+    if (ORDER) {  // (the grid is exactly the tokens' simdgroups: every thread reaches the barrier)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint S = nrows[0] * K, i = thread_position_in_threadgroup.x;
+        if (i < S) {
+            const uint e = chosen[i];
+            uint rank = 0;
+            for (uint j = 0; j < S; j++) rank += (chosen[j] < e || (chosen[j] == e && j < i)) ? 1u : 0u;
+            order[rank] = i;
+        }
+    }
+"""
+
+_route_softmax_kernel = None
+
+
+def route_softmax(logits: mx.array, E: int, k: int, norm: bool = True, order: bool = False):
+    """(experts, weights[, slots in expert order]) as mlx-lm's Qwen3NextSparseMoeBlock chooses them from router
+    ``logits`` (..., L) whose first ``E`` are the router's (L > E: more fused after them): uint32 experts in ascending
+    order of their probability (ties: ascending index) and float32 weights that hold the block's values in the
+    logits' dtype: the block's experts, order and weights bit for bit, ties at the k-th place included."""
+    global _route_softmax_kernel
+    if _route_softmax_kernel is None:
+        _route_softmax_kernel = mx.fast.metal_kernel(name="locals_route_softmax", input_names=["logits", "nrows"],
+                                                     output_names=["inds", "weights", "order"], source=_ROUTE_SOFTMAX_SRC)
+    L = logits.shape[-1]
+    T = logits.size // L
+    fused = order and T <= ORDER_MAX_ROWS
+    inds, weights, slots = _route_softmax_kernel(
+        inputs=[logits.reshape(T, L), mx.array([T], dtype=mx.uint32)],
+        template=[("T", logits.dtype), ("E", E), ("K", k), ("NORM", int(norm)), ("ORDER", int(fused)),
+                  ("ORDER_ROWS", ORDER_MAX_ROWS)],
+        grid=(T * 32, 1, 1), threadgroup=(T * 32 if fused else min(256, T * 32), 1, 1),
+        output_shapes=[(*logits.shape[:-1], k)] * 2 + [(T * k if fused else 1,)],
+        output_dtypes=[mx.uint32, mx.float32, mx.uint32])
+    if not order:
+        return inds, weights
+    return inds, weights, slots if fused else expert_order(inds.reshape(-1, k))
+
+
 # --- the routed experts of a few tokens -----------------------------------------------------------------------------
 #
 # gather_qmm, the gate/up slices, swiglu, gather_qmm, the weighted sum over the k experts, its cast and the shared
@@ -181,6 +287,15 @@ def route_topk(logits: mx.array, k: int, order: bool = False):
 # Weights are MLX's affine format with groups of 64: a group is a little-endian bit stream of 2 * BITS 32-bit words.
 
 _QDOT_HEADER = """
+// MLX's sigmoid in the type T, each step rounded as its kernel rounds it (1 / (1 + exp|x|), and 1 minus that for x >= 0):
+// in bf16 the bits of mx.sigmoid and of mlx-lm's swiglu, where 1 / (1 + exp(-x)) rounded once differs in 17% of values.
+template <typename T>
+inline T mlx_sigmoid(T x) {
+    const T e = T(metal::precise::exp(metal::abs(float(x))));
+    const T y = T(1.0f / float(T(1.0f + float(e))));
+    return float(x) < 0.0f ? y : T(1.0f - float(y));
+}
+
 // Values 8c..8c+7 of a group as one integer: value i at bits BITS*i (3 bits: four 24-bit chunks in three words).
 // A chunk kept in a register is a uint up to 4 bits and a ulong from 5 (40 to 64 bits).
 template <bool WIDE> struct chunk_type { typedef uint type; };
@@ -283,7 +398,7 @@ _UP_SRC = """
         for (int r = 0; r < R; r++) {  // (one group a lane: the simd_sum is each row's whole sum)
             const T gt = T(simd_sum(sg[r] * qg[r] + bg[r] * xs)), ut = T(simd_sum(su[r] * qu[r] + bu[r] * xs));
             if (lane == 0) {
-                const T sig = T(1.0f / (1.0f + metal::exp(-float(gt))));
+                const T sig = mlx_sigmoid<T>(gt);
                 const T act = T(float(gt) * float(sig));
                 h[size_t(slot) * I + j0 + r] = T(float(act) * float(ut));
             }
@@ -388,7 +503,63 @@ _COMBINE_NORM_SRC = """
     }
 """
 
-_up_kernel = _down_kernel = _combine_kernel = None
+# The combine as Qwen3-Next/3.5's block computes it in T (mlx-lm's Qwen3NextSparseMoeBlock): each slot's output times
+# its weight rounded, summed in slot order with each partial sum rounded (an MLX sum of a 16-bit axis of 8 is that
+# running sum), then the shared expert times MLX's sigmoid of its gate's logit (column GATE_COL of ``gate``), and the
+# layer's residual add.
+_COMBINE_GATED_SRC = """
+    const uint i = thread_position_in_grid.x;
+    const uint t = i / D, row = i % D;
+    if (t >= ntok[0]) return;
+    T acc = T(float(ys[size_t(t * K) * D + row]) * weights[t * K]);
+    for (int k = 1; k < K; k++) acc = T(float(acc) + float(T(float(ys[size_t(t * K + k) * D + row]) * weights[t * K + k])));
+    const T g = mlx_sigmoid<T>(T(gate[size_t(t) * gate_shape[1] + GATE_COL]));
+    acc = T(float(acc) + float(T(float(g) * float(shared[size_t(t) * D + row]))));
+    if (HAS_RES) acc = T(float(res[size_t(t) * D + row]) + float(acc));
+    y[size_t(t) * D + row] = acc;
+"""
+
+# The same, then the next layer's input norm of the layer's output, laid out as _COMBINE_NORM_SRC (MLX's RMS norm).
+_COMBINE_GATED_NORM_SRC = """
+    constexpr int N_READS = 4;
+    threadgroup float local_inv_mean[1];
+    threadgroup float local_sums[32];
+    const uint t = threadgroup_position_in_grid.x;
+    const uint lid = thread_position_in_threadgroup.x;
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const T g = mlx_sigmoid<T>(T(gate[size_t(t) * gate_shape[1] + GATE_COL]));
+    T hv[N_READS];
+    float sq = 0;
+    for (int i = 0; i < N_READS; i++) {
+        const uint row = lid * N_READS + i;
+        T acc = T(float(ys[size_t(t * K) * D + row]) * weights[t * K]);
+        for (int k = 1; k < K; k++) acc = T(float(acc) + float(T(float(ys[size_t(t * K + k) * D + row]) * weights[t * K + k])));
+        acc = T(float(acc) + float(T(float(g) * float(shared[size_t(t) * D + row]))));
+        acc = T(float(res[size_t(t) * D + row]) + float(acc));
+        y[size_t(t) * D + row] = acc;
+        hv[i] = acc;
+        float xi = hv[i];
+        sq += xi * xi;
+    }
+    sq = simd_sum(sq);
+    if (sg == 0) local_sums[lane] = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) local_sums[sg] = sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        sq = simd_sum(local_sums[lane]);
+        if (lane == 0) local_inv_mean[0] = metal::precise::rsqrt(sq / D + __EPS__);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = 0; i < N_READS; i++) {
+        const uint row = lid * N_READS + i;
+        n[size_t(t) * D + row] = nw[row] * static_cast<T>(hv[i] * local_inv_mean[0]);
+    }
+"""
+
+_up_kernel = _down_kernel = _combine_kernel = _combine_gated_kernel = None
+_combine_gated_norm_kernels: dict = {}
 _combine_norm_kernels: dict = {}
 USE_EXPERT_KERNELS = os.environ.get("LOCALS_EXPERT_KERNELS", "1") != "0"
 EXPERT_MAX_ROWS = 16  # more tokens (a prompt): gather_qmm, sorted, reads each expert once for all its tokens
@@ -463,11 +634,13 @@ def experts_up(x: mx.array, inds: mx.array, gate_up, order: Optional[mx.array] =
 
 
 def experts_down(h: mx.array, inds: mx.array, weights: mx.array, down, shared=None, order: Optional[mx.array] = None,
-                 r: Optional[int] = None, residual=None, norm=None):
+                 r: Optional[int] = None, residual=None, norm=None, gate=None, gate_col: int = 0):
     """sum_k weights[t, k] * down_{inds[t, k]}(h[t, k]) (+ ``shared``) (+ ``residual``, added last as the decoder layer
     adds it): ``h`` (T * K, I) -> (T, D). Each slot's projection (rows sharing an expert read it once), then a combine
     that sums a token's slots in their order. ``r`` output rows a lane (default: 4 from EXPERT_ROWS_FROM tokens) give
-    the same bits. With ``residual`` and ``norm`` (an RMSNorm, the next layer's input norm): (that sum, its norm)."""
+    the same bits. With ``residual`` and ``norm`` (an RMSNorm, the next layer's input norm): (that sum, its norm).
+    With ``gate`` (Qwen3-Next/3.5's block): the sum rounded as that block rounds it, and ``shared`` times the sigmoid of
+    ``gate[:, gate_col]`` (_COMBINE_GATED_SRC)."""
     global _down_kernel, _combine_kernel
     if _down_kernel is None:
         _down_kernel = mx.fast.metal_kernel(name="locals_experts_down_rows",
@@ -487,6 +660,8 @@ def experts_down(h: mx.array, inds: mx.array, weights: mx.array, down, shared=No
                          template=[("T", h.dtype), ("BITS", down.bits), ("D", D), ("I", I), ("K", K), ("R", r)],
                          grid=(S * (D // (rps * r)) * 32, 1, 1), threadgroup=(128, 1, 1), output_shapes=[(S, D)],
                          output_dtypes=[h.dtype])
+    if gate is not None:
+        return combine_gated(ys, weights, shared, gate, gate_col, residual, norm)
     has, res = shared is not None, residual is not None
     none = mx.zeros((1,), dtype=h.dtype)
     if res and norm is not None:
@@ -509,6 +684,43 @@ def experts_down(h: mx.array, inds: mx.array, weights: mx.array, down, shared=No
                                    mx.array([NT], dtype=mx.uint32)],
                            template=[("T", h.dtype), ("D", D), ("K", K), ("HAS_SHARED", int(has)), ("HAS_RES", int(res))],
                            grid=(NT * D, 1, 1), threadgroup=(256, 1, 1), output_shapes=[(NT, D)], output_dtypes=[h.dtype])
+    return y if norm is None else (y, norm(y))
+
+
+def combine_gated(ys: mx.array, weights: mx.array, shared: mx.array, gate: mx.array, gate_col: int = 0, residual=None,
+                  norm=None):
+    """Qwen3-Next/3.5's combine (_COMBINE_GATED_SRC): ``ys`` (T * K, D), each slot's expert output, with the routing
+    ``weights`` (T, K), plus ``shared`` (T, D) times the sigmoid of ``gate[:, gate_col]`` (+ ``residual``); with
+    ``residual`` and ``norm`` (the next layer's input norm): (that sum, its norm). The bits of mlx-lm's block."""
+    global _combine_gated_kernel
+    NT, K = weights.shape
+    D = ys.shape[-1]
+    res = residual is not None
+    if res and norm is not None:
+        from .norm_kernel import supported
+
+        if supported(D):
+            eps = float(norm.eps)
+            kern = _combine_gated_norm_kernels.get(eps)
+            if kern is None:
+                kern = _combine_gated_norm_kernels[eps] = mx.fast.metal_kernel(
+                    name="locals_experts_combine_gated_norm_%d" % len(_combine_gated_norm_kernels),
+                    input_names=["ys", "weights", "shared", "gate", "res", "nw"], output_names=["y", "n"],
+                    source=_COMBINE_GATED_NORM_SRC.replace("__EPS__", "%.9ef" % eps), header=_QDOT_HEADER)
+            y, n = kern(inputs=[ys, weights.astype(mx.float32), shared, gate, residual, norm.weight],
+                        template=[("T", ys.dtype), ("D", D), ("K", K), ("GATE_COL", gate_col)],
+                        grid=(NT * (D // 4), 1, 1), threadgroup=(D // 4, 1, 1), output_shapes=[(NT, D)] * 2,
+                        output_dtypes=[ys.dtype] * 2)
+            return y, n
+    if _combine_gated_kernel is None:
+        _combine_gated_kernel = mx.fast.metal_kernel(name="locals_experts_combine_gated",
+                                                     input_names=["ys", "weights", "shared", "gate", "res", "ntok"],
+                                                     output_names=["y"], source=_COMBINE_GATED_SRC, header=_QDOT_HEADER)
+    (y,) = _combine_gated_kernel(
+        inputs=[ys, weights.astype(mx.float32), shared, gate, residual if res else mx.zeros((1,), dtype=ys.dtype),
+                mx.array([NT], dtype=mx.uint32)],
+        template=[("T", ys.dtype), ("D", D), ("K", K), ("GATE_COL", gate_col), ("HAS_RES", int(res))],
+        grid=(NT * D, 1, 1), threadgroup=(256, 1, 1), output_shapes=[(NT, D)], output_dtypes=[ys.dtype])
     return y if norm is None else (y, norm(y))
 
 
@@ -661,4 +873,84 @@ def fuse_flint_moe(block) -> bool:
     if isinstance(getattr(se, "gate_proj", None), nn.QuantizedLinear) and _fusable([se.gate_proj, se.up_proj]) and _swiglu_mlp(se):
         _fuse_mlp(se)
     block.__class__ = type("Fused" + type(block).__name__, (FusedFlintMoe, type(block)), {})
+    return True
+
+
+class FusedQwenMoe(nn.Module):
+    """Qwen3-Next/3.5's SparseMoeBlock (mlx-lm's Qwen3NextSparseMoeBlock: Qwen3.5-MoE, Clover's causal pass). The
+    router and the shared expert's gate are one matmul (``gates``: the E logits, then the gate's), the choice one kernel
+    (route_softmax); a few tokens' experts go through experts_up / experts_down, whose combine adds the gated shared
+    expert and, with ``residual``, the layer's residual add (FusedQwenLayer). Rounded where mlx-lm's block rounds."""
+
+    def _logits(self, x):
+        """(router logits, the array holding the shared expert's gate logit, its column)."""
+        if "gates" in self:
+            g = self.gates(x)
+            return g, g, self.num_experts
+        return self.gate(x), self.shared_expert_gate(x), 0
+
+    def __call__(self, x: mx.array, residual: Optional[mx.array] = None, norm=None):
+        """With ``norm`` (and ``residual``): (residual + the block's output, ``norm`` of it), both from the combine."""
+        sw, D, k, E = self.switch_mlp, x.shape[-1], self.top_k, self.num_experts
+        logits, gl, col = self._logits(x)
+        if USE_EXPERT_KERNELS and hasattr(sw, "gate_up_proj") and experts_fit(x, sw.gate_up_proj, sw.down_proj):
+            inds, weights, order = route_softmax(logits, E, k, self.norm_topk_prob, order=True)
+            x2, inds2 = x.reshape(-1, D), inds.reshape(-1, k)
+            h = experts_up(x2, inds2, sw.gate_up_proj, order)
+            y = experts_down(h, inds2, weights.reshape(-1, k), sw.down_proj, self.shared_expert(x).reshape(-1, D), order,
+                             residual=None if residual is None else residual.reshape(-1, D), norm=norm,
+                             gate=gl.reshape(-1, gl.shape[-1]), gate_col=col)
+            if norm is None:
+                return y.reshape(x.shape)
+            return y[0].reshape(x.shape), y[1].reshape(x.shape)
+        gates = mx.softmax(logits[..., :E], axis=-1, precise=True)  # mlx-lm's block (a prompt)
+        inds = mx.stop_gradient(mx.argpartition(gates, kth=-k, axis=-1)[..., -k:])
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        if self.norm_topk_prob:
+            scores = scores / scores.sum(axis=-1, keepdims=True)
+        y = (self.switch_mlp(x, inds) * scores[..., None]).sum(axis=-2)
+        y = y + mx.sigmoid(gl[..., col : col + 1]) * self.shared_expert(x)
+        if residual is not None:
+            y = residual + y
+        return y if norm is None else (y, norm(y))
+
+
+class FusedQwenLayer(nn.Module):
+    """Qwen3.5's decoder layer with a FusedQwenMoe block, the block's residual add in its last kernel. ``step`` also
+    has the mixer's residual add and the post-mixer norm in one kernel (_add_norm), and the next layer's input norm
+    computed by the combine (fuse.FusedHybridBody, with ``_moe_steps``)."""
+
+    def __call__(self, x: mx.array, mask: Optional[mx.array] = None, cache=None) -> mx.array:
+        if self.is_linear:
+            r = self.linear_attn(self.input_layernorm(x), mask, cache)
+        else:
+            r = self.self_attn(self.input_layernorm(x), mask, cache)
+        h = x + r
+        return self.mlp(self.post_attention_layernorm(h), residual=h)
+
+    def step(self, x: mx.array, nx: mx.array, mask, cache, norm):
+        """(this layer's output, ``norm`` of it), from its input ``x`` and its input norm ``nx``."""
+        r = self.linear_attn(nx, mask, cache) if self.is_linear else self.self_attn(nx, mask, cache)
+        h, n = _add_norm(x, r, self.post_attention_layernorm)
+        return self.mlp(n, residual=h, norm=norm)
+
+
+def fuse_qwen_moe(block) -> bool:
+    """Qwen3-Next/3.5's SparseMoeBlock (mlx-lm's), in place: expert gate/up, the shared expert's gate/up, the router
+    with the shared expert's gate; False if it is another kind of block."""
+    from .fuse import _concat_quantized, _fusable, _fuse_mlp, _swiglu_mlp
+
+    if type(block).__name__ != "Qwen3NextSparseMoeBlock" or type(block).__module__.split(".")[-1] != "qwen3_next":
+        return False
+    if getattr(block, "sharding_group", None) is not None:
+        return False
+    fuse_switch_glu(block.switch_mlp)
+    se = block.shared_expert
+    if isinstance(getattr(se, "gate_proj", None), nn.QuantizedLinear) and _fusable([se.gate_proj, se.up_proj]) and _swiglu_mlp(se):
+        _fuse_mlp(se)
+    g, sg = block.gate, block.shared_expert_gate
+    if all(isinstance(m, nn.QuantizedLinear) for m in (g, sg)) and _fusable([g, sg]):
+        block.gates = _concat_quantized([g, sg])
+        del block.gate, block.shared_expert_gate
+    block.__class__ = type("Fused" + type(block).__name__, (FusedQwenMoe, type(block)), {})
     return True

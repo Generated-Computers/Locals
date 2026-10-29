@@ -40,7 +40,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import List, Optional
-from .defaults import DEFAULT_MODEL, MODEL_HELP, model_id
+from .defaults import DEFAULT_MODEL, MAC_BLOCK, MODEL_HELP, model_id
 
 HOME = Path.home()
 LOCALS_DIR = HOME / ".locals"
@@ -688,7 +688,7 @@ def fetch_model(model: str) -> None:
 # --- the server ---------------------------------------------------------------------------------
 
 _CMD_OPTS = ("engines", "preload", "slots", "temp", "top_p", "top_k", "max_tokens", "cache_gb", "max_calls", "max_context",
-             "ollama_port")
+             "ollama_port", "blocks")
 _CMD_FLAGS = ("thinking", "walk", "typed_tools")
 _KEPT = tuple(k for k in _CMD_OPTS + _CMD_FLAGS if k not in ("engines", "preload"))  # (a restart keeps these)
 
@@ -2486,6 +2486,9 @@ def _main(argv=None):
                        help="tool calls with parameter names and types fixed by the grammar (use with --walk)")
         p.add_argument("--ollama", dest="ollama_port", action="store_const", const=OLLAMA_PORT, default=None,
                        help=f"also answer as Ollama on its port ({OLLAMA_PORT}), for apps that only know Ollama's address")
+        p.add_argument("--blocks", type=int, nargs="?", const=MAC_BLOCK, default=None,
+                       help=f"a block-diffusion model (Clover): blocks of N tokens by diffusion (default {MAC_BLOCK}) "
+                       "instead of a token a step; slower on a Mac, no grammars")
 
     p = sub.add_parser("setup", help="connect an agent tool to the server: opencode (default), openclaw, hermes")
     p.add_argument("target", nargs="?", choices=["opencode", "openclaw", "hermes"], default="opencode",

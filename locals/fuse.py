@@ -212,6 +212,18 @@ def _fast_gdn(layer, dtype, S: int) -> bool:
         return False
 
 
+class SplitProjection(nn.Module):
+    """Two projections of one input, their outputs one after the other: in_proj_all for a Gated DeltaNet whose b and a
+    projections are quantized apart from qkv and z (Clover's: 8 bits next to 4), so that the decode kernel applies."""
+
+    def __init__(self, first, second):
+        super().__init__()
+        self.first, self.second = first, second
+
+    def __call__(self, x):
+        return mx.concatenate([self.first(x), self.second(x)], axis=-1)
+
+
 class FusedGatedDeltaNet(nn.Module):
     """Qwen3.5 GatedDeltaNet with in_proj_{qkv,z,b,a} as one matmul, and the
     whole single-token step after it as one kernel."""
@@ -340,18 +352,22 @@ class FusedGatedAttention(nn.Module):
 
 
 USE_ADD_RMS = False  # fused residual add + RMS norm (norm_kernel.py): measured no faster than MLX's two kernels, off
+USE_MOE_STEPS = os.environ.get("LOCALS_MOE_STEPS", "1") != "0"  # Qwen3.5-MoE: the adds in the norms and the combine
 
 
 class FusedHybridBody(nn.Module):
     """Qwen3.5 text model body with each residual add fused into the RMS norm
-    that follows it (the post-mixer norm, and the next layer's input norm)."""
+    that follows it (the post-mixer norm, and the next layer's input norm).
+    For Qwen3.5-MoE's layers (moe.FusedQwenLayer, ``_moe_steps``) the expert
+    combine computes the next layer's input norm, and the layer steps itself."""
 
     def __call__(self, inputs, cache=None, input_embeddings=None):
         from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
         from .norm_kernel import add_rms
 
-        if not USE_ADD_RMS:
+        steps = getattr(self, "_moe_steps", False)
+        if not USE_ADD_RMS and not steps:
             return self._stock_call(inputs, cache, input_embeddings=input_embeddings)
         h = input_embeddings if input_embeddings is not None else self.embed_tokens(inputs)
         if cache is None:
@@ -361,6 +377,10 @@ class FusedHybridBody(nn.Module):
         layers = self.layers
         n = layers[0].input_layernorm(h)
         for i, (layer, c) in enumerate(zip(layers, cache)):
+            if steps:
+                nxt = layers[i + 1].input_layernorm if i + 1 < len(layers) else self.norm
+                h, n = layer.step(h, n, ssm_mask if layer.is_linear else fa_mask, c, nxt)
+                continue
             if layer.is_linear:
                 r = layer.linear_attn(n, ssm_mask, c)
             else:
@@ -408,8 +428,13 @@ def fuse_model(model) -> int:
         lin = getattr(layer, "linear_attn", None)
         if lin is not None and type(lin).__name__ == "GatedDeltaNet" and hasattr(lin, "in_proj_qkv"):
             parts = [lin.in_proj_qkv, lin.in_proj_z, lin.in_proj_b, lin.in_proj_a]
+            proj = None
             if _fusable(parts):
-                lin.in_proj_all = _concat_quantized(parts)
+                proj = _concat_quantized(parts)
+            elif _fusable(parts[:2]) and _fusable(parts[2:]):  # b and a quantized apart (Clover's: 8 bits)
+                proj = SplitProjection(_concat_quantized(parts[:2]), _concat_quantized(parts[2:]))
+            if proj is not None:
+                lin.in_proj_all = proj
                 del lin.in_proj_qkv, lin.in_proj_z, lin.in_proj_b, lin.in_proj_a
                 from .gdn_kernel import supported as gdn_supported
 
@@ -436,10 +461,33 @@ def fuse_model(model) -> int:
             from .moe import fuse_flint_moe
 
             fuse_flint_moe(mlp)  # Flint's: router, experts, shared expert (another model's block stays as it is)
+        if mlp is not None and type(mlp).__name__ == "Qwen3NextSparseMoeBlock":
+            from .moe import FusedQwenLayer, FusedQwenMoe, fuse_qwen_moe
+
+            # Qwen3.5-MoE's (Clover's causal pass): router and shared gate, experts, shared expert; the residual add
+            if (fuse_qwen_moe(mlp) and type(layer).__name__ == "DecoderLayer"
+                    and type(layer).__module__.split(".")[-1] == "qwen3_5" and isinstance(layer.mlp, FusedQwenMoe)):
+                layer.__class__ = type("Fused" + type(layer).__name__, (FusedQwenLayer, type(layer)), {})
+        if mlp is not None and type(mlp).__name__ == "SparseMoe":
+            from .clover_fast import fuse_clover_moe
+
+            fuse_clover_moe(mlp)  # Clover's: the routing in one kernel, a block's experts in the tile kernels
+        if lin is not None and type(lin).__name__ == "CloverGatedDeltaNet":
+            from .clover_fast import fuse_clover_gdn
+
+            fuse_clover_gdn(lin)  # a Clover preview's convolution in one kernel, qkv and z one matmul
+        if attn is not None and type(attn).__name__ == "CloverAttention":
+            from .clover_fast import fuse_clover_attention
+
+            fuse_clover_attention(attn)  # q (and its gate), k and v one matmul
         if (isinstance(getattr(mlp, "gate_proj", None), nn.QuantizedLinear) and isinstance(getattr(mlp, "up_proj", None), nn.QuantizedLinear)
                 and _fusable([mlp.gate_proj, mlp.up_proj]) and _swiglu_mlp(mlp)):
             _fuse_mlp(mlp)
         n += 1
+    if isinstance(body, FusedHybridBody):
+        from .moe import FusedQwenLayer
+
+        body._moe_steps = USE_MOE_STEPS and all(isinstance(l, FusedQwenLayer) for l in body.layers)
     if type(body).__name__ == "FlintModel" and type(body).__module__.split(".")[-1] == "flint":
         from .moe import FusedFlintBody, FusedFlintLayer, FusedFlintMoe
 

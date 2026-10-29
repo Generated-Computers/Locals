@@ -12,7 +12,7 @@ import importlib
 import importlib.util
 import sys
 
-_MODULES = ("flint",)  # Recursive's Flint (mlx-lm has it from ml-explore/mlx-lm#1998, unreleased)
+_MODULES = ("flint", "clover_moe")  # Recursive's Flint (mlx-lm has it from ml-explore/mlx-lm#1998, unreleased); DiffuSpace's Clover
 
 
 def register() -> None:
