@@ -499,9 +499,10 @@ def _chain_us(build, calls, warm: bool = True):
 _LAUNCH = {}
 
 
-def _launcher(choice, M, K, N, dtype):
-    """A cached closure with the kernel's template and grid pre-computed."""
-    key = (choice, M, K, N, dtype)
+def _launcher(choice, M, K, N, dtype, bits=4):
+    """A cached closure with the kernel's template and grid pre-computed (``bits``: the weights', 4 for every family,
+    8 for MLX's kernel and mma)."""
+    key = (choice, M, K, N, dtype, bits)
     f = _LAUNCH.get(key)
     if f is not None:
         return f
@@ -535,7 +536,7 @@ def _launcher(choice, M, K, N, dtype):
         out_dtype = dtype if split == 1 else mx.float32
         kern = _kernel()
         template = [("T", dtype), ("U", out_dtype), ("BM", BM), ("BN", BN), ("BK", BK), ("WM", WM), ("WN", WN),
-                    ("K", K), ("N", N), ("M", M), ("SPLIT", split)]
+                    ("K", K), ("N", N), ("M", M), ("SPLIT", split), ("BITS", bits)]
         grid = (N // BN * 32 * WM * WN, (M + BM - 1) // BM, split)
         tg = (32 * WM * WN, 1, 1)
         shapes = [(split * M, N)]
@@ -557,14 +558,26 @@ def _launcher(choice, M, K, N, dtype):
             return qmm_small(x2, w, sc, bi, 64, R=R, NSG=NSG)
     else:
         def f(x2, w, sc, bi):
-            return mx.quantized_matmul(x2, w, sc, bi, transpose=True, group_size=64, bits=4)
+            return mx.quantized_matmul(x2, w, sc, bi, transpose=True, group_size=64, bits=bits)
     _LAUNCH[key] = f
     return f
 
 
 def _run(choice, x2, mod):
     M, K = x2.shape
-    return _launcher(choice, M, K, mod["weight"].shape[0], x2.dtype)(x2, mod["weight"], mod["scales"], mod["biases"])
+    return _launcher(choice, M, K, mod["weight"].shape[0], x2.dtype, mod.bits)(x2, mod["weight"], mod["scales"], mod["biases"])
+
+
+def _dtb(dt: str, bits: int) -> str:
+    """The activations' dtype and, past 4, the weights' bits: what a choice is cached under besides N, K, M."""
+    return dt if bits == 4 else f"{dt}b{bits}"
+
+
+def _mkey(N: int, K: int, M, dt: str, bits: int = 4) -> str:
+    """A matmul shape's key in the tuning cache: N x K x M, then the activations' dtype past float16 and the weights'
+    bits past 4 (``248320x2048x8xbfloat16b8``); a 4-bit layer's keys are as they always were."""
+    suffix = ("" if dt == "float16" else dt) + ("" if bits == 4 else f"b{bits}")
+    return f"{N}x{K}x{M}" + (f"x{suffix}" if suffix else "")
 
 
 _CHOICE = {}
@@ -580,11 +593,11 @@ _TUNING = False  # set while the background tuner itself chooses
 def _choose(x2, mod):
     M, K = x2.shape
     N = mod["weight"].shape[0]
-    dt = str(x2.dtype).split(".")[-1]
+    dt = _dtb(str(x2.dtype).split(".")[-1], mod.bits)
     c = _CHOICE.get((N, K, M, dt))
     if c is not None and not _RETIME:  # (the path of every call once chosen: no lock, no lookups)
         return c
-    key = f"{N}x{K}x{M}" + ("" if dt == "float16" else f"x{dt}")
+    key = _mkey(N, K, M, str(x2.dtype).split(".")[-1], mod.bits)
     tune = _load_tune()
     if c is not None and not _is_stale(tune, key):
         return c
@@ -631,10 +644,11 @@ def _tune_shape(x2, mod, M, K, N, dt, key, tune):
                 pass
 
 
-def _time_shape(x2, mod, M, K, N, dt, key, tune):
+def _cands4(M, K, N, dt, mma_ok):
+    """The kernel families a 4-bit layer of N x K at M rows can take, besides MLX's."""
     from . import qmv_frag, qmv_multi
 
-    cands = [("mlx",)]
+    cands = []
     if M <= 4:
         cands += [("multi", *c) for c in _MULTI_CANDIDATES if qmv_multi.supported(M, K, N, c[0], c[1])]
     if 3 <= M <= 6:  # at M <= 2 it wins in isolation but loses ~1% inside the model
@@ -646,14 +660,22 @@ def _time_shape(x2, mod, M, K, N, dt, key, tune):
     if M >= 2:
         if MIN_M_SMALL <= M <= MAX_M_SMALL and (N >= 4096 or K >= 4096):
             cands.append(("small",))
-        for BM, BN, BK, WM, WN, split in _MMA_CANDIDATES[8 if M <= 8 else 16]:
-            if N % BN or K % (BK * split) or (K // split) % 64 or BN % (8 * WN):
-                continue
-            cands.append(("mma", BM, BN, BK, WM, WN, split))
+        cands += mma_ok
         from . import nax_kernel
 
         if nax_kernel.available():  # the M5's neural accelerators
             cands += [("nax", *c) for c in nax_kernel.CANDIDATES if nax_kernel.supported(M, K, N, c)]
+    return cands
+
+
+def _time_shape(x2, mod, M, K, N, dt, key, tune):
+    cands = [("mlx",)]
+    mma_ok = [("mma", *c) for c in _MMA_CANDIDATES[8 if M <= 8 else 16]
+              if not (N % c[1] or K % (c[2] * c[5]) or (K // c[5]) % 64 or c[1] % (8 * c[4]))]
+    if mod.bits != 4:  # (an 8-bit output layer: MLX's kernel or mma, whose loader takes any width; the rest are 4-bit's)
+        cands += mma_ok
+    else:
+        cands += _cands4(M, K, N, dt, mma_ok)
     xr = mx.random.normal(x2.shape, key=mx.random.key(M * 131 + K)).astype(x2.dtype)  # not the global random state
     ref = _run(("mlx",), xr, mod).astype(mx.float32)
     tol = 0.05 * (1.0 + float(mx.max(mx.abs(ref))))
@@ -677,8 +699,11 @@ def _time_shape(x2, mod, M, K, N, dt, key, tune):
     # machine noise.
     nbytes = sum(mod[k].nbytes for k in ("weight", "scales", "biases"))
     ncopy = max(1, min(16, (64 << 20) // max(nbytes, 1)))
-    copies = [{k: mx.array(mod[k]) + 0 if k != "weight" else mx.array(mod[k]) | 0 for k in ("weight", "scales", "biases")}
-              for _ in range(ncopy)]
+    if nbytes >= 64 << 20:  # already more than the caches hold: timed in place (a copy of an output layer: 0.5 GB)
+        copies = [{k: mod[k] for k in ("weight", "scales", "biases")}]
+    else:
+        copies = [{k: mx.array(mod[k]) + 0 if k != "weight" else mx.array(mod[k]) | 0 for k in ("weight", "scales", "biases")}
+                  for _ in range(ncopy)]
     mx.eval(copies)
     calls = 16
 
@@ -694,7 +719,7 @@ def _time_shape(x2, mod, M, K, N, dt, key, tune):
     times = {c: float("inf") for c in ok}
     for r in range(4):
         for c in ok:
-            f = _launcher(c, M, K, N, x2.dtype)
+            f = _launcher(c, M, K, N, x2.dtype, mod.bits)
             times[c] = min(times[c], max(0.1, _chain_us(lambda: chain(f), calls, warm=r == 0) - base))
     del copies
     mlx_t = times[("mlx",)]
@@ -720,14 +745,31 @@ def _tunable(mod) -> bool:
             and mod.get("biases") is not None and (mod["weight"].shape[1] * 8) % 64 == 0)
 
 
+HEAD8 = _os.environ.get("LOCALS_HEAD8", "1") != "0"  # 0: 8-bit output layers on MLX's kernel at every row count
+HEAD8_MIN_N = 1 << 15  # 8-bit layers this wide (output layers, Clover's) go through mma where it is faster from
+HEAD8_MIN_M = 5  # this many rows: MLX's kernel reads the weights once up to 4, then a 32-row tile for 6 to 32
+# (Clover's 540 MB output layer: 2.2 ms at 1 to 4 rows, 4.7 at 8, 6.3 at 16; mma with 8-row tiles, 2.9 at 8)
+
+
+def _tunable_head8(mod) -> bool:
+    """A wide 8-bit layer (an output layer) the tuned kernels compute from HEAD8_MIN_M rows (affine, groups of 64)."""
+    return HEAD8 and isinstance(mod, nn.QuantizedLinear) and getattr(mod, "bits", None) == 8 and (
+        getattr(mod, "group_size", None) == 64 and getattr(mod, "mode", "affine") == "affine" and mod.get("biases") is not None
+        and mod["weight"].shape[0] >= HEAD8_MIN_N and (mod["weight"].shape[1] * 4) % 64 == 0)
+
+
 def _eligible(x: mx.array, mod) -> bool:
-    if not _tunable(mod):
+    if _tunable(mod):
+        low = MIN_M
+    elif _tunable_head8(mod):
+        low = HEAD8_MIN_M
+    else:
         return False
     K = x.shape[-1]
     if K % 64:
         return False
     M = x.size // K
-    return MIN_M <= M <= MAX_M and x.dtype in (mx.float16, mx.bfloat16)
+    return low <= M <= MAX_M and x.dtype in (mx.float16, mx.bfloat16)
 
 
 _PAD: dict = {}  # (N, K, M, dtype) -> the rows M rows of this shape are computed at (_pad_rows)
@@ -770,7 +812,7 @@ def _small_matmul(x, mod):
     shape = x.shape
     x2 = x.reshape(-1, shape[-1])
     M, K = x2.shape
-    P = _pad_rows(mod["weight"].shape[0], K, M, str(x2.dtype).split(".")[-1])
+    P = _pad_rows(mod["weight"].shape[0], K, M, str(x2.dtype).split(".")[-1]) if mod.bits == 4 else M
     if P > M:  # more rows run faster on this GPU: compute them, keep these
         xp = mx.concatenate([x2, mx.zeros((P - M, K), x2.dtype)])
         y = _run(_choose(xp, mod), xp, mod)[:M]
@@ -1010,7 +1052,7 @@ def _linear_call_inner(self, x):
     M = x.size // K
     dt = _DTYPE_NAME.get(x.dtype)
     if dt is not None and M < PREFILL_M and not _RETIME and vars(self).get("_locals_direct"):
-        key = (self["weight"].shape[0], K, M, dt)
+        key = (self["weight"].shape[0], K, M, _dtb(dt, self.bits))
         if _CHOICE.get(key) == ("mlx",) and _PAD.get(key, 0) == M:
             return _orig_linear_call(self, x)
     if _dense_ok(x, self):
@@ -1269,17 +1311,18 @@ def warmup(model, ms=range(1, 9)) -> int:
     instead of on first use in the middle of a request (each new kernel
     instance costs ~50 ms of Metal compilation). Returns instances run."""
     outs, seen, failed = [], set(), set()
-    for _, mod in model.named_modules():
-        if not _tunable(mod):
-            continue
-        N, K = mod["weight"].shape[0], mod["weight"].shape[1] * 8
+    for _, mod in _matmul_layers(model):
+        N, K = mod["weight"].shape[0], _in_dims(mod)
         dt = mod["scales"].dtype
+        dtb = _dtb(str(dt).split(".")[-1], mod.bits)
         for M in ms:
+            if M < _low_m(mod):
+                continue
             x = mx.zeros((M, K), dt)
             c = _choose(x, mod)
-            key = (c, M if c[0] not in ("frag", "fragh", "fragq") else (M + 7) // 8, K, N, dt)
+            key = (c, M if c[0] not in ("frag", "fragh", "fragq") else (M + 7) // 8, K, N, dt, mod.bits)
             if key in failed:  # the same kernel instance as one that failed (frag shares one across 8 row counts)
-                _CHOICE[(N, K, M, str(dt).split(".")[-1])] = ("mlx",)
+                _CHOICE[(N, K, M, dtb)] = ("mlx",)
                 continue
             if key in seen:
                 continue
@@ -1288,8 +1331,23 @@ def warmup(model, ms=range(1, 9)) -> int:
                 mx.eval(_run(c, x, mod))
             except Exception:  # noqa: BLE001  # (a cached choice the installed mlx no longer compiles)
                 failed.add(key)
-                _CHOICE[(N, K, M, str(dt).split(".")[-1])] = ("mlx",)
+                _CHOICE[(N, K, M, dtb)] = ("mlx",)
     return len(seen)
+
+
+def _in_dims(mod) -> int:
+    """A quantized layer's input size (32 / bits values a weight word)."""
+    return mod["weight"].shape[1] * 32 // mod.bits
+
+
+def _low_m(mod) -> int:
+    """The fewest rows the tuned kernels compute ``mod`` at (a 4-bit layer: MIN_M; a wide 8-bit one: HEAD8_MIN_M)."""
+    return MIN_M if _tunable(mod) else HEAD8_MIN_M
+
+
+def _matmul_layers(model):
+    """(name, layer) of every layer the tuned kernels compute: 4-bit ones, and wide 8-bit ones (an output layer)."""
+    return [(n, m) for n, m in model.named_modules() if _tunable(m) or _tunable_head8(m)]
 
 
 def pretune(model, max_m: int = MAX_M, log=None) -> int:
@@ -1298,22 +1356,21 @@ def pretune(model, max_m: int = MAX_M, log=None) -> int:
     ``log``: given a progress line now and then (every 10% and 20 s at most)."""
     tune = _load_tune()
     seen, work = set(), []
-    for _, mod in model.named_modules():
-        if _tunable(mod):
-            w = mod["weight"]
-            N, K = w.shape[0], w.shape[1] * 8
-            if (N, K) in seen or K % 64:
-                continue
-            seen.add((N, K))
-            dt = mod["scales"].dtype
-            name = str(dt).split(".")[-1]
-            stale = set(tune.get("__stale__") or ())
-            for M in range(MIN_M, max_m + 1):
-                key = f"{N}x{K}x{M}" + ("" if name == "float16" else f"x{name}")
-                work.append((mod, M, K, dt, key not in tune or key in stale or _missing_family(tune, key)))
-            if N * K <= DENSE_MAX:  # how prompts are read through it (_dense_prefill)
-                key = _prefill_key(N, K, name)
-                work.append((mod, PREFILL_TUNE_M, K, dt, key not in tune or key in stale))
+    for _, mod in _matmul_layers(model):
+        w = mod["weight"]
+        N, K = w.shape[0], _in_dims(mod)
+        if (N, K, mod.bits) in seen or K % 64:
+            continue
+        seen.add((N, K, mod.bits))
+        dt = mod["scales"].dtype
+        name = str(dt).split(".")[-1]
+        stale = set(tune.get("__stale__") or ())
+        for M in range(_low_m(mod), max_m + 1):
+            key = _mkey(N, K, M, name, mod.bits)
+            work.append((mod, M, K, dt, key not in tune or key in stale or _missing_family(tune, key)))
+        if _tunable(mod) and N * K <= DENSE_MAX:  # how prompts are read through it (_dense_prefill)
+            key = _prefill_key(N, K, name)
+            work.append((mod, PREFILL_TUNE_M, K, dt, key not in tune or key in stale))
     total, done = sum(w[-1] for w in work), 0
     t0 = last = _time.perf_counter()
     global _RETIME
@@ -1338,21 +1395,20 @@ def pending_work(model, max_m: int = 16) -> list:
     """The (layer, rows) pairs of ``model`` whose matmul shape is not tuned yet, smallest batches first."""
     tune = _load_tune()
     seen, work = set(), []
-    for _, mod in model.named_modules():
-        if _tunable(mod):
-            w = mod["weight"]
-            N, K = w.shape[0], w.shape[1] * 8
-            if (N, K) in seen or K % 64:
-                continue
-            seen.add((N, K))
-            name = str(mod["scales"].dtype).split(".")[-1]
-            stale = set(tune.get("__stale__") or ())
-            for M in range(MIN_M, max_m + 1):
-                key = f"{N}x{K}x{M}" + ("" if name == "float16" else f"x{name}")
-                if key not in tune or key in stale or _missing_family(tune, key):
-                    work.append((mod, M))
-            if N * K <= DENSE_MAX and (_prefill_key(N, K, name) not in tune or _prefill_key(N, K, name) in stale):
-                work.append((mod, PREFILL_TUNE_M))  # how prompts are read through it, after the batch sizes
+    for _, mod in _matmul_layers(model):
+        w = mod["weight"]
+        N, K = w.shape[0], _in_dims(mod)
+        if (N, K, mod.bits) in seen or K % 64:
+            continue
+        seen.add((N, K, mod.bits))
+        name = str(mod["scales"].dtype).split(".")[-1]
+        stale = set(tune.get("__stale__") or ())
+        for M in range(_low_m(mod), max_m + 1):
+            key = _mkey(N, K, M, name, mod.bits)
+            if key not in tune or key in stale or _missing_family(tune, key):
+                work.append((mod, M))
+        if _tunable(mod) and N * K <= DENSE_MAX and (_prefill_key(N, K, name) not in tune or _prefill_key(N, K, name) in stale):
+            work.append((mod, PREFILL_TUNE_M))  # how prompts are read through it, after the batch sizes
     return sorted(work, key=lambda w: w[1])
 
 
@@ -1363,8 +1419,7 @@ def tune_one(mod, M: int) -> tuple:
     try:
         if M >= PREFILL_M:
             return ("dense",) if _dense_prefill(mod, mod["scales"].dtype) else ("mlx",)
-        K = mod["weight"].shape[1] * 8
-        return _choose(mx.zeros((M, K), mod["scales"].dtype), mod)
+        return _choose(mx.zeros((M, _in_dims(mod)), mod["scales"].dtype), mod)
     finally:
         _TUNING = _RETIME = False
 
@@ -1374,17 +1429,15 @@ def tune_pending(model, max_m: int = MAX_M) -> int:
     tuning cache (or the shipped preset) does not cover yet."""
     tune = _load_tune()
     seen, missing = set(), 0
-    for _, mod in model.named_modules():
-        if _tunable(mod):
-            w = mod["weight"]
-            N, K = w.shape[0], w.shape[1] * 8
-            if (N, K) in seen or K % 64:
-                continue
-            seen.add((N, K))
-            dt = str(mod["scales"].dtype).split(".")[-1]
-            for M in range(MIN_M, max_m + 1):
-                key = f"{N}x{K}x{M}" + ("" if dt == "float16" else f"x{dt}")
-                missing += key not in tune
+    for _, mod in _matmul_layers(model):
+        w = mod["weight"]
+        N, K = w.shape[0], _in_dims(mod)
+        if (N, K, mod.bits) in seen or K % 64:
+            continue
+        seen.add((N, K, mod.bits))
+        dt = str(mod["scales"].dtype).split(".")[-1]
+        for M in range(_low_m(mod), max_m + 1):
+            missing += _mkey(N, K, M, dt, mod.bits) not in tune
     return missing
 
 
