@@ -76,8 +76,11 @@ More in [Constrained decoding](../docs/decoding/README.md).
 | `lm.py` | mlx-lm's functions with the same arguments, faster |
 | `fuse.py` | Fused projections (q/k/v, gate/up, Qwen3.5's linear-attention inputs) as single matmuls |
 | `kernels.py` | Routing of small-batch quantized matmuls to the fastest kernel, and the autotuner |
-| `qmv_multi.py`, `qmv_frag.py`, `mma_kernel.py` | Metal kernels for 4-bit matmuls with few rows |
+| `qmv_multi.py`, `qmv_frag.py`, `mma_kernel.py` | Metal kernels for 4-bit matmuls with few rows (`mma_kernel.py`: 8-bit output layers too) |
 | `gdn_kernel.py` | One Metal kernel for a Gated DeltaNet decode step |
+| `models/` | Architectures the installed mlx-lm lacks: Flint, and Clover (its causal pass as Qwen3.5-MoE's text model; the whole block-diffusion model) |
+| `moe.py`, `qk_kernel.py`, `qkv.py` | Mixture-of-experts kernels (Flint's and Qwen3.5-MoE's blocks), Flint's q/k norms and RoPE in one kernel, 8-bit keys and values |
+| `blockdiff.py`, `blockdiff_service.py`, `clover_fast.py`, `moe_tiles.py`, `convert_clover.py` | Clover in blocks (`--blocks`): its decoding, the server's service for it, its preview pass's kernels; and its MLX build |
 | `norm_kernel.py` | Fused residual add and RMS norm |
 | `attention.py` | Ragged batch decode attention: one kernel launch for all rows |
 | `defaults.py` | The tested models, their short names, the default for this Mac's memory, size checks before a download |

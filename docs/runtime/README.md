@@ -17,9 +17,9 @@ After these steps, `mx.set_wired_limit` is set to the GPU's `max_recommended_wor
 |---|---|
 | `runtime.py` | `Runtime` (load, patch, constraint and prompt caches), `set_compute_dtype`, `native_bf16` |
 | `lm.py` | Drop-in replacement for mlx-lm: `load`, `patch`, and mlx-lm's `generate`, `stream_generate`, `batch_generate` and `BatchGenerator` re-exported unchanged |
-| `fuse.py` | Projection fusion, `FusedAttention`, `FusedFlintAttention`, `FusedMLP`, `FusedGatedDeltaNet`, `FusedGatedAttention`, `FusedHybridBody` |
-| `models/` | Architectures the pinned mlx-lm lacks, registered where mlx-lm imports models (`models.register`): Flint |
-| `moe.py` | Flint's mixture-of-experts block: the router and expert kernels, fused expert gate/up |
+| `fuse.py` | Projection fusion, `FusedAttention`, `FusedFlintAttention`, `FusedMLP`, `SplitProjection`, `FusedGatedDeltaNet`, `FusedGatedAttention`, `FusedHybridBody` |
+| `models/` | Architectures the pinned mlx-lm lacks, registered where mlx-lm imports models (`models.register`): Flint; DiffuSpace's Clover (its causal pass as Qwen3.5-MoE's text model, `Model`, and the whole block-diffusion model, `BlockModel`) |
+| `moe.py` | Flint's and Qwen3.5-MoE's mixture-of-experts blocks: the routers and the expert kernels, fused expert gate/up, the combines, the layers' steps |
 | `qk_kernel.py` | Per-head q/k RMS norms and RoPE in one kernel (Flint's attention) |
 | `qkv.py` | 8-bit keys and values for full-attention layers (`LOCALS_KV_BITS=8`): the attention kernels and the batch cache |
 | `kernels.py` | Matmul routing (`enable_small_m`, `_linear_switch`), the dense prefill path, row packing, `qmm_small`, the autotuner and its cache, and output-layer helpers |
@@ -28,7 +28,10 @@ After these steps, `mx.set_wired_limit` is set to the GPU's `max_recommended_wor
 | `mma_kernel.py` | `qmm_mma`: MLX's tiled quantized GEMM rebuilt with 8- or 16-row tiles |
 | `nax_kernel.py` | The `nax` kernels: 4-bit matmuls of 1 to 32 rows on the M5's neural accelerators (Metal 4 tensor operations) |
 | `gdn_kernel.py` | One Metal kernel for a Gated DeltaNet decode step |
-| `norm_kernel.py` | Fused residual add + RMS norm, the bits of MLX's add and norm (Flint's layers; switched off for Qwen3.5) |
+| `norm_kernel.py` | Fused residual add + RMS norm, the bits of MLX's add and norm (Flint's and Qwen3.5-MoE's layers; switched off for dense Qwen3.5) |
+| `blockdiff.py`, `blockdiff_service.py` | Clover's block diffusion (`--blocks`): DiffuSpace's decoding, and the server's service for it |
+| `clover_fast.py`, `moe_tiles.py` | Kernels for Clover's preview pass: its routing with the block coreset, its GDN convolution, a block's experts in tiles |
+| `convert_clover.py` | Clover's MLX build from its bf16 checkpoint, a file at a time |
 | `attention.py` | Ragged batch decode attention (present, switched off) |
 | `defaults.py` | Model short names, the default model for this Mac, and checks run before a download |
 | `presets/` | Shipped tuning results for each GPU architecture |
@@ -88,10 +91,12 @@ What `fuse_model(model)` changes in each layer (`fuse.fuse_model`):
 | Target | Condition | Result | Models |
 |---|---|---|---|
 | Attention q/k/v | Class `Attention` from module `qwen2` or `llama`; q/k/v quantized and fusable | `qkv_proj`; class becomes a subclass of `FusedAttention` | Llama, Qwen2-style |
-| `GatedDeltaNet` `in_proj_{qkv,z,b,a}` | Has `in_proj_qkv`; all four fusable | `in_proj_all`; `FusedGatedDeltaNet` | Qwen3.5 linear-attention layers |
+| `GatedDeltaNet` `in_proj_{qkv,z,b,a}` | Has `in_proj_qkv`; all four fusable, or qkv/z and b/a each (b and a quantized apart: Clover's at 8 bits) | `in_proj_all`, one matmul or a `SplitProjection` of two; `FusedGatedDeltaNet` | Qwen3.5 linear-attention layers |
 | `Qwen3NextAttention` q/k/v | Fusable, no biases | `qkv_proj`; `FusedGatedAttention` | Qwen3.5 / Qwen3-Next full-attention layers |
 | MLP gate/up | `gate_proj` and `up_proj` quantized, fusable, and `_swiglu_mlp` passes | `gate_up_proj`; `FusedMLP` | SwiGLU MLPs |
-| Text model body | `Qwen3_5TextModel` and hidden size divisible by 256 | `FusedHybridBody` | Qwen3.5 (inactive, see below) |
+| `Qwen3NextSparseMoeBlock` | mlx-lm's (module `qwen3_next`) | `FusedQwenMoe` (`moe.fuse_qwen_moe`: router and shared-expert gate one matmul, experts' gate/up, shared expert's gate/up) | Qwen3.5-MoE, Qwen3-Next, Clover's causal pass |
+| Qwen3.5 `DecoderLayer` | its MLP a `FusedQwenMoe` | `FusedQwenLayer` (the MoE residual add in the expert combine) | Qwen3.5-MoE |
+| Text model body | `Qwen3_5TextModel` and hidden size divisible by 128 | `FusedHybridBody` | Qwen3.5: inactive for dense models (see below); Qwen3.5-MoE's layers step through it (`_moe_steps`) |
 
 A fused class is a new subclass named `"Fused" + <original name>`, with the fused class first in the method resolution order. The instance keeps all its other attributes (`fuse._fuse_mlp`, `fuse.py`, `fuse.py`, `fuse.py`). `fuse_model` returns a count of the layers it walked.
 
@@ -113,7 +118,7 @@ For one decode token, stock mlx-lm runs about fourteen small kernels per linear-
 3. the delta-rule recurrence, with each simdgroup owning `RPS = Dv / NSG` rows of the head's state: 16 rows with Dv = 128 and NSG = 8. Each lane holds a float4 of each row. The module docstring's "per 4 rows" does not match the code.
 4. gated RMS norm of the output
 
-The grid is `(32, NSG, B * Hv)` with `NSG=8` (`gdn_kernel.gdn_decode`, `gdn_kernel.gdn_decode`). Rounding to the activation dtype happens at the same points as in mlx-lm, so results match the stock path up to summation order (`gdn_kernel.py`). For S > 1 the state rows stay in registers across steps. A single step streams them instead, which keeps register pressure as in a plain decode kernel (`gdn_kernel.py`). The `states=True` variant (`locals_gdn_step2_states`) also writes the recurrent state after every token, which is needed to rewind a partially accepted draft (`gdn_kernel._kernel`).
+The grid is `(32, NSG, B * Hv)` with `NSG=8` (`gdn_kernel.gdn_decode`, `gdn_kernel.gdn_decode`). Rounding to the activation dtype happens where mlx-lm's operations round, so results match the stock path up to summation order (`gdn_kernel.py`): beta is MLX's `mx.sigmoid` of b and the decay's softplus MLX's `logaddexp(x, 0)`, each of their steps rounded in the activation dtype (`gdn_kernel._HEADER`); the convolution's SiLU is x times that sigmoid; the gated norm is MLX's `rms_norm` (`w * T(x * r)`) times SiLU(z) in float32 (mlx-lm's `precise_swiglu`); every exp a precise one, as MLX's own kernels compute it (a custom kernel compiles with fast math). Until these, the kernel rounded the sigmoid and softplus once (in bf16 that differs from MLX's in 17% and 15% of values), and a small Qwen3.5-MoE's decode steps drifted a few percent from stock's; now they are its logits bit for bit at one row (`tests/test_qwen_moe.py`), no slower. For S > 1 the state rows stay in registers across steps. A single step streams them instead, which keeps register pressure as in a plain decode kernel (`gdn_kernel.py`). The `states=True` variant (`locals_gdn_step3_states`) also writes the recurrent state after every token, which is needed to rewind a partially accepted draft (`gdn_kernel._kernel`).
 
 `FusedGatedDeltaNet._mix` uses the kernel only when all of these hold (`fuse.py`):
 
@@ -441,9 +446,132 @@ are as far apart as stock mlx-lm's against itself with the prompt read in two ch
 A 3-bit mixture of experts in bf16 is that sensitive to the order of a sum: a token whose sixth and seventh experts
 score within rounding of each other routes differently.
 
+## Qwen3.5-MoE and Clover (`moe.py`, `fuse.py`, `models/clover_moe.py`)
+
+mlx-lm's Qwen3.5-MoE (`qwen3_5_moe`: Qwen3.6-35B-A3B's network, 40 layers, three Gated DeltaNet layers to each
+full-attention one, 256 routed experts with 8 a token chosen by softmax, and a shared expert behind a sigmoid gate)
+gets a fused block, as Flint's does. DiffuSpace's Clover is a block-diffusion model trained on that network; its
+causal pass is Qwen3.5-MoE's forward, and that is how Locals runs it: `models/clover_moe.Model`, which `mlx_lm.load`
+builds for `model_type: clover_moe`, is mlx-lm's Qwen3.5 text model, the same parameters under the same names without
+the block-diffusion ones (`BLOCK_ONLY`). So both engines serve Clover a token a step as any model, with batching, the
+grammars of tool calls and JSON schemas, the prompt cache and mixed passes, and the stock engine runs stock mlx-lm.
+`BlockModel` is the whole model, for decoding in blocks (`--blocks`, below).
+
+**Why a token a step on a Mac.** A one-token pass reads the weights a token needs, about 1.9 GB, and is bound by
+memory; a block's preview (DiffuSpace's decoding) runs every matrix over all of the block's rows, which this GPU's
+arithmetic (2.85 trillion multiply-adds a second) does not hide. On an M4 Pro a pass of the causal model takes 10.7 ms
+for one row, 20.8 for 4 and 34.2 for 8, a preview of a 32-token block about 80, and a block of 32 resolves 1 to 2.7
+tokens a step at the model's 0.95 threshold (prose: about 1). Decoding as DiffuSpace's Hugging Face code does wrote
+14.6 tokens/s with stock MLX and 20.2 with Locals's kernels for the preview; the causal pass 93.6 (stock mlx-lm:
+79.5).
+
+| Target | Result |
+|---|---|
+| `Qwen3NextSparseMoeBlock` | `FusedQwenMoe`: the router and the shared expert's gate one matmul (`gates`, the E logits then the gate's; both 8-bit in Clover's build), the choice one kernel (`route_softmax`), a few tokens' experts in Flint's `experts_up` / `experts_down`, and a combine that adds the shared expert times its gate (`combine_gated`) and the layer's residual |
+| Qwen3.5's `DecoderLayer` with that block | `FusedQwenLayer`; with `_moe_steps` (`LOCALS_MOE_STEPS`, on) the mixer's residual add in the post-mixer norm's kernel (`add_rms`) and the next layer's input norm in the combine (`FusedHybridBody`): two kernels a layer fewer |
+| `GatedDeltaNet` whose b and a are quantized apart | `in_proj_all` a `SplitProjection` (qkv and z one matmul, b and a another, the outputs concatenated), so that `FusedGatedDeltaNet` and the decode kernel apply: Clover's build keeps b and a at 8 bits, and four projections of two widths fused nothing |
+
+**The bits of mlx-lm's block.** mlx-lm computes the block in bf16: the softmax (precise) of the router's logits,
+rounded; `argpartition`, here a stable ascending sort whose last k it takes, so a tie at the k-th place goes to the
+higher index and the k come in ascending order; their renormalization, a running bf16 sum and a division; the k
+outputs times their weights, each product and each partial sum rounded (MLX sums a 16-bit axis of 8 that way); the
+shared expert times `mx.sigmoid` of its gate. `route_softmax` holds a token's logits in MLX's softmax layout (4
+consecutive a lane, a pass of the simdgroup per 128) so that its normalizer is MLX's sum, and chooses and orders as
+argpartition does: the same experts and weights, bit for bit (tested with ties, 32 to 512 experts); `combine_gated`
+gives the block's bits on the same expert outputs. On Clover's own layers and hidden states, 1 to 8 rows: the same
+experts every time, 99.95% of the block's outputs bit for bit, the rest a last bit off (the expert kernels sum each
+dot product in another order than gather_qmm).
+
+**MLX's rounding in two older kernels.** `mx.sigmoid` in bf16 rounds exp|x|, one plus it, its inverse and one minus
+that; `nn.softplus` (`logaddexp`) and `nn.silu` round each step the same way, and MLX's own kernels use precise
+`exp` and `rsqrt` where a custom kernel, compiled with fast math, gets fast ones. The expert kernels' swiglu (Flint's
+too) and the GDN decode kernel's beta, decay, convolution SiLU and norms rounded once or used the fast functions,
+which differs from MLX in 15 to 17% of bf16 values; they now compute as MLX does (`moe.mlx_sigmoid`,
+`gdn_kernel._HEADER`), at no measured cost. A small Clover's patched decode steps give stock mlx-lm's logits bit for
+bit at one row; before, they drifted a few percent, and on a random router a near tie flipped on any of it
+(`tests/test_qwen_moe.py`).
+
+**Where a one-token step went** (Clover, M4 Pro, pipelined steps, each part swapped for nothing in turn):
+
+| | Stock mlx-lm | Locals before | Locals |
+|---|---|---|---|
+| Step | 12.6 ms | 12.3 ms | 10.7 ms |
+| MoE blocks (40) | | 5.11 ms | 3.89 ms |
+| GDN layers (30) | | 4.32 ms | 3.76 ms |
+| Attention layers (10) | | about 1.7 ms | 1.13 ms |
+| Output layer (8-bit, 248k rows, 540 MB) | | 2.3 ms | 2.3 ms |
+
+Before, Locals's patch fused only the attention's q/k/v: the GDN layers' b and a at 8 bits next to 4-bit qkv and z
+kept those layers on mlx-lm's fourteen kernels, and the MoE block was mlx-lm's (about twenty kernels a layer). The
+weights a step reads take about 7.8 ms at the 250 GB/s this GPU's matrix-vector products reach on them (the GDN
+layers' qkvz, 14 MB, in 56 us; a token's experts' gate/up, 7.3 MB, in about 35); each GDN layer also reads and writes
+its 2 MB state (22 us a layer in the kernel). Those kernels run near that; most of what is left is the launches of
+about 600 dependent kernels, and the output layer at 8 bits.
+
+**Measured.** In the process, a 256-token prompt each (the package's own source), 48 greedy steps after 4 warm-up
+steps, tokens per second all rows write together, the best of two runs, stock and Locals alternated:
+
+| Requests at once | mlx-lm | Locals | Locals / mlx-lm |
+|---|---|---|---|
+| 1 | 79.5 | 93.6 | 1.18x |
+| 2 | 117.5 | 146.8 | 1.25x |
+| 4 | 150.2 | 192.2 | 1.28x |
+| 8 | 179.8 | 247.9 | 1.38x |
+
+Through the batch engine (requests of 256 tokens, the end ignored, from the first token to the last;
+`LOCALS_SOLO=0`, so one-token steps only): 94.6 tokens/s for one request, 180.7 for 4 at once, 223.2 for 8.
+
+**Tried and left out.** Larger command buffers (`MLX_MAX_MB_PER_BUFFER` 2,000, `MLX_MAX_OPS_PER_BUFFER` 1,000): no
+faster. The route kernel's register arrays indexed only by constants (an index computed at run time can put an array
+in thread memory): no faster here, the kernel's time is its launch. The shared expert's three kernels run beside the
+routed experts' and cost about 9 us a layer in the step; folded into the expert kernels as one more slot, its
+weights' read (1.6 MB, about 7 us) would take most of that back (it costs 0.15 ms of a one-row step, 1.5 of an
+8-row one). At 8 rows the expert kernels read 2.8 GB a step (48 distinct experts a layer for 64 slots) at about 180
+GB/s and are bound by their arithmetic, not their loads (the up kernel: 9.8 ms, its loads alone 7.4 at 237 GB/s, its
+arithmetic alone 8.9): a 3-bit weight takes an and, an or and a subtraction to become a float, then a multiply-add.
+Loading each lane's weights as vectors, no faster (the same bits); unpacking each weight once for all of a run's
+slots (a third of an 8-row step's slots share an expert), slower at every width tried (10.5 ms against 9.6: the
+registers it holds).
+
+**The output layer's bits** (not changed: a choice of the build, which changes outputs). Requantized from the 8-bit
+weights, on 4,096 positions of the package's runtime docs read teacher-forced:
+
+| Output layer | Size | One row | Perplexity | Greedy token as at 8 bits | Mean KL from 8 bits |
+|---|---|---|---|---|---|
+| 8 bits (the build's) | 540 MB | 2.42 ms | 10.878 | | |
+| 6 bits | 413 MB | 1.86 ms | 10.883 | 98.0% | 0.0016 |
+| 4 bits | 286 MB | 1.31 ms | 11.057 | 91.6% | 0.017 |
+
+At 6 bits a one-row step would be about 5% faster for 0.04% of perplexity.
+
+### Clover in blocks (`blockdiff.py`, `blockdiff_service.py`, `clover_fast.py`, `moe_tiles.py`)
+
+`locals serve --blocks [N]` (and `locals start --blocks`, `locals chat --blocks`) decodes Clover as DiffuSpace's
+Hugging Face code does (`blockdiff.stream_generate`, LowConfidence): a block starts as N mask tokens; each step
+previews it and resolves the open positions whose most likely token is above 0.95, or the most confident one; a
+resolved block is committed (the causal pass) and the next starts. The model's response penalties apply (presence 0.9,
+repetition 1.05; ramps toward the end tokens and `</think>` late in a long response), and greedy is the default, as
+its generation_config says. N defaults to 8 (`defaults.MAC_BLOCK`; the model's blocks are 32): a preview costs about
+what a prompt chunk of its size does and resolves about as many tokens whatever its size, so on an M4 Pro blocks of 8
+write 38.0 tokens/s, of 16 27.3, of 32 20.2 (stock MLX: 14.6). Requests run one at a time (a step is already N rows),
+each resolved block streamed, and the state after a reply kept for a next prompt that continues it; JSON schemas and
+regexes are refused (a block is written at once, not a token a grammar can steer), and tool calls are parsed from the
+reply as on the stock engine. `blockdiff.stream_speculative` is DiffuSpace's own serving mode (a preview drafts a
+block, the causal pass checks it: 64.6 tokens/s at 4 drafted tokens, measured before the causal pass's kernels here);
+it is not served.
+
+The preview (`BlockModel(..., preview=True)`): the block reads the cached prefix and sees itself both ways; a GDN
+layer adds a right convolution (the block's next three positions) to the causal one and, in place of the recurrence,
+a softmax over the block's l2-normalized keys plus one bucket for the prefix, whose value is the clean state's
+readout decayed by the position's gate; attention has no causal mask; each MoE layer routes within the block coreset,
+the fewest experts that carry 90% of the block's summed top-8 routing mass. Its kernels: the routing with the coreset
+in one threadgroup (`clover_fast.clover_route`); a block's experts in tiles of 4 slots a simdgroup, each weight chunk
+unpacked once for the tile (`moe_tiles.py`: 1.3 to 1.45 ms a layer against SwitchGLU's 2.0); the GDN convolution in
+one kernel and its softmax memory one compiled graph. A preview step's layers take 79 ms against stock MLX's 116.
+
 ## Switched-off kernels
 
-- **Fused add + RMS norm** (`norm_kernel.add_rms`). It computes `h = x + r` and `rms_norm(h) * w` in one kernel, which halves the norm launches of a pre-norm layer (`norm_kernel.py`), laid out as MLX's own norm for one row so that both outputs are MLX's bits. It needs a hidden size divisible by 128, at most 4,096, and uses a quarter of it in threads per row (`norm_kernel.supported`). Flint's layers use it (`moe.FusedFlintLayer`, `moe.FusedFlintBody`). `FusedHybridBody` would use it for Qwen3.5, but `USE_ADD_RMS = False`: measured at one row, it was no faster than MLX's two kernels. With the flag off, the body calls the stock `__call__` (`fuse.py`, `fuse.py`).
+- **Fused add + RMS norm** (`norm_kernel.add_rms`). It computes `h = x + r` and `rms_norm(h) * w` in one kernel, which halves the norm launches of a pre-norm layer (`norm_kernel.py`), laid out as MLX's own norm for one row so that both outputs are MLX's bits. It needs a hidden size divisible by 128, at most 4,096, and uses a quarter of it in threads per row (`norm_kernel.supported`). Flint's layers use it (`moe.FusedFlintLayer`, `moe.FusedFlintBody`), and Qwen3.5-MoE's (`moe.FusedQwenLayer.step`, through `FusedHybridBody` when `_moe_steps` is set). `FusedHybridBody` would use it for dense Qwen3.5 too, but `USE_ADD_RMS = False`: measured at one row, it was no faster than MLX's two kernels. With the flag off and no MoE steps, the body calls the stock `__call__` (`fuse.py`, `fuse.py`).
 - **Ragged batch attention** (`attention.ragged_attention`). Adapted from MLX's `sdpa_vector`, it handles all rows of all requests in one launch. Row r sees the first `nkeys[r]` keys of KV slot `slots[r]`, and K/V are stored slot-major as `(n_slots, n_kv_heads, cap, D)` (`attention.py`). A GQA variant processes one (row, kv head) per threadgroup, so each K/V vector is read once (`attention.py`, `attention.ragged_attention`). `packed.py` calls it only when `USE_RAGGED` is set, no segment is a tree, and every segment has at most 64 tokens. The flag is False because per-request MLX SDPA keeps outputs identical to single-stream decoding (`packed.py`, `packed.packed_forward`).
 
 ## Quantized matmul routing (`kernels.py`)
@@ -470,13 +598,22 @@ A tied embedding head goes through `QuantizedEmbedding.as_linear` -> `_embed_swi
 
 **Which layers qualify.** `_tunable(mod)` requires a quantized linear or embedding with 4 bits, group size 64, affine mode, biases, and K divisible by 64. Other group sizes, and mxfp4 and similar formats, stay on MLX's kernels: tuning them crashed the load (`kernels._tunable`). The weight layout is MLX's affine 4-bit: `w` is `(N, K/8)` uint32 with the low nibble first, and `scales`/`biases` are `(N, K/64)` (`kernels.py`). `_eligible(x, mod)` also requires `MIN_M` (1) <= M <= `MAX_M` (32), where M is the number of rows after flattening all leading dimensions, and fp16 or bf16 activations (`kernels._eligible`).
 
+**Wide 8-bit layers** (`_tunable_head8`). An 8-bit layer of at least `HEAD8_MIN_N` (32,768) outputs, an output
+layer kept at 8 bits (Clover's: 248,320 x 2,048, 540 MB), is tuned from `HEAD8_MIN_M` (5) rows, against MLX's kernel
+only the `mma` tilings (MLX's loader in `mma_kernel.py` takes any width: `bits`). MLX reads it once up to 4 rows
+(2.2 ms for Clover's) and then switches to its 32-row tiles: 3.8 ms at 6 rows, 4.6 at 8, 7.0 at 12, 6.3 at 16; `mma`
+with 8- or 16-row tiles, 2.8, 2.8, 3.7 and 3.7 (the same tokens; outputs within bf16 rounding of MLX's). Its keys carry
+the bits (`_mkey`: `248320x2048x8xbfloat16b8`; a 4-bit layer's keys are unchanged), it is never padded, and a
+matrix of 64 MB or more is timed in place rather than copied (a copy of an output layer is 0.5 GB). Clover decodes 5.6%
+faster at 8 rows (247.6 tokens/s instead of 234.5) and 3% at 6. `LOCALS_HEAD8=0` keeps such layers on MLX's kernel.
+
 **Dense prefill path.** At `PREFILL_M = 128` rows or more, a qualifying layer can be computed as dequantize + dense GEMM in the activations' own dtype instead of MLX's quantized GEMM (`_dense_ok`, `_dense_matmul`). Which one is timed on the GPU once per layer shape at `PREFILL_TUNE_M = 1024` rows and cached with the other choices (`_dense_prefill`, `_tune_prefill`; keys `NxKxP`): dense must be 5% faster, since it also needs the dequantized weights as a temporary. On an M2 Pro with MLX 0.32 it is 6-11% faster for the large shapes and level for the small ones (it was 1.5x with older MLX); MLX's quantized GEMM uses the neural accelerators of M5 GPUs (`quantized_nax.h` in MLX's kernels). The server times untimed shapes while idle and reads prompts densely until then; `locals tune` times them at once. `LOCALS_DENSE_PREFILL=1` always reads densely, `0` never. A bf16 model is not computed in fp16 on this path, because values above 65504 would become inf. Layers with more than `DENSE_MAX = 1 << 27` weights are excluded: a 248k x 2560 lm_head would need a 1.3 GB temporary.
 
 **Row packing.** Inside `with packed_rows(B, L, lengths):` (a thread-local context), a linear layer applied to right-padded `(B, L, D)` activations gathers only the valid rows. It runs the matmul on those rows and scatters the result back into zeros, so padding costs no matmul work (`kernels.py`). Packing applies even when small-row routing is disabled (`_linear_call_plain`). Ragged batched passes use it. `hybrid_batch.py` is `HybridBatchEngine._forward`, the batch decode step, whose rows feed different numbers of tokens (called at `hybrid_batch.HybridBatchEngine.run` and `:1355`). `regions.py` is `RegionScorer.logprobs`, which scores candidate paths in one right-padded pass.
 
 ## Kernel families
 
-The autotuner chooses among these for each (N, K, M, dtype). A choice is a tuple whose first element names the family. `_launcher` turns a choice into a closure with the template and grid precomputed, cached by `(choice, M, K, N, dtype)` (`kernels.py`).
+The autotuner chooses among these for each (N, K, M, dtype). A choice is a tuple whose first element names the family. `_launcher` turns a choice into a closure with the template and grid precomputed, cached by `(choice, M, K, N, dtype, bits)` (`kernels.py`).
 
 | Family | Choice tuple | File | How it works |
 |---|---|---|---|
@@ -636,7 +773,9 @@ To re-tune from scratch, stop every Locals server, delete the cache file (or poi
 | `LOCALS_GDN_KERNEL` | `1` | `0`: mlx-lm's Gated DeltaNet decode instead of `gdn_kernel.py` (`fuse.USE_GDN_KERNEL`) |
 | `LOCALS_DENSE_PREFILL` | timed | `1`: prompts always through dequantize + dense GEMM; `0`: through MLX's quantized GEMM |
 | `LOCALS_PAD_ROWS` | `1` | `0`: never compute a batch at more rows. By default batches of 8 to 16 are computed at a larger size, up to twice the rows, where the tuned timings show it at least 7% faster (`_pad_rows`; on an M5 Pro 12 requests computed as 16 ran 10-20% faster). `all`: other sizes too (the timings also pad 2 rows to 3, 4 to 5 and 24 to 32 on some M5 layers; measured end to end, within noise) |
-| `LOCALS_EXPERT_KERNELS` | `1` | `0`: Flint's routed experts through `FusedSwitchGLU` (gather_qmm) at every row count (`moe.USE_EXPERT_KERNELS`) |
+| `LOCALS_EXPERT_KERNELS` | `1` | `0`: Flint's and Qwen3.5-MoE's routed experts through `FusedSwitchGLU` (gather_qmm) at every row count (`moe.USE_EXPERT_KERNELS`) |
+| `LOCALS_HEAD8` | `1` | `0`: wide 8-bit layers (an output layer at 8 bits) on MLX's kernel at every row count (`kernels.HEAD8`) |
+| `LOCALS_MOE_STEPS` | `1` | `0`: Qwen3.5-MoE's layers without the residual adds in the norms and the next norm in the expert combine (`fuse.USE_MOE_STEPS`) |
 | `LOCALS_QK_KERNEL` | `1` | `0`: Flint's q/k norms and RoPE as four MLX kernels (`qk_kernel.USE_QK_KERNEL`) |
 | `LOCALS_KV_BITS` | `16` | `8`: Flint's full-attention keys and values in 8 bits (`qkv.py`): about twice the context, 4 to 13% slower writing |
 | `LOCALS_GDN_FAST` | timed | `1`: unpadded prompts through MLX's `mx.fast.gated_delta_update` in Qwen3.5's recurrent layers; `0`: through mlx-lm's kernel (`kernels.gdn_fast`) |

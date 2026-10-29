@@ -409,6 +409,16 @@ how to raise that, until the next restart. For long work, `LOCALS_KV_BITS=8`
 keeps Flint's keys and values in 8 bits: requests up to 67,584 tokens instead of
 about 35,800, writing 4 to 13% slower.
 
+DiffuSpace's Clover (35B, 3B active per token, a block-diffusion model on
+Qwen3.6-35B-A3B's network) has no MLX build on Hugging Face:
+`python -m locals.convert_clover` makes one (16.7 GB, from its 69 GB checkpoint
+a file at a time), for `--model ~/models/Clover-35B-A3B-Preview-MLX-mixed-3-4bit`
+on a Mac with 24 GB or more. On a Mac it writes fastest a token at a time, by
+its causal pass, which is how Locals runs it, with tool calls and several
+requests at once: on an M4 Pro, 94 tps for one request and 248 with 8 at once,
+where mlx-lm gives 80 and 180. `--blocks` writes it by block diffusion instead,
+8 tokens a block (38 tps, one request at a time, no JSON schemas).
+
 Each model also has a thinking mode, in which it reasons before it answers: add
 `-thinking` to the name, for example `locals/lfm2.5-2.6b-thinking`. The smaller
 models are good choices for a Mac with 8 GB of memory, and other models made for
