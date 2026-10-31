@@ -550,7 +550,6 @@ class Server:
         """One /v1/completions request, streamed when ``write`` is given."""
         t0 = time.perf_counter()
         cid = "cmpl-" + uuid.uuid4().hex[:24]
-        tok = p["svc"].tokenizer
         stops = p["stop"]
         hold = max((len(s) for s in stops), default=1) - 1  # text that may be the start of a stop sequence
 
@@ -566,8 +565,10 @@ class Server:
         key = uuid.uuid4().hex[:8]
         self._active[key] = {"engine": p["engine"], "prompt_tokens": len(p["prompt"]), "tokens": 0, "started": time.time()}
         q: "queue.Queue[List[int]]" = queue.Queue()
-        job = p["svc"].submit(p["prompt"], max_tokens=p["max_tokens"], on_token=q.put, temp=p.get("temp"),
-                              ignore_eos=p.get("ignore_eos", False), **p.get("sampling", {}))
+        job = self._retry_unloaded(p, lambda svc: svc.submit(
+            p["prompt"], max_tokens=p["max_tokens"], on_token=q.put, temp=p.get("temp"),
+            ignore_eos=p.get("ignore_eos", False), **p.get("sampling", {})))
+        tok = p["svc"].tokenizer  # (after the submit: a model loaded again has its own)
         toks: List[int] = []
         sent, stopped, last_emit = 0, None, time.perf_counter()
         last_probe = last_emit
@@ -856,13 +857,17 @@ class Server:
 
     def _submit(self, p: dict, on_token=None, prompt: Optional[List[int]] = None):
         """``p``'s job (``prompt``: its prompt and the reply's prefix, written already)."""
+        return self._retry_unloaded(p, lambda svc: self._submit_to(p, on_token, prompt))
+
+    def _retry_unloaded(self, p: dict, submit):
+        """``submit(p["svc"])``; unloaded while this request was prepared, the same model, loaded again, takes it."""
         from .service import Unloaded
 
         try:
-            return self._submit_to(p, on_token, prompt)
-        except Unloaded:  # (unloaded while this request was prepared: the same model, loaded again, takes it)
+            return submit(p["svc"])
+        except Unloaded:
             p["svc"] = self.service(p["engine"])
-            return self._submit_to(p, on_token, prompt)
+            return submit(p["svc"])
 
     def _submit_to(self, p: dict, on_token=None, prompt: Optional[List[int]] = None):
         return p["svc"].submit(p["prompt"] if prompt is None else prompt, schema=p["schema"], max_tokens=p["max_tokens"],

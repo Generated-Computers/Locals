@@ -212,6 +212,7 @@ class BatchService:
         self._inflight = {}  # id(job) -> job, taken by the worker and not yet finished
         self._vision_q: List[Job] = []  # image prompts waiting for the batch to be idle
         self._closed = False
+        self._unloaded = False  # (closed by unload: what was queued ends as cancelled, to be sent again)
         self._ready = threading.Event()
         self._error: Optional[BaseException] = None
         self.tokenizer = None
@@ -274,10 +275,10 @@ class BatchService:
         except Exception:  # noqa: BLE001  # (compile in the batch loop does it again: this request's error)
             pass
         finally:
-            if self._closed:  # (the batch loop has stopped: the job would wait forever)
-                self._finish(job, [], "error: the server is shutting down")
-            else:
+            if not self._closed:
                 self._q.put(job)
+            if self._closed and not job._event.is_set():  # (closed before the put, or just after it: never taken)
+                self._finish(job, [], "cancelled" if self._unloaded else "error: the server is shutting down")
 
     def prime(self, tokens: List[int]) -> None:
         """Prefill ``tokens`` once and store them in the prompt cache (e.g. the
@@ -421,9 +422,14 @@ class BatchService:
         import mlx.core as mx
 
         t0 = time.perf_counter()
+        self._unloaded = True
         for job in list(self._inflight.values()):
             job.cancel()  # (the worker stops at its next commit or between prefill chunks)
         self.close()
+        while self._thread.is_alive():  # its state dropped now, the worker would keep the weights: and a request
+            # loading the model again (it waits for the engine's load lock, held while this runs) would be a second copy
+            print(f"locals: waiting for the {self.engine} worker to stop before the model is let go", file=sys.stderr, flush=True)
+            self._thread.join(timeout=30)
         stuck = list(self._inflight.values()) + list(self._vision_q)
         self._vision_q = []
         while True:
@@ -435,8 +441,6 @@ class BatchService:
             if not job._event.is_set():
                 self._finish(job, [], "cancelled")
         self._inflight.clear()
-        if self._thread.is_alive():
-            print(f"locals: the {self.engine} worker did not stop within 30 s; its model is kept", file=sys.stderr, flush=True)
         self.tokenizer = None
         self._vision_enc = None
         self._eng = None

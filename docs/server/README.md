@@ -482,10 +482,14 @@ Both models read large text in a small picture badly, here and in mlx-vlm alike:
 
 `POST /unload` (mlx-vlm's request, also `/v1/unload`), Ollama's `keep_alive: 0`, and `locals unload` take the model
 out of GPU memory while the server keeps running; the next request loads it again. `Server.unload` takes each loaded
-engine out of `Server._svc` and calls `BatchService.unload`: replies in progress or queued end as `cancelled`, the
-worker thread stops, the weights, prompt cache and vision tower are dropped, and MLX's buffer pool is emptied. The
-answer is `{"status": "unloaded", "engines": [...], "freed_mb", "gpu_active_mb"}` (`"not loaded"` when nothing was).
-A request prepared while the model was unloaded is submitted to the model loaded again (`service.Unloaded`).
+engine out of `Server._svc` and calls `BatchService.unload`: replies in progress or queued end as `cancelled` (also
+one whose grammar was still being made), the worker thread stops, the weights, prompt cache and vision tower are
+dropped, and MLX's buffer pool is emptied. Unloading waits for the worker to stop, however long its current step
+takes (an image prompt's prefill stops at its next chunk): let go before, the model would stay in the worker's hands,
+and a request loading it again, which waits for the engine's load lock that `unload` holds, would make a second
+copy. The answer is `{"status": "unloaded", "engines": [...], "freed_mb", "gpu_active_mb"}` (`"not loaded"` when
+nothing was). A request prepared while the model was unloaded, a chat or a `/v1/completions` one, is submitted to the
+model loaded again (`service.Unloaded`, `Server._retry_unloaded`).
 
 Measured on an M2 Max (32 GB) with Qwen3.5-4B 4-bit (`mlx-community/Qwen3.5-4B-MLX-4bit`), one server process
 (`Server` and `serve`, as `locals serve` starts them), after two image requests: the process's `phys_footprint`

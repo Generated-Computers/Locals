@@ -1338,6 +1338,8 @@ class Engine:
             n_all = emb.shape[1]
             with deepstack_layers(self.model, adds) as state:  # (the last token, fed below, is text: nothing to add)
                 while n_all - i > 1:  # the last prompt token is the first step's feed, as in _prefill
+                    if cancel is not None and cancel():
+                        break  # (between chunks: an unload or a client gone; the decode loop ends it as cancelled)
                     n = min(self.prefill_step, n_all - 1 - i)
                     state["at"] = i
                     body(None, cache, input_embeddings=emb[:, i: i + n])
