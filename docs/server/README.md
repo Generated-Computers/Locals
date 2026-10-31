@@ -403,7 +403,7 @@ Requests are translated to Chat Completions and go through the same `prepare`, b
 | `GET /api/version` | `{"version": "0.12.6"}` (`OLLAMA_VERSION`, which apps check) |
 | `GET /api/tags` | one entry per enabled engine: `<short>:latest` for ours, `mlx/<short>:latest` for the stock engine |
 | `GET /api/ps` | the same, for loaded engines only |
-| `POST /api/show` | details, `capabilities` (`completion`, `tools`, and `thinking` when the loaded model offers it) and `model_info.<family>.context_length` |
+| `POST /api/show` | details, `capabilities` (`completion`, `tools`, `thinking` when the loaded model offers it, and `vision` when our engine reads the checkpoint's images, loaded or not) and `model_info.<family>.context_length` |
 | `POST /api/chat` | chat |
 | `POST /api/generate` | `system` and `prompt` as a chat. With `raw`, the prompt goes untemplated through `/v1/completions`. `suffix` (fill-in-the-middle) is refused |
 | `POST /api/pull` | `{"status": "success"}`: there is nothing to pull |

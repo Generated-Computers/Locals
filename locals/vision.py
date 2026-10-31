@@ -27,6 +27,7 @@ from typing import List, Optional, Sequence, Tuple
 import mlx.core as mx
 
 from .defaults import cached_snapshot
+from .models.qwen3_5_vl import rotate_half
 from .oai import IMAGE_MARK, IMAGE_PARTS  # (IMAGE_MARK: what the chat template writes for one image)
 
 # The text model's special tokens, from its config.json (Qwen3.5-4B)
@@ -111,7 +112,7 @@ def _b64(s: str, validate: bool) -> bytes:
         raise ValueError(f"the image is not valid base64: {e}") from None
 
 
-def decode(source: str, media_type: Optional[str] = None, local: bool = True) -> bytes:
+def decode(source: str, local: bool = True) -> bytes:
     """Image bytes from what a client sends: a data URL, a bare base64 string (Ollama), an http(s) URL,
     or a path to a file on this Mac. URLs and files only for a server no other machine can reach (``local``):
     else a client could read this Mac's files, or have the server fetch from its network for it."""
@@ -135,8 +136,6 @@ def decode(source: str, media_type: Optional[str] = None, local: bool = True) ->
         if not local:
             raise ValueError(NO_FILES)
         return Path(source[7:]).read_bytes()
-    if media_type and "/" in media_type and not os.path.exists(source):
-        return _b64(source, validate=True)  # a bare base64 payload (Ollama's images list)
     if len(source) > 4096:
         return _b64(source, validate=False)
     if not local:
@@ -172,7 +171,7 @@ def take_images(messages) -> Tuple[List[dict], List[str]]:
     sources: List[str] = []
     for m in messages or []:
         content = m.get("content") if isinstance(m, dict) else None
-        if m.get("role") not in ("user", "tool") or not isinstance(content, list):
+        if not isinstance(content, list) or m.get("role") not in ("user", "tool"):
             out.append(m)
             continue
         parts = []
@@ -297,9 +296,7 @@ class MRoPE:
         cos = mx.cos(freq).astype(x.dtype)
         sin = mx.sin(freq).astype(x.dtype)
         r, rest = x[..., : self.dims], x[..., self.dims:]  # (Qwen3.5 rotates 64 of a head's 256 dims, as nn.RoPE does)
-        half = self.dims // 2
-        rotated = mx.concatenate([-r[..., half:], r[..., :half]], axis=-1)
-        out = r * cos + rotated * sin
+        out = r * cos + rotate_half(r) * sin
         return mx.concatenate([out, rest], axis=-1) if rest.shape[-1] else out
 
 

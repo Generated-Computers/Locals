@@ -269,8 +269,18 @@ class Server:
                                f"{family}.context_length": ctx}}
 
     def reads_images(self) -> bool:
-        """Whether our engine, loaded, reads this model's images (a checkpoint with its vision tower)."""
-        return _reads_images(self._svc.get("locals"))
+        """Whether our engine reads this model's images (a checkpoint with its vision tower), loaded or not: a client
+        that asked /api/show before the first request, or after an unload, was told the model reads text only."""
+        if "locals" not in self.engines:
+            return False
+        svc = self._svc.get("locals")
+        if svc is not None:
+            return _reads_images(svc)
+        if getattr(self, "_checkpoint_reads_images", None) is None:  # (read from the files once: config and headers)
+            from . import vision
+
+            self._checkpoint_reads_images = vision.Encoder(self.model_id, None).available()
+        return self._checkpoint_reads_images
 
     # -- engines ------------------------------------------------------------------------------
     def service(self, engine: str):

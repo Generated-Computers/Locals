@@ -106,7 +106,8 @@ def vision_config(model_dir: Path) -> Optional[VisionConfig]:
     return out
 
 
-def _rotate_half(x: mx.array) -> mx.array:
+def rotate_half(x: mx.array) -> mx.array:
+    """RoPE's rotation: the second half of the last axis, negated, then the first."""
     half = x.shape[-1] // 2
     return mx.concatenate([-x[..., half:], x[..., :half]], axis=-1)
 
@@ -163,8 +164,8 @@ class VisionAttention(nn.Module):
                    for t in mx.split(self.qkv(x), 3, axis=-1))
         q = q.astype(mx.float32)
         k = k.astype(mx.float32)
-        q = (q * cos) + (_rotate_half(q) * sin)
-        k = (k * cos) + (_rotate_half(k) * sin)
+        q = (q * cos) + (rotate_half(q) * sin)
+        k = (k * cos) + (rotate_half(k) * sin)
         out = mx.fast.scaled_dot_product_attention(q.astype(x.dtype), k.astype(x.dtype), v, scale=self.scale)
         return self.proj(out.transpose(0, 2, 1, 3).reshape(s, -1))
 

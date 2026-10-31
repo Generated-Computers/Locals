@@ -15,6 +15,8 @@ the low nibble first; ``scales`` and ``biases`` are (N, K/64).
 
 from __future__ import annotations
 
+from typing import Optional
+
 import mlx.core as mx
 import mlx.nn as nn
 

@@ -101,10 +101,10 @@ def test_take_images_and_decode():
     assert vision.has_images(msgs) and not vision.has_images(msgs[:1])
     out, sources = vision.take_images(msgs)
     assert sources == [url]
+    assert vision.take_images(["hi"]) == (["hi"], [])  # (not an object: the server's shape check answers it)
     assert oai.text_of(out[1]["content"]) == "what is it?" + vision.IMAGE_MARK
     assert msgs[1]["content"][1]["type"] == "image_url"  # (the request itself is left as it was)
     assert vision.decode(url) == data
-    assert vision.decode(base64.b64encode(data).decode(), media_type="image/png") == data  # Ollama's bare base64
     pics = vision.load([url])
     assert pics[0].tokens == pics[0].grid[0] * pics[0].grid[1] // 4
     with pytest.raises(ValueError, match="image 1 of 1"):
@@ -237,6 +237,23 @@ def test_a_config_that_names_a_tower_reads_images_only_with_its_weights(tmp_path
         mx.save_safetensors(str(tmp_path / name), {k: mx.zeros((2,)) for k in keys})
     enc = vision.Encoder(str(tmp_path), mx.float16)
     assert enc.available() == reads
+
+
+def test_a_model_not_loaded_says_whether_it_reads_images(tmp_path):
+    """/api/show listed vision only while the model was loaded: a client that asked before the first request, or
+    after an unload, was told the model reads text only. The checkpoint decides now; the stock engine never reads them."""
+    import json
+
+    from locals.server import Server
+
+    cfg = {"model_type": "qwen3_vl", "vision_config": {"hidden_size": 1152, "deepstack_visual_indexes": [8, 16, 24]},
+           "text_config": {"head_dim": 128, "rope_scaling": {"mrope_interleaved": True, "mrope_section": [24, 20, 20]}}}
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {"vision_tower.blocks.0.attn.qkv.weight": mx.zeros((2,))})
+    for engines, reads in ((("locals",), True), (("stock",), False)):
+        srv = Server.__new__(Server)
+        srv.model_id, srv.engines, srv._svc = str(tmp_path), engines, {}
+        assert srv.reads_images() == reads
 
 
 def test_mrope_split_for_qwen3_vl_and_a_wrong_one():

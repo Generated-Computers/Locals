@@ -29,6 +29,7 @@ import re
 import shutil
 import threading
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -90,7 +91,6 @@ def _chat(base_url: str, body: dict, timeout: float = 900, stop: Optional[thread
             return json.loads(r.read())
     import http.client
     import socket
-    import urllib.parse
 
     u = urllib.parse.urlsplit(base_url)
     conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)

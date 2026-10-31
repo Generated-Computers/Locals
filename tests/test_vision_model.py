@@ -56,6 +56,7 @@ def test_reads_the_image_and_unloads(server):
     r = server.unload()
     assert r["status"] == "unloaded" and r["engines"] == ["locals"]
     assert "locals" not in server._svc and not server.stats()["engines"]["locals"]["loaded"]
+    assert "vision" in server.ollama_show("")["capabilities"]  # (from the checkpoint: the model is not loaded)
     assert mx.get_active_memory() < loaded * 0.1  # (the weights, prompt cache and vision tower all let go)
 
     # the next request loads the model again

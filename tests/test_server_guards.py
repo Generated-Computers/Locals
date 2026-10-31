@@ -133,7 +133,9 @@ def test_requests_of_the_wrong_shape_are_told_what_is_wrong():
     """A malformed request failed inside the server with Python's words ("AttributeError: 'str' object has no
     attribute 'get'"); each shape gets its own sentence now, and a lone surrogate (a JavaScript client that cut a
     string inside an emoji) is replaced instead of failing the request."""
+    img = {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}
     for req, said in (({"messages": ["hi"]}, "messages[0] must be an object"),
+                      ({"messages": [img, ["hi"]]}, "messages[1] must be an object"),  # (before its images are read)
                       ({"messages": [{"role": "user", "content": 5}]}, "messages[0].content must be a string"),
                       ({"messages": [{"role": "assistant", "tool_calls": "x"}]}, "tool_calls must be a list"),
                       ({"messages": [], "tools": "x"}, "tools must be a list"),

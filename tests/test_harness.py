@@ -608,3 +608,14 @@ def test_a_stop_while_the_files_are_renamed_waits_for_the_last(tmp_path, monkeyp
             shutil.rmtree(c, ignore_errors=True)
     assert (root / "a.py").read_text() == "A = 1\n" and (root / "b.py").read_text() == "B = 1\n"
     assert run.report["changed"] == ["a.py", "b.py"] and signal.getsignal(signal.SIGINT) is before
+
+
+def test_a_chat_without_a_stop_event_reaches_the_server():
+    """_chat's own ``import urllib.parse`` made ``urllib`` a local name of the whole function: without ``stop``,
+    its first line was an UnboundLocalError instead of a request."""
+    import urllib.error
+
+    import pytest
+
+    with pytest.raises(urllib.error.URLError):
+        harness._chat("http://127.0.0.1:9", {"messages": []}, timeout=2)  # (nothing listens on port 9)
