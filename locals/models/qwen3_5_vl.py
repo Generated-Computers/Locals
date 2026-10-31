@@ -102,6 +102,8 @@ def vision_config(model_dir: Path) -> Optional[VisionConfig]:
     if head and sum(section) * 2 != int(head * partial):
         return None  # (a split that does not cover the rotated dims: vision.MRoPE would refuse it on the first image)
     out = VisionConfig.from_dict(v)
+    if (out.patch_size, out.temporal_patch_size, out.spatial_merge_size) != (16, 2, 2):
+        return None  # (vision.preprocess cuts 16x16 patches over two frames, merged 2x2: other values, other tokens)
     out.mrope_section = tuple(section)
     return out
 

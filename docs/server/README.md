@@ -431,7 +431,8 @@ In a stream, tool calls are collected and sent in the final `done` line. Errors 
 ## Images
 
 Qwen3.5 and Qwen3-VL read images on our engine (`vision_config` in `locals/models/qwen3_5_vl.py` decides, from the
-checkpoint's `config.json`: a vision tower, and an interleaved M-RoPE split that covers the rotated dims; and
+checkpoint's `config.json`: a vision tower with Qwen's patch values (16x16 patches over two frames, merged 2x2: the
+only ones `vision.preprocess` cuts), and an interleaved M-RoPE split that covers the rotated dims; and
 `has_tower`, from its safetensors files' headers: the tower's weights are in them). mlx-lm keeps
 only the text half of such a checkpoint, so the tower is rebuilt from the same files (`locals/models/qwen3_5_vl.py`) and loaded with the
 first image, not at start. Any other model, and the stock engine, gets `IMAGE_NOTE` in each image's place, as before.

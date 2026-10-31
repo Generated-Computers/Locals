@@ -231,6 +231,15 @@ def test_anthropic_images_become_image_parts():
     ("qwen3_5", {"hidden_size": 1024}, {"head_dim": 256, "rope_parameters": {"mrope_section": [24, 20, 20], "partial_rotary_factor": 0.25}}, False),
     ("qwen3_vl", {"hidden_size": 1152}, {"head_dim": 128, "rope_scaling": {"rope_type": "default"}}, False),
     ("qwen3_vl", {"hidden_size": 1152}, {"head_dim": 128, "rope_scaling": {"mrope_interleaved": False, "mrope_section": [24, 20, 20]}}, False),
+    # other patch values: vision.preprocess cuts 16x16 patches over two frames, and the merger takes 2x2 of them
+    ("qwen3_vl", {"hidden_size": 1152, "patch_size": 14},
+     {"head_dim": 128, "rope_scaling": {"mrope_interleaved": True, "mrope_section": [24, 20, 20]}}, False),
+    ("qwen3_vl", {"hidden_size": 1152, "spatial_merge_size": 4},
+     {"head_dim": 128, "rope_scaling": {"mrope_interleaved": True, "mrope_section": [24, 20, 20]}}, False),
+    ("qwen3_vl", {"hidden_size": 1152, "temporal_patch_size": 1},
+     {"head_dim": 128, "rope_scaling": {"mrope_interleaved": True, "mrope_section": [24, 20, 20]}}, False),
+    ("qwen3_vl", {"hidden_size": 1152, "patch_size": 16, "temporal_patch_size": 2, "spatial_merge_size": 2},
+     {"head_dim": 128, "rope_scaling": {"mrope_interleaved": True, "mrope_section": [24, 20, 20]}}, True),
     ("qwen3_5", None, {}, False),  # a text-only checkpoint (Qwen3.8)
     ("gemma4", {"hidden_size": 768}, {}, False),
 ])
