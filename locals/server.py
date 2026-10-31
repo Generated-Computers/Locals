@@ -103,6 +103,11 @@ def _origin_ok(origin: str) -> bool:
     return u.scheme in _APP_SCHEMES
 
 
+def _reads_images(svc) -> bool:
+    """Whether a loaded service reads this model's images (the test fakes have no ``vision``)."""
+    return svc is not None and getattr(svc, "vision", lambda: None)() is not None
+
+
 def _host_ok(host_header: Optional[str], bind_host: str) -> bool:
     """The Host header of a server that listens on this machine only names this machine: a page whose
     domain was pointed at 127.0.0.1 (DNS rebinding) names its own. This machine's names: localhost and
@@ -254,12 +259,18 @@ class Server:
         loaded = list(self._svc.values())
         if loaded and formats.offers_thinking(loaded[0].tokenizer):
             caps.append("thinking")
+        if self.reads_images():
+            caps.append("vision")
         ctx = self.context_for(oai.engine_of(name) if name else "locals")
         entry = apis.ollama_model_entry(name or self.ollama_name(), self.short, family, ctx)
         return {"license": "", "modelfile": f"# served by locals: {self.model_id}", "parameters": "", "template": "",
                 "details": entry["details"], "capabilities": caps,
                 "model_info": {"general.architecture": family, "general.basename": self.short,
                                f"{family}.context_length": ctx}}
+
+    def reads_images(self) -> bool:
+        """Whether our engine, loaded, reads this model's images (a checkpoint with its vision tower)."""
+        return _reads_images(self._svc.get("locals"))
 
     # -- engines ------------------------------------------------------------------------------
     def service(self, engine: str):
@@ -288,6 +299,26 @@ class Server:
             self._svc[engine] = svc
             self.log(f"engine {engine} ready in {time.perf_counter() - t:.1f}s")
             return svc
+
+    def unload(self) -> dict:
+        """Let the model go and give its memory back, the server still running: the next request loads it
+        again (Ollama's keep_alive 0, mlx-vlm's POST /unload). Replies in progress end as cancelled."""
+        import mlx.core as mx
+
+        before = mx.get_active_memory()
+        done = []
+        for e in [e for e in self.engines if e in self._svc]:
+            with self._loading[e]:  # (not while it loads)
+                svc = self._svc.pop(e, None)
+                if svc is None:
+                    continue
+                self.log(f"unloading {self.model_id} from engine {e} ...")
+                s = svc.unload()
+                done.append(e)
+                self.log(f"engine {e} unloaded in {s:.1f}s")
+        after = mx.get_active_memory()
+        return {"status": "unloaded" if done else "not loaded", "model": self.model_id, "engines": done,
+                "freed_mb": round(max(0, before - after) / 1e6), "gpu_active_mb": round(after / 1e6)}
 
     def _can_think(self, engine: str, tok) -> bool:
         if engine not in getattr(self, "_thinks", {}):
@@ -366,7 +397,16 @@ class Server:
         prefill = req.get("_prefill") if isinstance(req.get("_prefill"), str) else ""  # (an Anthropic prefill)
         if prefill:
             thinking = False
-        msgs = oai.convert_messages(req.get("messages") or [], raw=self._raw if fmt.replay_raw else None)
+        from . import vision
+
+        raw_msgs = req.get("messages") or []
+        pictures = []
+        if vision.has_images(raw_msgs) and _reads_images(svc):
+            # each image as the template's <|image_pad|> (expanded below to the image's own tokens); a model or engine
+            # that reads text only gets the note IMAGE_NOTE in its place, from convert_messages
+            raw_msgs, sources = vision.take_images(raw_msgs)
+            pictures = vision.load(sources, local=self.bind_host in _LOOPBACK)
+        msgs = oai.convert_messages(raw_msgs, raw=self._raw if fmt.replay_raw else None)
         tools = oai.tool_specs(req.get("tools"))
         _volatile_to_end(msgs, tools)
         if tools:
@@ -393,7 +433,12 @@ class Server:
             # answers at once (a short request answered nothing, every token spent thinking; JSON started in it)
             text += fmt.think_close
         text += prefill  # the reply goes on from it
-        prompt = self._tokens_for(engine, tok, text)
+        spans = []
+        if pictures:  # (not from a remembered stream: those hold the image tokens expanded)
+            prompt, spans = vision.expand(list(tok._tokenizer.encode(text, add_special_tokens=False)),
+                                          tok.convert_tokens_to_ids(vision.IMAGE_TOKEN), pictures)
+        else:
+            prompt = self._tokens_for(engine, tok, text)
         limit = self.limit_for(engine)
         if len(prompt) >= limit:
             raise ContextTooLong(f"This model's maximum context length is {limit} tokens. However, your messages "
@@ -445,8 +490,10 @@ class Server:
                 output_regex = out if tc == "auto" else None
         if sealed and regex is None and schema is None:  # (no tools: free text, without the tags)
             regex = oai.not_containing(*oai.THINK_TAGS)
-        cps = self._checkpoints(tok, msgs, tpl_tools, think_kw, text, prompt) if engine == "locals" and self._needs_checkpoints(engine) else []
+        cps = (self._checkpoints(tok, msgs, tpl_tools, think_kw, text, prompt)
+               if engine == "locals" and not pictures and self._needs_checkpoints(engine) else [])
         return {"engine": engine, "thinking": thinking, "svc": svc, "prompt": prompt, "checkpoints": cps, "text": text,
+                "pictures": pictures, "spans": spans,
                 "tools": tools, "schema": schema, "regex": regex, "output_regex": output_regex, "max_tokens": max_tokens,
                 "model": model, "fmt": fmt, "sealed": sealed, "seps": seps,
                 "tool_choice": req.get("tool_choice", "auto"), "stop": _stops(req), "temp": _temperature(req),
@@ -792,7 +839,7 @@ class Server:
     def _remember(self, engine: str, p: dict, job, calls: List[dict], prefix: str = "", raw: Optional[str] = None,
                   exact: bool = True) -> None:
         raw = prefix + job.text if raw is None else raw
-        exact = exact and raw == prefix + job.text
+        exact = exact and raw == prefix + job.text and not p.get("pictures")  # (its ids: each image's tokens expanded)
         ids = list(p["prompt"])
         if prefix:
             ids += list(p["svc"].tokenizer._tokenizer.encode(prefix, add_special_tokens=False))
@@ -807,10 +854,22 @@ class Server:
                 st.append({"text": p["text"] + raw, "ids": ids + list(job.tokens)})
                 del st[:-64]
 
-    def _submit(self, p: dict, on_token=None):
-        return p["svc"].submit(p["prompt"], schema=p["schema"], max_tokens=p["max_tokens"], regex=p["regex"], on_token=on_token,
+    def _submit(self, p: dict, on_token=None, prompt: Optional[List[int]] = None):
+        """``p``'s job (``prompt``: its prompt and the reply's prefix, written already)."""
+        from .service import Unloaded
+
+        try:
+            return self._submit_to(p, on_token, prompt)
+        except Unloaded:  # (unloaded while this request was prepared: the same model, loaded again, takes it)
+            p["svc"] = self.service(p["engine"])
+            return self._submit_to(p, on_token, prompt)
+
+    def _submit_to(self, p: dict, on_token=None, prompt: Optional[List[int]] = None):
+        return p["svc"].submit(p["prompt"] if prompt is None else prompt, schema=p["schema"], max_tokens=p["max_tokens"],
+                               regex=p["regex"], on_token=on_token,
                                temp=p.get("temp"), ignore_eos=p.get("ignore_eos", False),
-                               checkpoints=p.get("checkpoints"), **p.get("sampling", {}))
+                               checkpoints=p.get("checkpoints"), pictures=p.get("pictures"), spans=p.get("spans"),
+                               **p.get("sampling", {}))
 
     def _account(self, p: dict, job, out_tokens: int, calls: int, t0: float, stopped: Optional[str] = None) -> dict:
         r = getattr(job, "_req", None)
@@ -1086,9 +1145,7 @@ class Server:
         if prefix:
             prompt += list(tok._tokenizer.encode(prefix, add_special_tokens=False))
         q: "queue.Queue[List[int]]" = queue.Queue()
-        job = p["svc"].submit(prompt, schema=p["schema"], max_tokens=p["max_tokens"], regex=p["regex"], on_token=q.put,
-                              temp=p.get("temp"), ignore_eos=p.get("ignore_eos", False),
-                              checkpoints=p.get("checkpoints"), **p.get("sampling", {}))
+        job = self._submit(p, q.put, prompt)
         job.prefix_tokens = len(prompt) - len(p["prompt"])
         toks: List[int] = []
         rs = oai.ReplyStream(p["thinking"] and (not prefix or _in_think(p)), p.get("fmt"),
@@ -1654,7 +1711,14 @@ def make_handler(server: Server, ollama_root: bool = False):
                 return fail(str(e), 404)
             if (path == "/api/chat" and not req.get("messages")) or (path == "/api/generate" and not req.get("prompt")):
                 # Ollama's way to load a model (or, with keep_alive 0, unload it): an answer at once, nothing generated
-                reason = "unload" if str(req.get("keep_alive")) in ("0", "0s", "0m") else "load"
+                reason = "unload" if str(req.get("keep_alive")) in ("0", "0s", "0m", "0.0") else "load"
+                try:
+                    if reason == "unload":
+                        server.unload()
+                    else:
+                        server.service(oai.engine_of(model))
+                except Exception as e:  # noqa: BLE001  # (a load that failed: its error, as Ollama answers it)
+                    return fail(f"{type(e).__name__}: {e}", 500)
                 body = {"model": name or model, "created_at": apis._now_iso(), "done": True, "done_reason": reason}
                 body.update({"message": {"role": "assistant", "content": ""}} if path == "/api/chat" else {"response": ""})
                 return self._json(body)
@@ -1795,6 +1859,8 @@ def make_handler(server: Server, ollama_root: bool = False):
             except RecursionError:
                 return self._error("the request is nested too deeply")
             text_api = path in ("/v1/completions", "/completions")
+            if path in ("/unload", "/v1/unload"):  # mlx-vlm's: the model's memory back, the server still running
+                return self._json(server.unload())
             if path in OTHER_POSTS:
                 return self._other_api(path, req)
             if path in apis.ANTHROPIC_POSTS:

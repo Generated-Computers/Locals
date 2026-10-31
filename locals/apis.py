@@ -71,19 +71,31 @@ def _ollama_options(req: dict) -> dict:
     return got
 
 
+def _with_images(text: str, images) -> object:
+    """Ollama's ``images`` (base64 strings) as OpenAI image parts before the text, where Ollama puts them; a model
+    that reads text only gets IMAGE_NOTE for each (oai.text_of)."""
+    if not images:
+        return text
+    if not isinstance(images, list) or not all(isinstance(i, str) and i for i in images):
+        raise ValueError("images must be a list of base64 strings")
+    parts: List[dict] = [{"type": "image_url", "image_url": {"url": i if i.startswith("data:") else "data:image;base64," + i}}
+                         for i in images]
+    return parts + ([{"type": "text", "text": text}] if text else [])
+
+
 def ollama_to_chat(req: dict, model: str, generate: bool = False) -> dict:
     """An Ollama /api/chat (or /api/generate) request as a Chat Completions request."""
     msgs: List[dict] = []
     if generate:
         if req.get("system"):
             msgs.append({"role": "system", "content": req["system"]})
-        msgs.append({"role": "user", "content": (req.get("prompt") or "") + (" " + IMAGE_NOTE if req.get("images") else "")})
+        msgs.append({"role": "user", "content": _with_images(req.get("prompt") or "", req.get("images"))})
     else:
         pending: List[str] = []  # the ids of the last assistant turn's calls, for results that come without one
         for mi, m in enumerate(req.get("messages") or []):
             content = m.get("content") or ""
             if m.get("images"):
-                content = (content + "\n" if content else "") + IMAGE_NOTE
+                content = _with_images(content, m["images"])
             msg = {"role": m.get("role") or "user", "content": content}
             if m.get("role") == "assistant" and m.get("tool_calls"):
                 # Ollama's calls have no ids: the same ones on every request (a random one changed the history the
@@ -272,6 +284,47 @@ def _document_text(b: dict) -> str:
     return FILE_NOTE
 
 
+def _image_url(b: dict) -> Optional[str]:
+    """An Anthropic image block's image as a URL (a data URL for base64), or None."""
+    src = b.get("source") if isinstance(b.get("source"), dict) else {}
+    if src.get("type") == "base64" and isinstance(src.get("data"), str):
+        return f"data:{src.get('media_type') or 'image'};base64,{src['data']}"
+    if src.get("type") == "url" and isinstance(src.get("url"), str):
+        return src["url"]
+    return None
+
+
+def _user_content(parts: List[object]):
+    """The user's text joined, as before; with an image among it, OpenAI content parts."""
+    if all(isinstance(x, str) for x in parts):
+        return "\n".join(parts)
+    return [x if isinstance(x, dict) else {"type": "text", "text": x} for x in parts]
+
+
+def _result_content(b: dict):
+    """A tool_result block's content for its tool message: the text, or with an image among it, OpenAI
+    content parts, as for the user (a screenshot a tool returns is read like one the user sends)."""
+    content = b.get("content")
+    if isinstance(content, str):
+        parts: List[object] = [content]
+    else:
+        parts = []
+        for x in _blocks(content):
+            kind = x.get("type")
+            if kind == "text":
+                parts.append(x.get("text") or "")
+            elif kind == "image":
+                url = _image_url(x)
+                parts.append({"type": "image_url", "image_url": {"url": url}} if url else IMAGE_NOTE)
+            elif kind == "document":
+                parts.append(_document_text(x))
+    if b.get("is_error"):
+        if not parts or not isinstance(parts[0], str):
+            parts = [""] + parts
+        parts = ["Error: " + parts[0]] + parts[1:]
+    return _user_content(parts)
+
+
 def anthropic_to_chat(req: dict, model: str) -> dict:
     """A Messages API request as a Chat Completions request for ``model``: the system blocks as one system
     message, tool_use blocks as the assistant's tool_calls, tool_result blocks as tool messages (in their
@@ -304,24 +357,23 @@ def anthropic_to_chat(req: dict, model: str) -> dict:
                 out["tool_calls"] = calls
             msgs.append(out)
         elif role in ("user", "system"):  # a mid-conversation system message: an instruction in the user's turn
-            parts: List[str] = []
+            parts: List[object] = []  # text, and image parts (dicts) for a model that reads images
             for b in blocks:
                 kind = b.get("type")
                 if kind == "tool_result":
                     if parts:  # (results answer the previous turn's calls: they come first)
-                        msgs.append({"role": "user", "content": "\n".join(parts)})
+                        msgs.append({"role": "user", "content": _user_content(parts)})
                         parts = []
-                    content = _block_text(b.get("content"))
-                    msgs.append({"role": "tool", "tool_call_id": b.get("tool_use_id") or "",
-                                 "content": ("Error: " + content) if b.get("is_error") else content})
+                    msgs.append({"role": "tool", "tool_call_id": b.get("tool_use_id") or "", "content": _result_content(b)})
                 elif kind == "text":
                     parts.append(b.get("text") or "")
                 elif kind == "image":
-                    parts.append(IMAGE_NOTE)
+                    url = _image_url(b) if role == "user" else None
+                    parts.append({"type": "image_url", "image_url": {"url": url}} if url else IMAGE_NOTE)
                 elif kind == "document":
                     parts.append(_document_text(b))
             if parts:
-                msgs.append({"role": "user", "content": "\n".join(parts)})
+                msgs.append({"role": "user", "content": _user_content(parts)})
         else:
             raise ValueError(f"messages: unknown role {role!r}")
     chat = {"model": model, "messages": msgs, "stream": bool(req.get("stream")), "stream_options": {"include_usage": True}}

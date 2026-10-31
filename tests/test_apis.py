@@ -3,7 +3,7 @@ model: the server's own output is scripted)."""
 
 import json
 
-from locals import apis
+from locals import apis, oai
 
 
 def _sse(*chunks):
@@ -29,7 +29,9 @@ def test_ollama_request_reply_and_stream():
         {"role": "tool", "content": "ok", "tool_name": "f"}],
         "options": {"num_predict": 20, "temperature": 0.1}, "format": "json", "think": False}, "locals/q")
     assert chat["stream"] and chat["max_tokens"] == 20 and chat["temperature"] == 0.1 and chat["response_format"] == {"type": "json_object"}
-    assert apis.IMAGE_NOTE in chat["messages"][0]["content"] and chat["messages"][1]["tool_calls"][0]["function"]["arguments"] == '{"a": 1}'
+    # the image as an OpenAI image part (a model that reads text only gets the note in its place)
+    assert chat["messages"][0]["content"][0] == {"type": "image_url", "image_url": {"url": "data:image;base64,AAAA"}}
+    assert apis.IMAGE_NOTE in oai.text_of(chat["messages"][0]["content"]) and chat["messages"][1]["tool_calls"][0]["function"]["arguments"] == '{"a": 1}'
     assert chat["chat_template_kwargs"] == {"enable_thinking": False}
     g = apis.ollama_to_chat({"prompt": "2+2=", "system": "math", "stream": False}, "locals/q", generate=True)
     assert [m["role"] for m in g["messages"]] == ["system", "user"] and not g["stream"]

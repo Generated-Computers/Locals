@@ -27,6 +27,7 @@ dependencies = [
   "mlx>=0.32,<0.34",
   "mlx-lm>=0.32,<0.33",  # 0.32 fixed Qwen3.5 q/k normalization; our fused layers match it
   "numpy>=1.26",
+  "pillow>=10.3",  # images: decode, resize (locals/vision.py)
   "huggingface_hub>=0.30",  # model downloads (locals.app, locals.server); also needed by mlx-lm
   "llguidance>=1.8",  # the server's stock-MLX engine (mlx/<model>), for side-by-side comparison
   "outlines-core>=0.2,<0.3",

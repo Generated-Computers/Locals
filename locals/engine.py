@@ -148,8 +148,8 @@ class Controller:
     def accept(self, token: int) -> None:
         pass
 
-    def forced(self, token: int) -> Tuple[List[int], bool]:
-        """Tokens to feed after ``token``; the flag says they replace it."""
+    def forced(self, token: int, heal: bool = True) -> Tuple[List[int], bool]:
+        """Tokens to feed after ``token``; the flag says they replace it (only with ``heal``)."""
         return [], False
 
     def finished(self) -> bool:
@@ -515,7 +515,7 @@ class LLGuidanceController(Controller):
         if not self.m.consume_token(token):
             raise RuntimeError(self.m.get_error())
 
-    def forced(self, token):
+    def forced(self, token, heal: bool = True):
         if not self.use_ff:
             return [], False
         ff = self.m.compute_ff_tokens()
@@ -1241,12 +1241,16 @@ class Engine:
         res.trees = trees
         return res
 
-    def _generate_sync(self, prompt, ctl, max_tokens, temp, seed, top_p: float = 0.0, top_k: int = 0) -> GenResult:
+    def _generate_sync(self, prompt, ctl, max_tokens, temp, seed, top_p: float = 0.0, top_k: int = 0,
+                       prefill=None, on_token=None, cancel=None) -> GenResult:
         eos = set(ctl.eos_ids) or set(self.tokenizer.eos_token_ids)
         cache = make_prompt_cache(self.model)
         key = mx.random.key(seed)
         t0 = time.perf_counter()
-        self._prefill(cache, prompt)
+        if prefill is not None:
+            prefill(cache)  # (an image prompt: its embeddings and M-RoPE positions)
+        else:
+            self._prefill(cache, prompt)
         mx.synchronize()
         t1 = time.perf_counter()
         feed = [prompt[-1]]
@@ -1255,6 +1259,9 @@ class Engine:
         sizes: List[int] = []
         finish = "length"
         while len(out) < max_tokens:
+            if cancel is not None and cancel():
+                finish = "cancelled"
+                break
             logits = forward_last(self.model, mx.array([feed]), cache)[0]
             passes += 1
             sizes.append(len(feed))
@@ -1277,11 +1284,16 @@ class Engine:
                 finish = "exhausted"
                 break
             out.append(y)
+            if on_token is not None:
+                on_token([y])
             feed = [y]
             if ctl.finished():
                 finish = "stop"
                 break
-            extra, replaces = ctl.forced(y) if ctl.heal_ok(max_tokens - len(out) + 1) else ctl.forced(y, heal=False)
+            # (streamed: y has gone to the client, so nothing may replace it, as in the batch engine)
+            heal = on_token is None and ctl.heal_ok(max_tokens - len(out) + 1)
+            extra, replaces = ctl.forced(y, heal=heal)
+            assert heal or not replaces
             if extra:
                 if replaces:
                     out.pop()
@@ -1291,6 +1303,8 @@ class Engine:
                     feed = [y] + list(extra)
                     forced_n += len(extra)
                 out.extend(extra)
+                if on_token is not None:
+                    on_token(list(extra))
                 if ctl.finished():
                     finish = "stop"
                     break
@@ -1298,3 +1312,40 @@ class Engine:
         t2 = time.perf_counter()
         text = self.tokenizer.decode(out)
         return GenResult(out, text, len(prompt), t1 - t0, t2 - t1, passes, forced_n, sizes, finish)
+
+    def generate_embedded(self, prompt: List[int], spans, features, positions, controller: Optional[Controller] = None,
+                          max_tokens: int = 256, temp: float = 0.0, seed: int = 0, top_p: float = 0.0, top_k: int = 0,
+                          on_token=None, cancel=None, deepstack=(), section=(11, 11, 10)) -> GenResult:
+        """Generate from a prompt whose input embeddings are given: ``spans`` says where each image's
+        tokens sit in ``prompt`` and ``features`` holds the vision tower's block for it. ``positions``
+        (3, 1, len(prompt) + max_tokens) is the M-RoPE position of every token, prompt and reply, split over the
+        frequencies by ``section``. ``deepstack`` (Qwen3-VL) holds, per layer, each image's features that the text
+        model adds to the image's tokens after that layer while the prompt is read.
+
+        The synchronous path on purpose: an image prompt is one request, and the batched engine's
+        per-row positions are token indices, not (t, h, w). ``on_token`` streams each committed token
+        and ``cancel`` is asked before every step, so a client that leaves stops the reply."""
+        from .vision import deepstack as deepstack_layers, embed_prompt, mrope, place
+
+        ctl = controller or Controller()
+        body = text_model(self.model).model
+        emb = embed_prompt(body, prompt, spans, features)
+
+        adds = [place(len(prompt), spans, level) for level in deepstack]
+
+        def prefill(cache):
+            nonlocal emb, adds
+            i = 0
+            n_all = emb.shape[1]
+            with deepstack_layers(self.model, adds) as state:  # (the last token, fed below, is text: nothing to add)
+                while n_all - i > 1:  # the last prompt token is the first step's feed, as in _prefill
+                    n = min(self.prefill_step, n_all - 1 - i)
+                    state["at"] = i
+                    body(None, cache, input_embeddings=emb[:, i: i + n])
+                    mx.eval([c.state for c in cache])
+                    i += n
+            emb = adds = None  # (the whole prompt's embeddings: not kept for the reply's decode)
+
+        with mrope(self.model, positions, section):
+            return self._generate_sync(prompt, ctl, max_tokens, temp, seed, top_p, top_k, prefill=prefill,
+                                       on_token=on_token, cancel=cancel)

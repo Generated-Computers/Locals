@@ -49,6 +49,8 @@ class Job:
     top_k: Optional[int] = None
     seed: Optional[int] = None  # its own seed: the same reply for the same request alone (None: unseeded)
     ignore_eos: bool = False  # run to max_tokens: end-of-sequence tokens do not end the reply (a benchmark option)
+    pictures: List[object] = field(default_factory=list)  # images (vision.Picture): this prompt reads them
+    spans: List[Tuple[int, int]] = field(default_factory=list)  # where each image's tokens sit in ``prompt``
     _event: threading.Event = field(default_factory=threading.Event)
     _req: object = None
 
@@ -191,6 +193,10 @@ def _reason(e: BaseException) -> str:
     return str(e) if isinstance(e, ValueError) and str(e) else f"{type(e).__name__}: {e}"
 
 
+class Unloaded(RuntimeError):
+    """A request for a service that has let go of its model (BatchService.unload)."""
+
+
 class BatchService:
     def __init__(self, engine: str, model: str, slots: int = 16, temp: float = 0.0, seed: int = 0, cache_gb: Optional[float] = None,
                  walk: bool = False, top_p: float = 0.0, top_k: int = 0):
@@ -205,6 +211,7 @@ class BatchService:
         self._q: "queue.Queue[Job]" = queue.Queue()
         self._compile_lock = threading.Lock()
         self._inflight = {}  # id(job) -> job, taken by the worker and not yet finished
+        self._vision_q: List[Job] = []  # image prompts waiting for the batch to be idle
         self._closed = False
         self._ready = threading.Event()
         self._error: Optional[BaseException] = None
@@ -225,7 +232,7 @@ class BatchService:
     def submit(self, prompt: List[int], schema: Optional[dict] = None, max_tokens: int = 512, regex: Optional[str] = None,
                on_token: Optional[Callable[[List[int]], None]] = None, checkpoints: Optional[List[Tuple[int, str]]] = None,
                temp: Optional[float] = None, ignore_eos: bool = False, top_p: Optional[float] = None,
-               top_k: Optional[int] = None, seed: Optional[int] = None) -> Job:
+               top_k: Optional[int] = None, seed: Optional[int] = None, pictures=None, spans=None) -> Job:
         """Queue a generation; the output matches ``schema`` (JSON Schema) or ``regex`` if given.
         ``on_token`` streams committed tokens (called from the worker thread). For
         each ``(n, kind)`` in ``checkpoints`` the cache of ``prompt[:n]`` is also kept
@@ -237,9 +244,11 @@ class BatchService:
         tokens whatever the model ends with (benchmarks' fixed output lengths, as vLLM's option)."""
         if not prompt:
             raise ValueError("empty prompt")
+        if self._closed:  # (unloaded while the request was prepared: the server loads the model again for it)
+            raise Unloaded("the model was unloaded")
         job = Job(list(prompt), schema, max_tokens, regex, t_submit=time.perf_counter(), on_token=on_token,
                   checkpoints=list(checkpoints or []), temp=temp, ignore_eos=ignore_eos, top_p=top_p, top_k=top_k,
-                  seed=seed)
+                  seed=seed, pictures=list(pictures or []), spans=list(spans or []))
         rt = getattr(self, "_rt", None)
         if rt is not None and not self.walk and (schema is not None or regex is not None):
             # its grammar is made in a thread of its own, and the job queued once it is: made in the batch loop, a
@@ -248,6 +257,8 @@ class BatchService:
             threading.Thread(target=self._compile_then_queue, args=(rt, job), name="locals-compile", daemon=True).start()
         else:
             self._q.put(job)
+            if self._closed and not job._event.is_set():  # (closed between the check and the put: never taken)
+                self._finish(job, [], "cancelled")
         return job
 
     def _compile_then_queue(self, rt, job: "Job") -> None:
@@ -358,9 +369,89 @@ class BatchService:
         if not work:
             print("locals: kernel tuning finished; batches now run on the tuned kernels", file=sys.stderr, flush=True)
 
+    def _vision(self, rt, job: Job, ctl) -> None:
+        """One image prompt, alone: the vision tower's features go where the prompt's ``<|image_pad|>``
+        tokens are, and every token carries its own M-RoPE (t, h, w) position. The batch engine cannot
+        run this row: its positions are token indices, and its prefill is one token stream for all rows."""
+        from .vision import positions, tail
+
+        try:
+            enc = self.vision()
+            if enc is None:
+                raise ValueError(f"{self.model_id} reads text only")
+            features, deep = enc.encode(job.pictures)
+            pos = positions(job.spans, [p.grid for p in job.pictures], len(job.prompt))
+            # (3, 1, prompt + reply); the margin is for the forced tokens a grammar adds past max_tokens in one step
+            pos = tail(pos, job.max_tokens + 1024)[:, None, :]
+            res = rt.engine.generate_embedded(
+                job.prompt, job.spans, features, pos, ctl, max_tokens=job.max_tokens,
+                temp=self.temp if job.temp is None else job.temp,
+                seed=self.seed if job.seed is None else job.seed,
+                top_p=self.top_p if job.top_p is None else job.top_p,
+                top_k=self.top_k if job.top_k is None else job.top_k,
+                on_token=job.on_token, cancel=lambda: job.cancelled, deepstack=deep, section=enc.mrope_section)
+        except Exception as e:  # noqa: BLE001  # the tower's weights, an image it cannot read, a prefill out of memory:
+            self._finish(job, [], f"error: {_reason(e)}")  # this request's error, not the batch's (serve's catch-all)
+            return
+        self.prompt_tokens += len(job.prompt)
+        self.tokens_out += len(res.tokens)
+        self._finish(job, res.tokens, res.finish)
+
+    def vision(self):
+        """This model's vision tower (vision.Encoder, its weights read on the first image), or None: the stock
+        engine, or a checkpoint without one."""
+        if self.engine != "locals" or getattr(self, "_rt", None) is None:
+            return None
+        enc = getattr(self, "_vision_enc", None)
+        if enc is None:
+            import mlx.core as mx
+
+            from .vision import Encoder
+
+            enc = self._vision_enc = Encoder(self.model_id, getattr(mx, getattr(self._rt, "dtype", "float16")),
+                                             log=lambda s: print(f"locals: {s}", file=sys.stderr, flush=True))
+        return enc if enc.available() else None
+
+    def unload(self) -> float:
+        """Let go of the model and give its memory back, without stopping the server: the next request
+        loads it again. What is queued or in flight is cancelled (a client can send the same request
+        again), the worker stops, the weights, the prompt cache and the vision tower are dropped, and
+        MLX's pool is emptied. The service is finished afterwards: the server makes a new one. Returns the seconds taken."""
+        import gc
+
+        import mlx.core as mx
+
+        t0 = time.perf_counter()
+        for job in list(self._inflight.values()):
+            job.cancel()  # (the worker stops at its next commit or between prefill chunks)
+        self.close()
+        stuck = list(self._inflight.values()) + list(self._vision_q)
+        self._vision_q = []
+        while True:
+            try:
+                stuck.append(self._q.get_nowait())
+            except queue.Empty:
+                break
+        for job in stuck:  # (finished before the tokenizer goes: a reply's text is decoded with it)
+            if not job._event.is_set():
+                self._finish(job, [], "cancelled")
+        self._inflight.clear()
+        if self._thread.is_alive():
+            print(f"locals: the {self.engine} worker did not stop within 30 s; its model is kept", file=sys.stderr, flush=True)
+        self.tokenizer = None
+        self._vision_enc = None
+        self._eng = None
+        self._rt = None
+        self._lru = None
+        self._tune_work = None
+        gc.collect()
+        mx.clear_cache()
+        mx.reset_peak_memory()
+        return time.perf_counter() - t0
+
     def _finish(self, job: Job, tokens, finish: str) -> None:
         job.tokens = list(tokens)
-        job.text = self.tokenizer.decode(job.tokens)
+        job.text = self.tokenizer.decode(job.tokens) if self.tokenizer is not None else ""  # (None: unloaded)
         job.finish = finish
         job.t_done = time.perf_counter()
         self._inflight.pop(id(job), None)
@@ -467,7 +558,10 @@ class BatchService:
         self._ready.set()
 
         def source(block):
-            jobs = self._take(block)
+            jobs = []
+            if block and self._vision_q:  # an image prompt waits for the batch to be idle (it runs alone)
+                jobs, self._vision_q = self._vision_q, []
+            jobs += self._take(block and not jobs)
             reqs = []
             for job in jobs:
                 # One request's fault (a regex that does not compile, a schema too large or recursive)
@@ -502,6 +596,14 @@ class BatchService:
                     continue
                 except Exception as e:  # noqa: BLE001  # the engine's (a Metal error making the tables): a 500, retried once
                     self._finish(job, [], f"error: {e!r}")
+                    continue
+                if job.pictures:
+                    # one image prompt at a time, on the synchronous engine: its rows carry (t, h, w)
+                    # positions and its prompt's embeddings, which the batch's per-row token indices cannot
+                    if not block:  # (taken while other rows decode: held for the idle call)
+                        self._vision_q.append(job)
+                        continue
+                    self._vision(rt, job, ctl)
                     continue
                 r = Request(job.prompt, ctl, job.max_tokens)
                 r.on_token = job.on_token

@@ -42,6 +42,7 @@ THINK_CLOSE = "</think>"
 
 IMAGE_NOTE = "[an image was attached here; this model reads text only]"
 FILE_NOTE = "[a file was attached here; this model reads only the text of the conversation]"
+IMAGE_PARTS = ("image_url", "image", "input_image")  # an image content part: OpenAI's, the Responses API's
 
 def text_of(content) -> str:
     """The text of an OpenAI message content (a string or a list of parts)."""
@@ -55,7 +56,7 @@ def text_of(content) -> str:
             out.append(part)
         elif part.get("type") == "text":
             out.append(part.get("text") or "")
-        elif part.get("type") in ("image_url", "image", "input_image"):
+        elif part.get("type") in IMAGE_PARTS:
             out.append(IMAGE_NOTE)  # the model can say it cannot see it (a bare "[image omitted]" it took for text)
         elif part.get("type") in ("file", "input_file"):
             out.append(FILE_NOTE)

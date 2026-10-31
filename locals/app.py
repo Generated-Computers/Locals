@@ -983,6 +983,26 @@ def cmd_stop(args) -> None:
     print(f"stopped the locals server on port {args.port} (pid {target})")
 
 
+def cmd_unload(args) -> None:
+    """The model out of memory, the server still running (its next request loads it again)."""
+    from .client import _post
+
+    if not server_alive(args.port):
+        print(f"no locals server on port {args.port}")
+        return
+    try:
+        with _post(f"{base_url(args.port)}/v1/unload", {}, timeout=120) as r:
+            d = json.load(r)
+    except ValueError as e:  # (the server's own error message)
+        print(f"the locals server on port {args.port} did not unload: {e}")
+        return
+    if d.get("status") != "unloaded":
+        print(f"the locals server on port {args.port} has no model loaded")
+        return
+    print(f"unloaded {d.get('model')} ({', '.join(d.get('engines') or [])}): {d.get('freed_mb', 0):,} MB of GPU memory "
+          f"freed, {d.get('gpu_active_mb', 0):,} MB still in use; the next request loads it again")
+
+
 def cmd_status(args) -> None:
     st = server_alive(args.port)
     if not st:
@@ -2633,6 +2653,9 @@ def _main(argv=None):
     p = sub.add_parser("status", help="server counters")
     add_common(p)
     p.set_defaults(fn=cmd_status)
+    p = sub.add_parser("unload", help="take the model out of memory, the server still running (the next request loads it)")
+    add_common(p)
+    p.set_defaults(fn=cmd_unload)
     p = sub.add_parser("stop", help="stop the background server")
     add_common(p)
     p.set_defaults(fn=cmd_stop)
