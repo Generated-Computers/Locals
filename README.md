@@ -1,5 +1,5 @@
 > [!NOTE]
-> **This is a fork of [Generated-Computers/Locals](https://github.com/Generated-Computers/Locals).** It starts from
+> **Locals-Qwen-Vision is a fork of [Generated-Computers/Locals](https://github.com/Generated-Computers/Locals).** It starts from
 > upstream `main` at commit `b35c46c` and adds two things:
 >
 > - **Images, for Qwen3.5 and Qwen3-VL.** Send images as your API does it: OpenAI `image_url` parts, Anthropic
@@ -24,7 +24,7 @@
 > To use this fork, install it from this repository, not from PyPI:
 >
 > ```bash
-> uvx --python 3.12 --from git+https://github.com/kaziko/Locals.git locals serve --model mlx-community/Qwen3.5-4B-MLX-4bit
+> uvx --python 3.12 --from git+https://github.com/kaziko/Locals-Qwen-Vision.git locals serve --model mlx-community/Qwen3.5-4B-MLX-4bit
 > ```
 >
 > The changes are listed in the [CHANGELOG](CHANGELOG.md) (the first two entries under 0.2.2).
