@@ -291,6 +291,19 @@ def _append_rows(cache, merged) -> None:
         merged[i] = None
 
 
+def _shift_rope(cache, deltas: List[int]) -> None:
+    """Shift each row's rope offset by its ``deltas`` entry (an image row's M-RoPE delta, vision.rope_delta). The
+    offset of a batch's attention layer is only its rope position: its mask and writes go by ``_idx`` and the left
+    padding, so the shift moves with the row through filter, extend and trim."""
+    if not any(deltas):
+        return
+    d = mx.array(deltas, dtype=mx.int32)
+    for c in cache:
+        off = getattr(c, "offset", None)
+        if isinstance(off, mx.array) and off.ndim == 1:  # (the KV layers; recurrent ones have no position)
+            c.offset = off + d.astype(off.dtype)
+
+
 def _merge_layerwise(caches) -> list:
     """One batch cache of several requests' own caches (lists), a layer at a time, each request's layer released
     (set to None) once copied: merged whole, every request's cache and its copy existed at once, and three
@@ -1507,6 +1520,27 @@ class HybridBatchEngine(BatchEngine):
             return self._walk[5][id(c.wc)] + c.q if isinstance(c, WalkController) else 0
         return self._tab[3][id(c.c)] + c.q if isinstance(c, LocalsController) else 0
 
+    def _embed(self, new: List[Request], found, on_done):
+        """Read the image prompts among ``new`` (``Request.embed``), each alone into a cache of its own: the rows
+        wait meanwhile, as for a prompt read at an admission. Returns ``new`` and ``found`` without the ones that
+        ended there (a client gone, the request's error), finished through ``on_done``."""
+        keep_new, keep_found = [], []
+        for r, f in zip(new, found):
+            if r.embed is not None:
+                c0 = make_prompt_cache(self.model)
+                tp = time.perf_counter()
+                end = r.embed(c0)
+                self.counters["prefill_s"] += time.perf_counter() - tp
+                if end is not None:
+                    r.finish = end
+                    if on_done is not None:
+                        on_done(r)
+                    continue
+                f = (c0, [])
+            keep_new.append(r)
+            keep_found.append(f)
+        return keep_new, keep_found
+
     def serve(self, source, temp: float = 0.0, lru=None, lru_key="locals", on_done=None) -> BatchStats:
         """Continuous batching over requests that arrive while it runs.
 
@@ -1556,7 +1590,7 @@ class HybridBatchEngine(BatchEngine):
             return got
 
         def retire(i, r):
-            if lru is not None:
+            if lru is not None and r.embed is None:  # (an image row's pad tokens name no prompt: see _source)
                 if len(rows) == 1:
                     # the only row: the batch cache is dropped next, so its buffers move to the
                     # prompt cache as they are (a copy would hold the KV cache twice at once)
@@ -1592,6 +1626,7 @@ class HybridBatchEngine(BatchEngine):
                 offs = self._tab[3]
                 g = g + mx.array([offs[id(r.controller.c)] - old[id(r.controller.c)]
                                   if isinstance(r.controller, LocalsController) else 0 for r in rows], dtype=g.dtype)
+            _shift_rope(merged, [r.rope_delta for r in new])
             if cache is None:
                 cache = merged
             else:
@@ -1729,6 +1764,10 @@ class HybridBatchEngine(BatchEngine):
                     starts = []
                     found = []
                     for r in new:  # every cached prefix first: making room for one must not drop the next one's
+                        if r.embed is not None:  # an image prompt: read below, from no cached prefix
+                            r.cached_tokens = 0
+                            found.append((None, list(r.prompt[:-1])))
+                            continue
                         if lru is not None and self.disk is not None:  # a system prompt saved before a restart
                             self.disk.restore(lru, lru_key, list(r.prompt[:-1]))
                         c0, rest = (lru.fetch_nearest_cache(lru_key, list(r.prompt[:-1])) if lru is not None else (None, list(r.prompt[:-1])))
@@ -1740,6 +1779,8 @@ class HybridBatchEngine(BatchEngine):
                                              for r, (_, rest) in zip(new, found)), 0,
                                     self._merge_tokens(rows, [len(e["r"].prompt) for e in filling] + [len(r.prompt) for r in new]),
                                     rows=len(new))
+                    if any(r.embed is not None for r in new):
+                        new, found = self._embed(new, found, on_done)
                     if self._mix_ok and rows and sum(len(rest) for _, rest in found) > self.mix_chunk:
                         # the running rows decode on while these prompts are prefilled, a chunk in each step. Prompts
                         # that fit one pass are prefilled together at once instead: the rows would get a single token

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 import mlx.core as mx
 import numpy as np
@@ -267,6 +267,11 @@ class Request:
     top_k: Optional[int] = None
     seed: Optional[int] = None
     draws: int = 0  # random draws made for it so far (a seeded request's next key)
+    # an image prompt (locals/hybrid_batch.py): embed(cache) reads prompt[:-1] into a fresh cache, alone, when the
+    # batch admits it, and returns None, or how the request ends ("cancelled", "error: ..."); rope_delta shifts
+    # its rope offset as it decodes (vision.rope_delta)
+    embed: Optional[Callable[[list], Optional[str]]] = None
+    rope_delta: int = 0
 
 
 @dataclass

@@ -451,15 +451,22 @@ template refuses it there).
    engine's thread cannot compute it.
 2. The prompt is tokenized whole (not from a remembered token stream) and each `<|image_pad|>` is expanded to the
    image's token count, one per 32x32 pixels (`vision.expand`). The context limit counts those tokens.
-3. The job carries the images and where their tokens sit (`Job.pictures`, `Job.spans`). The batch loop holds it, with
-   the controller its grammar gave, until no other row is running. Meanwhile the batch takes no new request, so the
-   running replies end and it runs next (`BatchService._source`); a request sent after it waits for it. It then runs
-   alone (`BatchService._vision`), unless its client has left: the tower turns the patches into one
-   embedding per token, the prompt's embeddings take them in the placeholders' place, and the reply is generated on
-   the synchronous engine (`Engine.generate_embedded`) with M-RoPE: each image token's position is its (frame, row,
-   column), and the full-attention layers' RoPE is swapped for `vision.MRoPE` for that one request, split over the
-   frequencies as the checkpoint says (`mrope_section`: Qwen3.5's `[11, 11, 10]` over 64 of each head's 256 dims,
-   Qwen3-VL's `[24, 20, 20]` over all 128). The batch engine cannot run such a row: its positions are token indices.
+3. The job carries the images and where their tokens sit (`Job.pictures`, `Job.spans`). It becomes a batch request
+   as a text job does (`BatchService._source`), and joins the running rows when there is room for it. When the batch
+   admits it, its prompt is read alone (`Request.embed`, made by `BatchService._embedder`), unless its client has
+   left: the tower turns the patches into one embedding per token, the prompt's embeddings take them in the
+   placeholders' place, and the prompt is read with M-RoPE (`Engine.prefill_embedded`): each image token's position
+   is its (frame, row, column), and the full-attention layers' RoPE is swapped for `vision.MRoPE` while the prompt is
+   read, split over the frequencies as the checkpoint says (`mrope_section`: Qwen3.5's `[11, 11, 10]` over 64 of
+   each head's 256 dims, Qwen3-VL's `[24, 20, 20]` over all 128). The running rows wait while it is read, as they
+   wait for a text prompt read at an admission. The reply then decodes in the batch with the other rows. Past the
+   prompt, a token's three positions are one number, its index plus a fixed delta (`vision.rope_delta`, negative:
+   an image takes fewer positions than tokens), and M-RoPE with equal positions is the layer's own RoPE. So the row's
+   rope offset in the batch cache is shifted by the delta (`hybrid_batch._shift_rope`), and nothing else changes. An
+   image row leaves no prompt-cache entry: its pad tokens would name the next image of the same size too. The
+   synchronous engine's image path (`Engine.generate_embedded`, M-RoPE through the reply) is kept as the reference
+   the batch rows are tested against (`tests/test_vision_batch.py`). Before, an image request ran alone on it to the
+   end of its reply, and waited for an idle batch to start.
 4. Qwen3-VL's tower also merges the output of its blocks 8, 16 and 24 (`deepstack_visual_indexes`). While the prompt
    is read, the text model adds those to the image's tokens after its layers 0, 1 and 2 (`vision.deepstack`, as
    transformers' `_deepstack_process`). Qwen3.5 has none.

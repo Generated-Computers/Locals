@@ -5,9 +5,9 @@
 - **Images, for Qwen3.5 and Qwen3-VL.** Qwen3.5 and Qwen3-VL now read the images in a request (OpenAI `image_url` parts, Anthropic
   `image` blocks, also in a `tool_result`, Ollama's `images`) on our engine; before, each was the note "this model reads text only", which other
   models still get. mlx-lm drops the vision tower of these checkpoints, so it is rebuilt from the same files
-  (`locals/models/qwen3_5_vl.py`) and loaded with the first image. An image request runs alone, on the synchronous
-  engine, with M-RoPE positions (`locals/vision.py`). While one waits, the batch takes no new request: the replies running end, and it
-  runs next. Its prompt is read a chunk at a time, each chunk's embeddings made for it: a 36,691-token prompt with one image
+  (`locals/models/qwen3_5_vl.py`) and loaded with the first image. An image request's prompt is read alone, with M-RoPE
+  positions (`locals/vision.py`), when the batch admits it; its reply then decodes in the batch beside the text replies,
+  its rope offset shifted by the prompt's M-RoPE delta. Its prompt is read a chunk at a time, each chunk's embeddings made for it: a 36,691-token prompt with one image
   peaked at 11,231 MB instead of 12,363 on Qwen3-VL-8B 4-bit (M2 Max), with the same reply. Qwen3-VL's deepstack features are added to the image's tokens
   in its first three layers. An image is joined to its text as Qwen's template joins it, with no newline: our prompt is
   mlx-vlm's word for word, and on six test pictures Qwen3-VL-8B 4-bit gave mlx-vlm 0.7.11's answers word for word on all

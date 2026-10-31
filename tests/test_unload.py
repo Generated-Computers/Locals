@@ -19,7 +19,6 @@ def _service(**kw) -> BatchService:
     svc._q = queue.Queue()
     svc._compile_lock = threading.Lock()
     svc._inflight = {}
-    svc._vision_q = []
     svc._closed = svc._unloaded = False
     svc.__dict__.update(kw)
     return svc

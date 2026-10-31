@@ -62,3 +62,32 @@ def test_reads_the_image_and_unloads(server):
     # the next request loads the model again
     assert "7319" in _ask(server, url, "What is the invoice number?")
     assert "locals" in server._svc
+
+
+def test_an_image_request_finishes_while_a_long_text_reply_runs(server):
+    """The image request's reply decodes in the batch beside the text reply (GitHub issue 2). Before, it waited for
+    an idle batch, so it could not end before the text reply did, and then held every text reply for its own."""
+    import threading
+    import time
+
+    url = _invoice()
+    _ask(server, url, "What is the customer's name?")  # (the tower loaded and the kernels warm, before the timing)
+    text_done = threading.Event()
+    text = {}
+
+    def long_text():
+        req = {"model": "locals", "max_tokens": 600, "temperature": 0, "messages": [
+            {"role": "user", "content": "Count from 1 to 1000, one number per line, and nothing else."}]}
+        text["reply"] = server.complete(req)
+        text_done.set()
+
+    t = threading.Thread(target=long_text)
+    t.start()
+    time.sleep(1.0)  # (the text reply decoding)
+    assert not text_done.is_set()
+    answer = _ask(server, url, "What is the invoice number?")
+    ended_first = not text_done.is_set()
+    t.join()
+    assert "7319" in answer
+    assert ended_first, "the image reply waited for the text reply to end"
+    assert text["reply"]["choices"][0]["finish_reason"] == "length"

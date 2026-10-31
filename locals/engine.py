@@ -1312,6 +1312,36 @@ class Engine:
         text = self.tokenizer.decode(out)
         return GenResult(out, text, len(prompt), t1 - t0, t2 - t1, passes, forced_n, sizes, finish)
 
+    def prefill_embedded(self, cache, prompt: List[int], spans, features, positions, deepstack=(), section=(11, 11, 10),
+                         cancel=None) -> bool:
+        """Read ``prompt[:-1]`` into ``cache`` with its input embeddings given (``generate_embedded`` says what the
+        arguments hold; ``positions`` needs to cover only the prompt), with M-RoPE for this call only. The last prompt
+        token is left for the first decode step, as ``_prefill`` leaves it. False if ``cancel()``, asked between
+        chunks, stopped it."""
+        from .vision import mrope
+
+        with mrope(self.model, positions, section):
+            return self._read_embedded(cache, prompt, spans, features, deepstack, cancel)
+
+    def _read_embedded(self, cache, prompt, spans, features, deepstack, cancel) -> bool:
+        from .vision import deepstack as deepstack_layers, embed_chunk
+
+        body = text_model(self.model).model
+        # each chunk's embeddings made for it, as _prefill's: the whole prompt's (and, for Qwen3-VL, one as long
+        # per deepstack level) were kept next to the KV cache until the prompt was read
+        i = 0
+        n_all = len(prompt)
+        with deepstack_layers(self.model, spans, deepstack) as state:  # (the last token, fed by the decode, is text)
+            while n_all - i > 1:
+                if cancel is not None and cancel():
+                    return False  # (between chunks: an unload or a client gone)
+                n = min(self.prefill_step, n_all - 1 - i)
+                state["at"] = i
+                body(None, cache, input_embeddings=embed_chunk(body, prompt, spans, features, i, n))
+                mx.eval([c.state for c in cache])
+                i += n
+        return True
+
     def generate_embedded(self, prompt: List[int], spans, features, positions, controller: Optional[Controller] = None,
                           max_tokens: int = 256, temp: float = 0.0, seed: int = 0, top_p: float = 0.0, top_k: int = 0,
                           on_token=None, cancel=None, deepstack=(), section=(11, 11, 10)) -> GenResult:
@@ -1321,28 +1351,16 @@ class Engine:
         frequencies by ``section``. ``deepstack`` (Qwen3-VL) holds, per layer, each image's features that the text
         model adds to the image's tokens after that layer while the prompt is read.
 
-        The synchronous path on purpose: an image prompt is one request, and the batched engine's
-        per-row positions are token indices, not (t, h, w). ``on_token`` streams each committed token
-        and ``cancel`` is asked before every step, so a client that leaves stops the reply."""
-        from .vision import deepstack as deepstack_layers, embed_chunk, mrope
+        One request on the synchronous engine, with M-RoPE through the reply too: the reference the batch engine's
+        image rows are tested against (they decode with the layers' own rope and a per-row offset,
+        ``vision.rope_delta``). ``on_token`` streams each committed token and ``cancel`` is asked before every step,
+        so a client that leaves stops the reply."""
+        from .vision import mrope
 
         ctl = controller or Controller()
-        body = text_model(self.model).model
 
-        def prefill(cache):
-            # each chunk's embeddings made for it, as _prefill's: the whole prompt's (and, for Qwen3-VL, one as long
-            # per deepstack level) were kept next to the KV cache until the prompt was read
-            i = 0
-            n_all = len(prompt)
-            with deepstack_layers(self.model, spans, deepstack) as state:  # (the last token, fed below, is text)
-                while n_all - i > 1:  # the last prompt token is the first step's feed, as in _prefill
-                    if cancel is not None and cancel():
-                        break  # (between chunks: an unload or a client gone; the decode loop ends it as cancelled)
-                    n = min(self.prefill_step, n_all - 1 - i)
-                    state["at"] = i
-                    body(None, cache, input_embeddings=embed_chunk(body, prompt, spans, features, i, n))
-                    mx.eval([c.state for c in cache])
-                    i += n
+        def prefill(cache):  # (stopped by cancel: the decode loop ends it as cancelled)
+            self._read_embedded(cache, prompt, spans, features, deepstack, cancel)
 
         with mrope(self.model, positions, section):
             return self._generate_sync(prompt, ctl, max_tokens, temp, seed, top_p, top_k, prefill=prefill,

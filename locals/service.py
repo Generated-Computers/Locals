@@ -210,7 +210,6 @@ class BatchService:
         self._q: "queue.Queue[Job]" = queue.Queue()
         self._compile_lock = threading.Lock()
         self._inflight = {}  # id(job) -> job, taken by the worker and not yet finished
-        self._vision_q: List[Tuple[Job, object]] = []  # image prompts and their controllers, waiting for the batch to be idle
         self._closed = False
         self._unloaded = False  # (closed by unload: what was queued ends as cancelled, to be sent again)
         self._ready = threading.Event()
@@ -370,19 +369,15 @@ class BatchService:
             print("locals: kernel tuning finished; batches now run on the tuned kernels", file=sys.stderr, flush=True)
 
     def _source(self, rt, block: bool) -> list:
-        """The batch engine's ``source(block)``: the jobs taken now, as batch requests. An image job runs here,
-        alone, when the batch is idle (``block``). While one waits, nothing new is taken: the running rows end,
-        and it runs next. Taking new rows meanwhile, a busy server never had an idle batch for it."""
+        """The batch engine's ``source(block)``: the jobs taken now, as batch requests. An image job is one too: its
+        prompt is read alone when the batch admits it (``Request.embed``), and its reply decodes with the other rows.
+        Run alone to its end, it held every text reply for its whole reply, and waited for an idle batch to start."""
         import mlx.core as mx
 
         from .packed import Request
 
-        if self._vision_q and not block:
-            return []
-        held, self._vision_q = self._vision_q, []  # (job, controller): its grammar was made when it was taken
-        taken = [(job, None) for job in self._take(block and not held)]
         reqs = []
-        for job, ctl in held + taken:
+        for job in self._take(block):
             if getattr(job, "prime", False):
                 try:
                     lru, eng = self._lru, self._eng
@@ -395,21 +390,19 @@ class BatchService:
                 except Exception as e:  # noqa: BLE001
                     self._finish(job, [], f"error: {e!r}")
                 continue
+            ctl = self._controller(rt, job)
             if ctl is None:
-                ctl = self._controller(rt, job)
-                if ctl is None:
-                    continue
-            if job.pictures:
-                # one image prompt at a time, on the synchronous engine: its rows carry (t, h, w)
-                # positions and its prompt's embeddings, which the batch's per-row token indices cannot
-                if not block:  # (taken while other rows decode: held for the idle call)
-                    self._vision_q.append((job, ctl))
-                    continue
-                self._vision(rt, job, ctl)
                 continue
             r = Request(job.prompt, ctl, job.max_tokens)
+            if job.pictures:
+                try:
+                    r.embed, r.rope_delta = self._embedder(rt, job)
+                except Exception as e:  # noqa: BLE001  # (spans that do not fit the prompt)
+                    self._finish(job, [], f"error: {_reason(e)}")
+                    continue
+            else:  # (an image prompt's pad tokens name no prompt: a cache entry under them would be another image's)
+                r.checkpoints = job.checkpoints
             r.on_token = job.on_token
-            r.checkpoints = job.checkpoints
             r.temp, r.top_p, r.top_k, r.seed = job.temp, job.top_p, job.top_k, job.seed
             job._req = r  # before reading job.cancelled: a cancel in between sets r.cancel itself
             r.cancel = job.cancelled
@@ -445,36 +438,31 @@ class BatchService:
             self._finish(job, [], f"error: {e!r}")
         return None
 
-    def _vision(self, rt, job: Job, ctl) -> None:
-        """One image prompt, alone: the vision tower's features go where the prompt's ``<|image_pad|>``
-        tokens are, and every token carries its own M-RoPE (t, h, w) position. The batch engine cannot
-        run this row: its positions are token indices, and its prefill is one token stream for all rows."""
-        from .vision import positions, tail
+    def _embedder(self, rt, job: Job):
+        """(embed, rope_delta) of an image job's batch request. ``embed(cache)``, called by the batch engine on its
+        thread when it admits the request: the vision tower's features go where the prompt's ``<|image_pad|>`` tokens
+        are, and the prompt is read with every token at its own M-RoPE (t, h, w) position. None when read, else how
+        the job ends: one request's fault (the tower's weights, an image it cannot read, a prefill out of memory) is
+        that request's error, not the batch's."""
+        from .vision import positions, rope_delta
 
-        if job.cancelled:  # (its client left while it waited for the batch: the tower need not read its images)
-            self._finish(job, [], "cancelled")
-            return
-        try:
-            enc = self.vision()
-            if enc is None:
-                raise ValueError(f"{self.model_id} reads text only")
-            features, deep = enc.encode(job.pictures)
-            pos = positions(job.spans, [p.grid for p in job.pictures], len(job.prompt))
-            # (3, 1, prompt + reply); the margin is for the forced tokens a grammar adds past max_tokens in one step
-            pos = tail(pos, job.max_tokens + 1024)[:, None, :]
-            res = rt.engine.generate_embedded(
-                job.prompt, job.spans, features, pos, ctl, max_tokens=job.max_tokens,
-                temp=self.temp if job.temp is None else job.temp,
-                seed=self.seed if job.seed is None else job.seed,
-                top_p=self.top_p if job.top_p is None else job.top_p,
-                top_k=self.top_k if job.top_k is None else job.top_k,
-                on_token=job.on_token, cancel=lambda: job.cancelled, deepstack=deep, section=enc.mrope_section)
-        except Exception as e:  # noqa: BLE001  # the tower's weights, an image it cannot read, a prefill out of memory:
-            self._finish(job, [], f"error: {_reason(e)}")  # this request's error, not the batch's (serve's catch-all)
-            return
-        self.prompt_tokens += len(job.prompt)
-        self.tokens_out += len(res.tokens)
-        self._finish(job, res.tokens, res.finish)
+        pos = positions(job.spans, [p.grid for p in job.pictures], len(job.prompt))  # (3, prompt)
+
+        def embed(cache):
+            if job.cancelled:  # (its client left while it waited: the tower need not read its images)
+                return "cancelled"
+            try:
+                enc = self.vision()
+                if enc is None:
+                    raise ValueError(f"{self.model_id} reads text only")
+                features, deep = enc.encode(job.pictures)
+                read = rt.engine.prefill_embedded(cache, job.prompt, job.spans, features, pos[:, None, :], deep,
+                                                  enc.mrope_section, cancel=lambda: job.cancelled)
+            except Exception as e:  # noqa: BLE001
+                return f"error: {_reason(e)}"
+            return None if read else "cancelled"
+
+        return embed, rope_delta(pos)
 
     def vision(self):
         """This model's vision tower (vision.Encoder, its weights read on the first image), or None: the stock
@@ -509,8 +497,7 @@ class BatchService:
             # loading the model again (it waits for the engine's load lock, held while this runs) would be a second copy
             print(f"locals: waiting for the {self.engine} worker to stop before the model is let go", file=sys.stderr, flush=True)
             self._thread.join(timeout=30)
-        stuck = list(self._inflight.values()) + [job for job, _ in self._vision_q]
-        self._vision_q = []
+        stuck = list(self._inflight.values())
         while True:
             try:
                 stuck.append(self._q.get_nowait())
@@ -668,7 +655,6 @@ class BatchService:
                     self._inflight.pop(id(job), None)
                     job._event.set()
                 owner.clear()
-                self._vision_q = []  # (its jobs were in _inflight: failed above, not to be run later)
                 eng._fill_eval = []  # a prompt that was being prefilled in mixed passes: its cache goes too
                 lru.trim_to(n_bytes=lru.nbytes // 2)
                 gc.collect()

@@ -262,6 +262,13 @@ def tail(prompt_positions: mx.array, n: int) -> mx.array:
     return mx.concatenate([prompt_positions, mx.broadcast_to(step[None, :], (3, n))], axis=1)
 
 
+
+def rope_delta(prompt_positions: mx.array) -> int:
+    """Past the prompt, a token's three M-RoPE positions are one number, its index plus this (negative where an
+    image's tokens take fewer positions than tokens). M-RoPE with t = h = w is the layer's own rope at that
+    position, so the reply decodes as a text row whose rope offset is shifted by this much."""
+    return int(mx.max(prompt_positions)) + 1 - prompt_positions.shape[-1]
+
 # -- M-RoPE ----------------------------------------------------------------------------------------
 
 

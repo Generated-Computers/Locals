@@ -347,36 +347,6 @@ def test_a_streamed_reply_is_the_reply_the_client_gets(monkeypatch):
     assert res.tokens[:2] == [7, 7]
 
 
-def test_an_image_request_that_fails_ends_only_itself(monkeypatch):
-    """An error in generate_embedded (memory the prefill could not get) is the request's error,
-    not an exception out of the worker, which would fail every job in flight."""
-    from locals.service import BatchService, Job
-
-    svc = BatchService.__new__(BatchService)
-    svc.tokenizer = None
-    svc._inflight = {}
-    svc.prompt_tokens = svc.tokens_out = 0
-    svc.temp, svc.top_p, svc.top_k, svc.seed = 0.0, 0.0, 0, 0
-    svc.model_id = "m"
-    enc = type("Enc", (), {"encode": lambda self, pics: (None, ()), "mrope_section": (11, 11, 10)})()
-    svc.vision = lambda: enc
-    monkeypatch.setattr(vision, "positions", lambda spans, grids, n: mx.zeros((3, n)))
-    monkeypatch.setattr(vision, "tail", lambda pos, n: pos)
-
-    def oom(*a, **k):
-        raise RuntimeError("[metal::malloc] Attempting to allocate 9 GB")
-
-    rt = type("Rt", (), {"engine": type("E", (), {"generate_embedded": staticmethod(oom)})()})()
-    other = Job(prompt=[5])
-    svc._inflight[id(other)] = other
-    job = Job(prompt=[1, 2, 3])
-    svc._inflight[id(job)] = job
-    svc._vision(rt, job, None)
-    assert job.done and job.finish.startswith("error: ") and "allocate" in job.finish
-    assert not other.done and id(other) in svc._inflight
-    assert svc.prompt_tokens == 0
-
-
 def _batch_service(monkeypatch, compiled):
     """A service with a stub runtime whose grammars count their compiles (no model, no worker thread)."""
     import queue
@@ -389,7 +359,7 @@ def _batch_service(monkeypatch, compiled):
     svc.tokenizer = None
     svc._q = queue.Queue()
     svc._compile_lock = threading.Lock()
-    svc._inflight, svc._owner, svc._vision_q = {}, {}, []
+    svc._inflight, svc._owner = {}, {}
     svc._closed = svc._unloaded = False
     svc.prompt_tokens = svc.tokens_out = 0
     svc._free = svc._endless = eng.Controller
@@ -403,55 +373,112 @@ def _batch_service(monkeypatch, compiled):
     return svc, Rt()
 
 
-def test_an_image_job_held_for_an_idle_batch_keeps_its_grammar(monkeypatch):
-    """Taken while rows decode, an image job is held; released at the idle call, it runs with the controller made
-    when it was taken. Its grammar was made again there, on the engine thread, while every reply waited."""
+def _image_job(**kw):
     from locals.service import Job
 
-    compiled, ran = [], []
+    pic = vision.Picture(None, (4, 4))  # (a 4x4 patch grid: 4 tokens over 2 positions)
+    return Job(prompt=[1, 9, 9, 9, 9, 2, 3], pictures=[pic], spans=[(1, 5)], **kw)
+
+
+def test_an_image_job_joins_the_batch_while_rows_decode(monkeypatch):
+    """Taken while other rows decode (block False), an image job is a batch request at once, with its grammar,
+    next to the text taken with it. It used to wait for an idle batch, which a busy server never had."""
+    from locals.service import Job
+
+    compiled = []
     svc, rt = _batch_service(monkeypatch, compiled)
-    svc._vision = lambda rt, job, ctl: ran.append((job, ctl))
-    job = Job(prompt=[1, 2], schema={"type": "object"}, pictures=["image"])
-    svc._q.put(job)
-    assert svc._source(rt, block=False) == []
-    assert ran == [] and [j for j, _ in svc._vision_q] == [job]
-    assert svc._source(rt, block=True) == []
-    assert ran == [(job, ("grammar", 1))]
-    assert compiled == [{"type": "object"}]
-
-
-def test_while_an_image_job_waits_the_batch_takes_no_new_rows(monkeypatch):
-    """Text that arrives after the image job waits for it: the running rows end, and the idle batch runs the
-    image job. Taking text meanwhile, a busy server never let it run."""
-    from locals.service import Job
-
-    svc, rt = _batch_service(monkeypatch, [])
-    ran = []
-    svc._vision = lambda rt, job, ctl: ran.append(job)
-    image = Job(prompt=[1], pictures=["image"])
+    image = _image_job(schema={"type": "object"}, checkpoints=[(3, "system")])
+    text = Job(prompt=[2, 3], checkpoints=[(1, "system")])
     svc._q.put(image)
-    assert svc._source(rt, block=False) == []
-    text = Job(prompt=[2, 3])
     svc._q.put(text)
-    for _ in range(3):  # the rows still running: nothing new joins them
-        assert svc._source(rt, block=False) == []
-    assert ran == [] and not svc._q.empty()
-    reqs = svc._source(rt, block=True)  # the batch is idle: the image job first, then the text joins
-    assert ran == [image]
-    assert [r.prompt for r in reqs] == [[2, 3]]
+    reqs = svc._source(rt, block=False)
+    assert [r.prompt for r in reqs] == [image.prompt, text.prompt]
+    assert reqs[0].controller == ("grammar", 1) and compiled == [{"type": "object"}]
+    assert reqs[0].embed is not None and reqs[1].embed is None
+    # 1 text + the image's 2 positions + 2 text: the reply's first token is at 5, its index 7, so the rope goes -2
+    assert reqs[0].rope_delta == -2 and reqs[1].rope_delta == 0
+    # (its pad tokens name no prompt: no prompt-cache checkpoint under them)
+    assert getattr(reqs[0], "checkpoints", None) is None and reqs[1].checkpoints == [(1, "system")]
+
+
+def test_an_image_prompt_read_reads_the_tower_then_the_prompt(monkeypatch):
+    svc, rt = _batch_service(monkeypatch, [])
+    read = []
+    enc = type("Enc", (), {"encode": lambda self, pics: ("features", ["deep"]), "mrope_section": (11, 11, 10)})()
+    svc.vision = lambda: enc
+    rt.engine = type("E", (), {"prefill_embedded": lambda self, cache, *a, **k: read.append((cache, a)) or True})()
+    job = _image_job()
+    svc._q.put(job)
+    (r,) = svc._source(rt, block=False)
+    assert r.embed("cache") is None
+    cache, (prompt, spans, features, pos, deep, section) = read[0]
+    assert cache == "cache" and prompt == job.prompt and spans == [(1, 5)] and features == "features"
+    assert pos.shape == (3, 1, 7) and deep == ["deep"] and section == (11, 11, 10)
+
+
+def test_an_image_request_that_fails_ends_only_itself(monkeypatch):
+    """An error reading the image prompt (memory the prefill could not get) is the request's end, returned to the
+    batch engine, not an exception out of serve(), which would fail every job in flight."""
+    svc, rt = _batch_service(monkeypatch, [])
+    enc = type("Enc", (), {"encode": lambda self, pics: (None, ()), "mrope_section": (11, 11, 10)})()
+    svc.vision = lambda: enc
+
+    def oom(*a, **k):
+        raise RuntimeError("[metal::malloc] Attempting to allocate 9 GB")
+
+    rt.engine = type("E", (), {"prefill_embedded": staticmethod(oom)})()
+    svc._q.put(_image_job())
+    (r,) = svc._source(rt, block=False)
+    end = r.embed(None)
+    assert end.startswith("error: RuntimeError") and "allocate" in end
+    svc.vision = lambda: None  # (a checkpoint without the tower's weights)
+    assert r.embed(None) == "error: m reads text only"
 
 
 def test_an_image_job_cancelled_while_it_waits_does_not_run_the_tower(monkeypatch):
-    from locals.service import Job
-
     svc, rt = _batch_service(monkeypatch, [])
     read = []
     svc.vision = lambda: type("Enc", (), {"encode": lambda self, pics: read.append(pics)})()
-    job = Job(prompt=[1], pictures=["image"])
-    svc._inflight[id(job)] = job
+    job = _image_job()
     svc._q.put(job)
-    svc._source(rt, block=False)
+    (r,) = svc._source(rt, block=False)
     job.cancel()
-    assert svc._source(rt, block=True) == []
-    assert job.done and job.finish == "cancelled"
-    assert read == [] and not svc._inflight
+    assert r.embed(None) == "cancelled" and read == []
+
+
+def test_an_image_rows_rope_past_the_prompt_is_mrope():
+    """Past the prompt, an image row's M-RoPE is the layer's own rope at its index plus rope_delta, also as one
+    row of a batch whose offsets differ per row (what the batch engine's attention layers do)."""
+    rope = nn.RoPE(64, traditional=False, base=10_000_000)
+    pos = vision.positions([(3, 19)], [(8, 8)], 24)  # 3 text, a 4x4-token image over 4 positions, 5 text
+    delta = vision.rope_delta(pos)
+    assert delta == 3 + 4 + 5 - 24
+    full = vision.tail(pos, 6)[:, None, :]
+    x = mx.random.normal((1, 4, 1, 256)).astype(mx.float16)
+    for i in (23, 24, 29):  # the prompt's last token (fed by the first decode step), then reply tokens
+        want = vision.MRoPE(64, 10_000_000, full)(x, offset=i)
+        got = rope(x, offset=i + delta)
+        assert float(mx.abs(got.astype(mx.float32) - want.astype(mx.float32)).max()) < 2e-2
+        rows = rope(mx.concatenate([x, x]), offset=mx.array([i + 100, i + delta]))  # (a text row beside it)
+        assert float(mx.abs(rows[1:].astype(mx.float32) - want.astype(mx.float32)).max()) < 2e-2
+
+
+def test_the_rope_shift_moves_with_its_row():
+    """_shift_rope changes only the attention layers' rope offsets: the row's shift stays with it when other rows
+    leave (filter) and join (extend), and its mask and writes (_idx, left padding) are not touched."""
+    from mlx_lm.models.cache import ArraysCache, BatchKVCache
+
+    from locals.hybrid_batch import _shift_rope
+
+    def layer(n_rows, length):
+        c = BatchKVCache([0] * n_rows)
+        c.update_and_fetch(mx.zeros((n_rows, 1, length, 4)), mx.zeros((n_rows, 1, length, 4)))
+        return c
+
+    kv, rec = layer(2, 5), ArraysCache(1)
+    _shift_rope([kv, rec], [0, -7])
+    assert kv.offset.tolist() == [5, -2] and kv._idx == 5 and kv.left_padding.tolist() == [0, 0]
+    kv.filter(mx.array([1]))
+    assert kv.offset.tolist() == [-2]
+    kv.extend(layer(1, 3))
+    assert kv.offset.tolist() == [-2, 3]
