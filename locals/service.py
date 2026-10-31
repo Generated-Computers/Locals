@@ -16,7 +16,6 @@ growing token stream only prefills what it appended since its last call.
 
 from __future__ import annotations
 
-import json
 import os
 import queue
 import sys
@@ -466,7 +465,6 @@ class BatchService:
                 mx.set_cache_limit(1 << 30)  # MLX keeps freed buffers up to the whole memory limit by default
             (self._run_locals if self.engine == "locals" else self._run_stock)()
         except BaseException as e:  # surface load errors to the constructor, others to clients
-            import sys
             import traceback
 
             loaded = self._ready.is_set()
@@ -635,7 +633,6 @@ class BatchService:
                 eng.serve(source, temp=self.temp, lru=lru, on_done=done)
             except Exception as e:  # noqa: BLE001  # e.g. Metal out of memory: fail what is in flight, keep serving
                 import gc
-                import sys
                 import traceback
 
                 traceback.print_exc(file=sys.stderr)

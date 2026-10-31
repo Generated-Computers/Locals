@@ -19,7 +19,6 @@ from .constraint import CompiledConstraint
 from .forced import ForcedPlanner
 from .kernels import forward_hidden, forward_last, head_dense, head_rows, text_model
 from .regex import DEAD
-from .vocab import TokenVocab
 
 NEG_INF = float("-inf")
 

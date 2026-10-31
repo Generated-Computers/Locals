@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from typing import Callable, Dict, List, Optional
+from typing import Callable, List, Optional
 
 from .oai import FILE_NOTE, IMAGE_NOTE  # noqa: E402,F401  # one wording for every API
 
