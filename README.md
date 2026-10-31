@@ -10,7 +10,7 @@
 >   In upstream Locals, only stopping the server frees it. See [Unloading the model](docs/server/README.md#unloading-the-model).
 >
 > **Why vision?** I build a local agent app, and in my tests Locals ran it faster than anything else I tried,
-> Ollama included. But an agent also needs to see: screenshots, photos, scanned pages. That left two roads. The first
+> Ollama included. But an agent also needs to see: screenshots, photos, scanned pages. That left me with two choices. The first
 > was a separate vision model next to Locals: on a busy Mac that is a lot of extra memory, and on a 16 GB Mac there is
 > simply no room for it. The second was to let Locals read images itself. Qwen3.5 and Qwen3-VL already carry a
 > vision tower in their checkpoint files, but Locals loads its models through mlx-lm, which reads only the text part,
