@@ -255,6 +255,7 @@ class FusedGatedDeltaNet(nn.Module):
             outs = gdn_decode(
                 proj, cache[0], self._conv_w, self.A_log, self.dt_bias, cache[1], self.norm.weight,
                 self.num_k_heads, self.num_v_heads, self.head_k_dim, self.head_v_dim, states=want,
+                exact=getattr(self, "_gdn_exact", False),
             )
             y = outs[0]
             if want:
@@ -407,6 +408,10 @@ def fuse_model(model) -> int:
         return 0
     from .norm_kernel import supported as add_rms_supported
 
+    # DiffuSpace's Clover (models/clover_moe: its causal pass is Qwen3.5-MoE's text model): the fast paths below marked
+    # Clover's are its own; no other model takes them (another Qwen3.5-MoE keeps its kernels, its choices, its bits)
+    clover = type(model).__module__.split(".")[-1] == "clover_moe" and hasattr(model, "make_cache")
+
     if type(body).__name__ == "Qwen3_5TextModel" and add_rms_supported(model.args.hidden_size):
         stock = type(body)
         body.__class__ = type("FusedQwen3_5TextModel", (FusedHybridBody, stock), {"_stock_call": stock.__call__})
@@ -431,7 +436,7 @@ def fuse_model(model) -> int:
             proj = None
             if _fusable(parts):
                 proj = _concat_quantized(parts)
-            elif _fusable(parts[:2]) and _fusable(parts[2:]):  # b and a quantized apart (Clover's: 8 bits)
+            elif clover and _fusable(parts[:2]) and _fusable(parts[2:]):  # b and a quantized apart (Clover's: 8 bits)
                 proj = SplitProjection(_concat_quantized(parts[:2]), _concat_quantized(parts[2:]))
             if proj is not None:
                 lin.in_proj_all = proj
@@ -443,6 +448,7 @@ def fuse_model(model) -> int:
                 lin._gdn_ok = abs(float(eps) - 1e-6) < 1e-12 and w.ndim == 3 and w.shape[-1] == 1 and gdn_supported(  # the kernel's norm eps
                     lin.num_k_heads, lin.num_v_heads, lin.head_k_dim, lin.head_v_dim, w.shape[1])
                 lin._conv_w = mx.contiguous(w.reshape(w.shape[0], w.shape[1]))
+                lin._gdn_exact = clover  # (the decode kernel rounding where MLX's operations round: gdn_kernel, EXACT)
                 lin.__class__ = type("Fused" + type(lin).__name__, (FusedGatedDeltaNet, type(lin)), {})
         if attn is not None and type(attn).__name__ == "Qwen3NextAttention":
             parts = [attn.q_proj, attn.k_proj, attn.v_proj]
@@ -461,13 +467,15 @@ def fuse_model(model) -> int:
             from .moe import fuse_flint_moe
 
             fuse_flint_moe(mlp)  # Flint's: router, experts, shared expert (another model's block stays as it is)
-        if mlp is not None and type(mlp).__name__ == "Qwen3NextSparseMoeBlock":
+        if clover and mlp is not None and type(mlp).__name__ == "Qwen3NextSparseMoeBlock":
             from .moe import FusedQwenLayer, FusedQwenMoe, fuse_qwen_moe
 
-            # Qwen3.5-MoE's (Clover's causal pass): router and shared gate, experts, shared expert; the residual add
+            # Clover's MoE block (mlx-lm's Qwen3.5-MoE's): router and shared gate, experts, shared expert; the residual
+            # add (the layer keeps its module's name: mixed.py knows a Qwen3.5 layer by it)
             if (fuse_qwen_moe(mlp) and type(layer).__name__ == "DecoderLayer"
                     and type(layer).__module__.split(".")[-1] == "qwen3_5" and isinstance(layer.mlp, FusedQwenMoe)):
-                layer.__class__ = type("Fused" + type(layer).__name__, (FusedQwenLayer, type(layer)), {})
+                layer.__class__ = type("Fused" + type(layer).__name__, (FusedQwenLayer, type(layer)),
+                                       {"__module__": type(layer).__module__})
         if mlp is not None and type(mlp).__name__ == "SparseMoe":
             from .clover_fast import fuse_clover_moe
 
@@ -512,6 +520,14 @@ def fuse_model(model) -> int:
         for _, m in model.named_modules():  # (kernels._linear_call_inner: MLX's own kernel without the routing)
             if isinstance(m, (nn.Linear, nn.QuantizedLinear)):
                 object.__setattr__(m, "_locals_direct", True)
+    if clover:
+        # tuned as Flint's layers are (fragq, chains; kernels._key_dt), under keys of their own, and the 8-bit output
+        # layer read once from 6 rows (kernels._tunable_head8)
+        for _, m in model.named_modules():
+            if isinstance(m, (nn.Linear, nn.QuantizedLinear)):
+                object.__setattr__(m, "_locals_direct", "clover")
+        if isinstance(getattr(model, "lm_head", None), nn.QuantizedLinear):
+            object.__setattr__(model.lm_head, "_locals_head8", True)
     mx.eval(model.parameters())
     if flint:
         # the projections fused away stay in MLX's buffer cache, which keeps freed buffers for reuse: 2.5 GB of

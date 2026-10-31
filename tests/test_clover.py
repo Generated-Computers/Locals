@@ -362,7 +362,7 @@ def test_tile_kernels_are_moe_pys_bits(bits):
         inds = mx.array(np.stack([rng.permutation(E)[:4] for _ in range(T)]).astype(np.uint32))
         w = mx.softmax(mx.array(rng.normal(size=(T, 4)).astype(np.float32)), axis=-1)
         order = moe.expert_order(inds)
-        want_h = moe.experts_up(x, inds, gu, order)
+        want_h = moe.experts_up(x, inds, gu, order, exact=True)  # (MLX's sigmoid, as Clover's kernels round)
         want = moe.experts_down(want_h, inds, w, sw.down_proj, None, order)
         for tile in (1, 3, 4, 8):
             tiles = moe_tiles.tile_lengths(inds, order, tile)

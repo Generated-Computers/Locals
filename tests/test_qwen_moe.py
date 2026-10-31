@@ -212,3 +212,38 @@ def test_server_decodes_in_blocks_only_for_a_block_diffusion_model(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5_moe"}))
     with pytest.raises(ValueError, match="not a block-diffusion model"):
         Server(str(tmp_path), engines=("locals",), preload=(), blocks=8, log=lambda s: None)
+
+
+def test_another_qwen3_5_moe_keeps_its_paths():
+    """Clover's fast paths are Clover's only: the same network as mlx-lm's own qwen3_5_moe (another Qwen3.5-MoE build)
+    keeps its MoE blocks and layers, its GDN layers unfused where b and a are quantized apart, and its layers unmarked
+    (main's tuning keys, MLX's kernel for its 8-bit output layer)."""
+    from mlx_lm.models import qwen3_5_moe
+
+    import locals
+    from locals import fuse
+
+    text = {k: v for k, v in copy.deepcopy(CFG).items() if k not in ("layer_types", "mask_token_id", "block_size")}
+    other = qwen3_5_moe.Model(qwen3_5_moe.ModelArgs(model_type="qwen3_5_moe", text_config=dict(text, model_type="qwen3_5_moe_text")))
+    mx.random.seed(2)
+    _randomize(other.language_model, mx.bfloat16)
+
+    def pred(path, mod):
+        if not hasattr(mod, "to_quantized"):
+            return False
+        if path.endswith(("mlp.gate", "shared_expert_gate", "in_proj_a", "in_proj_b", "lm_head")):
+            return {"group_size": 64, "bits": 8}
+        return {"group_size": 64, "bits": 3 if "switch_mlp" in path else 4}
+
+    nn.quantize(other, class_predicate=pred)
+    locals.patch(other, tune="off", kernels=False)
+    body = other.language_model.model
+    assert all(type(l.mlp).__name__ == "Qwen3NextSparseMoeBlock" and not isinstance(l, moe.FusedQwenLayer) for l in body.layers)
+    assert all(hasattr(l.linear_attn, "in_proj_qkv") for l in body.layers if l.is_linear)  # (as main: not fused)
+    assert not getattr(body, "_moe_steps", False)
+    assert not any(vars(m).get("_locals_direct") or vars(m).get("_locals_head8") for _, m in other.named_modules())
+    clover = _causal(seed=2)
+    locals.patch(clover, tune="off", kernels=False)
+    lin = clover.layers[0].linear_attn
+    assert isinstance(lin.in_proj_all, fuse.SplitProjection) and lin._gdn_exact
+    assert vars(clover.lm_head).get("_locals_head8") and vars(clover.layers[0].mlp.gates).get("_locals_direct") == "clover"

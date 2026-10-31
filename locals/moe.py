@@ -398,7 +398,7 @@ _UP_SRC = """
         for (int r = 0; r < R; r++) {  // (one group a lane: the simd_sum is each row's whole sum)
             const T gt = T(simd_sum(sg[r] * qg[r] + bg[r] * xs)), ut = T(simd_sum(su[r] * qu[r] + bu[r] * xs));
             if (lane == 0) {
-                const T sig = mlx_sigmoid<T>(gt);
+                const T sig = EXACT ? mlx_sigmoid<T>(gt) : T(1.0f / (1.0f + metal::exp(-float(gt))));
                 const T act = T(float(gt) * float(sig));
                 h[size_t(slot) * I + j0 + r] = T(float(act) * float(ut));
             }
@@ -610,7 +610,8 @@ def expert_order(inds: mx.array) -> mx.array:
     return mx.argsort(flat).astype(mx.uint32)
 
 
-def experts_up(x: mx.array, inds: mx.array, gate_up, order: Optional[mx.array] = None, r: Optional[int] = None) -> mx.array:
+def experts_up(x: mx.array, inds: mx.array, gate_up, order: Optional[mx.array] = None, r: Optional[int] = None,
+               exact: bool = False) -> mx.array:
     """swiglu(gate, up) of each token for each of its experts: ``x`` (T, D), ``inds`` (T, K) -> (T * K, I). Rows that
     share an expert read it once (``order``: expert_order(inds)): at 8 and 16 rows of Flint's routing 10 to 12% faster
     than a simdgroup a slot, at one row 2%. ``r`` hidden units a simdgroup (default: 2 from EXPERT_ROWS_FROM tokens)
@@ -628,7 +629,8 @@ def experts_up(x: mx.array, inds: mx.array, gate_up, order: Optional[mx.array] =
     order = expert_order(inds) if order is None else order
     w, sc, bi = _experts_buffers(gate_up)
     (h,) = _up_kernel(inputs=[x, inds.reshape(-1), order, w, sc, bi, mx.array([S], dtype=mx.uint32)],
-                      template=[("T", x.dtype), ("BITS", gate_up.bits), ("D", D), ("I", I), ("K", K), ("R", r)],
+                      template=[("T", x.dtype), ("BITS", gate_up.bits), ("D", D), ("I", I), ("K", K), ("R", r),
+                                ("EXACT", int(exact))],
                       grid=(S * (I // r) * 32, 1, 1), threadgroup=(64, 1, 1), output_shapes=[(S, I)], output_dtypes=[x.dtype])
     return h
 
@@ -896,7 +898,7 @@ class FusedQwenMoe(nn.Module):
         if USE_EXPERT_KERNELS and hasattr(sw, "gate_up_proj") and experts_fit(x, sw.gate_up_proj, sw.down_proj):
             inds, weights, order = route_softmax(logits, E, k, self.norm_topk_prob, order=True)
             x2, inds2 = x.reshape(-1, D), inds.reshape(-1, k)
-            h = experts_up(x2, inds2, sw.gate_up_proj, order)
+            h = experts_up(x2, inds2, sw.gate_up_proj, order, exact=True)
             y = experts_down(h, inds2, weights.reshape(-1, k), sw.down_proj, self.shared_expert(x).reshape(-1, D), order,
                              residual=None if residual is None else residual.reshape(-1, D), norm=norm,
                              gate=gl.reshape(-1, gl.shape[-1]), gate_col=col)

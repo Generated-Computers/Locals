@@ -94,9 +94,9 @@ What `fuse_model(model)` changes in each layer (`fuse.fuse_model`):
 | `GatedDeltaNet` `in_proj_{qkv,z,b,a}` | Has `in_proj_qkv`; all four fusable, or qkv/z and b/a each (b and a quantized apart: Clover's at 8 bits) | `in_proj_all`, one matmul or a `SplitProjection` of two; `FusedGatedDeltaNet` | Qwen3.5 linear-attention layers |
 | `Qwen3NextAttention` q/k/v | Fusable, no biases | `qkv_proj`; `FusedGatedAttention` | Qwen3.5 / Qwen3-Next full-attention layers |
 | MLP gate/up | `gate_proj` and `up_proj` quantized, fusable, and `_swiglu_mlp` passes | `gate_up_proj`; `FusedMLP` | SwiGLU MLPs |
-| `Qwen3NextSparseMoeBlock` | mlx-lm's (module `qwen3_next`) | `FusedQwenMoe` (`moe.fuse_qwen_moe`: router and shared-expert gate one matmul, experts' gate/up, shared expert's gate/up) | Qwen3.5-MoE, Qwen3-Next, Clover's causal pass |
-| Qwen3.5 `DecoderLayer` | its MLP a `FusedQwenMoe` | `FusedQwenLayer` (the MoE residual add in the expert combine) | Qwen3.5-MoE |
-| Text model body | `Qwen3_5TextModel` and hidden size divisible by 128 | `FusedHybridBody` | Qwen3.5: inactive for dense models (see below); Qwen3.5-MoE's layers step through it (`_moe_steps`) |
+| `Qwen3NextSparseMoeBlock` | Clover's model (module `clover_moe`) | `FusedQwenMoe` (`moe.fuse_qwen_moe`: router and shared-expert gate one matmul, experts' gate/up, shared expert's gate/up) | Clover's causal pass only: another Qwen3.5-MoE keeps mlx-lm's block |
+| Qwen3.5 `DecoderLayer` | its MLP a `FusedQwenMoe` | `FusedQwenLayer` (the MoE residual add in the expert combine; the layer keeps its module's name) | Clover |
+| Text model body | `Qwen3_5TextModel` and hidden size divisible by 128 | `FusedHybridBody` | Qwen3.5: inactive (see below); Clover's layers step through it (`_moe_steps`) |
 
 A fused class is a new subclass named `"Fused" + <original name>`, with the fused class first in the method resolution order. The instance keeps all its other attributes (`fuse._fuse_mlp`, `fuse.py`, `fuse.py`, `fuse.py`). `fuse_model` returns a count of the layers it walked.
 
@@ -476,14 +476,19 @@ its requests think unless they turn it off: see [Decoding](../decoding/README.md
 
 ## Qwen3.5-MoE and Clover (`moe.py`, `fuse.py`, `models/clover_moe.py`)
 
-mlx-lm's Qwen3.5-MoE (`qwen3_5_moe`: Qwen3.6-35B-A3B's network, 40 layers, three Gated DeltaNet layers to each
-full-attention one, 256 routed experts with 8 a token chosen by softmax, and a shared expert behind a sigmoid gate)
-gets a fused block, as Flint's does. DiffuSpace's Clover is a block-diffusion model trained on that network; its
-causal pass is Qwen3.5-MoE's forward, and that is how Locals runs it: `models/clover_moe.Model`, which `mlx_lm.load`
-builds for `model_type: clover_moe`, is mlx-lm's Qwen3.5 text model, the same parameters under the same names without
-the block-diffusion ones (`BLOCK_ONLY`). So both engines serve Clover a token a step as any model, with batching, the
-grammars of tool calls and JSON schemas, the prompt cache and mixed passes, and the stock engine runs stock mlx-lm.
-`BlockModel` is the whole model, for decoding in blocks (`--blocks`, below).
+DiffuSpace's Clover is a block-diffusion model trained on mlx-lm's Qwen3.5-MoE network (`qwen3_5_moe`:
+Qwen3.6-35B-A3B's, 40 layers, three Gated DeltaNet layers to each full-attention one, 256 routed experts with 8 a token
+chosen by softmax, and a shared expert behind a sigmoid gate); its causal pass is Qwen3.5-MoE's forward, and that is
+how Locals runs it: `models/clover_moe.Model`, which `mlx_lm.load` builds for `model_type: clover_moe`, is mlx-lm's
+Qwen3.5 text model, the same parameters under the same names without the block-diffusion ones (`BLOCK_ONLY`). So both
+engines serve Clover a token a step as any model, with batching, the grammars of tool calls and JSON schemas, the
+prompt cache and mixed passes, and the stock engine runs stock mlx-lm. `BlockModel` is the whole model, for decoding
+in blocks (`--blocks`, below).
+
+Every fast path below is Clover's alone (`fuse_model` knows its model by the module `clover_moe`): another
+Qwen3.5-MoE build keeps mlx-lm's block, and every other model its kernels, choices and bits, as main has them.
+Clover's layers are tuned as Flint's are (fragq, chains; `kernels._key_dt`), under keys of their own
+(`...xbfloat16clover`).
 
 **Why a token a step on a Mac.** A one-token pass reads the weights a token needs, about 1.9 GB, and is bound by
 memory; a block's preview (DiffuSpace's decoding) runs every matrix over all of the block's rows, which this GPU's
@@ -510,12 +515,13 @@ gives the block's bits on the same expert outputs. On Clover's own layers and hi
 experts every time, 99.95% of the block's outputs bit for bit, the rest a last bit off (the expert kernels sum each
 dot product in another order than gather_qmm).
 
-**MLX's rounding in two older kernels.** `mx.sigmoid` in bf16 rounds exp|x|, one plus it, its inverse and one minus
-that; `nn.softplus` (`logaddexp`) and `nn.silu` round each step the same way, and MLX's own kernels use precise
-`exp` and `rsqrt` where a custom kernel, compiled with fast math, gets fast ones. The expert kernels' swiglu (Flint's
-too) and the GDN decode kernel's beta, decay, convolution SiLU and norms rounded once or used the fast functions,
-which differs from MLX in 15 to 17% of bf16 values; they now compute as MLX does (`moe.mlx_sigmoid`,
-`gdn_kernel._HEADER`), at no measured cost. A small Clover's patched decode steps give stock mlx-lm's logits bit for
+**MLX's rounding, for Clover in two older kernels.** `mx.sigmoid` in bf16 rounds exp|x|, one plus it, its inverse
+and one minus that; `nn.softplus` (`logaddexp`) and `nn.silu` round each step the same way, and MLX's own kernels use
+precise `exp` and `rsqrt` where a custom kernel, compiled with fast math, gets fast ones. The expert kernels' swiglu
+and the GDN decode kernel's beta, decay, convolution SiLU and norms round once or use the fast functions, which
+differs from MLX in 15 to 17% of bf16 values; for Clover's layers (`experts_up(exact=True)`, `gdn_decode(exact=True)`)
+they compute as MLX does (`moe.mlx_sigmoid`, `gdn_kernel._HEADER`), at no measured cost, and every other model's
+(Flint's experts, Qwen3.5's GDN layers) as they did. A small Clover's patched decode steps give stock mlx-lm's logits bit for
 bit at one row; before, they drifted a few percent, and on a random router a near tie flipped on any of it
 (`tests/test_qwen_moe.py`).
 
@@ -626,12 +632,12 @@ A tied embedding head goes through `QuantizedEmbedding.as_linear` -> `_embed_swi
 
 **Which layers qualify.** `_tunable(mod)` requires a quantized linear or embedding with 4 bits, group size 64, affine mode, biases, and K divisible by 64. Other group sizes, and mxfp4 and similar formats, stay on MLX's kernels: tuning them crashed the load (`kernels._tunable`). The weight layout is MLX's affine 4-bit: `w` is `(N, K/8)` uint32 with the low nibble first, and `scales`/`biases` are `(N, K/64)` (`kernels.py`). `_eligible(x, mod)` also requires `MIN_M` (1) <= M <= `MAX_M` (32), where M is the number of rows after flattening all leading dimensions, and fp16 or bf16 activations (`kernels._eligible`).
 
-**Wide 8-bit layers** (`_tunable_head8`). An 8-bit layer of at least `HEAD8_MIN_N` (32,768) outputs, an output
-layer kept at 8 bits (Clover's: 248,320 x 2,048, 540 MB), is tuned from `HEAD8_MIN_M` (5) rows, against MLX's kernel
-only the `mma` tilings (MLX's loader in `mma_kernel.py` takes any width: `bits`). MLX reads it once up to 4 rows
+**An 8-bit output layer** (`_tunable_head8`). The output layer `fuse_model` marks `_locals_head8`, Clover's (8 bits,
+248,320 x 2,048, 540 MB), is tuned from `HEAD8_MIN_M` (5) rows, against MLX's kernel only the `mma` tilings (MLX's
+loader in `mma_kernel.py` takes any width: `bits`); every other 8-bit layer stays on MLX's kernel. MLX reads it once up to 4 rows
 (2.2 ms for Clover's) and then switches to its 32-row tiles: 3.8 ms at 6 rows, 4.6 at 8, 7.0 at 12, 6.3 at 16; `mma`
 with 8- or 16-row tiles, 2.8, 2.8, 3.7 and 3.7 (the same tokens; outputs within bf16 rounding of MLX's). Its keys carry
-the bits (`_mkey`: `248320x2048x8xbfloat16b8`; a 4-bit layer's keys are unchanged), it is never padded, and a
+the bits (`_bits_dt`: `248320x2048x8xbfloat16cloverb8`; a 4-bit layer's keys are unchanged), it is never padded, and a
 matrix of 64 MB or more is timed in place rather than copied (a copy of an output layer is 0.5 GB). Clover decodes 5.6%
 faster at 8 rows (247.6 tokens/s instead of 234.5) and 3% at 6. `LOCALS_HEAD8=0` keeps such layers on MLX's kernel.
 
@@ -803,7 +809,7 @@ To re-tune from scratch, stop every Locals server, delete the cache file (or poi
 | `LOCALS_DENSE_PREFILL` | timed | `1`: prompts always through dequantize + dense GEMM; `0`: through MLX's quantized GEMM |
 | `LOCALS_PAD_ROWS` | `1` | `0`: never compute a batch at more rows. By default batches of 8 to 16 are computed at a larger size, up to twice the rows, where the tuned timings show it at least 7% faster (`_pad_rows`; on an M5 Pro 12 requests computed as 16 ran 10-20% faster). `all`: other sizes too (the timings also pad 2 rows to 3, 4 to 5 and 24 to 32 on some M5 layers; measured end to end, within noise) |
 | `LOCALS_EXPERT_KERNELS` | `1` | `0`: Flint's and Qwen3.5-MoE's routed experts through `FusedSwitchGLU` (gather_qmm) at every row count (`moe.USE_EXPERT_KERNELS`) |
-| `LOCALS_HEAD8` | `1` | `0`: wide 8-bit layers (an output layer at 8 bits) on MLX's kernel at every row count (`kernels.HEAD8`) |
+| `LOCALS_HEAD8` | `1` | `0`: Clover's 8-bit output layer on MLX's kernel at every row count (`kernels.HEAD8`) |
 | `LOCALS_MOE_STEPS` | `1` | `0`: Qwen3.5-MoE's layers without the residual adds in the norms and the next norm in the expert combine (`fuse.USE_MOE_STEPS`) |
 | `LOCALS_QK_KERNEL` | `1` | `0`: Flint's q/k norms and RoPE as four MLX kernels (`qk_kernel.USE_QK_KERNEL`) |
 | `LOCALS_KV_BITS` | `16` | `8`: Flint's full-attention keys and values in 8 bits (`qkv.py`): about twice the context, 4 to 13% slower writing |

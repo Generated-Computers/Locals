@@ -42,12 +42,7 @@ def supported(body) -> bool:
         return False
     if getattr(body, "fa_idx", None) is None or getattr(body, "ssm_idx", None) is None:
         return False
-    from .moe import FusedQwenLayer
-
-    cls = type(layers[0])
-    if issubclass(cls, FusedQwenLayer):  # (the same layer, the MoE block's residual add in its kernel)
-        cls = next(c for c in cls.__mro__[1:] if c is not FusedQwenLayer)
-    if cls.__module__.rsplit(".", 1)[-1] not in ("qwen3_5", "qwen3_next"):
+    if type(layers[0]).__module__.rsplit(".", 1)[-1] not in ("qwen3_5", "qwen3_next"):
         return False  # the layer's own __call__ must be the plain pre-norm residual one written out below
     for layer in layers:
         if not all(hasattr(layer, a) for a in ("input_layernorm", "post_attention_layernorm", "mlp", "is_linear")):

@@ -200,9 +200,11 @@ def _mark_stale(tune: dict, user: Optional[dict]) -> bool:
 def _key_dt(dt: str, mod) -> str:
     """The dtype name a shape's tuning keys carry. Flint's layers (fuse marks them ``_locals_direct``) are tuned
     apart, under ``bfloat16flint`` and ``float16flint``: with the few-row family fragq and two more frag tiles, timed
-    in chains (_time_shape). Every other model's shapes keep the candidates, timings and choices they had, the
-    shapes Flint has too among them (its dense layers are MiniCPM5-2B's and Qwen3.5-2B's MLPs)."""
-    return dt + "flint" if vars(mod).get("_locals_direct") else dt
+    in chains (_time_shape); Clover's alike (marked ``"clover"``), under ``bfloat16clover`` and ``float16clover``.
+    Every other model's shapes keep the candidates, timings and choices they had, the shapes Flint has too among
+    them (its dense layers are MiniCPM5-2B's and Qwen3.5-2B's MLPs)."""
+    tag = vars(mod).get("_locals_direct")
+    return dt + (tag if isinstance(tag, str) else "flint") if tag else dt
 
 
 def _bits_dt(kd: str, mod) -> str:
@@ -1071,7 +1073,7 @@ def _linear_call_inner(self, x):
     M = x.size // K
     dt = _DTYPE_NAME.get(x.dtype)
     if dt is not None and M < PREFILL_M and not _RETIME and vars(self).get("_locals_direct"):
-        key = (self["weight"].shape[0], K, M, _bits_dt(dt + "flint", self))  # (_key_dt: these are Flint's or Clover's layers)
+        key = (self["weight"].shape[0], K, M, _bits_dt(_key_dt(dt, self), self))  # (Flint's or Clover's layers)
         if _CHOICE.get(key) == ("mlx",) and _PAD.get(key, 0) == M:
             return _orig_linear_call(self, x)
     if _dense_ok(x, self):

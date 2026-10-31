@@ -158,22 +158,24 @@
   of 8 by default (38.1 tokens/s; 32: 20.2), with kernels for its preview pass: the block coreset's routing in one
   kernel, a block's experts in tiles of slots, the Gated DeltaNet's two-sided convolution; one request at a time, no
   grammars.
-- **Qwen3.5-MoE** (mlx-lm's `qwen3_5_moe`, and Clover's causal pass) gets a fused MoE block: the router and the shared
+- **Clover's causal pass** (mlx-lm's Qwen3.5-MoE network) gets a fused MoE block, its own (another Qwen3.5-MoE build
+  keeps mlx-lm's block, and every other model its kernels and bits): the router and the shared
   expert's gate one matmul, the choice one kernel (mlx-lm's experts and weights bit for bit, ties included), the
   experts through Flint's kernels, and a combine that adds the gated shared expert, the layer's residual and the next
   layer's input norm; the mixer's residual add is in the post-mixer norm. Gated DeltaNet layers whose b and a
   projections are quantized apart from qkv and z (Clover's at 8 bits) take the one-kernel decode step: before, they
   fused nothing. Clover in the process: 93.6 tokens/s for one request instead of 81.1, 192.2 at 4 instead of 157.8.
-- An output layer kept at 8 bits (Clover's, 540 MB) is read once at 6 to 32 rows: the tuner times it against `mma`
+- Clover's output layer, kept at 8 bits (540 MB), is read once at 6 to 32 rows: the tuner times it against `mma`
   (8- or 16-row tiles; MLX's loader takes 8-bit weights too) from 5 rows, where MLX's kernel switches to 32-row
   tiles from 6. Clover's output layer at 8 rows: 2.8 ms instead of 4.6; decoding 247.9 tokens/s instead of 234.2 at 8
-  requests at once, 3% faster at 6. Its choices are cached under keys of their own (`...b8`); a 4-bit layer's keys and
-  choices are as they were. `LOCALS_HEAD8=0` keeps such layers on MLX's kernel.
-- The expert kernels' SwiGLU (Flint's too) and the Gated DeltaNet decode kernel's beta, decay, convolution SiLU and
-  norms compute as MLX's own operations do: its sigmoid and softplus round each step in bf16, and its exp and rsqrt
-  are the precise ones, where the kernels rounded once and used fast math (in 15 to 17% of bf16 values another
-  result). A small Qwen3.5-MoE's patched decode steps give stock mlx-lm's logits bit for bit at one row (they drifted a
-  few percent); no slower.
+  requests at once, 3% faster at 6. Its choices are cached under keys of their own (`...b8`); every other layer's keys
+  and choices are as they were, and Clover's layers are tuned as Flint's are (fragq, chains). `LOCALS_HEAD8=0` keeps
+  the layer on MLX's kernel.
+- For Clover's layers, the expert kernels' SwiGLU and the Gated DeltaNet decode kernel's beta, decay, convolution SiLU
+  and norms compute as MLX's own operations do: its sigmoid and softplus round each step in bf16, and its exp and
+  rsqrt are the precise ones, where the kernels round once and use fast math (in 15 to 17% of bf16 values another
+  result). A small Clover's patched decode steps give stock mlx-lm's logits bit for bit at one row; every other model
+  (Flint's experts, Qwen3.5's GDN layers) keeps its bits.
 
 ## 0.2.1 (2026-10-21)
 
