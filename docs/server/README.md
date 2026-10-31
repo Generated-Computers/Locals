@@ -82,7 +82,7 @@ Handler.do_POST
    - An Anthropic request ends with an assistant prefill (`_prefill`): the reply goes on from it.
 8. `oai.convert_messages` flattens the messages:
    - `system` and `developer` messages are merged into one at the front;
-   - content parts are joined with newlines, with an image as "[an image was attached here; this model reads text only]" (unless the model reads images: see Images, below) and a file as "[a file was attached here; this model reads only the text of the conversation]" (`oai.IMAGE_NOTE`, `oai.FILE_NOTE`);
+   - content parts are joined with newlines, with an image as "[an image was attached here; this model reads text only]" (unless the model reads images: then the template's image mark, joined to the text next to it with no newline; see Images, below) and a file as "[a file was attached here; this model reads only the text of the conversation]" (`oai.IMAGE_NOTE`, `oai.FILE_NOTE`);
    - tool-call arguments become dicts;
    - an empty user message is added when there is none, because templates require one.
 
@@ -473,17 +473,21 @@ Grammars (tools, `response_format`) apply as for text. Streaming and cancelling 
 does not use the prompt cache, and its reply is not remembered as a token stream.
 
 Compared with mlx-vlm 0.7.11 (`mlx_vlm.generate`, greedy, 60 tokens) on six test pictures (large text, small print,
-coloured shapes, an invoice, a bar chart), on an M2 Max (32 GB) at commit `20bafe1`; each question asked twice gave the
-same answer both times, on both sides. Our prompt has a newline after the image (`oai.text_of` joins the content parts
-with one); Qwen's template has none. With that newline added to mlx-vlm's prompt, so both read the same tokens:
+coloured shapes, an invoice, a bar chart), on an M2 Max (32 GB); each question asked twice gave the same answer both
+times, on both sides. An image is joined to the text next to it with nothing between, as Qwen's template joins it
+(`oai.text_of`; text parts are still joined with a newline), so our prompt is mlx-vlm's, word for word, for all six
+pictures on both models:
 
 - Qwen3-VL-8B 4-bit gave mlx-vlm's answers word for word on all six. With the deepstack features left out, five of the
   six changed.
-- Qwen3.5-4B 4-bit gave mlx-vlm's answers on five. On the sixth, "CAT 42" in 128-pixel letters on a 1280x800 picture,
-  ours read "cat 42" and mlx-vlm "CAT 12".
+- Qwen3.5-4B 4-bit gave mlx-vlm's answers on four. On "CAT 42" in 128-pixel letters on a 1280x800 picture, ours read
+  "cat 42" and mlx-vlm "cat 12"; on the invoice, both gave the total and the customer, and the closing sentence differed.
+
+Up to commit `929eb9f` our prompt had a newline after the image, which the models were not trained with: with mlx-vlm's
+own prompt, Qwen3-VL-8B then gave the same answers on four of the six and Qwen3.5-4B on three.
 
 Both models read large text in a small picture badly, here and in mlx-vlm alike: "CAT 42" in 64-pixel letters on a
-640x400 picture came back as "cat 2" from Qwen3.5 and "Cata" from Qwen3-VL. The scripts and answers are in
+640x400 picture came back as "cat 2" from Qwen3.5 and "c at a" from Qwen3-VL. The scripts and answers are in
 `docs/measurements/vision/`.
 
 ## Unloading the model

@@ -101,7 +101,7 @@ def test_take_images_and_decode():
     assert vision.has_images(msgs) and not vision.has_images(msgs[:1])
     out, sources = vision.take_images(msgs)
     assert sources == [url]
-    assert oai.text_of(out[1]["content"]) == "what is it?\n" + vision.IMAGE_MARK
+    assert oai.text_of(out[1]["content"]) == "what is it?" + vision.IMAGE_MARK
     assert msgs[1]["content"][1]["type"] == "image_url"  # (the request itself is left as it was)
     assert vision.decode(url) == data
     assert vision.decode(base64.b64encode(data).decode(), media_type="image/png") == data  # Ollama's bare base64
@@ -109,6 +109,19 @@ def test_take_images_and_decode():
     assert pics[0].tokens == pics[0].grid[0] * pics[0].grid[1] // 4
     with pytest.raises(ValueError, match="image 1 of 1"):
         vision.load(["data:image/png;base64,bm90IGFuIGltYWdl"])
+
+
+def test_an_image_is_joined_to_its_text_as_qwens_template_joins_it():
+    """Qwen's template writes ``AAA<|vision_start|><|image_pad|><|vision_end|>BBB``: a newline after the image,
+    which the model was not trained with, changed Qwen3-VL-8B's answers on two of six test pictures. Text parts
+    are still joined with a newline."""
+    url = "data:image/png;base64," + base64.b64encode(_png(64, 48)).decode()
+    img = {"type": "image_url", "image_url": {"url": url}}
+    content = [{"type": "text", "text": "AAA"}, img, {"type": "text", "text": "BBB"}, {"type": "text", "text": "CCC"}, img]
+    out, _ = vision.take_images([{"role": "user", "content": content}])
+    mark = vision.IMAGE_MARK
+    assert oai.text_of(out[0]["content"]) == "AAA" + mark + "BBB\nCCC" + mark
+    assert oai.text_of([img, img, {"type": "text", "text": "x"}]) == oai.IMAGE_NOTE + "\n" + oai.IMAGE_NOTE + "\nx"
 
 
 def test_a_server_others_reach_reads_no_local_files_and_fetches_no_urls(tmp_path, monkeypatch):

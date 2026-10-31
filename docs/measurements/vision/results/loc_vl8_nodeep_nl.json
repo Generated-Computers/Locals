@@ -1,0 +1,43 @@
+{
+ "cat42_640x400.png": {
+  "answers": [
+   "Cata 4",
+   "Cata 4"
+  ]
+ },
+ "cat42_1280x800.png": {
+  "answers": [
+   "Cata2",
+   "Cata2"
+  ]
+ },
+ "shapes_640x480.png": {
+  "answers": [
+   "From left to right, the shapes and their colours are:\n\n- Red circle\n- Blue square\n- Green triangle",
+   "From left to right, the shapes and their colours are:\n\n- Red circle\n- Blue square\n- Green triangle"
+  ]
+ },
+ "invoice_900x500.png": {
+  "answers": [
+   "Based on the provided invoice text, here is the information you requested:\n\n*   **Total:** 1,284.50 PLN\n*   **Customer:** Stefan Nowak\n\n*(Note: There are several typos in the original text, such as \"Invoice 73",
+   "Based on the provided invoice text, here is the information you requested:\n\n*   **Total:** 1,284.50 PLN\n*   **Customer:** Stefan Nowak\n\n*(Note: There are several typos in the original text, such as \"Invoice 73"
+  ]
+ },
+ "smallfont_512x256.png": {
+  "answers": [
+   "HELLO WORLD from a small font",
+   "HELLO WORLD from a small font"
+  ]
+ },
+ "bars_768x512.png": {
+  "answers": [
+   "Based on the provided bar chart:\n\n- The bar labeled **'B'** is the **tallest**. It reaches the highest point on the vertical axis.\n- The bar labeled **'A'** is the **shortest**. It is visibly shorter than both bar 'B' and",
+   "Based on the provided bar chart:\n\n- The bar labeled **'B'** is the **tallest**. It reaches the highest point on the vertical axis.\n- The bar labeled **'A'** is the **shortest**. It is visibly shorter than both bar 'B' and"
+  ]
+ },
+ "_deepstack": {
+  "levels": 3,
+  "dropped": true,
+  "encode_calls": 12
+ }
+}

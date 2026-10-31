@@ -1,7 +1,9 @@
-loc_q35.json vs vlm_q35_nl.json (mlx-vlm, the same prompt): 5 of 6 the same
+At commit 20bafe1, when our prompt had a newline after the image: ours against mlx-vlm with the same newline.
+
+loc_q35_nl.json vs vlm_q35_nl.json (mlx-vlm, the same prompt): 5 of 6 the same
   differs: cat42_1280x800.png: ours 'cat 42' / mlx-vlm 'CAT 12'
-loc_vl8.json vs vlm_vl8_nl.json (mlx-vlm, the same prompt): 6 of 6 the same
-loc_vl8_nodeep.json vs vlm_vl8_nl.json (mlx-vlm, the same prompt): 1 of 6 the same
+loc_vl8_nl.json vs vlm_vl8_nl.json (mlx-vlm, the same prompt): 6 of 6 the same
+loc_vl8_nodeep_nl.json vs vlm_vl8_nl.json (mlx-vlm, the same prompt): 1 of 6 the same
   differs: cat42_640x400.png: ours 'Cata 4' / mlx-vlm 'Cata'
   differs: cat42_1280x800.png: ours 'Cata2' / mlx-vlm 'cata2'
   differs: shapes_640x480.png: ours 'From left to right, the shapes and their colours are:\n\n- Red circle\n- Blue squar' / mlx-vlm 'Based on the image provided, here are the shapes listed from left to right with '

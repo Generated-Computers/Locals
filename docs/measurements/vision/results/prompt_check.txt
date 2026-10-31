@@ -1,0 +1,2 @@
+mlx-community/Qwen3.5-4B-MLX-4bit: our prompt is mlx-vlm's on 6 of 6
+mlx-community/Qwen3-VL-8B-Instruct-4bit: our prompt is mlx-vlm's on 6 of 6

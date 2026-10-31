@@ -27,11 +27,10 @@ from typing import List, Optional, Sequence, Tuple
 import mlx.core as mx
 
 from .defaults import cached_snapshot
-from .oai import IMAGE_PARTS
+from .oai import IMAGE_MARK, IMAGE_PARTS  # (IMAGE_MARK: what the chat template writes for one image)
 
 # The text model's special tokens, from its config.json (Qwen3.5-4B)
 IMAGE_TOKEN = "<|image_pad|>"
-IMAGE_MARK = "<|vision_start|><|image_pad|><|vision_end|>"  # what the chat template writes for one image
 # Pixels an image is resized to at most (LOCALS_VISION_MAX_PIXELS): one text token per 32x32 pixels, and the
 # tower attends over all of an image's 16x16 patches at once. The checkpoint allows 16.7M pixels (16,384 tokens,
 # 65,536 patches): a 2880x1800 screenshot was 5,000 tokens. 1M pixels is 1,024 tokens.

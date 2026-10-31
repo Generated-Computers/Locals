@@ -1,0 +1,43 @@
+{
+ "cat42_640x400.png": {
+  "answers": [
+   "cat 2",
+   "cat 2"
+  ]
+ },
+ "cat42_1280x800.png": {
+  "answers": [
+   "cat 42",
+   "cat 42"
+  ]
+ },
+ "shapes_640x480.png": {
+  "answers": [
+   "From left to right, the shapes and their colors are:\n\n1. **Red circle**  \n2. **Blue square**  \n3. **Green triangle**\n\nThis matches the visual arrangement in the image.",
+   "From left to right, the shapes and their colors are:\n\n1. **Red circle**  \n2. **Blue square**  \n3. **Green triangle**\n\nThis matches the visual arrangement in the image."
+  ]
+ },
+ "invoice_900x500.png": {
+  "answers": [
+   "Based on the invoice details provided:\n\n- **Total:** 1,284.50 PLN  \n- **Customer:** Stefan Nowak\n\nThis information is clearly stated in the invoice.",
+   "Based on the invoice details provided:\n\n- **Total:** 1,284.50 PLN  \n- **Customer:** Stefan Nowak\n\nThis information is clearly stated in the invoice."
+  ]
+ },
+ "smallfont_512x256.png": {
+  "answers": [
+   "HELLO WORLD from a small font",
+   "HELLO WORLD from a small font"
+  ]
+ },
+ "bars_768x512.png": {
+  "answers": [
+   "Looking at the bar chart:\n\n- **Bar A** is the shortest.\n- **Bar B** is the tallest.\n- **Bar C** is medium height — taller than A but shorter than B.\n\n✅ So, the **tallest bar is B**, and the **short",
+   "Looking at the bar chart:\n\n- **Bar A** is the shortest.\n- **Bar B** is the tallest.\n- **Bar C** is medium height — taller than A but shorter than B.\n\n✅ So, the **tallest bar is B**, and the **short"
+  ]
+ },
+ "_deepstack": {
+  "levels": 0,
+  "dropped": false,
+  "encode_calls": 12
+ }
+}

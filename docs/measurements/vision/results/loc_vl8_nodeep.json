@@ -1,8 +1,8 @@
 {
  "cat42_640x400.png": {
   "answers": [
-   "Cata 4",
-   "Cata 4"
+   "cata4",
+   "cata4"
   ]
  },
  "cat42_1280x800.png": {
@@ -31,8 +31,8 @@
  },
  "bars_768x512.png": {
   "answers": [
-   "Based on the provided bar chart:\n\n- The bar labeled **'B'** is the **tallest**. It reaches the highest point on the vertical axis.\n- The bar labeled **'A'** is the **shortest**. It is visibly shorter than both bar 'B' and",
-   "Based on the provided bar chart:\n\n- The bar labeled **'B'** is the **tallest**. It reaches the highest point on the vertical axis.\n- The bar labeled **'A'** is the **shortest**. It is visibly shorter than both bar 'B' and"
+   "Based on the bar chart provided:\n\n- The bar labeled **A** is the shortest.\n- The bar labeled **B** is the tallest.\n- The bar labeled **C** is of intermediate height.\n\nTherefore, the tallest bar is **B**, and the shortest bar is **A**.",
+   "Based on the bar chart provided:\n\n- The bar labeled **A** is the shortest.\n- The bar labeled **B** is the tallest.\n- The bar labeled **C** is of intermediate height.\n\nTherefore, the tallest bar is **B**, and the shortest bar is **A**."
   ]
  },
  "_deepstack": {

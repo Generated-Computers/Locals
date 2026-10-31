@@ -1,0 +1,52 @@
+loc_q35.json: repeats differ on 0 []
+vlm_q35.json: repeats differ on 0 []
+loc_vl8.json: repeats differ on 0 []
+vlm_vl8.json: repeats differ on 0 []
+loc_vl8_nodeep.json: repeats differ on 0 []
+
+Qwen3.5-4B: ours vs mlx-vlm: 4 of 6 the same
+  cat42_1280x800.png
+    loc_q35.json: 'cat 42'
+    vlm_q35.json: 'cat 12'
+  invoice_900x500.png
+    loc_q35.json: 'Based on the invoice details provided:\n\n- **Total:** 1,284.50 PLN  \n- **Customer:** Stefan Nowak\n\nThese are the key pieces of information from the inv'
+    vlm_q35.json: 'Based on the invoice details provided:\n\n- **Total:** 1,284.50 PLN  \n- **Customer:** Stefan Nowak\n\nThese are the key figures from the invoice.'
+
+Qwen3-VL-8B: ours vs mlx-vlm: 6 of 6 the same
+
+Qwen3-VL-8B: ours, no deepstack vs mlx-vlm: 1 of 6 the same
+  cat42_640x400.png
+    loc_vl8_nodeep.json: 'cata4'
+    vlm_vl8.json: 'c at a'
+  cat42_1280x800.png
+    loc_vl8_nodeep.json: 'Cata2'
+    vlm_vl8.json: 'catar'
+  shapes_640x480.png
+    loc_vl8_nodeep.json: 'From left to right, the shapes and their colours are:\n\n- Red circle\n- Blue square\n- Green triangle'
+    vlm_vl8.json: 'Based on the image provided, here are the shapes listed from left to right with their colours:\n\n- A red circle\n- A blue square\n- A green triangle'
+  invoice_900x500.png
+    loc_vl8_nodeep.json: 'Based on the provided invoice text, here is the information you requested:\n\n*   **Total:** 1,284.50 PLN\n*   **Customer:** Stefan Nowak\n\n*(Note: There '
+    vlm_vl8.json: 'Based on the invoice provided:\n\n*   **Total:** 1,284.50 PLN\n*   **Customer:** Stefan Nowak'
+  bars_768x512.png
+    loc_vl8_nodeep.json: 'Based on the bar chart provided:\n\n- The bar labeled **A** is the shortest.\n- The bar labeled **B** is the tallest.\n- The bar labeled **C** is of inter'
+    vlm_vl8.json: "Based on the provided bar chart:\n\n- The bar labeled **'B'** is the **tallest**. It reaches the highest point on the vertical axis.\n- The bar labeled *"
+
+Qwen3-VL-8B: ours, no deepstack vs ours: 1 of 6 the same
+  cat42_640x400.png
+    loc_vl8_nodeep.json: 'cata4'
+    loc_vl8.json: 'c at a'
+  cat42_1280x800.png
+    loc_vl8_nodeep.json: 'Cata2'
+    loc_vl8.json: 'catar'
+  shapes_640x480.png
+    loc_vl8_nodeep.json: 'From left to right, the shapes and their colours are:\n\n- Red circle\n- Blue square\n- Green triangle'
+    loc_vl8.json: 'Based on the image provided, here are the shapes listed from left to right with their colours:\n\n- A red circle\n- A blue square\n- A green triangle'
+  invoice_900x500.png
+    loc_vl8_nodeep.json: 'Based on the provided invoice text, here is the information you requested:\n\n*   **Total:** 1,284.50 PLN\n*   **Customer:** Stefan Nowak\n\n*(Note: There '
+    loc_vl8.json: 'Based on the invoice provided:\n\n*   **Total:** 1,284.50 PLN\n*   **Customer:** Stefan Nowak'
+  bars_768x512.png
+    loc_vl8_nodeep.json: 'Based on the bar chart provided:\n\n- The bar labeled **A** is the shortest.\n- The bar labeled **B** is the tallest.\n- The bar labeled **C** is of inter'
+    loc_vl8.json: "Based on the provided bar chart:\n\n- The bar labeled **'B'** is the **tallest**. It reaches the highest point on the vertical axis.\n- The bar labeled *"
+
+Qwen3-VL CAT 42: {'cat42_640x400.png': 'c at a', 'cat42_1280x800.png': 'catar'}
+Qwen3.5 CAT 42 ours: {'cat42_640x400.png': 'cat 2', 'cat42_1280x800.png': 'cat 42'}

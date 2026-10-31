@@ -13,14 +13,14 @@
  },
  "shapes_640x480.png": {
   "answers": [
-   "From left to right, the shapes and their colors are:\n\n1. **Red circle**  \n2. **Blue square**  \n3. **Green triangle**\n\nThis matches the visual arrangement in the image.",
-   "From left to right, the shapes and their colors are:\n\n1. **Red circle**  \n2. **Blue square**  \n3. **Green triangle**\n\nThis matches the visual arrangement in the image."
+   "From left to right, the shapes and their colors are:\n\n1. **Red circle**  \n2. **Blue square**  \n3. **Green triangle**\n\n✅ Final Answer:  \n**Red circle, Blue square, Green triangle**",
+   "From left to right, the shapes and their colors are:\n\n1. **Red circle**  \n2. **Blue square**  \n3. **Green triangle**\n\n✅ Final Answer:  \n**Red circle, Blue square, Green triangle**"
   ]
  },
  "invoice_900x500.png": {
   "answers": [
-   "Based on the invoice details provided:\n\n- **Total:** 1,284.50 PLN  \n- **Customer:** Stefan Nowak\n\nThis information is clearly stated in the invoice.",
-   "Based on the invoice details provided:\n\n- **Total:** 1,284.50 PLN  \n- **Customer:** Stefan Nowak\n\nThis information is clearly stated in the invoice."
+   "Based on the invoice details provided:\n\n- **Total:** 1,284.50 PLN  \n- **Customer:** Stefan Nowak\n\nThese are the key pieces of information from the invoice.",
+   "Based on the invoice details provided:\n\n- **Total:** 1,284.50 PLN  \n- **Customer:** Stefan Nowak\n\nThese are the key pieces of information from the invoice."
   ]
  },
  "smallfont_512x256.png": {
