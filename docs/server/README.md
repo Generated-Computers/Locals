@@ -450,8 +450,10 @@ template refuses it there).
    engine's thread cannot compute it.
 2. The prompt is tokenized whole (not from a remembered token stream) and each `<|image_pad|>` is expanded to the
    image's token count, one per 32x32 pixels (`vision.expand`). The context limit counts those tokens.
-3. The job carries the images and where their tokens sit (`Job.pictures`, `Job.spans`). The batch loop holds it until
-   no other row is running, then runs it alone (`BatchService._vision`): the tower turns the patches into one
+3. The job carries the images and where their tokens sit (`Job.pictures`, `Job.spans`). The batch loop holds it, with
+   the controller its grammar gave, until no other row is running. Meanwhile the batch takes no new request, so the
+   running replies end and it runs next (`BatchService._source`); a request sent after it waits for it. It then runs
+   alone (`BatchService._vision`), unless its client has left: the tower turns the patches into one
    embedding per token, the prompt's embeddings take them in the placeholders' place, and the reply is generated on
    the synchronous engine (`Engine.generate_embedded`) with M-RoPE: each image token's position is its (frame, row,
    column), and the full-attention layers' RoPE is swapped for `vision.MRoPE` for that one request, split over the

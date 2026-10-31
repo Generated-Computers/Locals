@@ -210,7 +210,7 @@ class BatchService:
         self._q: "queue.Queue[Job]" = queue.Queue()
         self._compile_lock = threading.Lock()
         self._inflight = {}  # id(job) -> job, taken by the worker and not yet finished
-        self._vision_q: List[Job] = []  # image prompts waiting for the batch to be idle
+        self._vision_q: List[Tuple[Job, object]] = []  # image prompts and their controllers, waiting for the batch to be idle
         self._closed = False
         self._unloaded = False  # (closed by unload: what was queued ends as cancelled, to be sent again)
         self._ready = threading.Event()
@@ -369,12 +369,91 @@ class BatchService:
         if not work:
             print("locals: kernel tuning finished; batches now run on the tuned kernels", file=sys.stderr, flush=True)
 
+    def _source(self, rt, block: bool) -> list:
+        """The batch engine's ``source(block)``: the jobs taken now, as batch requests. An image job runs here,
+        alone, when the batch is idle (``block``). While one waits, nothing new is taken: the running rows end,
+        and it runs next. Taking new rows meanwhile, a busy server never had an idle batch for it."""
+        import mlx.core as mx
+
+        from .packed import Request
+
+        if self._vision_q and not block:
+            return []
+        held, self._vision_q = self._vision_q, []  # (job, controller): its grammar was made when it was taken
+        taken = [(job, None) for job in self._take(block and not held)]
+        reqs = []
+        for job, ctl in held + taken:
+            if getattr(job, "prime", False):
+                try:
+                    lru, eng = self._lru, self._eng
+                    if lru.fetch_nearest_cache("locals", job.prompt)[1]:
+                        c, rest = eng._prefill_start(job.prompt, [])
+                        eng._run(c, list(rest))
+                        mx.eval([x.state for x in c])
+                        lru.insert_cache("locals", list(job.prompt), c, cache_type="system")
+                    self._finish(job, [], "primed")
+                except Exception as e:  # noqa: BLE001
+                    self._finish(job, [], f"error: {e!r}")
+                continue
+            if ctl is None:
+                ctl = self._controller(rt, job)
+                if ctl is None:
+                    continue
+            if job.pictures:
+                # one image prompt at a time, on the synchronous engine: its rows carry (t, h, w)
+                # positions and its prompt's embeddings, which the batch's per-row token indices cannot
+                if not block:  # (taken while other rows decode: held for the idle call)
+                    self._vision_q.append((job, ctl))
+                    continue
+                self._vision(rt, job, ctl)
+                continue
+            r = Request(job.prompt, ctl, job.max_tokens)
+            r.on_token = job.on_token
+            r.checkpoints = job.checkpoints
+            r.temp, r.top_p, r.top_k, r.seed = job.temp, job.top_p, job.top_k, job.seed
+            job._req = r  # before reading job.cancelled: a cancel in between sets r.cancel itself
+            r.cancel = job.cancelled
+            self._owner[id(r)] = (job, r)
+            reqs.append(r)
+            self.prompt_tokens += len(job.prompt)
+        return reqs
+
+    def _controller(self, rt, job: Job):
+        """The job's controller: its grammar's, or free text. None when the job has ended here instead.
+        One request's fault (a regex that does not compile, a schema too large or recursive) is that
+        request's error: it used to escape serve(), fail every request in flight and leave this one
+        waiting forever."""
+        from .engine import LocalsController
+
+        try:
+            if job.schema is None and job.regex is None:
+                return self._endless() if job.ignore_eos else self._free()
+            if job.cancelled:
+                self._finish(job, [], "cancelled")  # (gone while its grammar was made: nothing to compile)
+                return None
+            if self.walk:
+                from .walk import WalkController
+
+                wc, planner = rt.compile_walk(job.schema) if job.regex is None else rt.compile_walk(regex=job.regex)
+                return WalkController(wc, planner, True, True)
+            c = rt.compile(job.schema, regex=job.regex, ready=getattr(job, "_ready", None), recursive_ok=False)
+            job._ready = None
+            return LocalsController(c.constraint, c.planner, True, True)
+        except _REQUEST_ERRORS as e:  # the request's grammar: a 400
+            self._finish(job, [], f"invalid: {_reason(e)}")
+        except Exception as e:  # noqa: BLE001  # the engine's (a Metal error making the tables): a 500, retried once
+            self._finish(job, [], f"error: {e!r}")
+        return None
+
     def _vision(self, rt, job: Job, ctl) -> None:
         """One image prompt, alone: the vision tower's features go where the prompt's ``<|image_pad|>``
         tokens are, and every token carries its own M-RoPE (t, h, w) position. The batch engine cannot
         run this row: its positions are token indices, and its prefill is one token stream for all rows."""
         from .vision import positions, tail
 
+        if job.cancelled:  # (its client left while it waited for the batch: the tower need not read its images)
+            self._finish(job, [], "cancelled")
+            return
         try:
             enc = self.vision()
             if enc is None:
@@ -430,7 +509,7 @@ class BatchService:
             # loading the model again (it waits for the engine's load lock, held while this runs) would be a second copy
             print(f"locals: waiting for the {self.engine} worker to stop before the model is let go", file=sys.stderr, flush=True)
             self._thread.join(timeout=30)
-        stuck = list(self._inflight.values()) + list(self._vision_q)
+        stuck = list(self._inflight.values()) + [job for job, _ in self._vision_q]
         self._vision_q = []
         while True:
             try:
@@ -492,9 +571,8 @@ class BatchService:
     def _run_locals(self):
         import mlx.core as mx
 
-        from .engine import Controller, LocalsController
+        from .engine import Controller
         from .hybrid_batch import HybridBatchEngine, chain_cache
-        from .packed import Request
         from .runtime import Runtime
 
         rt = Runtime.load(self.model_id, tune=os.environ.get("LOCALS_TUNE", "background"))
@@ -556,67 +634,12 @@ class BatchService:
             self.cache_bytes = int(min(max(free, longest, 1.5 * (1 << 30)), 16 << 30))
         lru = chain_cache(max_size=256, max_bytes=self.cache_bytes)
         self._lru = lru
-        owner = {}
+        owner = self._owner = {}
+        self._free, self._endless = Free, Endless
         self._ready.set()
 
         def source(block):
-            jobs = []
-            if block and self._vision_q:  # an image prompt waits for the batch to be idle (it runs alone)
-                jobs, self._vision_q = self._vision_q, []
-            jobs += self._take(block and not jobs)
-            reqs = []
-            for job in jobs:
-                # One request's fault (a regex that does not compile, a schema too large or recursive)
-                # is that request's error: it used to escape serve(), fail every request in flight and
-                # leave this one waiting forever.
-                try:
-                    if getattr(job, "prime", False):
-                        if lru.fetch_nearest_cache("locals", job.prompt)[1]:
-                            c, rest = eng._prefill_start(job.prompt, [])
-                            eng._run(c, list(rest))
-                            mx.eval([x.state for x in c])
-                            lru.insert_cache("locals", list(job.prompt), c, cache_type="system")
-                        self._finish(job, [], "primed")
-                        continue
-                    if job.cancelled and (job.schema is not None or job.regex is not None):
-                        self._finish(job, [], "cancelled")  # (gone while its grammar was made: nothing to compile)
-                        continue
-                    if job.schema is not None or job.regex is not None:
-                        if self.walk:
-                            from .walk import WalkController
-
-                            wc, planner = rt.compile_walk(job.schema) if job.regex is None else rt.compile_walk(regex=job.regex)
-                            ctl = WalkController(wc, planner, True, True)
-                        else:
-                            c = rt.compile(job.schema, regex=job.regex, ready=getattr(job, "_ready", None), recursive_ok=False)
-                            job._ready = None
-                            ctl = LocalsController(c.constraint, c.planner, True, True)
-                    else:
-                        ctl = Endless() if job.ignore_eos else Free()
-                except _REQUEST_ERRORS as e:  # the request's grammar: a 400
-                    self._finish(job, [], f"invalid: {_reason(e)}")
-                    continue
-                except Exception as e:  # noqa: BLE001  # the engine's (a Metal error making the tables): a 500, retried once
-                    self._finish(job, [], f"error: {e!r}")
-                    continue
-                if job.pictures:
-                    # one image prompt at a time, on the synchronous engine: its rows carry (t, h, w)
-                    # positions and its prompt's embeddings, which the batch's per-row token indices cannot
-                    if not block:  # (taken while other rows decode: held for the idle call)
-                        self._vision_q.append(job)
-                        continue
-                    self._vision(rt, job, ctl)
-                    continue
-                r = Request(job.prompt, ctl, job.max_tokens)
-                r.on_token = job.on_token
-                r.checkpoints = job.checkpoints
-                r.temp, r.top_p, r.top_k, r.seed = job.temp, job.top_p, job.top_k, job.seed
-                job._req = r  # before reading job.cancelled: a cancel in between sets r.cancel itself
-                r.cancel = job.cancelled
-                owner[id(r)] = (job, r)
-                reqs.append(r)
-                self.prompt_tokens += len(job.prompt)
-            return reqs
+            return self._source(rt, block)
 
         def done(r):
             job, _ = owner.pop(id(r))
@@ -645,6 +668,7 @@ class BatchService:
                     self._inflight.pop(id(job), None)
                     job._event.set()
                 owner.clear()
+                self._vision_q = []  # (its jobs were in _inflight: failed above, not to be run later)
                 eng._fill_eval = []  # a prompt that was being prefilled in mixed passes: its cache goes too
                 lru.trim_to(n_bytes=lru.nbytes // 2)
                 gc.collect()

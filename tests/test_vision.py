@@ -303,3 +303,83 @@ def test_an_image_request_that_fails_ends_only_itself(monkeypatch):
     assert job.done and job.finish.startswith("error: ") and "allocate" in job.finish
     assert not other.done and id(other) in svc._inflight
     assert svc.prompt_tokens == 0
+
+
+def _batch_service(monkeypatch, compiled):
+    """A service with a stub runtime whose grammars count their compiles (no model, no worker thread)."""
+    import queue
+    import threading
+
+    from locals.service import BatchService
+
+    svc = BatchService.__new__(BatchService)
+    svc.engine, svc.model_id, svc.walk = "locals", "m", False
+    svc.tokenizer = None
+    svc._q = queue.Queue()
+    svc._compile_lock = threading.Lock()
+    svc._inflight, svc._owner, svc._vision_q = {}, {}, []
+    svc._closed = svc._unloaded = False
+    svc.prompt_tokens = svc.tokens_out = 0
+    svc._free = svc._endless = eng.Controller
+    monkeypatch.setattr(eng, "LocalsController", lambda c, planner, *a: ("grammar", c))
+
+    class Rt:
+        def compile(self, schema, regex=None, ready=None, recursive_ok=False):
+            compiled.append(schema)
+            return type("C", (), {"constraint": len(compiled), "planner": None})()
+
+    return svc, Rt()
+
+
+def test_an_image_job_held_for_an_idle_batch_keeps_its_grammar(monkeypatch):
+    """Taken while rows decode, an image job is held; released at the idle call, it runs with the controller made
+    when it was taken. Its grammar was made again there, on the engine thread, while every reply waited."""
+    from locals.service import Job
+
+    compiled, ran = [], []
+    svc, rt = _batch_service(monkeypatch, compiled)
+    svc._vision = lambda rt, job, ctl: ran.append((job, ctl))
+    job = Job(prompt=[1, 2], schema={"type": "object"}, pictures=["image"])
+    svc._q.put(job)
+    assert svc._source(rt, block=False) == []
+    assert ran == [] and [j for j, _ in svc._vision_q] == [job]
+    assert svc._source(rt, block=True) == []
+    assert ran == [(job, ("grammar", 1))]
+    assert compiled == [{"type": "object"}]
+
+
+def test_while_an_image_job_waits_the_batch_takes_no_new_rows(monkeypatch):
+    """Text that arrives after the image job waits for it: the running rows end, and the idle batch runs the
+    image job. Taking text meanwhile, a busy server never let it run."""
+    from locals.service import Job
+
+    svc, rt = _batch_service(monkeypatch, [])
+    ran = []
+    svc._vision = lambda rt, job, ctl: ran.append(job)
+    image = Job(prompt=[1], pictures=["image"])
+    svc._q.put(image)
+    assert svc._source(rt, block=False) == []
+    text = Job(prompt=[2, 3])
+    svc._q.put(text)
+    for _ in range(3):  # the rows still running: nothing new joins them
+        assert svc._source(rt, block=False) == []
+    assert ran == [] and not svc._q.empty()
+    reqs = svc._source(rt, block=True)  # the batch is idle: the image job first, then the text joins
+    assert ran == [image]
+    assert [r.prompt for r in reqs] == [[2, 3]]
+
+
+def test_an_image_job_cancelled_while_it_waits_does_not_run_the_tower(monkeypatch):
+    from locals.service import Job
+
+    svc, rt = _batch_service(monkeypatch, [])
+    read = []
+    svc.vision = lambda: type("Enc", (), {"encode": lambda self, pics: read.append(pics)})()
+    job = Job(prompt=[1], pictures=["image"])
+    svc._inflight[id(job)] = job
+    svc._q.put(job)
+    svc._source(rt, block=False)
+    job.cancel()
+    assert svc._source(rt, block=True) == []
+    assert job.done and job.finish == "cancelled"
+    assert read == [] and not svc._inflight
