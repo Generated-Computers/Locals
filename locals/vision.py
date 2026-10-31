@@ -40,7 +40,8 @@ MAX_PIXELS = 1 << 20
 
 @dataclass
 class Picture:
-    """One image, preprocessed: ``patches`` (patches, 2*16*16*3) pixels (numpy, float32) and the (h, w) patch grid."""
+    """One image, preprocessed: ``patches`` (patches, 2*16*16*3) pixels (numpy, float32; None when only counted)
+    and the (h, w) patch grid."""
 
     patches: object
     grid: Tuple[int, int]
@@ -77,6 +78,21 @@ def smart_resize(height: int, width: int, factor: int = 32, min_pixels: int = 65
     return h_bar, w_bar
 
 
+def _resized(h: int, w: int) -> Tuple[int, int]:
+    cap = int(os.environ.get("LOCALS_VISION_MAX_PIXELS") or MAX_PIXELS)
+    return smart_resize(h, w, 32, 65536, cap)  # 32: patch_size * spatial_merge_size
+
+
+def measure(raw: bytes) -> Picture:
+    """The image's grid from its header alone, no patches: for a token count (PIL reads no pixels for ``size``)."""
+    from PIL import Image
+
+    with Image.open(io.BytesIO(raw)) as im:
+        w, h = im.size
+    hb, wb = _resized(h, w)
+    return Picture(None, (hb // 16, wb // 16))
+
+
 def preprocess(raw: bytes) -> Picture:
     """Image bytes -> the model's patch vectors. 16x16 patches over two identical frames (an image is a
     one-frame video), in spatial-merge order: block row, block column, in-block row, in-block column."""
@@ -86,9 +102,7 @@ def preprocess(raw: bytes) -> Picture:
     with Image.open(io.BytesIO(raw)) as im:
         im = im.convert("RGB")
         w, h = im.size
-        side = 32  # patch_size * spatial_merge_size
-        cap = int(os.environ.get("LOCALS_VISION_MAX_PIXELS") or MAX_PIXELS)
-        hb, wb = smart_resize(h, w, side, 65536, cap)
+        hb, wb = _resized(h, w)
         if (hb, wb) != (h, w):
             im = im.resize((wb, hb), resample=Image.BICUBIC)
         pixels = np.asarray(im, dtype=np.float32) / 127.5 - 1.0  # (h, w, 3), mean/std 0.5
@@ -188,12 +202,14 @@ def take_images(messages) -> Tuple[List[dict], List[str]]:
     return out, sources
 
 
-def load(sources: Sequence[str], local: bool = True) -> List[Picture]:
-    """Each source decoded and preprocessed; a bad one is the request's error (a ValueError naming it)."""
+def load(sources: Sequence[str], local: bool = True, count: bool = False) -> List[Picture]:
+    """Each source decoded and preprocessed (with ``count``, only measured); a bad one is the request's error
+    (a ValueError naming it)."""
     out = []
     for i, src in enumerate(sources):
         try:
-            out.append(preprocess(decode(src, local=local)))
+            raw = decode(src, local=local)
+            out.append(measure(raw) if count else preprocess(raw))
         except Exception as e:  # noqa: BLE001  # PIL's UnidentifiedImageError, a URL that does not answer
             raise ValueError(f"image {i + 1} of {len(sources)}: {e}") from None
     return out

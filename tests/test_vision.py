@@ -111,6 +111,19 @@ def test_take_images_and_decode():
         vision.load(["data:image/png;base64,bm90IGFuIGltYWdl"])
 
 
+@pytest.mark.parametrize("size", [(64, 48), (640, 480), (2000, 1000), (37, 2100)])
+def test_a_count_reads_only_the_images_size(size, monkeypatch):
+    """count_tokens: the token count of a full load, from the image's header (two 4032x3024 JPEGs: 250 ms a count
+    before, 30 ms after, docs/measurements/vision/results/count_tokens.txt)."""
+    url = "data:image/png;base64," + base64.b64encode(_png(*size)).decode()
+    full = vision.load([url])
+    monkeypatch.setattr(vision, "preprocess", lambda raw: pytest.fail("a count preprocesses no image"))
+    counted = vision.load([url], count=True)
+    assert counted[0].grid == full[0].grid and counted[0].patches is None
+    with pytest.raises(ValueError, match="image 1 of 1"):
+        vision.load(["data:image/png;base64,bm90IGFuIGltYWdl"], count=True)
+
+
 def test_an_image_is_joined_to_its_text_as_qwens_template_joins_it():
     """Qwen's template writes ``AAA<|vision_start|><|image_pad|><|vision_end|>BBB``: a newline after the image,
     which the model was not trained with, changed Qwen3-VL-8B's answers on two of six test pictures. Text parts

@@ -46,3 +46,17 @@ PYTHONPATH=before <repo>/.venv/bin/python prefill_memory.py <model> pics/invoice
 `prefill_memory.py` prints which `locals` it imported. `mem` puts about 36,000 tokens of text before the picture;
 `exact` asks the invoice question with `prefill_step` 256, so a chunk ends inside the image. Each process sends the
 request twice, and both peaks were the same to the MB on every side. The output is `results/prefill_memory.txt`.
+
+## `count_tokens` with images (`docs/server/README.md`, Images)
+
+```
+git archive c358179 locals | tar -x -C before                   # the code before the change
+PYTHONPATH=before <repo>/.venv/bin/python unload_serve.py 8399 &  # from a folder outside the repo: the
+<repo>/.venv/bin/python count_tokens_client.py 8399             # repo as the current folder wins over PYTHONPATH
+PYTHONPATH=<repo> <repo>/.venv/bin/python unload_serve.py 8399 &  # after; each server stopped by its PID from $!
+<repo>/.venv/bin/python count_tokens_client.py 8399
+```
+
+The client sends two 4032x3024 JPEGs (made in the script) to `count_tokens` seven times, then once to
+`/v1/messages`, and prints both token counts and the median time. Each side was run twice, each by a fresh server.
+The output is `results/count_tokens.txt`.

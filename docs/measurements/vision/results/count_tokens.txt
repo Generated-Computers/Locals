@@ -1,0 +1,14 @@
+# M2 Max (32 GB), 2026-10-31, mlx-community/Qwen3.5-4B-MLX-4bit, unload_serve.py; before = commit c358179 (git archive), after = the change after it
+# each side served twice, by a fresh server; 'serving' is the locals package the server imported
+[old1] ready after 6s, pid 80247
+2 images 4032x3024 JPEG: count_tokens=1963 messages.usage.input_tokens=1963 count median 254 ms (min 248, max 301, n=7)
+serving <scratch>/old/locals/__init__.py
+[old2] ready after 5s, pid 80479
+2 images 4032x3024 JPEG: count_tokens=1963 messages.usage.input_tokens=1963 count median 250 ms (min 245, max 297, n=7)
+serving <scratch>/old/locals/__init__.py
+[new1] ready after 5s, pid 80671
+2 images 4032x3024 JPEG: count_tokens=1963 messages.usage.input_tokens=1963 count median 31 ms (min 29, max 65, n=7)
+serving /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py
+[new2] ready after 6s, pid 80800
+2 images 4032x3024 JPEG: count_tokens=1963 messages.usage.input_tokens=1963 count median 29 ms (min 28, max 69, n=7)
+serving /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py

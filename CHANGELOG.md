@@ -14,7 +14,8 @@
   six, and Qwen3.5-4B 4-bit on four (`docs/measurements/vision/`). With a newline after the image, as before, Qwen3-VL-8B
   gave them on four and Qwen3.5-4B on three. Images are resized to at most 1M pixels
   (`LOCALS_VISION_MAX_PIXELS`), 1,024 tokens. Qwen3.5-4B 4-bit and Qwen3-VL-8B 4-bit read the customer's name and the invoice number from a 900x500 invoice of four
-  lines (`tests/test_vision_model.py`).
+  lines (`tests/test_vision_model.py`). `count_tokens` reads only each image's size: with two 4032x3024 JPEGs it
+  answered in 29 to 31 ms where it took 250 to 254 ms when it decoded them, with the same 1,963 tokens (Qwen3.5-4B 4-bit, M2 Max).
 - **Unloading the model, the server still running.** `POST /unload` (as mlx-vlm's server), Ollama's `keep_alive: 0`,
   and `locals unload` give the model's memory back; the next request loads it again. On an M2 Max, Qwen3.5-4B's
   server went from 4,308 MB to 290 MB, and the next image request loaded it again in 3.3 s.

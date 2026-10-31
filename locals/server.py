@@ -374,7 +374,8 @@ class Server:
         return out
 
     # -- one chat completion ------------------------------------------------------------------
-    def prepare(self, req: dict) -> dict:
+    def prepare(self, req: dict, count: bool = False) -> dict:
+        """(``count``: for a token count only, so each image is measured, not preprocessed.)"""
         if os.environ.get("LOCALS_DEBUG"):
             _dump_request(req)
         _unsupported(req)
@@ -415,7 +416,7 @@ class Server:
             # each image as the template's <|image_pad|> (expanded below to the image's own tokens); a model or engine
             # that reads text only gets the note IMAGE_NOTE in its place, from convert_messages
             raw_msgs, sources = vision.take_images(raw_msgs)
-            pictures = vision.load(sources, local=self.bind_host in _LOOPBACK)
+            pictures = vision.load(sources, local=self.bind_host in _LOOPBACK, count=count)
         msgs = oai.convert_messages(raw_msgs, raw=self._raw if fmt.replay_raw else None)
         tools = oai.tool_specs(req.get("tools"))
         _volatile_to_end(msgs, tools)
@@ -1648,7 +1649,7 @@ def make_handler(server: Server, ollama_root: bool = False):
                 return fail("messages: at least one message is required", 400)
             try:
                 chat = apis.anthropic_to_chat(req, server.chat_model(name))
-                p = server.prepare(chat)
+                p = server.prepare(chat, count=path.endswith("/count_tokens"))
             except ContextTooLong as e:  # Anthropic's wording: Claude Code compacts the conversation on it
                 server.log(f"rejected: {e}")
                 return fail(f"prompt is too long: {e.n} tokens > {e.limit} maximum", 400)

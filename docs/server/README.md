@@ -448,7 +448,8 @@ template refuses it there).
    sides a multiple of 32 pixels, at most `LOCALS_VISION_MAX_PIXELS` pixels (default 1,048,576), as the model was
    trained (transformers' `smart_resize`), and cuts it into 16x16-pixel patches in the order the tower's 2x2 merger
    reads them. This is numpy, not MLX: an MLX array made in the HTTP thread belongs to that thread's stream, and the
-   engine's thread cannot compute it.
+   engine's thread cannot compute it. For `count_tokens` it reads only each image's size from its header
+   (`vision.measure`): the same count, with no pixels decoded.
 2. The prompt is tokenized whole (not from a remembered token stream) and each `<|image_pad|>` is expanded to the
    image's token count, one per 32x32 pixels (`vision.expand`). The context limit counts those tokens.
 3. The job carries the images and where their tokens sit (`Job.pictures`, `Job.spans`). It becomes a batch request
