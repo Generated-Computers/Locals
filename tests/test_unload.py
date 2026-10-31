@@ -149,7 +149,77 @@ def test_a_text_completion_prepared_before_an_unload_goes_to_the_model_loaded_ag
     srv._active = {}
     srv.service = lambda engine: New()
     monkeypatch.setattr(Server, "_account", lambda self, p, job, n, calls, t0, stopped=None: {"completion_tokens": n})
-    p = {"engine": "locals", "svc": Old(), "prompt": [1, 2], "max_tokens": 5, "model": "m", "stop": []}
+    p = {"engine": "locals", "svc": Old(), "tok": New.tokenizer, "prompt": [1, 2], "max_tokens": 5, "model": "m",
+         "stop": []}
     out = srv.text_completion({}, p)
     assert out["choices"][0]["text"] == "hi"
     assert isinstance(p["svc"], New)
+
+
+class _Tok:
+    """The tokenizer a request was prepared with."""
+
+    decode = staticmethod(lambda ids: "hi" * len(ids))
+    _tokenizer = type("HF", (), {"encode": staticmethod(lambda s, add_special_tokens=False: [ord(c) for c in s])})()
+
+
+class _Unloaded:
+    """A service an unload has finished: its tokenizer is dropped, and it takes no request."""
+
+    tokenizer = None
+
+    def submit(self, *a, **k):
+        raise Unloaded("the model was unloaded")
+
+
+class _Loaded:
+    tokenizer = _Tok()
+
+    def __init__(self):
+        self.prompts = []
+
+    def submit(self, prompt, on_token=None, **k):
+        self.prompts.append(list(prompt))
+        job = Job(prompt=list(prompt))
+        job.tokens, job.text, job.finish = [7], "hi", "stop"
+        on_token([7])
+        job._event.set()
+        return job
+
+
+def _chat_server(new):
+    srv = Server.__new__(Server)
+    srv._active = {"k": {}}
+    srv.service = lambda engine: new
+    return srv
+
+
+def _chat():
+    return {"engine": "locals", "svc": _Unloaded(), "tok": _Tok(), "prompt": [1, 2], "max_tokens": 5, "schema": None,
+            "regex": None, "thinking": False, "tools": [], "stop": [], "ignore_eos": True, "text": "q"}
+
+
+def test_a_chat_reply_prepared_before_an_unload_is_written_by_the_model_loaded_again():
+    """Its tokens are read with the tokenizer the request was prepared with, not the unloaded service's (None)."""
+    new = _Loaded()
+    srv, out = _chat_server(new), []
+    job, text, _ = srv._decode(_chat(), "", out.append, None, "k")
+    assert text == "hi" and job.finish == "stop"
+    assert new.prompts == [[1, 2]]
+
+
+def test_a_chat_reply_after_a_prefix_prepared_before_an_unload_is_written_by_the_model_loaded_again():
+    new = _Loaded()
+    srv, out = _chat_server(new), []
+    _, text, _ = srv._decode(_chat(), "ab", out.append, None, "k")
+    assert text == "abhi"
+    assert new.prompts == [[1, 2, ord("a"), ord("b")]]
+
+
+def test_a_reply_cancelled_by_an_unload_is_remembered_with_the_tokenizer_it_was_prepared_with():
+    srv = Server.__new__(Server)
+    srv._lock, srv._raw, srv._streams = threading.Lock(), {}, {"locals": []}
+    job = Job(prompt=[1, 2])
+    job.tokens, job.text, job.finish = [7], "hi", "cancelled"
+    srv._remember("locals", _chat(), job, [], prefix="ab")
+    assert srv._streams["locals"] == [{"text": "qabhi", "ids": [1, 2, ord("a"), ord("b"), 7]}]

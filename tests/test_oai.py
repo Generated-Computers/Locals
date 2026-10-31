@@ -271,7 +271,7 @@ def _scripted_server(monkeypatch, fmt, replies, thinking):
     tools = [{"type": "function", "function": {"name": n, "parameters": {"type": "object", "properties": {k: {"type": "string"}},
                                                                              "required": [k]}}} for n, k in (("bash", "command"), ("read", "filePath"))]
     tools = oai.tool_specs(tools)
-    p = {"engine": "locals", "thinking": thinking, "svc": svc, "prompt": [1, 2, 3], "checkpoints": [], "text": "<prompt>", "tools": tools,
+    p = {"engine": "locals", "thinking": thinking, "svc": svc, "tok": svc.tokenizer, "prompt": [1, 2, 3], "checkpoints": [], "text": "<prompt>", "tools": tools,
          "schema": None, "regex": oai.reply_regex(tools, "auto", thinking, fmt=fmt, preamble=False), "max_tokens": 4096,
          "model": "locals/x", "fmt": fmt, "tool_choice": "auto", "stop": [], "temp": None}
     prev = {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function",
@@ -454,7 +454,7 @@ def test_ignore_eos_and_usage_chunk_on_text_completions():
                                                  "forced_tokens", "passes", "decode_s", "tool_calls")}}
     for include in (True, False):
         svc = Svc()
-        p = {"engine": "locals", "svc": svc, "prompt": [1, 2, 3], "max_tokens": 5, "model": "locals/m", "stop": [],
+        p = {"engine": "locals", "svc": svc, "tok": svc.tokenizer, "prompt": [1, 2, 3], "max_tokens": 5, "model": "locals/m", "stop": [],
              "temp": 0.0, "ignore_eos": True, "include_usage": include, "regex": None, "schema": None}
         out = []
         srv.text_completion({}, p, write=out.append)
@@ -513,7 +513,8 @@ def test_keepalive_is_a_blank_line(monkeypatch):
     srv._active, srv.log = {}, (lambda s: None)
     srv.per_engine = {"locals": {k: 0 for k in ("requests", "prompt_tokens", "cached_tokens", "completion_tokens",
                                                  "forced_tokens", "passes", "decode_s", "tool_calls")}}
-    p = {"engine": "locals", "svc": Svc(), "prompt": [1], "max_tokens": 2, "model": "locals/m", "stop": [], "temp": 0.0,
+    svc = Svc()
+    p = {"engine": "locals", "svc": svc, "tok": svc.tokenizer, "prompt": [1], "max_tokens": 2, "model": "locals/m", "stop": [], "temp": 0.0,
          "ignore_eos": False, "include_usage": True, "regex": None, "schema": None}
     out = []
     srv.text_completion({}, p, write=out.append)

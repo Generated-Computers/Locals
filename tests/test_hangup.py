@@ -53,7 +53,7 @@ def _server():
 
 
 def _p(svc, **kw):
-    return {"engine": "locals", "svc": svc, "prompt": [1, 2, 3], "max_tokens": 2000, "model": "locals/m", "stop": [],
+    return {"engine": "locals", "svc": svc, "tok": svc.tokenizer, "prompt": [1, 2, 3], "max_tokens": 2000, "model": "locals/m", "stop": [],
             "temp": 0.0, "ignore_eos": False, "include_usage": False, "regex": None, "schema": None, "tools": None,
             "fmt": None, "thinking": False, "checkpoints": None, **kw}
 

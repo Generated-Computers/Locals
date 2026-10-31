@@ -280,7 +280,8 @@ what it printed. One command starts Locals and connects the tool to it:
 
 `locals launch list` shows every tool it can open. Locals keeps running in the
 background after you close a tool: `locals status` shows what it is doing and
-`locals stop` stops it.
+`locals stop` stops it. `locals unload` gives the model's memory back and keeps
+Locals running: the next request loads the model again.
 
 <sub>The logos belong to their projects and are shown only to say that Locals
 works with these tools.</sub>
@@ -513,6 +514,14 @@ Send many requests at once, from threads or with an async client, and Locals
 answers them together; that is where it is fastest. Streaming, answers in a
 fixed JSON format, function calls, the Ollama library and plain `curl` all work
 as well; the [examples](https://github.com/Generated-Computers/Locals/blob/main/examples/README.md) show each of them.
+
+To give the model's memory back while your program is idle, send `POST /unload`
+(the same request as mlx-vlm's server), or Ollama's `keep_alive: 0`. Locals keeps
+running, and the next request loads the model again:
+
+```bash
+curl -X POST http://127.0.0.1:8321/unload
+```
 
 ## Privacy and safety
 

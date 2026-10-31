@@ -508,7 +508,8 @@ takes (an image prompt's prefill stops at its next chunk): let go before, the mo
 and a request loading it again, which waits for the engine's load lock that `unload` holds, would make a second
 copy. The answer is `{"status": "unloaded", "engines": [...], "freed_mb", "gpu_active_mb"}` (`"not loaded"` when
 nothing was). A request prepared while the model was unloaded, a chat or a `/v1/completions` one, is submitted to the
-model loaded again (`service.Unloaded`, `Server._retry_unloaded`).
+model loaded again (`service.Unloaded`, `Server._retry_unloaded`). Its reply is read with the tokenizer it was
+prepared with (`p["tok"]`), never with its service's: an unload drops that one.
 
 Measured on an M2 Max (32 GB) with Qwen3.5-4B 4-bit (`mlx-community/Qwen3.5-4B-MLX-4bit`), one server process
 (`Server` and `serve`, as `locals serve` starts them), after two image requests: the process's `phys_footprint`

@@ -502,7 +502,7 @@ class Server:
             regex = oai.not_containing(*oai.THINK_TAGS)
         cps = (self._checkpoints(tok, msgs, tpl_tools, think_kw, text, prompt)
                if engine == "locals" and not pictures and self._needs_checkpoints(engine) else [])
-        return {"engine": engine, "thinking": thinking, "svc": svc, "prompt": prompt, "checkpoints": cps, "text": text,
+        return {"engine": engine, "thinking": thinking, "svc": svc, "tok": tok, "prompt": prompt, "checkpoints": cps, "text": text,
                 "pictures": pictures, "spans": spans,
                 "tools": tools, "schema": schema, "regex": regex, "output_regex": output_regex, "max_tokens": max_tokens,
                 "model": model, "fmt": fmt, "sealed": sealed, "seps": seps,
@@ -551,7 +551,7 @@ class Server:
         asked = _whole(req.get("max_tokens"), "max_tokens")
         max_tokens = asked if asked is not None and asked > 0 else 256
         max_tokens = max(1, min(max_tokens, self.max_tokens, limit - len(ids)))
-        return {"engine": engine, "thinking": False, "svc": svc, "prompt": ids, "checkpoints": [], "text": None, "tools": [],
+        return {"engine": engine, "thinking": False, "svc": svc, "tok": tok, "prompt": ids, "checkpoints": [], "text": None, "tools": [],
                 "schema": None, "regex": None, "max_tokens": max_tokens, "model": model, "fmt": None, "stop": _stops(req),
                 "temp": _temperature(req), "sampling": _sampling(req), "ignore_eos": bool(req.get("ignore_eos")),
                 "include_usage": _include_usage(req)}
@@ -578,7 +578,7 @@ class Server:
         job = self._retry_unloaded(p, lambda svc: svc.submit(
             p["prompt"], max_tokens=p["max_tokens"], on_token=q.put, temp=p.get("temp"),
             ignore_eos=p.get("ignore_eos", False), **p.get("sampling", {})))
-        tok = p["svc"].tokenizer  # (after the submit: a model loaded again has its own)
+        tok = p["tok"]
         toks: List[int] = []
         sent, stopped, last_emit = 0, None, time.perf_counter()
         last_probe = last_emit
@@ -853,7 +853,7 @@ class Server:
         exact = exact and raw == prefix + job.text and not p.get("pictures")  # (its ids: each image's tokens expanded)
         ids = list(p["prompt"])
         if prefix:
-            ids += list(p["svc"].tokenizer._tokenizer.encode(prefix, add_special_tokens=False))
+            ids += list(p["tok"]._tokenizer.encode(prefix, add_special_tokens=False))
         with self._lock:
             for c in calls:
                 self._raw[oai.id_key(c["id"])] = raw
@@ -1155,7 +1155,7 @@ class Server:
         """Generate one reply after ``prefix`` (assistant text already
         written), streaming deltas through ``chunk``; returns (job, reply
         text including the prefix, why it was stopped early or None)."""
-        tok = p["svc"].tokenizer
+        tok = p["tok"]  # (not p["svc"]'s: an unload drops it, and the model loaded again takes the request)
         prompt = list(p["prompt"])
         if prefix:
             prompt += list(tok._tokenizer.encode(prefix, add_special_tokens=False))
