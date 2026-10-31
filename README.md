@@ -15,8 +15,8 @@
 > simply no room for it. The second was to let Locals read images itself. Qwen3.5 and Qwen3-VL already carry a
 > vision tower in their checkpoint files, but Locals loads its models through mlx-lm, which reads only the text part,
 > so the images had nowhere to go. This fork rebuilds that tower from the same files and loads it with the first
-> image. It is still one model in memory, and text requests run on the same fast engine as before. While an image
-> request runs, it has the engine to itself.
+> image. It is still one model in memory, and text requests run on the same fast engine as before. An image
+> request's prompt is read on its own, and then its reply is written in the same batch as the text replies.
 >
 > A big thank-you to the authors of [Locals](https://github.com/Generated-Computers/Locals): the speed that made
 > this worth doing is all their work.
