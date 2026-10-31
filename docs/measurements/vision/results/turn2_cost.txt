@@ -1,0 +1,26 @@
+# M2 Max (32 GB), 2026-10-31; old = commit 6b290df (git archive, on PYTHONPATH, run from outside the repo), new = the change after it
+# each line one process; per run the prompt cache is emptied, turn 1 asked (40 tokens), turn 2 timed (max_tokens 1); medians of runs 2-4
+[old]
+locals from <scratch>/old/locals/__init__.py
+mlx-community/Qwen3.5-4B-MLX-4bit: turn 2 of 5728 tokens, cached [0, 0, 0], median 7041 ms (runs 2-4: 7041, 7026, 7068), first token ['Both', 'Both', 'Both']
+[new]
+locals from /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py
+mlx-community/Qwen3.5-4B-MLX-4bit: turn 2 of 5728 tokens, cached [5709, 5709, 5709], median 409 ms (runs 2-4: 399, 416, 409), first token ['Both', 'Both', 'Both']
+[old]
+locals from <scratch>/old/locals/__init__.py
+mlx-community/Qwen3.5-4B-MLX-4bit: turn 2 of 5728 tokens, cached [0, 0, 0], median 7052 ms (runs 2-4: 7052, 7066, 6987), first token ['Both', 'Both', 'Both']
+[new]
+locals from /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py
+mlx-community/Qwen3.5-4B-MLX-4bit: turn 2 of 5728 tokens, cached [5709, 5709, 5709], median 410 ms (runs 2-4: 409, 412, 410), first token ['Both', 'Both', 'Both']
+[old]
+locals from <scratch>/old/locals/__init__.py
+mlx-community/Qwen3-VL-8B-Instruct-4bit: turn 2 of 5567 tokens, cached [0, 0, 0], median 12560 ms (runs 2-4: 12487, 12572, 12560), first token ['Neither', 'Neither', 'Neither']
+[new]
+locals from /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py
+mlx-community/Qwen3-VL-8B-Instruct-4bit: turn 2 of 5567 tokens, cached [5553, 5553, 5553], median 478 ms (runs 2-4: 491, 476, 478), first token ['Neither', 'Neither', 'Neither']
+[old]
+locals from <scratch>/old/locals/__init__.py
+mlx-community/Qwen3-VL-8B-Instruct-4bit: turn 2 of 5567 tokens, cached [0, 0, 0], median 12442 ms (runs 2-4: 12424, 12446, 12442), first token ['Neither', 'Neither', 'Neither']
+[new]
+locals from /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py
+mlx-community/Qwen3-VL-8B-Instruct-4bit: turn 2 of 5567 tokens, cached [5553, 5553, 5553], median 486 ms (runs 2-4: 480, 486, 508), first token ['Neither', 'Neither', 'Neither']

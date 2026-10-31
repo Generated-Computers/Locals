@@ -4,7 +4,9 @@
 >
 > - **Images, for Qwen3.5 and Qwen3-VL.** Send images as your API does it: OpenAI `image_url` parts, Anthropic
 >   `image` blocks, or Ollama's `images`. Upstream Locals puts the note "this model reads text only" in place of
->   each image. Other models still get that note. See [Images](docs/server/README.md#images).
+>   each image. Other models still get that note. A follow-up turn about the same images starts from the prompt
+>   cache: on an M2 Max, a second turn of about 5,700 tokens about two pictures took 0.41 s instead of 7.0 s
+>   (Qwen3.5-4B 4-bit). See [Images](docs/server/README.md#images).
 > - **Unload the model, the server still running.** `POST /unload` (the same request as mlx-vlm's server),
 >   Ollama's `keep_alive: 0`, or `locals unload` frees the model's memory. The next request loads it again.
 >   In upstream Locals, only stopping the server frees it. See [Unloading the model](docs/server/README.md#unloading-the-model).

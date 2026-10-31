@@ -1,7 +1,8 @@
 """An image prompt's reply decodes in the batch engine (HybridBatchEngine.serve with Request.embed and rope_delta)
 and gives the tokens of the synchronous engine's image path (Engine.generate_embedded, M-RoPE through the reply), alone
 and beside text rows; the text rows give what they give without it. A small random Qwen3 with features made up for its
-image tokens: no checkpoint, no tower."""
+image tokens: no tower. And its prompt-cache entries, under the image's id, make a follow-up turn read only what it
+adds."""
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -17,6 +18,7 @@ N = 12  # reply tokens
 SPANS = [(5, 21)]  # 16 image tokens (an 8x8 patch grid) over 4 positions
 PROMPT = [3, 17, 40, 41, 42] + [99] * 16 + [60, 61, 62, 63, 64, 65, 66, 67, 68]
 TEXT = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+KEY = 77  # the image's id in prompt-cache keys (vision.Picture.key)
 
 
 class _Tok:
@@ -42,30 +44,34 @@ def model():
     return m
 
 
-def _image(model):
+def _image(model, prompt=PROMPT):
     feats = [mx.random.normal((16, 64), key=mx.random.key(2))]
-    pos = vision.positions(SPANS, [(8, 8)], len(PROMPT))
+    pos = vision.positions(SPANS, [(8, 8)], len(prompt))
     return feats, pos
 
 
-def _reference(model):
-    feats, pos = _image(model)
+def _reference(model, prompt=PROMPT):
+    feats, pos = _image(model, prompt)
     full = vision.tail(pos, N + 8)[:, None, :]
-    res = Engine(model, _Tok()).generate_embedded(PROMPT, SPANS, feats, full, _Free(), max_tokens=N,
+    res = Engine(model, _Tok()).generate_embedded(prompt, SPANS, feats, full, _Free(), max_tokens=N,
                                                   section=(6, 5, 5))
     return res.tokens
 
 
-def _image_request(model, read):
-    feats, pos = _image(model)
+def _image_request(model, read, prompt=PROMPT, key=KEY, checkpoints=None):
+    """``read`` gets each part of the prompt read, (start, stop)."""
+    feats, pos = _image(model, prompt)
     eng = Engine(model, _Tok())
-    r = Request(list(PROMPT), _Free(), N)
+    r = Request(list(prompt), _Free(), N)
 
-    def embed(cache):
-        read.append(len(PROMPT))
-        return None if eng.prefill_embedded(cache, PROMPT, SPANS, feats, pos[:, None, :], section=(6, 5, 5)) else "cancelled"
+    def embed(cache, start, stop):
+        read.append((start, stop))
+        return None if eng.prefill_embedded(cache, prompt, SPANS, feats, pos[:, None, :], section=(6, 5, 5),
+                                            start=start, stop=stop) else "cancelled"
 
     r.embed, r.rope_delta = embed, vision.rope_delta(pos)
+    r.key = vision.cache_key(prompt, SPANS, [vision.Picture(None, (8, 8), key=key)])
+    r.checkpoints = checkpoints
     return r
 
 
@@ -93,7 +99,7 @@ def test_the_image_row_decodes_as_the_synchronous_image_path(model):
     assert len(want) == N  # (a long enough reply to tell positions apart)
     read = []
     (r,) = _serve(model, [[_image_request(model, read)]])
-    assert read == [len(PROMPT)] and r.finish == "length"
+    assert read == [(0, len(PROMPT) - 1)] and r.finish == "length"
     assert r.out == want
 
 
@@ -111,17 +117,49 @@ def test_beside_text_rows_the_image_row_and_the_text_rows_keep_their_tokens(mode
         assert text.out == alone.out
 
 
-def test_an_image_row_leaves_no_prompt_cache_entry(model):
-    """Its pad tokens name no prompt: an entry under them would be the next image's of the same size."""
+def test_an_image_rows_prompt_cache_entry_is_under_its_key(model):
+    """Not under its pad tokens: an entry there would be the next image's of the same size."""
     lru = chain_cache(max_size=8, max_bytes=1 << 30)
-    _serve(model, [[_image_request(model, []), Request(list(TEXT), _Free(), N)]], lru=lru)
+    (r,) = _serve(model, [[_image_request(model, [])]], lru=lru)
     assert len(lru) == 1
-    assert lru.fetch_nearest_cache("locals", list(PROMPT[:-1]))[0] is None
+    assert lru.fetch_nearest_cache("locals", list(PROMPT[:-1]))[1] == list(PROMPT[5:-1])  # (the text before it only)
+    c, rest = lru.fetch_nearest_cache("locals", r.key + r.out)  # (the row holds the reply fed back, all N tokens)
+    assert c is not None and rest == []
+
+
+def test_the_next_turn_reads_only_what_follows_the_cached_turn(model):
+    """A follow-up (the turn, its reply, a question) starts from the turn's cached row: the tower and the prompt read
+    only the new tokens, and its reply is the one of the whole prompt read cold."""
+    lru = chain_cache(max_size=8, max_bytes=1 << 30)
+    (first,) = _serve(model, [[_image_request(model, [])]], lru=lru)
+    follow = PROMPT + first.out + [70, 71, 72]
+    read = []
+    (r,) = _serve(model, [[_image_request(model, read, follow)]], lru=lru)
+    assert read == [(len(PROMPT) + N, len(follow) - 1)] and r.cached_tokens == len(PROMPT) + N
+    assert r.out == _reference(model, follow)
+    # another image of the same size: only the text before the image is reused
+    read = []
+    (other,) = _serve(model, [[_image_request(model, read, follow, key=KEY + 1)]], lru=lru)
+    assert read == [(SPANS[0][0], len(follow) - 1)] and other.cached_tokens == SPANS[0][0]
+
+
+def test_an_image_rows_checkpoints_are_kept_under_its_key(model):
+    """Read in parts, the prompt stops at each checkpoint (past the image here), whose copy goes into the prompt cache
+    under the key; and its reply is the one of the prompt read in one part."""
+    lru = chain_cache(max_size=8, max_bytes=1 << 30)
+    kept = []
+    insert = lru.insert_cache
+    lru.insert_cache = lambda m, tokens, c, cache_type="assistant": kept.append((list(tokens), cache_type)) or insert(
+        m, tokens, c, cache_type=cache_type)  # (a KV-only model's row then replaces it: it can be cut back)
+    read = []
+    (r,) = _serve(model, [[_image_request(model, read, checkpoints=[(24, "user")])]], lru=lru)
+    assert read == [(0, 24), (24, len(PROMPT) - 1)] and r.out == _reference(model)
+    assert kept == [(r.key[:24], "user"), (r.key[:-1] + r.fed, "assistant")]
 
 
 def test_an_image_prompt_that_ends_at_its_read_is_finished_there(model):
     r = _image_request(model, [])
-    r.embed = lambda cache: "error: RuntimeError: out of memory"
+    r.embed = lambda cache, start, stop: "error: RuntimeError: out of memory"
     text = Request(list(TEXT), _Free(), N)
     done = _serve(model, [[r, text]])
     assert r.finish == "error: RuntimeError: out of memory" and r.out == []

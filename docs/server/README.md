@@ -463,11 +463,21 @@ template refuses it there).
    wait for a text prompt read at an admission. The reply then decodes in the batch with the other rows. Past the
    prompt, a token's three positions are one number, its index plus a fixed delta (`vision.rope_delta`, negative:
    an image takes fewer positions than tokens), and M-RoPE with equal positions is the layer's own RoPE. So the row's
-   rope offset in the batch cache is shifted by the delta (`hybrid_batch._shift_rope`), and nothing else changes. An
-   image row leaves no prompt-cache entry: its pad tokens would name the next image of the same size too. The
+   rope offset in the batch cache is shifted by the delta (`hybrid_batch._shift_rope`), and nothing else changes. The
    synchronous engine's image path (`Engine.generate_embedded`, M-RoPE through the reply) is kept as the reference
    the batch rows are tested against (`tests/test_vision_batch.py`). Before, an image request ran alone on it to the
    end of its reply, and waited for an idle batch to start.
+
+   The prompt cache keeps image prompts under a key of their own (`vision.cache_key`): the prompt's tokens, with each
+   image's pad tokens as minus the image's id, a hash of its bytes and its patch grid (`Picture.key`). Under the pad
+   tokens themselves, an entry would be the next image's of the same size too. A follow-up turn about the same images
+   starts from the turn before it and reads only what it adds (`Request.embed(cache, start, stop)`): the tower runs
+   on the images past the cached prefix only. Checkpoints are found on the prompt with one placeholder per image and
+   moved past the image tokens before them (`vision.expanded_at`); the prompt is read in parts between them
+   (`HybridBatchEngine._embed`), so Qwen3.5, whose recurrent layers cannot be cut back, continues from its reply
+   checkpoint. On an M2 Max a second turn of 5,728 tokens about two pictures took 0.41 s where it took 7.0 s
+   (Qwen3.5-4B 4-bit), and one of 5,567 tokens 0.48 s where it took 12.5 s (Qwen3-VL-8B 4-bit)
+   (`docs/measurements/vision/results/turn2_cost.txt`).
 4. Qwen3-VL's tower also merges the output of its blocks 8, 16 and 24 (`deepstack_visual_indexes`). While the prompt
    is read, the text model adds those to the image's tokens after its layers 0, 1 and 2 (`vision.deepstack`, as
    transformers' `_deepstack_process`). Qwen3.5 has none.

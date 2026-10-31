@@ -446,10 +446,10 @@ class Server:
         text += prefill  # the reply goes on from it
         spans = []
         if pictures:  # (not from a remembered stream: those hold the image tokens expanded)
-            prompt, spans = vision.expand(list(tok._tokenizer.encode(text, add_special_tokens=False)),
-                                          tok.convert_tokens_to_ids(vision.IMAGE_TOKEN), pictures)
+            placed = list(tok._tokenizer.encode(text, add_special_tokens=False))  # (one placeholder per image)
+            prompt, spans = vision.expand(placed, tok.convert_tokens_to_ids(vision.IMAGE_TOKEN), pictures)
         else:
-            prompt = self._tokens_for(engine, tok, text)
+            prompt = placed = self._tokens_for(engine, tok, text)
         limit = self.limit_for(engine)
         if len(prompt) >= limit:
             raise ContextTooLong(f"This model's maximum context length is {limit} tokens. However, your messages "
@@ -501,8 +501,8 @@ class Server:
                 output_regex = out if tc == "auto" else None
         if sealed and regex is None and schema is None:  # (no tools: free text, without the tags)
             regex = oai.not_containing(*oai.THINK_TAGS)
-        cps = (self._checkpoints(tok, msgs, tpl_tools, think_kw, text, prompt)
-               if engine == "locals" and not pictures and self._needs_checkpoints(engine) else [])
+        cps = (self._checkpoints(tok, msgs, tpl_tools, think_kw, text, placed, spans)
+               if engine == "locals" and self._needs_checkpoints(engine) else [])
         return {"engine": engine, "thinking": thinking, "svc": svc, "tok": tok, "prompt": prompt, "checkpoints": cps, "text": text,
                 "pictures": pictures, "spans": spans,
                 "tools": tools, "schema": schema, "regex": regex, "output_regex": output_regex, "max_tokens": max_tokens,
@@ -756,7 +756,8 @@ class Server:
             return -1
         return sys_text.rfind("\n", 0, i) + 1 if i > 0 else 0
 
-    def _checkpoints(self, tok, msgs: List[dict], tools, think_kw: dict, text: str, prompt: List[int]) -> List[tuple]:
+    def _checkpoints(self, tok, msgs: List[dict], tools, think_kw: dict, text: str, prompt: List[int],
+                     spans=()) -> List[tuple]:
         """Where to snapshot the prompt's cache on the way (a recurrent GDN
         cache cannot be cut back afterwards, so only stored prefixes are reused):
 
@@ -770,7 +771,10 @@ class Server:
 
         Both are found by rendering the conversation up to that point with the
         model's own template; a position is used only where that text is a
-        prefix of the prompt and tokenizes to the prompt's own first tokens."""
+        prefix of the prompt and tokenizes to the prompt's own first tokens.
+        With images, ``prompt`` has one placeholder per image and ``spans``
+        says where their tokens sit once expanded: the positions returned are
+        in the expanded prompt."""
         out = []
         if not msgs:
             return out
@@ -824,15 +828,18 @@ class Server:
             cands.append((a[:n], "reply"))
         except Exception:  # noqa: BLE001
             pass
+        from .vision import expanded_at
+
         for t, kind in cands:
-            if len(t) < 2048 or not text.startswith(t):  # a short prefix is cheaper to prefill again
+            if (len(t) < 2048 and not spans) or not text.startswith(t):  # a short prefix is cheaper to prefill again
                 continue
             ids = hf.encode(t, add_special_tokens=False)
             # where the prompt's tokens and these part (the last token may merge with what follows): one pass
             # (backing off a token at a time cost seconds on a 60k-token prompt)
             n = next((k for k, (a, b) in enumerate(zip(prompt, ids)) if a != b), min(len(prompt), len(ids)))
-            if n >= 1024 and n < len(prompt) and all(n != m for m, _ in out):
-                out.append((n, kind))
+            at = expanded_at(n, spans)  # (an image's tokens count: its prefix costs the tower and their prefill)
+            if at >= 1024 and n < len(prompt) and all(at != m for m, _ in out):
+                out.append((at, kind))
         return out
 
     def _tokens_for(self, engine: str, tok, text: str) -> List[int]:

@@ -213,6 +213,11 @@ def _replies(r) -> int:
     return sum(1 for _, kind in getattr(r, "checkpoints", None) or [] if kind == "reply")
 
 
+def _key(r) -> Optional[List[int]]:
+    """A request's prompt-cache key: its prompt, or an image prompt's ``key`` (None: an image prompt not cached)."""
+    return r.prompt if r.embed is None else r.key
+
+
 def _keep_reply_state(r, n: int, cache) -> None:
     """At a "reply" checkpoint (``n``: where the reply starts as the next request renders the
     conversation): keep a copy of the cache layers that cannot be cut back to a prefix (recurrent
@@ -1520,19 +1525,38 @@ class HybridBatchEngine(BatchEngine):
             return self._walk[5][id(c.wc)] + c.q if isinstance(c, WalkController) else 0
         return self._tab[3][id(c.c)] + c.q if isinstance(c, LocalsController) else 0
 
-    def _embed(self, new: List[Request], found, on_done):
-        """Read the image prompts among ``new`` (``Request.embed``), each alone into a cache of its own: the rows
-        wait meanwhile, as for a prompt read at an admission. Returns ``new`` and ``found`` without the ones that
-        ended there (a client gone, the request's error), finished through ``on_done``."""
+    def _embed(self, new: List[Request], found, on_done, lru, lru_key):
+        """Read the image prompts among ``new`` (``Request.embed``), each alone into its cached prefix (``found``) or
+        a cache of its own, stopping at each checkpoint to keep a copy there: the rows wait meanwhile, as for a
+        prompt read at an admission. Returns ``new`` and ``found`` without the ones that ended there (a client gone,
+        the request's error), finished through ``on_done``."""
         keep_new, keep_found = [], []
         for r, f in zip(new, found):
             if r.embed is not None:
-                c0 = make_prompt_cache(self.model)
+                c0, rest = f
+                end = len(r.prompt) - 1
+                at = end - len(rest)
+                c0 = c0 if c0 is not None else make_prompt_cache(self.model)
+                stops = {}
+                for cp, kind in sorted(getattr(r, "checkpoints", None) or []):
+                    if kind == "reply" and lru is not None and cp == at and at > 0:
+                        self._keep_reply(r, cp, c0)  # the cached prefix ends there (a regenerated reply)
+                    elif lru is not None and r.key is not None and at < cp < end:
+                        stops.setdefault(cp, kind)  # one snapshot per position, the first kind in sorted order
                 tp = time.perf_counter()
-                end = r.embed(c0)
+                why = None
+                for cp, kind in sorted(stops.items()) + [(end, None)]:
+                    why = r.embed(c0, at, cp)
+                    if why is not None:
+                        break
+                    at = cp
+                    if kind == "reply":
+                        self._keep_reply(r, cp, c0)
+                    elif kind is not None and self._room_for_copy(lru, len(r.prompt)):
+                        lru.insert_cache(lru_key, list(r.key[:cp]), copy.deepcopy(c0), cache_type=kind)
                 self.counters["prefill_s"] += time.perf_counter() - tp
-                if end is not None:
-                    r.finish = end
+                if why is not None:
+                    r.finish = why
                     if on_done is not None:
                         on_done(r)
                     continue
@@ -1590,7 +1614,8 @@ class HybridBatchEngine(BatchEngine):
             return got
 
         def retire(i, r):
-            if lru is not None and r.embed is None:  # (an image row's pad tokens name no prompt: see _source)
+            key = _key(r)  # (an image row's: its pad tokens name no image, see vision.cache_key)
+            if lru is not None and key is not None:
                 if len(rows) == 1:
                     # the only row: the batch cache is dropped next, so its buffers move to the
                     # prompt cache as they are (a copy would hold the KV cache twice at once)
@@ -1608,12 +1633,12 @@ class HybridBatchEngine(BatchEngine):
                 mx.eval([c.state for c in row])
                 reply = _reply_entry(r, row)
                 if reply is None:
-                    lru.insert_cache(lru_key, list(r.prompt[:-1]) + r.fed, row)
+                    lru.insert_cache(lru_key, list(key[:-1]) + r.fed, row)
                 else:
                     # where the next request continues instead of the whole row: the template writes the reply
                     # differently from the open turn, so the row is no prefix of the next request; and its KV,
                     # views of the row's buffers, would count twice in the prompt cache's bytes next to the row
-                    lru.insert_cache(lru_key, list(r.prompt[: r.reply_state[0]]), reply, cache_type="assistant")
+                    lru.insert_cache(lru_key, list(key[: r.reply_state[0]]), reply, cache_type="assistant")
                 r.reply_state = None
             if on_done is not None:
                 on_done(r)
@@ -1764,13 +1789,13 @@ class HybridBatchEngine(BatchEngine):
                     starts = []
                     found = []
                     for r in new:  # every cached prefix first: making room for one must not drop the next one's
-                        if r.embed is not None:  # an image prompt: read below, from no cached prefix
-                            r.cached_tokens = 0
-                            found.append((None, list(r.prompt[:-1])))
-                            continue
-                        if lru is not None and self.disk is not None:  # a system prompt saved before a restart
-                            self.disk.restore(lru, lru_key, list(r.prompt[:-1]))
-                        c0, rest = (lru.fetch_nearest_cache(lru_key, list(r.prompt[:-1])) if lru is not None else (None, list(r.prompt[:-1])))
+                        key = _key(r)  # (an image prompt: read below, from its cached prefix if any)
+                        if lru is not None and key is not None and self.disk is not None:  # a system prompt saved before a restart
+                            self.disk.restore(lru, lru_key, list(key[:-1]))
+                        c0, rest = (lru.fetch_nearest_cache(lru_key, list(key[:-1])) if lru is not None and key is not None
+                                    else (None, list(r.prompt[:-1])))
+                        if c0 is not None and r.embed is not None:
+                            rest = list(r.prompt[len(r.prompt) - 1 - len(rest):-1])  # (the prompt's tokens, not the key's)
                         r.cached_tokens = len(r.prompt) - 1 - len(rest) if c0 is not None else 0
                         found.append((c0, rest))
                     # each request's cached prefix is a lazy copy, made during the prefill: the whole prompt counts
@@ -1780,7 +1805,7 @@ class HybridBatchEngine(BatchEngine):
                                     self._merge_tokens(rows, [len(e["r"].prompt) for e in filling] + [len(r.prompt) for r in new]),
                                     rows=len(new))
                     if any(r.embed is not None for r in new):
-                        new, found = self._embed(new, found, on_done)
+                        new, found = self._embed(new, found, on_done, lru, lru_key)
                     if self._mix_ok and rows and sum(len(rest) for _, rest in found) > self.mix_chunk:
                         # the running rows decode on while these prompts are prefilled, a chunk in each step. Prompts
                         # that fit one pass are prefilled together at once instead: the rows would get a single token
@@ -1802,7 +1827,7 @@ class HybridBatchEngine(BatchEngine):
                     for r, (c0, rest) in zip(new, found):
                         if left_all():
                             break
-                        done = r.cached_tokens
+                        done = len(r.prompt) - 1 - len(rest)  # (an image prompt's: read to its end by _embed)
                         for cp, kind in sorted(getattr(r, "checkpoints", None) or []):
                             if kind == "reply" and lru is not None and c0 is not None and cp == done:
                                 self._keep_reply(r, cp, c0)  # the cached prefix ends there (a regenerated reply)

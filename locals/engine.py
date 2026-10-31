@@ -1313,29 +1313,31 @@ class Engine:
         return GenResult(out, text, len(prompt), t1 - t0, t2 - t1, passes, forced_n, sizes, finish)
 
     def prefill_embedded(self, cache, prompt: List[int], spans, features, positions, deepstack=(), section=(11, 11, 10),
-                         cancel=None) -> bool:
-        """Read ``prompt[:-1]`` into ``cache`` with its input embeddings given (``generate_embedded`` says what the
-        arguments hold; ``positions`` needs to cover only the prompt), with M-RoPE for this call only. The last prompt
-        token is left for the first decode step, as ``_prefill`` leaves it. False if ``cancel()``, asked between
-        chunks, stopped it."""
+                         cancel=None, start: int = 0, stop: Optional[int] = None) -> bool:
+        """Read ``prompt[start:stop]`` (default ``prompt[:-1]``) into ``cache``, which holds ``prompt[:start]``, with its
+        input embeddings given (``generate_embedded`` says what the arguments hold; ``positions`` needs to cover only
+        the prompt; ``spans`` and ``features`` only the images from ``start`` on), with M-RoPE for this call only. The
+        last prompt token is left for the first decode step, as ``_prefill`` leaves it. False if ``cancel()``, asked
+        between chunks, stopped it."""
         from .vision import mrope
 
         with mrope(self.model, positions, section):
-            return self._read_embedded(cache, prompt, spans, features, deepstack, cancel)
+            return self._read_embedded(cache, prompt, spans, features, deepstack, cancel, start,
+                                       len(prompt) - 1 if stop is None else stop)
 
-    def _read_embedded(self, cache, prompt, spans, features, deepstack, cancel) -> bool:
+    def _read_embedded(self, cache, prompt, spans, features, deepstack, cancel, start: int = 0, stop: Optional[int] = None) -> bool:
         from .vision import deepstack as deepstack_layers, embed_chunk
 
         body = text_model(self.model).model
         # each chunk's embeddings made for it, as _prefill's: the whole prompt's (and, for Qwen3-VL, one as long
         # per deepstack level) were kept next to the KV cache until the prompt was read
-        i = 0
-        n_all = len(prompt)
+        i = start
+        stop = len(prompt) - 1 if stop is None else stop
         with deepstack_layers(self.model, spans, deepstack) as state:  # (the last token, fed by the decode, is text)
-            while n_all - i > 1:
+            while stop - i > 0:
                 if cancel is not None and cancel():
                     return False  # (between chunks: an unload or a client gone)
-                n = min(self.prefill_step, n_all - 1 - i)
+                n = min(self.prefill_step, stop - i)
                 state["at"] = i
                 body(None, cache, input_embeddings=embed_chunk(body, prompt, spans, features, i, n))
                 mx.eval([c.state for c in cache])

@@ -40,11 +40,12 @@ MAX_PIXELS = 1 << 20
 
 @dataclass
 class Picture:
-    """One image, preprocessed: ``patches`` (patches, 2*16*16*3) pixels (numpy, float32; None when only counted)
-    and the (h, w) patch grid."""
+    """One image, preprocessed: ``patches`` (patches, 2*16*16*3) pixels (numpy, float32; None when only counted),
+    the (h, w) patch grid, and ``key``, the image's id in prompt-cache keys (``cache_key``: None, not cached)."""
 
     patches: object
     grid: Tuple[int, int]
+    key: Optional[int] = None
 
     @property
     def tokens(self) -> int:
@@ -83,6 +84,14 @@ def _resized(h: int, w: int) -> Tuple[int, int]:
     return smart_resize(h, w, 32, 65536, cap)  # 32: patch_size * spatial_merge_size
 
 
+def _key(raw: bytes, grid: Tuple[int, int]) -> int:
+    import hashlib
+
+    h = hashlib.blake2b(raw, digest_size=7)
+    h.update(repr(grid).encode())  # (the same bytes resized to another grid are other features)
+    return int.from_bytes(h.digest(), "big") + 1
+
+
 def measure(raw: bytes) -> Picture:
     """The image's grid from its header alone, no patches: for a token count (PIL reads no pixels for ``size``)."""
     from PIL import Image
@@ -90,7 +99,8 @@ def measure(raw: bytes) -> Picture:
     with Image.open(io.BytesIO(raw)) as im:
         w, h = im.size
     hb, wb = _resized(h, w)
-    return Picture(None, (hb // 16, wb // 16))
+    grid = (hb // 16, wb // 16)
+    return Picture(None, grid, _key(raw, grid))
 
 
 def preprocess(raw: bytes) -> Picture:
@@ -112,7 +122,7 @@ def preprocess(raw: bytes) -> Picture:
     hp, wp = hb // 16, wb // 16
     x = pixels.reshape(hp // 2, 2, 16, wp // 2, 2, 16, 3).transpose(0, 3, 1, 4, 2, 5, 6).reshape(-1, 1, 16, 16, 3)
     x = np.ascontiguousarray(np.broadcast_to(x, (x.shape[0], 2, 16, 16, 3)).reshape(x.shape[0], -1))
-    return Picture(x, (hp, wp))
+    return Picture(x, (hp, wp), _key(raw, (hp, wp)))
 
 
 NO_FILES = "this server reads no files of its own for an image: send the image's bytes (a data URL)"
@@ -240,6 +250,28 @@ def expand(ids: Sequence[int], image_token_id: int, pictures: Sequence[Picture])
         raise ValueError(f"the prompt has more image placeholders than the {len(pictures)} image(s) sent")
     out.extend(rest)
     return out, spans
+
+
+def expanded_at(n: int, spans: Sequence[Tuple[int, int]]) -> int:
+    """Where position ``n`` of the prompt before ``expand`` (one placeholder per image) is in the expanded one,
+    whose images' tokens sit at ``spans``."""
+    shift = 0
+    for start, end in spans:
+        if start - shift < n:
+            shift += end - start - 1
+    return n + shift
+
+
+def cache_key(prompt: Sequence[int], spans: Sequence[Tuple[int, int]], pictures: Sequence[Picture]) -> Optional[List[int]]:
+    """The prompt's key in the prompt cache: its tokens, with each image's pad tokens as minus the image's ``key``
+    (no token id is negative). Under the pad tokens themselves an entry would be the next image's of the same size
+    too. None if an image has no key."""
+    if any(p.key is None for p in pictures):
+        return None
+    out = list(prompt)
+    for (start, end), pic in zip(spans, pictures):
+        out[start:end] = [-pic.key] * (end - start)
+    return out
 
 
 def positions(spans: Sequence[Tuple[int, int]], grids: Sequence[Tuple[int, int]], total: int) -> mx.array:

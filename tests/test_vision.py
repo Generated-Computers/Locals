@@ -13,11 +13,11 @@ from locals import apis, oai, vision
 from locals import engine as eng
 
 
-def _png(w: int, h: int) -> bytes:
+def _png(w: int, h: int, colour=(10, 200, 30)) -> bytes:
     from PIL import Image
 
     buf = io.BytesIO()
-    Image.new("RGB", (w, h), (10, 200, 30)).save(buf, "PNG")
+    Image.new("RGB", (w, h), colour).save(buf, "PNG")
     return buf.getvalue()
 
 
@@ -109,6 +109,24 @@ def test_take_images_and_decode():
     assert pics[0].tokens == pics[0].grid[0] * pics[0].grid[1] // 4
     with pytest.raises(ValueError, match="image 1 of 1"):
         vision.load(["data:image/png;base64,bm90IGFuIGltYWdl"])
+
+
+def test_an_images_cache_key_is_its_bytes_and_size():
+    """Two images of one size have the same pad tokens: in the prompt cache's key each is the image's own id, from
+    its bytes and its grid (the same bytes resized to another grid are other features)."""
+    one, two = (base64.b64encode(_png(64, 48)).decode(), base64.b64encode(_png(64, 48, (1, 2, 3))).decode())
+    a, a2, b = vision.load(["data:image/png;base64," + one, "data:image/png;base64," + one, "data:image/png;base64," + two])
+    assert a.key == a2.key and a.key != b.key and a.key > 0 and a.grid == b.grid
+    assert vision.load(["data:image/png;base64," + one], count=True)[0].key == a.key
+    assert vision.cache_key([5, 9, 9, 9, 6], [(1, 4)], [a]) == [5, -a.key, -a.key, -a.key, 6]
+    assert vision.cache_key([5, 9, 6], [(1, 2)], [vision.Picture(None, (2, 2))]) is None  # (no key: not cached)
+
+
+def test_a_checkpoint_moves_past_the_image_tokens_before_it():
+    """Checkpoints are found on the prompt with one placeholder per image; each then moves by the tokens the images
+    before it expanded to."""
+    spans = [(1, 5), (7, 23)]  # [a, P, b, c, P, d] with P expanded to 4 and 16 tokens
+    assert [vision.expanded_at(n, spans) for n in range(7)] == [0, 1, 5, 6, 7, 23, 24]
 
 
 @pytest.mark.parametrize("size", [(64, 48), (640, 480), (2000, 1000), (37, 2100)])
@@ -389,7 +407,7 @@ def _batch_service(monkeypatch, compiled):
 def _image_job(**kw):
     from locals.service import Job
 
-    pic = vision.Picture(None, (4, 4))  # (a 4x4 patch grid: 4 tokens over 2 positions)
+    pic = vision.Picture(None, (4, 4), key=7)  # (a 4x4 patch grid: 4 tokens over 2 positions)
     return Job(prompt=[1, 9, 9, 9, 9, 2, 3], pictures=[pic], spans=[(1, 5)], **kw)
 
 
@@ -410,8 +428,9 @@ def test_an_image_job_joins_the_batch_while_rows_decode(monkeypatch):
     assert reqs[0].embed is not None and reqs[1].embed is None
     # 1 text + the image's 2 positions + 2 text: the reply's first token is at 5, its index 7, so the rope goes -2
     assert reqs[0].rope_delta == -2 and reqs[1].rope_delta == 0
-    # (its pad tokens name no prompt: no prompt-cache checkpoint under them)
-    assert getattr(reqs[0], "checkpoints", None) is None and reqs[1].checkpoints == [(1, "system")]
+    # its prompt-cache key: each image's pad tokens as the image's own id, so its checkpoints are kept too
+    assert reqs[0].key == [1, -7, -7, -7, -7, 2, 3] and reqs[1].key is None
+    assert reqs[0].checkpoints == [(3, "system")] and reqs[1].checkpoints == [(1, "system")]
 
 
 def test_an_image_prompt_read_reads_the_tower_then_the_prompt(monkeypatch):
@@ -423,10 +442,36 @@ def test_an_image_prompt_read_reads_the_tower_then_the_prompt(monkeypatch):
     job = _image_job()
     svc._q.put(job)
     (r,) = svc._source(rt, block=False)
-    assert r.embed("cache") is None
-    cache, (prompt, spans, features, pos, deep, section) = read[0]
+    assert r.embed("cache", 0, 6) is None
+    (cache, (prompt, spans, features, pos, deep, section)), = read
     assert cache == "cache" and prompt == job.prompt and spans == [(1, 5)] and features == "features"
     assert pos.shape == (3, 1, 7) and deep == ["deep"] and section == (11, 11, 10)
+
+
+def test_an_image_prompt_read_from_a_cached_prefix_runs_the_tower_on_the_images_after_it(monkeypatch):
+    """From a cached prefix (``start``), and in parts between checkpoints, the tower reads only the images the
+    prefix does not hold, once, and each part of the prompt is read from where the last one stopped."""
+    svc, rt = _batch_service(monkeypatch, [])
+    towered, read = [], []
+    enc = type("Enc", (), {"encode": lambda self, pics: towered.append([p.key for p in pics]) or (["f2"], [["d2"]]),
+                           "mrope_section": (11, 11, 10)})()
+    svc.vision = lambda: enc
+    rt.engine = type("E", (), {"prefill_embedded": lambda self, cache, prompt, spans, features, pos, deep, section, **k:
+                               read.append((spans, features, deep, k["start"], k["stop"])) or True})()
+    a, b = vision.Picture(None, (4, 4), key=1), vision.Picture(None, (4, 4), key=2)
+    from locals.service import Job
+
+    job = Job(prompt=[1, 9, 9, 9, 9, 2, 9, 9, 9, 9, 3, 4], pictures=[a, b], spans=[(1, 5), (6, 10)])
+    svc._q.put(job)
+    (r,) = svc._source(rt, block=False)
+    assert r.embed("cache", 5, 8) is None and r.embed("cache", 8, 11) is None
+    assert towered == [[2]]
+    assert read == [([(6, 10)], ["f2"], [["d2"]], 5, 8), ([(6, 10)], ["f2"], [["d2"]], 8, 11)]
+    # a prefix that holds every image: no tower at all
+    svc._q.put(job)
+    (r,) = svc._source(rt, block=False)
+    assert r.embed("cache", 10, 11) is None and towered == [[2]]
+    assert read[-1] == ([], [], [], 10, 11)
 
 
 def test_an_image_request_that_fails_ends_only_itself(monkeypatch):
@@ -442,10 +487,10 @@ def test_an_image_request_that_fails_ends_only_itself(monkeypatch):
     rt.engine = type("E", (), {"prefill_embedded": staticmethod(oom)})()
     svc._q.put(_image_job())
     (r,) = svc._source(rt, block=False)
-    end = r.embed(None)
+    end = r.embed(None, 0, 6)
     assert end.startswith("error: RuntimeError") and "allocate" in end
     svc.vision = lambda: None  # (a checkpoint without the tower's weights)
-    assert r.embed(None) == "error: m reads text only"
+    assert r.embed(None, 0, 6) == "error: m reads text only"
 
 
 def test_an_image_job_cancelled_while_it_waits_does_not_run_the_tower(monkeypatch):
@@ -456,7 +501,7 @@ def test_an_image_job_cancelled_while_it_waits_does_not_run_the_tower(monkeypatc
     svc._q.put(job)
     (r,) = svc._source(rt, block=False)
     job.cancel()
-    assert r.embed(None) == "cancelled" and read == []
+    assert r.embed(None, 0, 6) == "cancelled" and read == []
 
 
 def test_an_image_rows_rope_past_the_prompt_is_mrope():

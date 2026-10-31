@@ -1,0 +1,18 @@
+# M2 Max (32 GB), 2026-10-31, commit 6b290df; each line one process; median of runs 2-4 of Engine.prefill_embedded
+# stock = vision.mrope made a no-op (the layers' own rope: wrong positions, same shapes)
+locals from /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py mode mrope
+mlx-community/Qwen3.5-4B-MLX-4bit mrope: prompt 5666 tokens, prefill_embedded median 5417 ms (runs 2-4: 5398, 5431, 5417), layers on MRoPE: 8
+locals from /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py mode stock
+mlx-community/Qwen3.5-4B-MLX-4bit stock: prompt 5666 tokens, prefill_embedded median 5413 ms (runs 2-4: 5414, 5413, 5386), layers on MRoPE: 0
+locals from /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py mode mrope
+mlx-community/Qwen3.5-4B-MLX-4bit mrope: prompt 5666 tokens, prefill_embedded median 5413 ms (runs 2-4: 5442, 5413, 5392), layers on MRoPE: 8
+locals from /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py mode stock
+mlx-community/Qwen3.5-4B-MLX-4bit stock: prompt 5666 tokens, prefill_embedded median 5421 ms (runs 2-4: 5414, 5421, 5421), layers on MRoPE: 0
+locals from /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py mode mrope
+mlx-community/Qwen3-VL-8B-Instruct-4bit mrope: prompt 5512 tokens, prefill_embedded median 10505 ms (runs 2-4: 10533, 10493, 10505), layers on MRoPE: 36
+locals from /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py mode stock
+mlx-community/Qwen3-VL-8B-Instruct-4bit stock: prompt 5512 tokens, prefill_embedded median 10441 ms (runs 2-4: 10441, 10430, 10442), layers on MRoPE: 0
+locals from /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py mode mrope
+mlx-community/Qwen3-VL-8B-Instruct-4bit mrope: prompt 5512 tokens, prefill_embedded median 10499 ms (runs 2-4: 10508, 10490, 10499), layers on MRoPE: 36
+locals from /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py mode stock
+mlx-community/Qwen3-VL-8B-Instruct-4bit stock: prompt 5512 tokens, prefill_embedded median 10397 ms (runs 2-4: 10397, 10427, 10386), layers on MRoPE: 0

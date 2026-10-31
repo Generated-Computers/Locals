@@ -60,3 +60,25 @@ PYTHONPATH=<repo> <repo>/.venv/bin/python unload_serve.py 8399 &  # after; each 
 The client sends two 4032x3024 JPEGs (made in the script) to `count_tokens` seven times, then once to
 `/v1/messages`, and prints both token counts and the median time. Each side was run twice, each by a fresh server.
 The output is `results/count_tokens.txt`.
+
+## Where an image request's time goes (`results/stage_cost.txt`, `results/mrope_cost.txt`)
+
+```
+<repo>/.venv/bin/python stage_cost.py <model>                   # vision.load, the tower, the prompt read, the request
+<repo>/.venv/bin/python mrope_cost.py <model> mrope             # the prompt read with M-RoPE
+<repo>/.venv/bin/python mrope_cost.py <model> stock             # with the layers' own rope: the floor for any M-RoPE speedup
+```
+
+Both send four requests of about 5,600 tokens (text, a 1280x800 and a 1024x1024 picture) and print the medians of
+runs 2 to 4. Each line of the results is one process; each model and mode was run twice.
+
+## A follow-up turn about the same images (`results/turn2_cost.txt`)
+
+```
+git archive 6b290df locals | tar -x -C before                   # the code before image prompts were cached
+PYTHONPATH=before <repo>/.venv/bin/python turn2_cost.py <model>   # from a folder outside the repo (see above)
+PYTHONPATH=<repo> <repo>/.venv/bin/python turn2_cost.py <model>
+```
+
+The same request as above is the first turn; the second adds its answer and a question. Each run empties the prompt
+cache, asks the first turn, and times the second (one token). Each side was run twice per model.

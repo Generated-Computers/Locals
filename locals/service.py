@@ -395,13 +395,15 @@ class BatchService:
                 continue
             r = Request(job.prompt, ctl, job.max_tokens)
             if job.pictures:
+                from .vision import cache_key
+
                 try:
                     r.embed, r.rope_delta = self._embedder(rt, job)
                 except Exception as e:  # noqa: BLE001  # (spans that do not fit the prompt)
                     self._finish(job, [], f"error: {_reason(e)}")
                     continue
-            else:  # (an image prompt's pad tokens name no prompt: a cache entry under them would be another image's)
-                r.checkpoints = job.checkpoints
+                r.key = cache_key(job.prompt, job.spans, job.pictures)  # (its pad tokens name no image)
+            r.checkpoints = job.checkpoints
             r.on_token = job.on_token
             r.temp, r.top_p, r.top_k, r.seed = job.temp, job.top_p, job.top_k, job.seed
             job._req = r  # before reading job.cancelled: a cancel in between sets r.cancel itself
@@ -439,27 +441,36 @@ class BatchService:
         return None
 
     def _embedder(self, rt, job: Job):
-        """(embed, rope_delta) of an image job's batch request. ``embed(cache)``, called by the batch engine on its
-        thread when it admits the request: the vision tower's features go where the prompt's ``<|image_pad|>`` tokens
-        are, and the prompt is read with every token at its own M-RoPE (t, h, w) position. None when read, else how
-        the job ends: one request's fault (the tower's weights, an image it cannot read, a prefill out of memory) is
-        that request's error, not the batch's."""
+        """(embed, rope_delta) of an image job's batch request. ``embed(cache, start, stop)``, called by the batch
+        engine on its thread when it admits the request, reads ``prompt[start:stop]`` (``cache`` holds the prompt up to
+        ``start``: a cached prefix, a part read before a checkpoint): the vision tower's features go where the prompt's
+        ``<|image_pad|>`` tokens are, and the prompt is read with every token at its own M-RoPE (t, h, w) position. The
+        tower reads the images from the first ``start`` on, once. None when read, else how the job ends: one request's
+        fault (the tower's weights, an image it cannot read, a prefill out of memory) is that request's error, not the
+        batch's."""
         from .vision import positions, rope_delta
 
         pos = positions(job.spans, [p.grid for p in job.pictures], len(job.prompt))  # (3, prompt)
+        read_from = {}  # spans, features, deepstack and M-RoPE section of the images not in the cached prefix
 
-        def embed(cache):
+        def embed(cache, start, stop):
             if job.cancelled:  # (its client left while it waited: the tower need not read its images)
                 return "cancelled"
             try:
                 enc = self.vision()
                 if enc is None:
                     raise ValueError(f"{self.model_id} reads text only")
-                features, deep = enc.encode(job.pictures)
-                read = rt.engine.prefill_embedded(cache, job.prompt, job.spans, features, pos[:, None, :], deep,
-                                                  enc.mrope_section, cancel=lambda: job.cancelled)
+                if not read_from:
+                    keep = [k for k, (_, end) in enumerate(job.spans) if end > start]
+                    features, deep = enc.encode([job.pictures[k] for k in keep]) if keep else ([], [])
+                    read_from.update(spans=[job.spans[k] for k in keep], features=features, deep=deep)
+                read = rt.engine.prefill_embedded(cache, job.prompt, read_from["spans"], read_from["features"],
+                                                  pos[:, None, :], read_from["deep"], enc.mrope_section,
+                                                  cancel=lambda: job.cancelled, start=start, stop=stop)
             except Exception as e:  # noqa: BLE001
                 return f"error: {_reason(e)}"
+            if stop >= len(job.prompt) - 1:
+                read_from.clear()  # (the features, read: not kept while the reply decodes)
             return None if read else "cancelled"
 
         return embed, rope_delta(pos)

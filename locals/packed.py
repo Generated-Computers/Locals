@@ -267,11 +267,13 @@ class Request:
     top_k: Optional[int] = None
     seed: Optional[int] = None
     draws: int = 0  # random draws made for it so far (a seeded request's next key)
-    # an image prompt (locals/hybrid_batch.py): embed(cache) reads prompt[:-1] into a fresh cache, alone, when the
-    # batch admits it, and returns None, or how the request ends ("cancelled", "error: ..."); rope_delta shifts
-    # its rope offset as it decodes (vision.rope_delta)
-    embed: Optional[Callable[[list], Optional[str]]] = None
+    # an image prompt (locals/hybrid_batch.py): embed(cache, start, stop) reads prompt[start:stop] into a cache that
+    # holds prompt[:start], alone, when the batch admits it, and returns None, or how the request ends ("cancelled",
+    # "error: ..."); rope_delta shifts its rope offset as it decodes (vision.rope_delta); key is its prompt-cache key
+    # (vision.cache_key: None, it is not cached)
+    embed: Optional[Callable[[list, int, int], Optional[str]]] = None
     rope_delta: int = 0
+    key: Optional[List[int]] = None
 
 
 @dataclass

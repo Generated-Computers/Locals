@@ -91,3 +91,23 @@ def test_an_image_request_finishes_while_a_long_text_reply_runs(server):
     assert "7319" in answer
     assert ended_first, "the image reply waited for the text reply to end"
     assert text["reply"]["choices"][0]["finish_reason"] == "length"
+
+
+def test_the_next_turn_about_an_image_reads_only_what_it_adds(server):
+    """A follow-up question on the same image starts from the turn before it in the prompt cache (Qwen3.5's from the
+    reply checkpoint: its recurrent layers cannot be cut back), and answers as when its whole prompt is read."""
+    url = _invoice()
+    first = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}},
+                                          {"type": "text", "text": "What is the customer's name?"}]}]
+    req = {"model": "locals", "max_tokens": 60, "temperature": 0, "messages": first}
+    answer = server.complete(req)["choices"][0]["message"]["content"]
+    follow = dict(req, messages=first + [{"role": "assistant", "content": answer},
+                                         {"role": "user", "content": "And what is the total?"}])
+    warm = server.complete(follow)
+    image_tokens = 900 * 500 // (32 * 32)  # (about: smart_resize rounds each side)
+    assert warm["usage"]["prompt_tokens_details"]["cached_tokens"] > image_tokens
+    server.service("locals")._lru.trim_to(n_sequences=0)
+    cold = server.complete(follow)
+    assert cold["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+    assert warm["choices"][0]["message"]["content"] == cold["choices"][0]["message"]["content"]
+    assert "1,284.50" in cold["choices"][0]["message"]["content"]
