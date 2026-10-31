@@ -78,6 +78,16 @@ When a prompt is prefilled in mixed passes next to decoding rows (`mix_chunk`, `
 
 **Qwen3.5 with thinking off.** Its template writes the think block of an assistant turn only while the turn is the current one, and drops it from every earlier reply once the user writes again. So at each new user message, the conversation stopped being a prefix of what was cached at the previous turn's first reply: all of that turn's tool calls and results were read again (in an OpenCode session, 1,100 tokens after the first turn, 1,950 after the second, growing with the session). `_render` therefore renders with a variant of such a template (`_stable_template`: the condition `loop.index0 > ns.last_query_index` also holds for a reply without reasoning), so the empty block stays where the reply was generated after it. Replies with reasoning are written as the template writes them. The next turn's first request is then a continuation of the last one: 5,646 of its 5,673 tokens came from the cache, where 4,534 did before. `LOCALS_KEEP_THINK=0` turns the variant off.
 
+**Templates with a `preserve_thinking` switch, thinking on.** LFM3's template (and LFM2.5's) drops a reply's reasoning
+once a newer user message exists, and has a switch to keep it, off by default. Claude Code asks for thinking, and the
+text it sends next to its tool results (its reminders) is a user message after them: every request rendered every
+earlier reply without its reasoning, the `reply` position fell inside `<think></think>`, which the open prompt (ending
+`<think>`) does not have, and each step read the conversation again from the first reply (13,775 of about 30,000
+tokens cached, a 10 s wait a step; the rename task ran past 15 minutes). With thinking on, `prepare` turns the switch on
+unless the client set it, so each reply stays as it was written and the next request continues the last one: the same
+task in 86 s, 95% of its prompt tokens from the cache. Qwen3.8's template keeps reasoning unless told not to; with
+thinking off there is no reasoning to keep.
+
 **The position.** The `reply` candidate ends where the two renderings differ: where the reply's content starts in the next request's rendering. The open prompt continues past that point (for example, with the empty think block), which is why the position falls inside the prompt. A template that writes both turns the same way gives a position at the prompt's end. The `n < len(prompt)` rule drops it, and the finished row is then a prefix of the next request as it stands.
 
 **What is kept.** The copy is small, so `_room_for_copy` is not consulted:

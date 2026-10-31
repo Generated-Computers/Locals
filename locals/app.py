@@ -20,7 +20,8 @@
   locals menubar. Each has --help.
 
 Models (--model): qwen (Qwen3.5-4B, the default from 16 GB of memory; Qwen3.5-2B below), qwen3.5-2b,
-gemma (Gemma 4 E4B), lfm (LFM2.5-2.6B), minicpm (MiniCPM5-2B), or any mlx-lm model id or local path;
+gemma (Gemma 4 E4B), lfm (LFM2.5-2.6B), lfm3 (LFM3-1.7B), minicpm (MiniCPM5-2B), or any mlx-lm model id
+or local path;
 the last one used is remembered.
 """
 
@@ -556,7 +557,9 @@ def model_thinks(model: str) -> bool:
         from mlx_lm.utils import load_tokenizer
 
         from . import formats
+        from .models import register
 
+        register()  # (LFM3: transformers would ask whether to run Liquid's code)
         return formats.offers_thinking(load_tokenizer(model))
     except Exception:
         return True
@@ -571,7 +574,9 @@ def default_agent(model: str) -> str:
         from mlx_lm.utils import load_tokenizer
 
         from . import formats
+        from .models import register
 
+        register()  # (LFM3: transformers would ask whether to run Liquid's code)
         return "orchestrator" if formats.detect(load_tokenizer(model)).name == "qwen_xml" else "coder"
     except Exception:
         return "orchestrator"

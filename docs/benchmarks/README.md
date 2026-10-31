@@ -528,6 +528,8 @@ that ask for them. The same seeded request alone gives the same reply.
 
 ## 11. Recursive's Flint (M4 Pro, 24 GB)
 
+On an M5 Pro (24 GB), through the server: [M5 Pro Flint measurements](../measurements/m5-pro-flint.md).
+
 Flint (40B, 2.5B active per token: 256 routed experts, 6 a token, and a shared expert) on a MacBook Pro with an M4
 Pro and 24 GB, the GPU's limit raised to 20 GB (`sudo sysctl iogpu.wired_limit_mb=20480`),
 `mlx-community/flint-mixed-3-4bit` (17.8 GB: experts at 3 bits), MLX 0.32.4. Three setups, each alone on the GPU
@@ -624,7 +626,55 @@ though a pass of several tokens reads each token's experts, so the time is about
 Writing time is wall time less the prompt's reading; the untyped grammar has no span of 3 tokens or more, so its
 two rows differ only by noise. The typed automaton for these six tools took 3.9 s to build, once per tool set.
 
-## 12. DiffuSpace's Clover (M4 Pro, 24 GB)
+## 12. Liquid's LFM3 (M2 Pro, 16 GB)
+
+LFM3-1.7B (`LiquidAI/LFM3-1.7B-MLX-4bit`, 1.0 GB) on the M2 Pro with 16 GB, 28 October 2026, MLX 0.32.3. No mlx-lm
+release has LFM3 yet: both engines run Locals's model code (`locals/models/lfm3.py`), mlx-lm with its own kernels and
+bfloat16, Locals with its tuned kernels and float16.
+
+**Through the server** (`locals bench --sizes 1,2,4,8,16`: 256 tokens a request, the end of text ignored; tokens per
+second all requests write together):
+
+| Requests at once | mlx-lm | Locals | Ratio |
+|---|---|---|---|
+| 1 | 143 | 153 | 1.07x |
+| 2 | 192 | 281 | 1.46x |
+| 4 | 204 | 332 | 1.63x |
+| 8 | 207 | 620 | 2.99x |
+| 16 | 370 | 864 | 2.33x |
+
+Liquid's 8-bit build runs on MLX's kernels in both engines (the tuned kernels take 4-bit layers): Locals 86, 169, 249,
+287 and 537 tokens/s at 1 to 16 requests, mlx-lm 87, 164, 228, 210 and 367.
+
+**Agents, end to end** (tests/e2e: eight agent tools on the suite's coding tasks, each tool alone; OpenCode does all
+four tasks, the others two; done = the task's own check passes):
+
+| | Thinking off | Thinking on (the default) |
+|---|---|---|
+| OpenCode (fix a bug, rename, add a feature, answer a question) | 2 of 4 | 3 of 4 |
+| Hermes, OpenClaw, Kilo, Cline, OpenHands (fix a bug, rename) | 5 of 10 | 10 of 10 |
+| Aider (fix a bug, rename) | 0 of 2 | 0 of 2 |
+| Claude Code (fix a bug, rename; it asks for thinking itself) | 2 of 2 (before `preserve_thinking`: the rename past the 15-minute limit) | 2 of 2 |
+| All | 10 of 18 | 15 of 18 |
+| Six OpenCode agents at once, each fixing the bug | 3 of 6 in 141 s | 6 of 6 in 158 s |
+
+Qwen3.5-4B does 18 of 18 on the same suite. With thinking off LFM3 reasoned in its answers ("Let me go. Actually, I
+can ..."), and most renames left the old name in some of the four files. Claude Code, which thinks, read the
+conversation again from its first reply at every step until `preserve_thinking` was turned on (55% of prompt tokens
+cached; [Prompt cache](../prompt-cache/README.md)); with it, the rename took 86 s with 95% cached.
+
+**A long request.** 245,547 tokens of filler with one fact two thirds of the way in, through the server, thinking
+off: read in 631 s (390 tokens/s; 891 tokens/s for the first 64k), the fact found, 4.9 GB of GPU memory at the peak. Only
+6 of the 24 layers keep every token's keys and values (12 KB a token). A first try was stopped 10 minutes in by macOS's
+GPU watchdog and read again from its start; a chunk dropped so is now read again where it began
+([Batch engine](../engine/README.md), "Engine errors and recovery").
+
+**Exactness.** Against Liquid's own PyTorch code (transformers 5.21) in float32, on a 759-token prompt past the
+sliding window: the same top token at every position, logits within 0.001, and the same 40 greedy tokens through a
+cache filled in two chunks. In float16 the top token is the same at 99.7% of positions, in bfloat16 at 97.4% (PyTorch's
+own bfloat16: 97.2%). Liquid's 8-bit build: 96.3%; its 4-bit build: 78.8%.
+
+## 13. DiffuSpace's Clover (M4 Pro, 24 GB)
 
 Clover-35B-A3B-Preview (35B, 3B active per token: Qwen3.6-35B-A3B's network, 256 routed experts with 8 a token and a
 shared expert, trained as a block-diffusion model) on a MacBook Pro with an M4 Pro and 24 GB, the GPU's limit raised

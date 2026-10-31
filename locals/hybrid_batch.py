@@ -112,6 +112,77 @@ def _reserve(cache, upto: int) -> None:
         del k, v
 
 
+# A prompt chunk the GPU dropped: macOS ends a Metal command buffer that holds the GPU while the display needs it
+# ("Internal Error (0000000e)", kIOGPUCommandBufferCallbackErrorImpactingInteractivity; MLX leaves it to the OS). It
+# happened 10 minutes into a 245k-token prompt on an M2 Pro while the Mac was in use, and the request was read again
+# from its start; minute-long runs of 1.4 s attention calls on an idle Mac never met it. The chunk is read again from
+# where it began instead (HybridBatchEngine._read_chunk), this many times, each after a pause and in half the tokens.
+GPU_RETRIES = 3
+RETRY_PAUSE = 0.5  # seconds before the first try again, doubling
+
+
+def _dropped(e: BaseException) -> bool:
+    return isinstance(e, RuntimeError) and "Command buffer execution failed" in str(e)
+
+
+def _held(v):
+    """``v`` as it is now: MLX's ``a += b`` and ``a[i] = b`` change the array object itself, and ``mx.array(a)``
+    keeps the value it had."""
+    if isinstance(v, mx.array):
+        return mx.array(v)
+    if isinstance(v, (list, tuple)):
+        return type(v)(_held(x) for x in v)
+    if isinstance(v, dict):
+        return {k: _held(x) for k, x in v.items()}
+    return v
+
+
+def _marks(cache):
+    """What a prompt chunk changes in each cache layer, to put back if the GPU drops the chunk; None if a layer is of
+    a kind not known here. The key and value buffers of full-attention layers are not kept (holding them, MLX would
+    copy a whole buffer at every chunk instead of writing the chunk into it): the chunk writes past their offset, so
+    the offset going back is enough if it wrote into the same buffers (_rewind checks their addresses: a buffer MLX
+    copied, to grow it or because something else held it, was copied in the dropped command buffer, maybe not at all)."""
+    from mlx_lm.models.cache import QuantizedKVCache, RotatingKVCache
+
+    from .qkv import BatchQuantizedKVCache
+
+    out = []
+    for c in cache:
+        if isinstance(c, (KVCache, BatchKVCache, QuantizedKVCache, BatchQuantizedKVCache)):
+            keep = {k: _held(v) for k, v in vars(c).items() if k not in ("keys", "values")}
+            out.append((keep, _buffers(c)))
+        elif isinstance(c, (RotatingKVCache, BatchRotatingKVCache, ArraysCache)):
+            out.append(({k: _held(v) for k, v in vars(c).items()}, None))
+        else:
+            return None
+    return out
+
+
+def _buffers(c) -> tuple:
+    """Where a full-attention layer's key and value buffers are in memory (() before it has any)."""
+    import numpy as np
+
+    arrs = [a for kv in (c.keys, c.values) for a in (kv if isinstance(kv, tuple) else (kv,)) if a is not None]
+    return tuple(np.frombuffer(memoryview(a), dtype=np.uint8, count=1).__array_interface__["data"][0] for a in arrs)
+
+
+def _rewind(cache, marks) -> bool:
+    """Each layer as ``marks`` (_marks) found it; False, and nothing changed, if that cannot be done."""
+    if marks is None:
+        return False
+    try:
+        if any(n and _buffers(c) != n for c, (_, n) in zip(cache, marks)):
+            return False
+    except Exception:  # noqa: BLE001  # (a buffer the dropped command buffer left unreadable)
+        return False
+    for c, (keep, n) in zip(cache, marks):
+        if n == ():  # no buffer before the chunk
+            c.keys = c.values = None
+        vars(c).update(_held(keep))  # (copies again: the chunk read again may change these in place, and fail too)
+    return True
+
+
 def _wrap_one(kv):
     """A single-stream KV cache as a batch-of-one cache layer, sharing its buffers."""
     b = BatchKVCache([0])
@@ -377,12 +448,14 @@ class DiskPromptCache:
             return 0
 
 
-def prefill_chunk(done: int, rows: int = 1, base: int = 2048, scores: int = PREFILL_SCORES) -> int:
-    """Tokens of the next prefill chunk after ``done`` cached positions."""
+def prefill_chunk(done: int, rows: int = 1, base: int = 2048, scores: Optional[int] = PREFILL_SCORES,
+                  tokens: int = PREFILL_TOKENS) -> int:
+    """Tokens of the next prefill chunk after ``done`` cached positions (``scores`` and ``tokens``: a model's
+    own limits, see HybridBatchEngine.__init__; ``scores`` None: no bound on a chunk's scores)."""
     c = base
-    while c > 128 and rows * c * (done + c) > scores:
+    while scores is not None and c > 128 and rows * c * (done + c) > scores:
         c //= 2
-    while c > 16 and rows * c > PREFILL_TOKENS:
+    while c > 16 and rows * c > tokens:
         c //= 2
     return c
 
@@ -461,6 +534,11 @@ class HybridBatchEngine(BatchEngine):
         self.lm = text_model(model)
         self._prefill_scores = getattr(self.lm, "prefill_scores", PREFILL_SCORES)
         self._prefill_base = getattr(self.lm, "prefill_chunk_tokens", 1024)  # a prompt's chunk where it may be longest
+        # A model may set its own prompt passes: Flint's 4-bit build with its experts in their files reads every expert
+        # of a layer for each pass over a prompt (locals/models/flint_streamed.py), whatever its length, so it takes few
+        # long passes; its attention is fused, with no score matrix for PREFILL_SCORES to bound (None).
+        self.prefill_tokens = getattr(self.lm, "prefill_tokens", None)
+        self._prefill_cap = max(PREFILL_TOKENS, self.prefill_tokens or 0)
         # GPU bytes the engine may use (0: no guard). Before a prefill, prompt-cache
         # entries are dropped if the prefill would not fit next to them.
         self.memory_limit = 0
@@ -766,11 +844,10 @@ class HybridBatchEngine(BatchEngine):
         base = next((c._idx for c in cache if isinstance(c, BatchKVCache)), 0)  # positions already in the batch cache
         i = 0
         while i < L:
-            n = prefill_chunk(done + i, len(prompts), chunk, self._prefill_scores)
+            n = prefill_chunk(done + i, len(prompts), self.prefill_tokens or chunk, self._prefill_scores, self._prefill_cap)
             a0 = mx.get_active_memory()
             _reset_peak()
-            self.lm.model(x[:, i : i + n], cache)
-            mx.eval([c.state for c in cache])
+            n = self._read_chunk(cache, lambda k: self.lm.model(x[:, i : i + k], cache), n)
             self._note_read(len(prompts) * n, mx.get_peak_memory() - a0)
             if i == 0 and n < L:
                 _reserve(cache, base + L)
@@ -783,17 +860,40 @@ class HybridBatchEngine(BatchEngine):
             mx.eval([c.state for c in cache])
         return cache
 
+    def _read_chunk(self, cache, feed, n: int) -> int:
+        """``feed(n)``: n prompt tokens through the body, into ``cache``; evaluated. Returns the tokens read: fewer if
+        the GPU dropped the chunk (GPU_RETRIES), which is then read again from where it began."""
+        marks = _marks(cache)
+        for attempt in range(GPU_RETRIES + 1):
+            try:
+                feed(n)
+                self._sync(cache)
+                return n
+            except RuntimeError as e:
+                if attempt == GPU_RETRIES or not _dropped(e) or not _rewind(cache, marks):
+                    raise
+                import sys
+
+                print(f"locals: the GPU dropped a prompt chunk ({e}); reading it again", file=sys.stderr, flush=True)
+                mx.clear_cache()
+                time.sleep(RETRY_PAUSE * 2 ** attempt)  # (the display's work first)
+                n = max(16, n // 2)
+        return n
+
+    @staticmethod
+    def _sync(cache) -> None:
+        mx.eval([c.state for c in cache])
+
     def _run(self, cache, toks: List[int], chunk: int = 2048, stop=None) -> bool:
         """Prefill ``toks`` into ``cache``. The body only, without the output
         layer: its logits (chunk x 248k) are not needed and cost ~1 GB at 2048.
         False if ``stop()`` (asked between chunks) gave it up."""
         done, i = _cached(cache), 0
         while i < len(toks):
-            n = prefill_chunk(done + i, 1, chunk, self._prefill_scores)
+            n = prefill_chunk(done + i, 1, self.prefill_tokens or chunk, self._prefill_scores, self._prefill_cap)
             a0 = mx.get_active_memory()
             _reset_peak()
-            self.lm.model(mx.array([toks[i : i + n]]), cache)
-            mx.eval([c.state for c in cache])
+            n = self._read_chunk(cache, lambda k: self.lm.model(mx.array([toks[i : i + k]]), cache), n)
             self._note_read(n, mx.get_peak_memory() - a0)
             if i == 0 and n < len(toks):
                 _reserve(cache, done + len(toks))
@@ -931,16 +1031,20 @@ class HybridBatchEngine(BatchEngine):
                 return False  # (Flint's only: Gemma's sliding-window layers keep their spans a token at a time)
             if any(type(c) not in (BatchKVCache, ArraysCache, BatchRotatingKVCache, BatchQuantizedKVCache) for c in cache):
                 return False
-            # a ring that has wrapped masks a span's keys from its index, before the ring is put back in order: a row
-            # still left-padded (it joined a longer one) would lose its oldest key in the window. Its spans go a token
-            # at a time until the padding is gone
-            if any(type(c) is BatchRotatingKVCache and c.left_padding is not None and int(mx.max(c.left_padding).item()) > 0
-                   for c in cache):
-                return False
             if self._solo_drafts_ok(cache):
                 return False
         name = type(r.controller).__name__
         return name not in ("WalkController", "PDAController")
+
+    def _solo_unpadded(self, cache) -> bool:
+        """Whether no sliding-window ring of the batch is left-padded. A ring that has wrapped masks a span's keys from
+        its index, before the ring is put back in order: a row still left-padded (it joined a longer one) would lose
+        its oldest key in the window, so its spans go a token at a time until the padding is gone. It reads the
+        padding from the GPU (one read for every layer), so it is asked only where a span is about to go in one pass,
+        never after every token (_solo_ok is: there it took 5.3 ms a token of Flint's on an M5 Pro, 35 reads that
+        waited for the step in flight, 138 tokens/s down to 89)."""
+        rings = [c.left_padding for c in cache if type(c) is BatchRotatingKVCache and c.left_padding is not None]
+        return not rings or int(mx.max(mx.concatenate([mx.reshape(p, (-1,)) for p in rings])).item()) <= 0
 
     def _solo_drafts_ok(self, cache) -> bool:
         """Drafts need the per-token recurrent states the fused Gated DeltaNet kernel records (to rewind)."""
@@ -1700,7 +1804,7 @@ class HybridBatchEngine(BatchEngine):
                     continue
                 if g is None:
                     g = mx.array([self._gstate(r) for r in rows], dtype=mx.int32)
-                if len(rows) == 1 and not queue and not filling and self._solo_ok(rows[0], cache):
+                if len(rows) == 1 and not queue and not filling and self._solo_ok(rows[0], cache) and self._solo_unpadded(cache):
                     got, x1, g1 = self._solo(rows[0], cache, xs[0], g, temp, arrive, dead)
                     if x1 is None:  # done: it is retired at the next boundary
                         cur = None
@@ -1750,8 +1854,9 @@ class HybridBatchEngine(BatchEngine):
                     self._after_commit(r, n0, dead)
             cur, g = nxt, g2
             if _SOLO and len(rows) == 1 and not queue and not filling and not dead and self._solo_ok(rows[0], cache):
-                # entering costs about a step (the pipeline drains): a forced span of 3 or more tokens, or a draft
-                solo_next = len(rows[0].pend) >= 3 or bool(self._solo_draft(rows[0], cache))
+                # entering costs about a step (the pipeline drains): a forced span of 3 or more tokens, or a draft (the
+                # padding read, which waits for the GPU, only with a span: the pipeline drains for it anyway)
+                solo_next = (len(rows[0].pend) >= 3 and self._solo_unpadded(cache)) or bool(self._solo_draft(rows[0], cache))
         mx.synchronize()
         self.active = 0
         return BatchStats(time.perf_counter() - t0, prefill_s, steps, nrows, self.tokens_out)

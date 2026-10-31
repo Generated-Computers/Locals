@@ -406,6 +406,9 @@ class BatchService:
 
         rt = Runtime.load(self.model_id, tune=os.environ.get("LOCALS_TUNE", "background"))
         self._rt = rt
+        store = getattr(rt.model, "expert_store", None)
+        if store is not None:  # (experts read from the files as tokens need them: their GPU slots are made now, so
+            store.reserve(getattr(mx, rt.dtype))  # the memory plan below counts them; made on first use, they were not)
         self.weights_bytes = mx.get_active_memory()
         self.tokenizer = rt.tokenizer
         eos = list(rt.vocab.eos_ids)

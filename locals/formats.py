@@ -1125,3 +1125,45 @@ def thinking_style(tokenizer) -> str:
     except Exception:
         return "open"
     return "always" if off.rstrip().endswith("<think>") else "open"
+
+
+def thinks_when_off(tokenizer) -> bool:
+    """Whether the model writes a think block with thinking off, so a reply must be kept from it: a template that
+    closes the block empty with no line after it (``<think></think>``, LFM3's; Qwen3.5's is ``<think>\\n\\n</think>``).
+    With thinking off LFM3-1.7B's 4-bit build opened ``<think>`` itself, or reasoned and closed ``</think>`` before
+    answering (the answer then came twice), in 4 of 11 replies; its unquantized weights in 1 of 11."""
+    if thinking_style(tokenizer) != "open":
+        return False
+    try:
+        off = tokenizer.apply_chat_template([{"role": "user", "content": "x"}], add_generation_prompt=True, enable_thinking=False,
+                                            tokenize=False)
+    except Exception:
+        return False
+    return off.endswith("<think></think>")
+
+
+def call_gap(tokenizer) -> str:
+    """The newlines a chat template writes between two calls of one turn, for Qwen3.5's calls ("\n"; LFM3's
+    "\n\n"): the grammar writes them as the template shows the model its earlier turns. "\n" when unclear."""
+    calls = [{"type": "function", "function": {"name": "f", "arguments": {"a": n}}} for n in ("1", "2")]
+    try:
+        t = tokenizer.apply_chat_template([{"role": "user", "content": "x"}, {"role": "assistant", "content": "", "tool_calls": calls}],
+                                          tokenize=False)
+        i = t.index("</tool_call>") + len("</tool_call>")
+        gap = t[i:t.index("<tool_call>", i)]
+    except Exception:
+        return "\n"
+    return gap if gap and set(gap) == {"\n"} and len(gap) <= 3 else "\n"
+
+
+def think_gap(tokenizer) -> str:
+    """The newlines a chat template writes after ``</think>``, before the answer (Qwen3.5's two, LFM3's none): the
+    grammar of a reply with thinking on closes the block as the template shows the model its earlier turns."""
+    try:
+        t = tokenizer.apply_chat_template([{"role": "user", "content": "x"}, {"role": "assistant", "content": "ANSWER",
+                                                                               "reasoning_content": "REASON"}], tokenize=False)
+        i = t.index(THINK_CLOSE, t.index("REASON")) + len(THINK_CLOSE)
+        gap = t[i:t.index("ANSWER", i)]
+    except Exception:
+        return "\n\n"
+    return gap if set(gap) <= {"\n"} and len(gap) <= 3 else "\n\n"

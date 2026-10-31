@@ -2,6 +2,37 @@
 
 ## 0.2.2 (unreleased)
 
+- **Liquid's LFM3** (`--model lfm3`: LiquidAI/LFM3-1.7B-MLX-4bit, 1.0 GB). No mlx-lm release has LFM3 yet, so its code
+  ships with Locals (`locals/models/lfm3.py`): LFM2's gated convolutions, 7 wide, and attention over a 256-token window
+  or the whole context, with a sigmoid gate on each head, q/k norms, RoPE on half of each full-attention head's
+  frequencies, and sandwich norms. It computes what Liquid's PyTorch code does (float32 logits within 0.001 on a
+  759-token prompt; the same 40 greedy tokens through the cache). On an M2 Pro with 16 GB (`locals bench`), 620
+  tokens/s for eight requests at once where mlx-lm, running the same code, gives 207; 153 for one where it gives 143.
+  Only 6 of its 24 layers keep every token's keys and values (12 KB a token): on the 16 GB M2 Pro a 245,547-token
+  request was read in 10.5 minutes, the one fact hidden in it found, with 4.9 GB of GPU memory at the peak.
+  It thinks by default, as its template does (`"reasoning_effort": "none"` or `enable_thinking: false` turn it off):
+  in the end-to-end suite (eight agent tools, 18 coding tasks, an M2 Pro) it finished 15 thinking and 10 not, and six
+  OpenCode agents at once finished 6 and 3; with thinking off it reasoned in its answers instead.
+- With thinking off, LFM3 still opened a think block of its own, or reasoned, closed a block it never opened and gave
+  its answer twice (4 of 11 replies of the 4-bit build). For a chat template like LFM3's (`<think></think>` closed
+  empty), a reply with thinking off is now kept from think tags by its grammar, for about 1% of the writing speed;
+  other models' replies are as before. LFM3's calls are Qwen3.5's form with two newlines between calls, and the
+  grammar now writes them as its template does.
+- With thinking on, a chat template's `preserve_thinking` switch (LFM3's, LFM2.5's) is turned on unless the client
+  sets it: earlier replies keep their reasoning as written, so the conversation stays a prefix of the cache. Claude
+  Code on LFM3 (thinking on, its tool results followed by text, a user message to the template) read the conversation
+  again from its first reply at every step: 55% of prompt tokens cached and a rename past 15 minutes, now 95% and 86 s.
+- A prompt chunk the GPU drops is read again from where it began, instead of the request from its start. macOS ends a
+  Metal command buffer that holds the GPU while the display needs it ("Internal Error (0000000e)", which MLX leaves to
+  the OS): 10 minutes into a 245,547-token prompt, the request was read again from its start (19 minutes in all). The
+  caches go back to where the chunk began, and it is read again after a pause, in half the tokens.
+- Loading a model whose config.json names its own Python code for transformers (LFM3) no longer stops at
+  transformers' question whether to run it (in a terminal, 15 seconds before it went on without).
+
+- One request on a model with sliding-window layers (Flint) no longer waits for the GPU after every token: the
+  check before a forced span's one-pass step read the layers' padding from the GPU each token, 35 reads that waited
+  for the step in flight. It now reads it once, only where a span is about to go in one pass. On an M5 Pro, Flint
+  wrote 89 tokens/s for one request with the check and 138 without it (mlx-lm: 101).
 - OpenCode 2 works with Locals as OpenCode 1 does. `locals code` opened OpenCode 2's interface with `-m`, which it
   rejects ("Unrecognized flag: -m"); the model (and the agent `--agent` names) now goes in OPENCODE_CONFIG_CONTENT,
   which wins over a project's own opencode.json, and OpenCode's server runs for that launch (`--standalone`)
@@ -57,12 +88,62 @@
   floats without an int-to-float conversion; the expert choice also orders the experts' rows (no sort kernel), and
   each layer's residual adds and next norm are inside its kernels (an add and RMS norm kernel laid out as MLX's,
   the same bits). 305 tokens/s at 8 at once instead of 284, 225 at 4 instead of 212, 340 at 16 instead of 313.
-- A kernel family for matmuls of up to 16 rows, `fragq`: the weights go into the GPU's matrix units as 1 + q/16 in
-  the activations' 16-bit type (two by one shift, mask and or), the scale and bias per group on a float accumulator,
-  a quarter of the matrix product's arithmetic spent on dequantizing instead of a half. The tuner times each kernel in
-  a chain of calls that wait on each other, as a model runs them (back to back without waiting it chose kernels that
-  made Flint 2% slower), and times again the shapes timed before the family. Flint: 317 tokens/s at 8 at once instead
+- A kernel family for Flint's matmuls of up to 16 rows, `fragq`: the weights go into the GPU's matrix units as
+  1 + q/16 in the activations' 16-bit type (two by one shift, mask and or), the scale and bias per group on a float
+  accumulator, a quarter of the matrix product's arithmetic spent on dequantizing instead of a half. The tuner times
+  Flint's layers in a chain of calls that wait on each other, as a model runs them (back to back without waiting it
+  chose kernels that made Flint 2% slower), and times again its shapes timed before the family. Flint's layers have
+  tuning entries of their own (`…xbfloat16flint`): every other model's layers, of the same shapes too, keep their
+  kernels, timings and choices. Flint: 317 tokens/s at 8 at once instead
   of 302, 352 at 16 instead of 339, 227 at 4 instead of 224; through the server, 305 at 8 clients.
+- Recursive's own 4-bit build of Flint (RecursiveSI/flint-int4, 22.6 GB) runs on a 16 GB Mac: the GPU holds its
+  weights without the experts (1.2 GB) and slots for recently used experts (40% of GPU memory), and the rest are
+  read from the weight files as tokens need them (locals/models/flint_streamed.py, which loads that build on any
+  Mac; mlx-community's builds load whole as before). On the M2 Pro: about 6 tokens per second, a 6,000-token prompt
+  read in 19 s, and OpenCode fixed a bug in a small project with it.
+- Flint's decode passes run its MoE blocks in Metal kernels of their own: the layer's router and the routers that
+  guess the next layers' experts in one product and one selection (0.27 ms of a layer's GPU time became 0.04),
+  and the routed and shared experts in two kernels instead of about fourteen; the experts already on the GPU are
+  computed while the others are read. Without reads a token takes 31 ms instead of 40.
+- Where Flint's layers mostly find their experts on the GPU, a decode step asks the host only when one is missing:
+  each layer looks its experts up on the GPU, and the step runs windows of layers at once, resuming after a layer
+  that missed one (its later layers' KV caches restored). With every expert on the GPU, a token takes 20 ms
+  instead of 31 (50 tokens per second on the M2 Pro). Steps switch to it when 90% of the layers find their
+  experts (LOCALS_FLINT_OPTIMISTIC: auto, always, 0).
+- Flint reads a prompt's layers into two reused buffers, the next layer while the GPU computes this one, and copies
+  the experts already on the GPU instead of reading them: a 1,024-token pass after some decoding, 5.4 s instead of
+  6.9. Its GPU memory holds the files' bytes in every compute dtype, converted on the GPU when used.
+- On M1 and M2 Flint computes in float16: its one value past float16's range (an expert's SwiGLU product in layer
+  46, about 68,000) is taken in float32 and scaled by a power of 2. It is closer to a float32 run than bfloat16
+  (logit error median 0.77 against 2.0) and a 4,096-token prompt pass takes 8.0 s instead of 10.1. A model that
+  keeps its values in float16's range says so (``float16_safe``) and skips the runtime's dtype probe.
+- A sliding layer of Flint attends over a long pass in blocks of 256 queries, each over the keys its window reaches
+  (the same softmax): 11.6 ms a layer over 4,096 tokens instead of 57 with the window as a mask over every key. A
+  4,096-token prompt pass takes 6.9 s (10.9 before these changes).
+- Flint's results no longer depend on when expert reads end: the second call of a split MoE block sums every
+  expert's contribution in the experts' order, taking those of the first call from it (the same bits as one call;
+  a float32 sum in another order rounded differently now and then). The layer sets for prompt passes are let go
+  after 2 s of decoding without one (0.84 GB) and made again for the next prompt (66 ms).
+- `python -m locals.models.pack MODEL` writes an expert-major copy of a streamed model's experts (21.4 GB for
+  Flint, in ~/.cache/locals/experts, 34 s on the M2 Pro). Flint's experts are stacked per tensor in its files, nine
+  slices of one expert in nine places; from the copy each is one read, scattered into its slot: decoding 10.7
+  tokens per second instead of 7.3, a 4,096-token prompt pass 6.3 s instead of 6.7. Used when present.
+- LOCALS_EXPERT_RAM_GB: experts Flint evicts from the GPU are kept in memory outside the GPU's share, purgeable
+  (macOS takes it back before it would swap), and a later miss copies them back instead of reading the SSD.
+- Experts are read the most urgent first, the parts of one expert at once, bypassing macOS's file cache (which
+  held the same experts a second time); the slot taken is the least used one (uses counted less as they age), and
+  more experts are read ahead the more surely they are guessed. At most four guessed reads run at once
+  (LOCALS_EXPERT_GUESS_READS), so a read a layer waits for finds the SSD free: 139 ms a token instead of 156.
+  While a layer of Flint waits for its reads, the residual with the shared expert and the experts in slots goes
+  through the next layer's norm and router: it names the next layer's experts far better than this layer's
+  input (86% of them in its top 6 against 78%), and the next layer's reads ahead are revised (87 -> 83 ms a token).
+- Mixture-of-experts models decode several requests at once with each expert read and decoded once a step: the
+  step's (token, expert) pairs grouped by expert, one threadgroup per used expert and block of its rows (MLX's
+  affine 4-bit and mxfp4). On the M2 Pro with Mellum2.1-12B-A2.5B (64 experts, 8 a token) 16 requests decode at
+  187 tokens per second together against 142 with mlx-lm's batch_generate (1.32x), 4 at 131 against 115; one
+  request as before (86 against 85.5). From about 5 tokens an expert MLX's sorted kernel fills its tiles and is
+  used instead (64 requests: 367 against mlx-lm's 291). LOCALS_MOE_KERNEL=0: MLX's kernels.
+- A model can set its own prompt passes (HybridBatchEngine.prefill_tokens).
 
 - **DiffuSpace's Clover** (Clover-35B-A3B-Preview, a block-diffusion model on Qwen3.6-35B-A3B's network: 35B, 3B
   active per token). `python -m locals.convert_clover` makes its MLX build (16.7 GB: 3-bit experts, 4-bit down
@@ -71,7 +152,7 @@
   pass, which is Qwen3.5-MoE's forward (`models/clover_moe.py`: mlx-lm's Qwen3.5 text model, the block-diffusion
   weights left out), as any model: several requests at once, tool calls and JSON schemas under their grammars, the
   prompt cache. On an M4 Pro with 24 GB: 94.6 tokens/s for one request and 223.2 for eight at once through the batch
-  engine; in the process 93.6 and 247.9 where mlx-lm gives 79.5 and 179.8 (docs/benchmarks, section 12). On a Mac that is
+  engine; in the process 93.6 and 247.9 where mlx-lm gives 79.5 and 179.8 (docs/benchmarks, section 13). On a Mac that is
   the faster way: DiffuSpace's own decoding, blocks of 32 masked tokens resolved a few positions a step, wrote 14.6
   tokens/s with stock MLX. `--blocks [N]` (`locals serve`, `locals start`, `locals chat`) decodes so instead, in blocks
   of 8 by default (38.1 tokens/s; 32: 20.2), with kernels for its preview pass: the block coreset's routing in one

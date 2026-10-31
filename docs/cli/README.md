@@ -63,6 +63,7 @@ The `type=model_id` converter in `locals/defaults.py` resolves names as follows:
   | `gemma-4-e4b` | `gemma`, `gemma4`, `gemma-4`, `gemma4-e4b`, `gemma-4-e4b-it` | `mlx-community/gemma-4-e4b-it-4bit` |
   | `lfm2.5-2.6b` | `lfm`, `lfm2.5` | `LiquidAI/LFM2.5-2.6B-MLX-4bit` |
   | `minicpm5-2b` | `minicpm`, `minicpm5` | `mlx-community/MiniCPM5-2B-mlx-4Bit` |
+  | `lfm3-1.7b` | `lfm3` | `LiquidAI/LFM3-1.7B-MLX-4bit` |
 
 - Ollama's names for these models (`qwen3.5:4b`, `qwen3.5:2b`, `gemma4:e4b`, `qwen3.5:latest`) map to them too: a `:` becomes `-`, and `:latest` is dropped.
 - An existing local path (a folder or a file, with `~` expanded) becomes its absolute path. Links are kept, not resolved., because the background server runs from another directory and later commands may run from other folders. A short name takes precedence over a folder with the same name.

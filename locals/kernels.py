@@ -135,8 +135,9 @@ _TUNE_PATH = _os.environ.get("LOCALS_TUNE_CACHE") or _os.path.expanduser("~/.cac
 _TUNE = None
 _MULTI_CANDIDATES = [(8, 4, 2), (16, 4, 2), (8, 2, 2)]  # (VPT, R, NSG), M <= 4
 _V3_CANDIDATES = [(8, 8, 2), (8, 4, 2), (16, 4, 2), (16, 4, 4), (16, 2, 2)]  # (VPT, R, NSG), 3 <= M <= 6
-_FRAG_CANDIDATES = [(2, 2, 1), (4, 2, 1), (2, 4, 1), (1, 2, 2), (2, 8, 1), (1, 4, 1)]  # (TN, NSG, SPLIT)
-_FRAGQ_CANDIDATES = [(1, 2), (1, 4), (2, 2), (2, 4), (2, 8), (4, 4)]  # (TN, NSG), M <= 16
+_FRAG_CANDIDATES = [(2, 2, 1), (4, 2, 1), (2, 4, 1), (1, 2, 2)]  # (TN, NSG, SPLIT)
+_FRAG_CANDIDATES_FLINT = _FRAG_CANDIDATES + [(2, 8, 1), (1, 4, 1)]  # (Flint's layers: see _key_dt)
+_FRAGQ_CANDIDATES = [(1, 2), (1, 4), (2, 2), (2, 4), (2, 8), (4, 4)]  # (TN, NSG), M <= 16; Flint's layers
 _MMA_CANDIDATES = {
     8: [(8, 32, 64, 1, 2, 1), (8, 32, 64, 1, 4, 1), (8, 64, 64, 1, 8, 1), (8, 32, 32, 1, 2, 1), (8, 32, 64, 1, 2, 2)],
     16: [(16, 32, 64, 2, 2, 1), (16, 64, 64, 2, 2, 1), (16, 32, 64, 1, 4, 1), (16, 64, 64, 1, 8, 1)],
@@ -196,13 +197,33 @@ def _mark_stale(tune: dict, user: Optional[dict]) -> bool:
     return True
 
 
+def _key_dt(dt: str, mod) -> str:
+    """The dtype name a shape's tuning keys carry. Flint's layers (fuse marks them ``_locals_direct``) are tuned
+    apart, under ``bfloat16flint`` and ``float16flint``: with the few-row family fragq and two more frag tiles, timed
+    in chains (_time_shape). Every other model's shapes keep the candidates, timings and choices they had, the
+    shapes Flint has too among them (its dense layers are MiniCPM5-2B's and Qwen3.5-2B's MLPs)."""
+    return dt + "flint" if vars(mod).get("_locals_direct") else dt
+
+
+def _bits_dt(kd: str, mod) -> str:
+    """A key's dtype part with the weights' bits past 4 (an 8-bit output layer's: ``bfloat16flintb8``); a 4-bit
+    layer's is unchanged."""
+    bits = getattr(mod, "bits", 4)
+    return kd if bits == 4 else f"{kd}b{bits}"
+
+
+def _mod_dt(mod) -> str:
+    return _bits_dt(_key_dt(str(mod["scales"].dtype).split(".")[-1], mod), mod)
+
+
 def _missing_family(tune: dict, key: str) -> bool:
     """Whether ``key`` (a matmul shape's choice) was timed before a kernel family that applies to it existed (its
-    timings have no ``fragq``): it keeps its choice until it is timed again, as a stale one."""
+    timings have no ``fragq``): it keeps its choice until it is timed again, as a stale one. Flint's keys only."""
     t = (tune.get("__times__") or {}).get(key)
     parts = key.split("x")
-    if t is None or "fragq" in t or not _SHAPE_KEY.fullmatch(key) or parts[2] == "P" or parts[3:] not in ([], ["bfloat16"]):
-        return False  # (fragq takes float16 and bfloat16 activations)
+    if (t is None or "fragq" in t or not _SHAPE_KEY.fullmatch(key) or parts[2] == "P"
+            or parts[3:] not in (["float16flint"], ["bfloat16flint"])):
+        return False  # (fragq takes float16 and bfloat16 activations, on Flint's layers)
     from .qmv_frag import supported_q
 
     N, K, M = (int(v) for v in key.split("x")[:3])
@@ -568,18 +589,6 @@ def _run(choice, x2, mod):
     return _launcher(choice, M, K, mod["weight"].shape[0], x2.dtype, mod.bits)(x2, mod["weight"], mod["scales"], mod["biases"])
 
 
-def _dtb(dt: str, bits: int) -> str:
-    """The activations' dtype and, past 4, the weights' bits: what a choice is cached under besides N, K, M."""
-    return dt if bits == 4 else f"{dt}b{bits}"
-
-
-def _mkey(N: int, K: int, M, dt: str, bits: int = 4) -> str:
-    """A matmul shape's key in the tuning cache: N x K x M, then the activations' dtype past float16 and the weights'
-    bits past 4 (``248320x2048x8xbfloat16b8``); a 4-bit layer's keys are as they always were."""
-    suffix = ("" if dt == "float16" else dt) + ("" if bits == 4 else f"b{bits}")
-    return f"{N}x{K}x{M}" + (f"x{suffix}" if suffix else "")
-
-
 _CHOICE = {}
 
 
@@ -593,11 +602,12 @@ _TUNING = False  # set while the background tuner itself chooses
 def _choose(x2, mod):
     M, K = x2.shape
     N = mod["weight"].shape[0]
-    dt = _dtb(str(x2.dtype).split(".")[-1], mod.bits)
-    c = _CHOICE.get((N, K, M, dt))
+    dt = str(x2.dtype).split(".")[-1]
+    kd = _bits_dt(_key_dt(dt, mod), mod)
+    c = _CHOICE.get((N, K, M, kd))
     if c is not None and not _RETIME:  # (the path of every call once chosen: no lock, no lookups)
         return c
-    key = _mkey(N, K, M, str(x2.dtype).split(".")[-1], mod.bits)
+    key = f"{N}x{K}x{M}" + ("" if kd == "float16" else f"x{kd}")
     tune = _load_tune()
     if c is not None and not _is_stale(tune, key):
         return c
@@ -610,12 +620,12 @@ def _choose(x2, mod):
 
             if not nax_kernel.available():
                 c = ("mlx",)
-        _CHOICE[(N, K, M, dt)] = c
+        _CHOICE[(N, K, M, kd)] = c
         return c
     if _DEFER and not _TUNING:
         return ("mlx",)
     with _TUNE_LOCK:
-        c = _CHOICE.get((N, K, M, dt))
+        c = _CHOICE.get((N, K, M, kd))
         return c if c is not None and not _is_stale(tune, key) else _tune_shape(x2, mod, M, K, N, dt, key, tune)
 
 
@@ -644,38 +654,36 @@ def _tune_shape(x2, mod, M, K, N, dt, key, tune):
                 pass
 
 
-def _cands4(M, K, N, dt, mma_ok):
-    """The kernel families a 4-bit layer of N x K at M rows can take, besides MLX's."""
+def _time_shape(x2, mod, M, K, N, dt, key, tune):
     from . import qmv_frag, qmv_multi
 
-    cands = []
-    if M <= 4:
+    flint = _key_dt(dt, mod) != dt
+    kd = _bits_dt(_key_dt(dt, mod), mod)
+    four = mod.bits == 4
+    cands = [("mlx",)]
+    if not four:  # (an 8-bit output layer: MLX's kernel or mma, whose loader takes any width; the rest are 4-bit's)
+        cands += [("mma", *c) for c in _MMA_CANDIDATES[8 if M <= 8 else 16]
+                  if not (N % c[1] or K % (c[2] * c[5]) or (K // c[5]) % 64 or c[1] % (8 * c[4]))]
+    elif M <= 4:
         cands += [("multi", *c) for c in _MULTI_CANDIDATES if qmv_multi.supported(M, K, N, c[0], c[1])]
-    if 3 <= M <= 6:  # at M <= 2 it wins in isolation but loses ~1% inside the model
+    if four and 3 <= M <= 6:  # at M <= 2 it wins in isolation but loses ~1% inside the model
         cands += [("v3", *c) for c in _V3_CANDIDATES if K % (c[0] * 32) == 0 and N % c[1] == 0]
-    for kind in ("frag", "fragh") if dt == "float16" else ("frag",):  # fragh clamps to fp16's range
-        cands += [(kind, *c) for c in _FRAG_CANDIDATES if qmv_frag.supported(M, K, N, c[0], c[2]) and (c[2] == 1 or K >= 4096)]
-    if dt in ("float16", "bfloat16"):
+    for kind in (("frag", "fragh") if dt == "float16" else ("frag",)) if four else ():  # fragh clamps to fp16's range
+        cands += [(kind, *c) for c in (_FRAG_CANDIDATES_FLINT if flint else _FRAG_CANDIDATES)
+                  if qmv_frag.supported(M, K, N, c[0], c[2]) and (c[2] == 1 or K >= 4096)]
+    if four and flint and dt in ("float16", "bfloat16"):
         cands += [("fragq", *c) for c in _FRAGQ_CANDIDATES if qmv_frag.supported_q(M, K, N, c[0])]
-    if M >= 2:
+    if four and M >= 2:
         if MIN_M_SMALL <= M <= MAX_M_SMALL and (N >= 4096 or K >= 4096):
             cands.append(("small",))
-        cands += mma_ok
+        for BM, BN, BK, WM, WN, split in _MMA_CANDIDATES[8 if M <= 8 else 16]:
+            if N % BN or K % (BK * split) or (K // split) % 64 or BN % (8 * WN):
+                continue
+            cands.append(("mma", BM, BN, BK, WM, WN, split))
         from . import nax_kernel
 
         if nax_kernel.available():  # the M5's neural accelerators
             cands += [("nax", *c) for c in nax_kernel.CANDIDATES if nax_kernel.supported(M, K, N, c)]
-    return cands
-
-
-def _time_shape(x2, mod, M, K, N, dt, key, tune):
-    cands = [("mlx",)]
-    mma_ok = [("mma", *c) for c in _MMA_CANDIDATES[8 if M <= 8 else 16]
-              if not (N % c[1] or K % (c[2] * c[5]) or (K // c[5]) % 64 or c[1] % (8 * c[4]))]
-    if mod.bits != 4:  # (an 8-bit output layer: MLX's kernel or mma, whose loader takes any width; the rest are 4-bit's)
-        cands += mma_ok
-    else:
-        cands += _cands4(M, K, N, dt, mma_ok)
     xr = mx.random.normal(x2.shape, key=mx.random.key(M * 131 + K)).astype(x2.dtype)  # not the global random state
     ref = _run(("mlx",), xr, mod).astype(mx.float32)
     tol = 0.05 * (1.0 + float(mx.max(mx.abs(ref))))
@@ -689,49 +697,59 @@ def _time_shape(x2, mod, M, K, N, dt, key, tune):
         except Exception:
             continue
     # Time over enough weight copies (>= 64 MB) that they come from DRAM, as
-    # inside a model, not from the GPU's system cache; each call's input waiting
-    # on the call before (a chain, as a model's layers wait on each other), the
-    # graph built before the clock starts and the chain's own add taken off.
-    # Calls that do not wait overlap one's start with another's end, which
-    # rewarded few large threadgroups: at 8 rows of Flint's q/k/v, fragq with 4
-    # tiles a simdgroup was the fastest that way and 14% slower than with 1 in
-    # the model. Interleaved rounds, best round per candidate, for robustness to
-    # machine noise.
+    # inside a model, not from the GPU's system cache; interleaved rounds, best
+    # round per candidate, for robustness to machine noise. Flint's layers are
+    # timed in chains: each call's input waiting on the call before, as a
+    # model's layers wait on each other, the graph built before the clock
+    # starts and the chain's own add taken off. Calls that do not wait overlap
+    # one's start with another's end, which rewarded few large threadgroups: at
+    # 8 rows of Flint's q/k/v, fragq with 4 tiles a simdgroup was the fastest
+    # that way and 14% slower than with 1 in the model.
     nbytes = sum(mod[k].nbytes for k in ("weight", "scales", "biases"))
     ncopy = max(1, min(16, (64 << 20) // max(nbytes, 1)))
-    if nbytes >= 64 << 20:  # already more than the caches hold: timed in place (a copy of an output layer: 0.5 GB)
+    if not four and nbytes >= 64 << 20:  # an 8-bit output layer, more than the caches hold: timed in place (0.5 GB)
         copies = [{k: mod[k] for k in ("weight", "scales", "biases")}]
     else:
         copies = [{k: mx.array(mod[k]) + 0 if k != "weight" else mx.array(mod[k]) | 0 for k in ("weight", "scales", "biases")}
                   for _ in range(ncopy)]
     mx.eval(copies)
-    calls = 16
-
-    def chain(f):
-        y = xr
-        for i in range(calls):
-            cp = copies[i % ncopy]
-            o = f(y, cp["weight"], cp["scales"], cp["biases"])
-            y = xr + (o[:, :1] * 0).astype(xr.dtype)
-        return y
-
-    base = min(_chain_us(lambda: chain(lambda y, w, sc, bi: y), calls, warm=r == 0) for r in range(3))
     times = {c: float("inf") for c in ok}
-    for r in range(4):
-        for c in ok:
+    base = 0.0
+    if flint:
+        calls = 16
+
+        def chain(f):
+            y = xr
+            for i in range(calls):
+                cp = copies[i % ncopy]
+                o = f(y, cp["weight"], cp["scales"], cp["biases"])
+                y = xr + (o[:, :1] * 0).astype(xr.dtype)
+            return y
+
+        base = min(_chain_us(lambda: chain(lambda y, w, sc, bi: y), calls, warm=r == 0) for r in range(3))
+        for r in range(4):
+            for c in ok:
+                f = _launcher(c, M, K, N, x2.dtype, mod.bits)
+                times[c] = min(times[c], max(0.1, _chain_us(lambda: chain(f), calls, warm=r == 0) - base))
+    else:
+        def sweep(c):
             f = _launcher(c, M, K, N, x2.dtype, mod.bits)
-            times[c] = min(times[c], max(0.1, _chain_us(lambda: chain(f), calls, warm=r == 0) - base))
+            return [f(xr, cp["weight"], cp["scales"], cp["biases"]) for cp in copies]
+
+        for _ in range(4):
+            for c in ok:
+                times[c] = min(times[c], _time_us(lambda: sweep(c), reps=max(1, 8 // ncopy)) / ncopy)
     del copies
     mlx_t = times[("mlx",)]
     for fam in {c[0] for c in ok}:
         tune[f"{key}|{fam}"] = min((c for c in ok if c[0] == fam), key=lambda c: times[c])
     tune.setdefault("__times__", {})[key] = {fam: round(min(times[c] for c in ok if c[0] == fam), 1) for fam in {c[0] for c in ok}}
     challenger = min((c for c in ok if c[0] != "mlx"), key=lambda c: times[c], default=None)
-    # (against the chain's whole time: a small shape's own time is not much more than noise)
+    # (Flint's: against the chain's whole time, as a small shape's own time is not much more than noise)
     choice = challenger if challenger is not None and times[challenger] + base < 0.9 * (mlx_t + base) else ("mlx",)
     best = (times[choice], choice)
     tune[key] = best[1]
-    _CHOICE[(N, K, M, dt)] = best[1]
+    _CHOICE[(N, K, M, kd)] = best[1]
     _unstale(tune, key)
     _save_tune()
     return best[1]
@@ -745,17 +763,18 @@ def _tunable(mod) -> bool:
             and mod.get("biases") is not None and (mod["weight"].shape[1] * 8) % 64 == 0)
 
 
-HEAD8 = _os.environ.get("LOCALS_HEAD8", "1") != "0"  # 0: 8-bit output layers on MLX's kernel at every row count
-HEAD8_MIN_N = 1 << 15  # 8-bit layers this wide (output layers, Clover's) go through mma where it is faster from
-HEAD8_MIN_M = 5  # this many rows: MLX's kernel reads the weights once up to 4, then a 32-row tile for 6 to 32
-# (Clover's 540 MB output layer: 2.2 ms at 1 to 4 rows, 4.7 at 8, 6.3 at 16; mma with 8-row tiles, 2.9 at 8)
+HEAD8 = _os.environ.get("LOCALS_HEAD8", "1") != "0"  # 0: an 8-bit output layer on MLX's kernel at every row count
+HEAD8_MIN_M = 5  # MLX's kernel reads an 8-bit matrix once up to 4 rows, then takes 32-row tiles from 6
+# (Clover's 540 MB output layer: 2.2 ms at 1 to 4 rows, 4.6 at 8, 7.0 at 12; mma with 8- or 16-row tiles, 2.8 and 3.7)
 
 
 def _tunable_head8(mod) -> bool:
-    """A wide 8-bit layer (an output layer) the tuned kernels compute from HEAD8_MIN_M rows (affine, groups of 64)."""
-    return HEAD8 and isinstance(mod, nn.QuantizedLinear) and getattr(mod, "bits", None) == 8 and (
-        getattr(mod, "group_size", None) == 64 and getattr(mod, "mode", "affine") == "affine" and mod.get("biases") is not None
-        and mod["weight"].shape[0] >= HEAD8_MIN_N and (mod["weight"].shape[1] * 4) % 64 == 0)
+    """An 8-bit output layer the tuned kernels compute from HEAD8_MIN_M rows: one fuse marks (``_locals_head8``,
+    Clover's), affine in groups of 64. Every other 8-bit layer stays on MLX's kernel."""
+    return (HEAD8 and isinstance(mod, nn.QuantizedLinear) and vars(mod).get("_locals_head8", False)
+            and getattr(mod, "bits", None) == 8 and getattr(mod, "group_size", None) == 64
+            and getattr(mod, "mode", "affine") == "affine" and mod.get("biases") is not None
+            and (mod["weight"].shape[1] * 4) % 64 == 0)
 
 
 def _eligible(x: mx.array, mod) -> bool:
@@ -812,7 +831,7 @@ def _small_matmul(x, mod):
     shape = x.shape
     x2 = x.reshape(-1, shape[-1])
     M, K = x2.shape
-    P = _pad_rows(mod["weight"].shape[0], K, M, str(x2.dtype).split(".")[-1]) if mod.bits == 4 else M
+    P = _pad_rows(mod["weight"].shape[0], K, M, _key_dt(str(x2.dtype).split(".")[-1], mod)) if mod.bits == 4 else M
     if P > M:  # more rows run faster on this GPU: compute them, keep these
         xp = mx.concatenate([x2, mx.zeros((P - M, K), x2.dtype)])
         y = _run(_choose(xp, mod), xp, mod)[:M]
@@ -1052,7 +1071,7 @@ def _linear_call_inner(self, x):
     M = x.size // K
     dt = _DTYPE_NAME.get(x.dtype)
     if dt is not None and M < PREFILL_M and not _RETIME and vars(self).get("_locals_direct"):
-        key = (self["weight"].shape[0], K, M, _dtb(dt, self.bits))
+        key = (self["weight"].shape[0], K, M, _bits_dt(dt + "flint", self))  # (_key_dt: these are Flint's or Clover's layers)
         if _CHOICE.get(key) == ("mlx",) and _PAD.get(key, 0) == M:
             return _orig_linear_call(self, x)
     if _dense_ok(x, self):
@@ -1240,7 +1259,7 @@ def model_tune(model, ms=range(2, MAX_M + 1), families=("v3", "multi", "fragh", 
     shapes = set()
     for _, mod in model.named_modules():
         if _tunable(mod):
-            shapes.add((mod["weight"].shape[0], mod["weight"].shape[1] * 8, str(mod["scales"].dtype).split(".")[-1]))
+            shapes.add((mod["weight"].shape[0], mod["weight"].shape[1] * 8, _mod_dt(mod)))
     tune = _load_tune()
     import hashlib
 
@@ -1314,7 +1333,6 @@ def warmup(model, ms=range(1, 9)) -> int:
     for _, mod in _matmul_layers(model):
         N, K = mod["weight"].shape[0], _in_dims(mod)
         dt = mod["scales"].dtype
-        dtb = _dtb(str(dt).split(".")[-1], mod.bits)
         for M in ms:
             if M < _low_m(mod):
                 continue
@@ -1322,7 +1340,7 @@ def warmup(model, ms=range(1, 9)) -> int:
             c = _choose(x, mod)
             key = (c, M if c[0] not in ("frag", "fragh", "fragq") else (M + 7) // 8, K, N, dt, mod.bits)
             if key in failed:  # the same kernel instance as one that failed (frag shares one across 8 row counts)
-                _CHOICE[(N, K, M, dtb)] = ("mlx",)
+                _CHOICE[(N, K, M, _mod_dt(mod))] = ("mlx",)
                 continue
             if key in seen:
                 continue
@@ -1331,7 +1349,7 @@ def warmup(model, ms=range(1, 9)) -> int:
                 mx.eval(_run(c, x, mod))
             except Exception:  # noqa: BLE001  # (a cached choice the installed mlx no longer compiles)
                 failed.add(key)
-                _CHOICE[(N, K, M, dtb)] = ("mlx",)
+                _CHOICE[(N, K, M, _mod_dt(mod))] = ("mlx",)
     return len(seen)
 
 
@@ -1341,12 +1359,12 @@ def _in_dims(mod) -> int:
 
 
 def _low_m(mod) -> int:
-    """The fewest rows the tuned kernels compute ``mod`` at (a 4-bit layer: MIN_M; a wide 8-bit one: HEAD8_MIN_M)."""
+    """The fewest rows the tuned kernels compute ``mod`` at (a 4-bit layer: MIN_M; an 8-bit output layer: HEAD8_MIN_M)."""
     return MIN_M if _tunable(mod) else HEAD8_MIN_M
 
 
 def _matmul_layers(model):
-    """(name, layer) of every layer the tuned kernels compute: 4-bit ones, and wide 8-bit ones (an output layer)."""
+    """(name, layer) of every layer the tuned kernels compute: the 4-bit ones, and a marked 8-bit output layer."""
     return [(n, m) for n, m in model.named_modules() if _tunable(m) or _tunable_head8(m)]
 
 
@@ -1364,9 +1382,10 @@ def pretune(model, max_m: int = MAX_M, log=None) -> int:
         seen.add((N, K, mod.bits))
         dt = mod["scales"].dtype
         name = str(dt).split(".")[-1]
+        kd = _mod_dt(mod)
         stale = set(tune.get("__stale__") or ())
         for M in range(_low_m(mod), max_m + 1):
-            key = _mkey(N, K, M, name, mod.bits)
+            key = f"{N}x{K}x{M}" + ("" if kd == "float16" else f"x{kd}")
             work.append((mod, M, K, dt, key not in tune or key in stale or _missing_family(tune, key)))
         if _tunable(mod) and N * K <= DENSE_MAX:  # how prompts are read through it (_dense_prefill)
             key = _prefill_key(N, K, name)
@@ -1402,9 +1421,10 @@ def pending_work(model, max_m: int = 16) -> list:
             continue
         seen.add((N, K, mod.bits))
         name = str(mod["scales"].dtype).split(".")[-1]
+        kd = _mod_dt(mod)
         stale = set(tune.get("__stale__") or ())
         for M in range(_low_m(mod), max_m + 1):
-            key = _mkey(N, K, M, name, mod.bits)
+            key = f"{N}x{K}x{M}" + ("" if kd == "float16" else f"x{kd}")
             if key not in tune or key in stale or _missing_family(tune, key):
                 work.append((mod, M))
         if _tunable(mod) and N * K <= DENSE_MAX and (_prefill_key(N, K, name) not in tune or _prefill_key(N, K, name) in stale):
@@ -1435,9 +1455,10 @@ def tune_pending(model, max_m: int = MAX_M) -> int:
         if (N, K, mod.bits) in seen or K % 64:
             continue
         seen.add((N, K, mod.bits))
-        dt = str(mod["scales"].dtype).split(".")[-1]
+        dt = _mod_dt(mod)
         for M in range(_low_m(mod), max_m + 1):
-            missing += _mkey(N, K, M, dt, mod.bits) not in tune
+            key = f"{N}x{K}x{M}" + ("" if dt == "float16" else f"x{dt}")
+            missing += key not in tune
     return missing
 
 
@@ -1455,7 +1476,7 @@ def tune_report(model) -> str:
         if _tunable(mod):
             w = mod["weight"]
             if (w.shape[1] * 8) % 64 == 0:
-                shapes[(w.shape[0], w.shape[1] * 8, str(mod["scales"].dtype).split(".")[-1])] += 1
+                shapes[(w.shape[0], w.shape[1] * 8, _mod_dt(mod))] += 1
     dts = sorted({dt for _, _, dt in shapes})
     out = [f"GPU {mx.device_info()['architecture']}, MLX {mx.__version__}, {', '.join(dts)}, "
            f"{sum(shapes.values())} quantized layers in {len(shapes)} shapes; cache {_TUNE_PATH}",

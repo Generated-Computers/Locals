@@ -189,6 +189,8 @@ class Server:
         self._streams: Dict[str, List[dict]] = {e: [] for e in self.engines}
         self._raw: Dict[str, str] = {}  # tool-call id -> the raw reply text it came from
         self._fmt: Dict[str, tuple] = {}  # engine -> (tool-call format, thinking style), from the chat template
+        self._sealed: Dict[str, bool] = {}  # engine -> whether replies with thinking off are kept from think tags
+        self._seps: Dict[str, dict] = {}  # engine -> the newlines its template writes between calls, after </think>
         self._ckpt: Dict[str, bool] = {}  # engine -> whether the model's cache needs prompt snapshots
         for e in preload or ():
             if e in self.engines:
@@ -353,7 +355,9 @@ class Server:
         model = req.get("model") or f"locals/{self.short}"
         self.check_model(model)
         engine = oai.engine_of(model)
-        thinking = oai.thinking_of(model, self.thinking)
+        # a model that thinks with thinking off thinks by default (LFM3, as its template does): with thinking off it
+        # reasoned in its answers, and did 10 of 18 agent tasks where it did 15 with thinking on
+        thinking = oai.thinking_of(model, self.thinking or self._seals_thinking(engine))
         kw = req.get("chat_template_kwargs") or {}
         if isinstance(kw, dict) and isinstance(kw.get("enable_thinking"), bool):  # vLLM / SGLang style switch
             thinking = kw["enable_thinking"]
@@ -383,6 +387,12 @@ class Server:
             _cwd_hint(msgs)
         msgs, tpl_tools = fmt.prepare(msgs, tools)
         think_kw = {} if style == "none" else {"enable_thinking": thinking}
+        if thinking and "preserve_thinking" in formats.chat_template(tok):
+            # earlier replies keep their reasoning, as the model wrote it: LFM3's template drops it from every reply
+            # before the newest user message, and Claude Code's tool results come with text of their own (a user
+            # message after them), so each request read the conversation again from its first reply (13,775 of
+            # 30,000 tokens cached, a 10 s wait a step)
+            think_kw["preserve_thinking"] = True
         think_kw.update(_template_switches(req.get("chat_template_kwargs")))  # vLLM-style template switches
         if thinking and isinstance(effort, str) and effort and "reasoning_effort" not in think_kw:
             think_kw["reasoning_effort"] = effort
@@ -410,6 +420,9 @@ class Server:
                                  f"resulted in {len(prompt)} tokens, which leaves {room} for the reply. Please reduce the "
                                  f"length of the messages.", len(prompt) + min(max_tokens, 256), limit)
         max_tokens = max(1, min(max_tokens, self.max_tokens, room))
+        # (not for a benchmark's fixed-length reply, which gets no grammar for its calls either)
+        sealed = engine == "locals" and not thinking and not req.get("ignore_eos") and self._seals_thinking(engine)
+        seps = self._template_seps(engine) if engine == "locals" and tools else {}
         schema = oai.response_schema(req)
         regex = output_regex = None
         rf = req.get("response_format") if isinstance(req.get("response_format"), dict) else {}
@@ -427,7 +440,7 @@ class Server:
             # ignore_eos (a benchmark's fixed reply length): free text past the end of turn, unless a call is required
             if not req.get("ignore_eos") or tc == "required" or isinstance(tc, dict):
                 regex = oai.reply_regex(tools, tc, thinking, typed=self.typed_tools, fmt=fmt, preamble=False,
-                                        parallel=req.get("parallel_tool_calls") is not False)
+                                        parallel=req.get("parallel_tool_calls") is not False, sealed=sealed, **seps)
         if engine == "locals" and tools and getattr(svc, "constrains", True) and (
                 schema is not None or rf.get("type") == "json_object" or rf.get("type") == "regex" or req.get("guided_regex")):
             tc = req.get("tool_choice", "auto")
@@ -440,13 +453,16 @@ class Server:
 
                 out = regex if regex is not None else schema_regex(json_safe_schema(schema))
                 calls = oai.reply_regex(tools, "required" if tc == "auto" else tc, thinking, typed=self.typed_tools,
-                                        fmt=fmt, preamble=False, parallel=req.get("parallel_tool_calls") is not False)
+                                        fmt=fmt, preamble=False, parallel=req.get("parallel_tool_calls") is not False,
+                                        sealed=sealed, **seps)
                 schema, regex = None, ("(" + calls + "|" + out + ")" if tc == "auto" else calls)
                 output_regex = out if tc == "auto" else None
+        if sealed and regex is None and schema is None and getattr(svc, "constrains", True):  # (no tools: free text, without the tags)
+            regex = oai.not_containing(*oai.THINK_TAGS)
         cps = self._checkpoints(tok, msgs, tpl_tools, think_kw, text, prompt) if engine == "locals" and self._needs_checkpoints(engine) else []
         return {"engine": engine, "thinking": thinking, "svc": svc, "prompt": prompt, "checkpoints": cps, "text": text,
                 "tools": tools, "schema": schema, "regex": regex, "output_regex": output_regex, "max_tokens": max_tokens,
-                "model": model, "fmt": fmt,
+                "model": model, "fmt": fmt, "sealed": sealed, "seps": seps,
                 "tool_choice": req.get("tool_choice", "auto"), "stop": _stops(req), "temp": _temperature(req),
                 "sampling": _sampling(req), "ignore_eos": bool(req.get("ignore_eos")), "include_usage": _include_usage(req)}
 
@@ -636,6 +652,26 @@ class Server:
             self._fmt[engine] = (formats.detect(tok), formats.thinking_style(tok))
             self.log(f"[{engine}] tool calls: {self._fmt[engine][0].name}; thinking: {self._fmt[engine][1]}")
         return self._fmt[engine]
+
+    def _seals_thinking(self, engine: str) -> bool:
+        """Whether the model thinks with thinking off (formats.thinks_when_off: LFM3 opened a block itself, or closed
+        one it never opened and answered again after it): its requests think unless they turn it off, and a reply
+        with thinking off is kept from writing a think block."""
+        if engine not in self._sealed:
+            from . import formats
+
+            self._sealed[engine] = formats.thinks_when_off(self.service(engine).tokenizer)
+        return self._sealed[engine]
+
+    def _template_seps(self, engine: str) -> dict:
+        """reply_regex's ``gap`` and ``think_gap`` for Qwen3.5's calls: the newlines the template writes between two
+        calls and after ``</think>`` (Qwen3.5's one and two, LFM3's two and none)."""
+        if engine not in self._seps:
+            from . import formats
+
+            tok = self.service(engine).tokenizer
+            self._seps[engine] = {"gap": formats.call_gap(tok), "think_gap": formats.think_gap(tok)}
+        return self._seps[engine]
 
     def _needs_checkpoints(self, engine: str) -> bool:
         """Whether prompt snapshots pay: only where a cached state cannot be cut
@@ -1149,7 +1185,8 @@ class Server:
         if rx and not isinstance(req.get("tool_choice"), dict):
             tools = [t for t in oai.tool_specs(p["tools"]) if t["function"]["name"] not in banned]
             rx = oai.reply_regex(tools, "required", p["thinking"], typed=self.typed_tools, fmt=p["fmt"], preamble=False,
-                                 parallel=req.get("parallel_tool_calls") is not False)
+                                 parallel=req.get("parallel_tool_calls") is not False, sealed=p.get("sealed", False),
+                                 **p.get("seps", {}))
         lead = p["fmt"].thought_regex() if hasattr(p["fmt"], "thought_regex") else ""
         if rx and lead and rx.startswith(lead):
             rx = rx[len(lead):]

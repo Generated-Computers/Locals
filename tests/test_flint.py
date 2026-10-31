@@ -392,7 +392,11 @@ def test_a_left_padded_sliding_window_row_takes_its_spans_a_token_at_a_time():
         pass
 
     r = type("R", (), {"controller": Controller()})()
-    ok = lambda cache, module="locals.models.flint": HybridBatchEngine._solo_ok(Engine(module), r, cache)  # noqa: E731
+
+    def ok(cache, module="locals.models.flint"):  # (as a span is about to go in one pass)
+        e = Engine(module)
+        return HybridBatchEngine._solo_ok(e, r, cache) and HybridBatchEngine._solo_unpadded(e, cache)
+
     assert ok([BatchKVCache([0]), BatchRotatingKVCache(8, [0]), ArraysCache(2)])
     assert not ok([BatchKVCache([0]), BatchRotatingKVCache(8, [3])])
     rot = BatchRotatingKVCache(8, [0])
@@ -401,6 +405,16 @@ def test_a_left_padded_sliding_window_row_takes_its_spans_a_token_at_a_time():
     # another model's sliding-window layers (Gemma's) keep their spans a token at a time, as before Flint
     assert not ok([BatchKVCache([0]), BatchRotatingKVCache(8, [0])], "mlx_lm.models.gemma4_text")
     assert ok([BatchKVCache([0]), ArraysCache(2)], "mlx_lm.models.qwen3_5")
+
+    # The check after every token while one request runs (_solo_ok) reads nothing from the GPU: reading the rings'
+    # padding there waited for the step in flight, 35 times a token (an M5 Pro wrote 89 tokens/s instead of 138)
+    class Untouchable:
+        def __getattr__(self, name):
+            raise AssertionError(f"left_padding read after every token ({name})")
+
+    ring = BatchRotatingKVCache(8, [0])
+    ring.left_padding = Untouchable()
+    assert HybridBatchEngine._solo_ok(Engine("locals.models.flint"), r, [BatchKVCache([0]), ring])
 
 
 @pytest.mark.parametrize("kv_bits", ["16", "8"])
@@ -436,7 +450,7 @@ def test_a_span_in_one_pass_is_its_tokens_one_at_a_time(kv_bits, monkeypatch):
         a, b = (m(mx.array([[t]]), cache=c)[0, -1].astype(mx.float32) for c in (drip, one))
         assert float(mx.abs(a - b).max()) <= 0.05 * (1 + float(mx.abs(a).max()))
     eng = HybridBatchEngine.__new__(HybridBatchEngine)
-    eng.lm = SimpleNamespace(model=m)
+    eng.lm = m  # (as the engine has it: text_model(model), whose .model is the fused body)
     r = SimpleNamespace(controller=SimpleNamespace())
     assert eng._solo_ok(r, one) and not eng._solo_drafts_ok(one)
 

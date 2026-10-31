@@ -18,8 +18,8 @@ After these steps, `mx.set_wired_limit` is set to the GPU's `max_recommended_wor
 | `runtime.py` | `Runtime` (load, patch, constraint and prompt caches), `set_compute_dtype`, `native_bf16` |
 | `lm.py` | Drop-in replacement for mlx-lm: `load`, `patch`, and mlx-lm's `generate`, `stream_generate`, `batch_generate` and `BatchGenerator` re-exported unchanged |
 | `fuse.py` | Projection fusion, `FusedAttention`, `FusedFlintAttention`, `FusedMLP`, `SplitProjection`, `FusedGatedDeltaNet`, `FusedGatedAttention`, `FusedHybridBody` |
-| `models/` | Architectures the pinned mlx-lm lacks, registered where mlx-lm imports models (`models.register`): Flint; DiffuSpace's Clover (its causal pass as Qwen3.5-MoE's text model, `Model`, and the whole block-diffusion model, `BlockModel`) |
-| `moe.py` | Flint's and Qwen3.5-MoE's mixture-of-experts blocks: the routers and the expert kernels, fused expert gate/up, the combines, the layers' steps |
+| `models/` | Architectures the pinned mlx-lm lacks, registered where mlx-lm imports models (`models.register`): Flint, LFM3; DiffuSpace's Clover (its causal pass as Qwen3.5-MoE's text model, `Model`, and the whole block-diffusion model, `BlockModel`) |
+| `moe.py` | Flint's and Clover's mixture-of-experts blocks: the routers and the expert kernels, fused expert gate/up, the combines, the layers' steps |
 | `qk_kernel.py` | Per-head q/k RMS norms and RoPE in one kernel (Flint's attention) |
 | `qkv.py` | 8-bit keys and values for full-attention layers (`LOCALS_KV_BITS=8`): the attention kernels and the batch cache |
 | `kernels.py` | Matmul routing (`enable_small_m`, `_linear_switch`), the dense prefill path, row packing, `qmm_small`, the autotuner and its cache, and output-layer helpers |
@@ -245,7 +245,7 @@ to 293 at 8 clients (276 before), 216 at 4 (204), 320 to 324 at 16 (305): a busy
 alone at 8 rows: 293 with four processes parsing JSON beside it, 299 without), and the server's steps are 1% longer
 than the engine's alone, not more.
 
-**Few-row matmuls: the weights as 1 + q/16** (`qmv_frag.launch_q`, the `fragq` family). At 8 rows the dense matmuls
+**Few-row matmuls: the weights as 1 + q/16** (`qmv_frag.launch_q`, the `fragq` family, for Flint's layers). At 8 rows the dense matmuls
 (the attention's projections, the shared expert, the output layer) took 8.5 ms of a 26.4 ms step, twice what their
 weights take to read. Each weight serves one 8 x 8 matrix product there, and `qmv_frag` spends half again the
 product's own arithmetic dequantizing its two weights a lane (shift, mask, int-to-float, the scale's fma, twice): this
@@ -446,6 +446,34 @@ are as far apart as stock mlx-lm's against itself with the prompt read in two ch
 A 3-bit mixture of experts in bf16 is that sensitive to the order of a sum: a token whose sixth and seventh experts
 score within rounding of each other routes differently.
 
+## LFM3 (`models/lfm3.py`)
+
+Liquid's LFM3-1.7B (`--model lfm3`, `LiquidAI/LFM3-1.7B-MLX-4bit`, 1.0 GB). No mlx-lm release has it yet (Liquid's
+model card: support "in progress"), so `models/lfm3.py` carries the computation of Liquid's `modeling_lfm3.py` in MLX
+operations, and `models.register()` puts it at `mlx_lm.models.lfm3`. It is LFM2 with a third layer type. Of its 24
+layers, 13 are LFM2's gated short convolutions, 7 wide instead of 3 (an `ArraysCache` of the last 6 inputs), 5 attend
+over a 256-token window (a `RotatingKVCache`) and 6 over the whole context (a `KVCache`). The attention is grouped-query
+(16 query heads, 4 key/value heads, head size 128) with q/k RMS norms and a sigmoid gate on each head's output.
+The window layers rotate the whole head (theta 10,000); the full layers rotate the first half of each head's
+frequencies, keeping the whole head's progression (theta 1,000,000), and leave the rest unrotated: `mx.fast.rope`
+with `freqs` whose tail is infinite, since its `dims` would rotate a smaller head instead. Each mixer's and each
+MLP's output is normed again before the residual. Liquid's MLX builds keep the weights under `language_model.`;
+`sanitize` takes that and the original checkpoint's names.
+
+Checked against Liquid's PyTorch code (transformers 5.21, float32, a 759-token prompt past the window): every
+position's top token the same, logits within 0.001, and 40 greedy tokens the same through a cache filled in two chunks.
+In float16, which `set_compute_dtype` picks on an M2, the top token was the same at 99.7% of positions (bfloat16:
+97.4%, like PyTorch's own bfloat16, 97.2%). Locals's engine with MLX's kernels and bfloat16 writes the same tokens as
+mlx-lm. Nothing in `fuse.py` applies to it (its MLP's projections are `w1`/`w3`), and the tuned kernels take its
+4-bit layers.
+
+LFM3's `config.json` names Liquid's Python code for transformers' `AutoConfig`, which transformers 5.19 does not
+have: loading the tokenizer asked in a terminal whether to run that code, and went on without it after 15 s.
+`models.register()` gives transformers a plain config class for `lfm3` (`_CONFIGS`), so it neither asks nor runs it.
+Its chat template is Qwen3.5's calls with two newlines between calls, and a model that thinks with thinking off, so
+its requests think unless they turn it off: see [Decoding](../decoding/README.md) (`formats.call_gap`,
+`formats.thinks_when_off`) and [Prompt cache](../prompt-cache/README.md) (`preserve_thinking`).
+
 ## Qwen3.5-MoE and Clover (`moe.py`, `fuse.py`, `models/clover_moe.py`)
 
 mlx-lm's Qwen3.5-MoE (`qwen3_5_moe`: Qwen3.6-35B-A3B's network, 40 layers, three Gated DeltaNet layers to each
@@ -630,7 +658,7 @@ The autotuner chooses among these for each (N, K, M, dtype). A choice is a tuple
 Notes on the families:
 
 - In `frag`, `fragh` and `fragq`, M is a runtime input (`mcount`), and only `MT = (M + 7) // 8` is compiled in. One compiled kernel therefore serves eight row counts (`qmv_frag.py`, `qmv_frag.launch`).
-- `fragq` takes up to 16 rows of float16 or bfloat16 activations. Its outputs are not `frag`'s bits: it sums `s * sum q x + b * sum x` as MLX's qmv does, as close to the exact sum as MLX's kernel is (`test_fragq_is_the_exact_sum_as_closely_as_mlxs_kernel`).
+- `fragq` is for Flint's layers only (fuse marks them `_locals_direct`; their tuning keys end in `flint`, as `…x8xbfloat16flint`, so every other model's layers, the same shapes among them, keep their own choices), and takes up to 16 rows of float16 or bfloat16 activations. Its outputs are not `frag`'s bits: it sums `s * sum q x + b * sum x` as MLX's qmv does, as close to the exact sum as MLX's kernel is (`test_fragq_is_the_exact_sum_as_closely_as_mlxs_kernel`).
 - `SPLIT > 1` (split-K, used by `frag`, `fragh` and `mma`) divides K across threadgroups, writes float32 partials and sums them afterwards. This helps small matrices fill the GPU (`mma_kernel.qmm_mma`, `qmv_frag.launch.f`).
 - Because `fragh` clamps activations to the fp16 range, it is a candidate only for fp16 activations. A cached `fragh` choice read back for bf16 activations is replaced by `mlx` (`kernels._choose`, `kernels._tune_shape`).
 
@@ -664,8 +692,8 @@ At M <= 2, `v3` is not a candidate: it wins in isolation there but loses about 1
 The tuning procedure (`kernels._tune_shape`):
 
 1. **Correctness.** Every candidate runs on a random input (fixed key `M * 131 + K`, not the global random state). Its output must be within `0.05 * (1 + max|ref|)` of MLX's. A NaN or an exception removes the candidate.
-2. **Timing.** Candidates are timed on `max(1, min(16, (64 << 20) // nbytes))` copies of the weights. The aim (code comment) is that the weights come from DRAM as inside a model, not from the GPU's system cache. In fact the copies total at most about 64 MB, unless a single copy is already larger, and well below that for layers under 4 MB, where the 16-copy cap applies. The calls form a chain: each call's input waits on the last call's output (an add of a zero slice of it), as a model's layers wait on each other, `max(16, 2 * ncopy)` calls, the graph built before the clock starts (`_chain_us`); the chain's own adds, timed alone, are taken off. Calls timed back to back without waiting overlapped one's start with another's end, which rewarded few large threadgroups: at 8 rows of Flint's q/k/v projection, `fragq` with 4 tiles a simdgroup was then the fastest and 14% slower than with 1 inside the model, and choices made that way made Flint's 8-row step 2% slower where those made from chains made it 5% faster. Four interleaved rounds run, and each candidate keeps its best round.
-3. **Decision.** A non-MLX kernel must be at least 10% faster than MLX over the whole chain, its adds included (`< 0.9 *` MLX's time): a small shape's own time is not much more than noise. Otherwise the choice is `("mlx",)`.
+2. **Timing.** (Flint's layers; every other model's are timed as before: each candidate called on every copy in turn, independently, best of 4 interleaved rounds.) Candidates are timed on `max(1, min(16, (64 << 20) // nbytes))` copies of the weights. The aim (code comment) is that the weights come from DRAM as inside a model, not from the GPU's system cache. In fact the copies total at most about 64 MB, unless a single copy is already larger, and well below that for layers under 4 MB, where the 16-copy cap applies. The calls form a chain: each call's input waits on the last call's output (an add of a zero slice of it), as a model's layers wait on each other, `max(16, 2 * ncopy)` calls, the graph built before the clock starts (`_chain_us`); the chain's own adds, timed alone, are taken off. Calls timed back to back without waiting overlapped one's start with another's end, which rewarded few large threadgroups: at 8 rows of Flint's q/k/v projection, `fragq` with 4 tiles a simdgroup was then the fastest and 14% slower than with 1 inside the model, and choices made that way made Flint's 8-row step 2% slower where those made from chains made it 5% faster. Four interleaved rounds run, and each candidate keeps its best round.
+3. **Decision.** A non-MLX kernel must be at least 10% faster than MLX: for Flint's layers over the whole chain, its adds included (`< 0.9 *` MLX's time), as a small shape's own time is not much more than noise; for every other model's, over its own time, as before. Otherwise the choice is `("mlx",)`.
 4. **Storage.** The choice is stored under the shape key. The best candidate of each family is also stored under `"{key}|{family}"` for the whole-step tuner. The cache file is rewritten.
 
 ### Whole-step tuning (`model_tune`, full mode only)
@@ -736,8 +764,9 @@ To re-tune from scratch, stop every Locals server, delete the cache file (or poi
 | `gemma-4-e4b` | `mlx-community/gemma-4-e4b-it-4bit` |
 | `lfm2.5-2.6b` | `LiquidAI/LFM2.5-2.6B-MLX-4bit` (1.6 GB: 8 GB Macs) |
 | `minicpm5-2b` | `mlx-community/MiniCPM5-2B-mlx-4Bit` (1.4 GB) |
+| `lfm3-1.7b` | `LiquidAI/LFM3-1.7B-MLX-4bit` (1.0 GB; its code ships with Locals, `locals/models/lfm3.py`) |
 
-`ALIASES` maps more names onto these: `qwen` and `qwen3.5` to the 4B; `gemma`, `gemma4`, `gemma-4`, `gemma4-e4b` and `gemma-4-e4b-it` to Gemma 4 E4B; `lfm` and `lfm2.5`; `minicpm` and `minicpm5` (`defaults.py`).
+`ALIASES` maps more names onto these: `qwen` and `qwen3.5` to the 4B; `gemma`, `gemma4`, `gemma-4`, `gemma4-e4b` and `gemma-4-e4b-it` to Gemma 4 E4B; `lfm` and `lfm2.5`; `lfm3`; `minicpm` and `minicpm5` (`defaults.py`).
 
 - **`default_model()`** reads the Mac's memory with `sysctl -n hw.memsize`. It picks `qwen3.5-2b` when memory is known and below 12 GB, and `qwen3.5-4b` otherwise, including when memory is unknown (`defaults.memory_gb`, `defaults.default_model`). The 4B (3 GB of weights, 64k context) and its prompt cache do not fit next to macOS in 8 GB. `DEFAULT_MODEL` is computed once, at import (`defaults.py`).
 - **`model_id(name)`** resolves a `--model` value; every command uses it as the argparse `type` (for example `server.main`). Resolution order (`defaults.model_id`):

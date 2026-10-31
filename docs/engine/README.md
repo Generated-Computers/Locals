@@ -349,6 +349,29 @@ If a caller's `on_token` callback raises, only that row ends, with `finish = "er
 
 ## Engine errors and recovery
 
+**A prompt chunk the GPU drops.** macOS ends a Metal command buffer that holds the GPU while the display needs it:
+MLX raises `[METAL] Command buffer execution failed: Internal Error (0000000e:Internal Error)`
+(`kIOGPUCommandBufferCallbackErrorImpactingInteractivity`; MLX leaves it to the OS, ml-explore/mlx#3267). It happened
+10 minutes into a 245,547-token prompt on an M2 Pro while the Mac was in use, and the request was read again from its
+start; minute-long runs of 1.4 s attention calls on an idle Mac, or under a busy animation, never met it. Both prompt
+loops (`_prefill_batch`, `_run`) read each chunk through `_read_chunk`, which on that error puts every cache layer back
+where the chunk began and reads the chunk again, after a pause (`RETRY_PAUSE`, 0.5 s, doubling) and in half the tokens,
+up to `GPU_RETRIES` (3) times:
+
+* `_marks` keeps, before each chunk, every attribute of the sliding-window and convolution caches (`mx.array(a)`, since
+  MLX's `a += b` and `a[i] = b` change the array object itself), and of full-attention caches everything but their key
+  and value buffers: holding those, MLX would copy a whole buffer at every chunk (3 GB a chunk at 245k tokens) instead
+  of writing the chunk into it, past the offset that goes back.
+* `_rewind` first checks that each full-attention buffer is where it was in memory: one MLX copied (to grow it, or
+  because something else held it) was copied inside the dropped command buffer, maybe not at all. Then, and for a cache
+  kind it does not know, the error goes on as before.
+* MLX clears its stored error once it has raised it (`Error::check`), so the next chunk runs normally.
+
+With drops simulated on chunks of a 6,000-token prompt (the chunk's results spoiled, then the error raised), LFM3 and
+Qwen3.5-4B end with the next token an uninterrupted read gives, the logits within 0.04: as far apart as two clean reads
+in chunks of 1,024 and 512. The marks cost nothing measurable (LFM3, 32k tokens: 34.2 s with them, 34.1 s without). A
+pass mixing decode rows and a prompt chunk (`_launch`) is not covered: an error there goes to the service, as below.
+
 Some faults belong to one request: a regex or schema that does not compile, or a recursive schema. `source` catches these and finishes that job as `"invalid: ..."`, so they never reach `serve`.
 
 Any other exception escapes `serve`, for example a Metal out-of-memory error. `BatchService._run_locals` catches it and then:

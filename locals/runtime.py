@@ -121,6 +121,10 @@ def set_compute_dtype(model, dtype: Optional[str] = "auto") -> str:
     params = [v for _, v in tree_flatten(model.parameters())]
     has_bf16 = any(v.dtype == mx.bfloat16 for v in params)
     auto = dtype == "auto"
+    if auto and has_bf16 and not native_bf16() and getattr(model, "float16_safe", False):
+        # the model keeps its own values in float16's range (Flint: models/flint_streamed.py, _swiglu_fp16), so no probe
+        model.set_dtype(mx.float16, predicate=lambda t: t == mx.bfloat16)
+        return "float16"
     if auto:
         dtype = "float16" if has_bf16 and not native_bf16() and not _fp16_special(model) else None
     if dtype in (None, "bfloat16") or not has_bf16:
@@ -258,6 +262,9 @@ class Runtime:
                 f"this GPU; those passes are split in two")
         if fuse:
             fuse_model(model)
+        from . import moe_kernel
+
+        moe_kernel.enable(model)  # (mixture-of-experts models: each expert read once a decode step, however many requests)
         enable_small_m(small_m_kernel, model)
         if small_m_kernel:
             from .kernels import tune_model

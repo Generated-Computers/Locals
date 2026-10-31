@@ -191,6 +191,7 @@ def not_containing(*lits: str) -> str:
 
 
 FREE_TEXT = ("<tool_call>", "<function=")  # free text may not start a call, with or without its wrapper
+THINK_TAGS = ("<think>", THINK_CLOSE)
 
 NAME_RE = r"[A-Za-z0-9_.\-]+"
 PARAM_RE_ = r"[A-Za-z0-9_.\-]+"
@@ -246,7 +247,8 @@ def call_regex(names: Optional[Iterable[str]] = None, params: Iterable[str] = ()
 
 
 def reply_regex(tools: List[dict], tool_choice: Any = "auto", thinking: bool = False, typed: bool = False,
-                fmt=None, preamble: bool = True, parallel: bool = True) -> Optional[str]:
+                fmt=None, preamble: bool = True, parallel: bool = True, sealed: bool = False,
+                gap: str = "\n", think_gap: str = "\n\n") -> Optional[str]:
     """The grammar of a reply to a request that offers ``tools``: free text
     (without ``<tool_call>``), then calls as ``tool_choice`` demands:
     ``auto`` zero or more, ``required`` one or more, a named function exactly
@@ -257,13 +259,18 @@ def reply_regex(tools: List[dict], tool_choice: Any = "auto", thinking: bool = F
     ``parallel=False`` (a request's ``parallel_tool_calls: false``): at most
     one call. With ``thinking`` the reply starts inside an open ``<think>``
     block. ``fmt`` is the model's tool-call format (locals.formats; default
-    Qwen3.5's XML calls; it and Flint's have ``typed`` calls)."""
+    Qwen3.5's XML calls; it and Flint's have ``typed`` calls). In Qwen3.5's form,
+    ``sealed``: the free text holds no think tags either (formats.thinks_when_off),
+    ``gap`` is the newlines between two calls (formats.call_gap), ``think_gap``
+    those after ``</think>`` (formats.think_gap)."""
     names = [t["function"]["name"] for t in tool_specs(tools)]
     if fmt is not None and fmt.name != "qwen_xml":
         if typed and getattr(fmt, "typed", False):  # a format with typed calls of its own (Flint's)
             return fmt.reply_regex(names, tool_choice, thinking, preamble=preamble, parallel=parallel, specs=tool_specs(tools))
         return fmt.reply_regex(names, tool_choice, thinking, preamble=preamble, parallel=parallel)
-    free = not_containing(*FREE_TEXT)
+    free = not_containing(*FREE_TEXT, *(THINK_TAGS if sealed else ()))
+    sep = "\\n" * len(gap) if gap and set(gap) == {"\n"} else "\\n"  # (newlines only: regex text as it is)
+    after = "\\n" * len(think_gap) if set(think_gap) <= {"\n"} else "\\n\\n"
     if not names:
         return None
     specs = tool_specs(tools)
@@ -277,12 +284,12 @@ def reply_regex(tools: List[dict], tool_choice: Any = "auto", thinking: bool = F
         body = lead + (typed_call_regex(chosen) if typed else call_regex([fn] if fn in names else names, params))
     elif tool_choice == "required":
         call = typed_call_regex(specs) if typed else call_regex(names, params)
-        body = lead + call + ("(\\n" + call + ")*" if parallel else "")
+        body = lead + call + ("(" + sep + call + ")*" if parallel else "")
     else:
         call = typed_call_regex(specs) if typed else call_regex(names, params)
-        body = free + "(" + call + ("(\\n" + call + ")*" if parallel else "") + ")?"
+        body = free + "(" + call + ("(" + sep + call + ")*" if parallel else "") + ")?"
     if thinking:
-        body = not_containing(THINK_CLOSE) + "</think>\\n\\n" + body
+        body = not_containing(THINK_CLOSE) + "</think>" + after + body
     return body
 
 

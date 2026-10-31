@@ -176,8 +176,9 @@ def test_fragq_is_the_exact_sum_as_closely_as_mlxs_kernel(dtype):
 
 
 def test_a_shape_timed_before_a_kernel_family_is_timed_again(tmp_path, monkeypatch):
-    """A shape whose timings have no fragq (timed before it existed) keeps its choice in requests, and the idle
-    tuner times it again; once timed with it, it is not pending."""
+    """A shape of Flint's layers whose timings have no fragq (timed before it existed) keeps its choice in requests,
+    and the idle tuner times it again; once timed with it, it is not pending. Flint's layers have keys of their own
+    (_key_dt): another model's layer of the same shape keeps its key and its choice, and is not timed again."""
     monkeypatch.setattr(kernels, "_TUNE_PATH", str(tmp_path / "tune.json"))
     monkeypatch.setattr(kernels, "_preset_path", lambda: None)
     monkeypatch.setattr(kernels, "_TUNE", None)
@@ -185,19 +186,56 @@ def test_a_shape_timed_before_a_kernel_family_is_timed_again(tmp_path, monkeypat
     monkeypatch.setattr(kernels, "_DEFER", True)
     layer = nn.QuantizedLinear(512, 1024, bits=4, group_size=64)
     layer.set_dtype(mx.bfloat16)
-    key = "1024x512x8xbfloat16"
-    f32 = "1024x512x8xfloat32"  # (activations fragq does not take: never stale for it)
+    other = nn.QuantizedLinear(512, 1024, bits=4, group_size=64)  # (another model's layer of the same shape)
+    other.set_dtype(mx.bfloat16)
+    object.__setattr__(layer, "_locals_direct", True)  # (as fuse marks Flint's layers)
+    key, plain = "1024x512x8xbfloat16flint", "1024x512x8xbfloat16"
+    f32 = "1024x512x8xfloat32flint"  # (activations fragq does not take: never stale for it)
     assert not kernels._missing_family({"__times__": {f32: {"mlx": 1.0}}}, f32)
-    (tmp_path / "tune.json").write_text(json.dumps({"__mlx__": mx.__version__, key: ["frag", 2, 4, 1],
-                                                    "__times__": {key: {"frag": 9.0, "mlx": 20.0}}}))
+    (tmp_path / "tune.json").write_text(json.dumps({"__mlx__": mx.__version__, key: ["frag", 2, 4, 1], plain: ["mlx"],
+                                                    "__times__": {key: {"frag": 9.0, "mlx": 20.0},
+                                                                  plain: {"frag": 21.0, "mlx": 20.0}}}))
     tune = kernels._load_tune()
-    assert not tune.get("__stale__") and kernels._missing_family(tune, key)
+    assert not tune.get("__stale__") and kernels._missing_family(tune, key) and not kernels._missing_family(tune, plain)
     assert kernels._choose(mx.zeros((8, 512), layer["scales"].dtype), layer) == ("frag", 2, 4, 1)  # kept in requests
+    assert kernels._choose(mx.zeros((8, 512), other["scales"].dtype), other) == ("mlx",)  # its own key and choice
     work = kernels.pending_work(nn.Sequential(layer), max_m=8)
     assert 8 in [m for _, m in work]
+    assert 8 not in [m for _, m in kernels.pending_work(nn.Sequential(other), max_m=8)]
     kernels.tune_one(layer, 8)
     assert "fragq" in kernels._load_tune()["__times__"][key] and not kernels._missing_family(kernels._load_tune(), key)
     assert 8 not in [m for _, m in kernels.pending_work(nn.Sequential(layer), max_m=8)]
+    assert tuple(kernels._load_tune()[plain]) == ("mlx",) and "fragq" not in kernels._load_tune()["__times__"][plain]
+
+
+def test_other_models_layers_are_timed_as_before(tmp_path, monkeypatch):
+    """Only Flint's layers are offered fragq and the two added frag tiles, and timed in chains: any other layer is
+    timed with the candidates and the method it had."""
+    monkeypatch.setattr(kernels, "_TUNE_PATH", str(tmp_path / "tune.json"))
+    monkeypatch.setattr(kernels, "_preset_path", lambda: None)
+    monkeypatch.setattr(kernels, "_TUNE", None)
+    monkeypatch.setattr(kernels, "_CHOICE", {})
+    timed, chained = [], []
+    real_launcher, real_chain = kernels._launcher, kernels._chain_us
+    monkeypatch.setattr(kernels, "_launcher", lambda c, *a: timed.append(c) or real_launcher(c, *a))
+    monkeypatch.setattr(kernels, "_chain_us", lambda *a, **k: chained.append(1) or real_chain(*a, **k))
+    for flint in (False, True):
+        timed.clear()
+        chained.clear()
+        layer = nn.QuantizedLinear(512, 1024, bits=4, group_size=64)
+        layer.set_dtype(mx.bfloat16)
+        if flint:
+            object.__setattr__(layer, "_locals_direct", True)
+        kernels.tune_one(layer, 8)
+        fams = {c[0] for c in timed}
+        tiles = {c for c in timed if c[0] == "frag"}
+        if flint:
+            assert "fragq" in fams and chained
+            assert "1024x512x8xbfloat16flint" in kernels._load_tune()
+        else:
+            assert "fragq" not in fams and not chained
+            assert not tiles & {("frag", 2, 8, 1), ("frag", 1, 4, 1)}
+            assert "1024x512x8xbfloat16" in kernels._load_tune()
 
 
 def test_mma_takes_8bit_weights_and_4bit_as_before():
@@ -215,30 +253,30 @@ def test_mma_takes_8bit_weights_and_4bit_as_before():
                 assert float(mx.abs(y - ref).max()) <= 0.01 * float(mx.abs(ref).max())
 
 
-def test_a_wide_8bit_layer_is_tuned_from_5_rows_and_4bit_keys_stay(tmp_path, monkeypatch):
-    """A wide 8-bit layer (an output layer) goes through the tuner from HEAD8_MIN_M rows, under keys of its own
-    (``...b8``); a 4-bit layer's keys are what they were, and narrow 8-bit layers stay on MLX's kernel."""
+def test_a_marked_8bit_output_layer_is_tuned_from_5_rows_and_no_other(tmp_path, monkeypatch):
+    """The 8-bit output layer fuse marks (``_locals_head8``: Clover's) goes through the tuner from HEAD8_MIN_M rows,
+    under keys of its own (``...b8``); an unmarked 8-bit layer, of any width, stays on MLX's kernel, and a 4-bit
+    layer's keys are what they were."""
     monkeypatch.setattr(kernels, "_TUNE_PATH", str(tmp_path / "tune.json"))
     monkeypatch.setattr(kernels, "_preset_path", lambda: None)
     monkeypatch.setattr(kernels, "_TUNE", None)
     monkeypatch.setattr(kernels, "_CHOICE", {})
-    assert kernels._mkey(2560, 4096, 8, "float16") == "2560x4096x8"
-    assert kernels._mkey(2560, 4096, 8, "bfloat16") == "2560x4096x8xbfloat16"
-    assert kernels._mkey(2560, 4096, 8, "bfloat16", 8) == "2560x4096x8xbfloat16b8"
-    assert kernels._mkey(2560, 4096, 8, "float16", 8) == "2560x4096x8xb8"
-    assert all(kernels._SHAPE_KEY.fullmatch(k) for k in ("2560x4096x8xbfloat16b8", "2560x4096x8xb8"))
-    head = _q(kernels.HEAD8_MIN_N, in_dims=256, bits=8)
+    four = nn.QuantizedLinear(256, 512, bits=4, group_size=64)
+    four.set_dtype(mx.bfloat16)
+    assert kernels._mod_dt(four) == "bfloat16"
+    head = _q(1 << 15, in_dims=256, bits=8)
     head.set_dtype(mx.bfloat16)
-    narrow = _q(256, in_dims=256, bits=8)
-    assert kernels._tunable_head8(head) and not kernels._tunable(head) and not kernels._tunable_head8(narrow)
+    unmarked = _q(1 << 15, in_dims=256, bits=8)
+    assert not kernels._tunable_head8(head) and not kernels._eligible(mx.zeros((8, 256), mx.bfloat16), head)
+    object.__setattr__(head, "_locals_head8", True)
+    assert kernels._tunable_head8(head) and not kernels._tunable(head) and not kernels._tunable_head8(unmarked)
+    assert kernels._mod_dt(head) == "bfloat16b8" and kernels._SHAPE_KEY.fullmatch(f"{1 << 15}x256x8xbfloat16b8")
     for M, routed in ((1, False), (4, False), (5, True), (8, True), (32, True), (33, False)):
         assert kernels._eligible(mx.zeros((M, 256), mx.bfloat16), head) == routed
-    assert not kernels._eligible(mx.zeros((8, 256), mx.bfloat16), narrow)
     x = (mx.random.normal((8, 256), key=mx.random.key(1)) * 0.5).astype(mx.bfloat16)
     ref = mx.quantized_matmul(x, head["weight"], head["scales"], head["biases"], transpose=True, group_size=64, bits=8)
     got = kernels._small_matmul(x, head)
     assert float(mx.abs(got.astype(mx.float32) - ref.astype(mx.float32)).max()) <= 0.01 * float(mx.abs(ref).max())
-    key = f"{kernels.HEAD8_MIN_N}x256x8xbfloat16b8"
-    assert json.loads((tmp_path / "tune.json").read_text())[key][0] in ("mlx", "mma")
-    work = kernels.pending_work(nn.Sequential(head), max_m=8)
+    assert json.loads((tmp_path / "tune.json").read_text())[f"{1 << 15}x256x8xbfloat16b8"][0] in ("mlx", "mma")
+    work = kernels.pending_work(nn.Sequential(head, unmarked), max_m=8)
     assert sorted(m for _, m in work) == [5, 6, 7]  # (8 is tuned; under 5 rows MLX's kernel reads the weights once)

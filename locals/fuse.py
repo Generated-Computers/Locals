@@ -498,8 +498,9 @@ def fuse_model(model) -> int:
                         and isinstance(l.self_attn, FusedFlintAttention) for l in layers)
                 and any(isinstance(l.mlp, FusedFlintMoe) for l in layers)):
             for l in layers:
-                l.__class__ = type("Fused" + type(l).__name__, (FusedFlintLayer, type(l)), {})
-            body.__class__ = type("Fused" + type(body).__name__, (FusedFlintBody, type(body)), {})
+                # (each keeps its module's name: code that knows Flint by it, hybrid_batch._solo_ok's, still does)
+                l.__class__ = type("Fused" + type(l).__name__, (FusedFlintLayer, type(l)), {"__module__": type(l).__module__})
+            body.__class__ = type("Fused" + type(body).__name__, (FusedFlintBody, type(body)), {"__module__": type(body).__module__})
     flint = type(model).__module__.split(".")[-1] == "flint" and hasattr(model, "make_cache")
     if flint:
         from .qkv import opt_in

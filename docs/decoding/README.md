@@ -360,7 +360,7 @@ fallback     the hermes form; the tools are described in the system prompt
 
 | `name` | Families (formats.py) | Several calls per reply | Arguments in the grammar | `replay_raw` |
 |---|---|---|---|---|
-| `qwen_xml` | Qwen3.5, Qwen3-Coder | yes, separated by `\n` | Parameter names `[A-Za-z0-9_.\-]+` or one of the offered tools' own (`$select`, `größe`), values any text without `</parameter>` (typed with `--typed-tools`) | yes |
+| `qwen_xml` | Qwen3.5, Qwen3-Coder, LFM3 | yes, separated by `\n` (LFM3: `\n\n`, as its template writes them; `formats.call_gap`) | Parameter names `[A-Za-z0-9_.\-]+` or one of the offered tools' own (`$select`, `größe`), values any text without `</parameter>` (typed with `--typed-tools`) | yes |
 | `hermes` | Qwen2.5, Qwen3, Hermes | yes, separated by `\n` | `json_args_regex()` | yes |
 | `llama3_json` | Llama 3.1-3.3 | no | `json_args_regex()` under `"parameters"` | yes |
 | `mistral` | Mistral 7B v0.3 | yes, in one JSON list | `json_args_regex()` | no |
@@ -378,7 +378,7 @@ In every format, tool names are restricted to the offered names by `_alts(names)
 
 ### The reply grammar
 
-`oai.reply_regex(tools, tool_choice="auto", thinking=False, typed=False, fmt=None, preamble=True, parallel=True)` handles Qwen's XML calls itself and delegates every other format to `fmt.reply_regex`. The grammar is free text that cannot start a call, followed by calls whose fixed parts are literals. Those literals are forced spans, so a reply always parses.
+`oai.reply_regex(tools, tool_choice="auto", thinking=False, typed=False, fmt=None, preamble=True, parallel=True, sealed=False, gap="\n")` handles Qwen's XML calls itself and delegates every other format to `fmt.reply_regex`. The grammar is free text that cannot start a call, followed by calls whose fixed parts are literals. Those literals are forced spans, so a reply always parses.
 
 | `tool_choice` | Reply body |
 |---|---|
@@ -392,7 +392,7 @@ The server always passes `preamble=False`, because a small model given room to t
 How free text excludes a call. `not_containing(*lits)` is an exact regex for strings that contain none of the given literals, all of which must start with the same character and not contain it again. The string is split at every occurrence of that lead character, and each segment must not begin with the rest of any literal. The free text of each format:
 
 - **hermes, fallback, mistral_v11, minicpm_xml, lfm2_python:** `not_containing(opener)` (the `ToolFormat.free_text` default, or `MistralV11`'s own copy of it)
-- **qwen_xml:** `not_containing("<tool_call>", "<function=")` (no call with or without its wrapper)
+- **qwen_xml:** `not_containing("<tool_call>", "<function=")` (no call with or without its wrapper); with `sealed`, `"<think>"` and `"</think>"` too (below)
 - **gemma4:** `not_containing("<|tool_call>", "<|channel>", "<channel|>")`
 - **llama3_json:** text, possibly empty, that starts with neither `{` nor `<|p`. The regex `([^{<](.|\n)*|<([^|]|\|[^p])(.|\n)*|<|<\|)?` rules out every text that starts with `<|p`, not only `<|python_tag|>`.
 - **mistral:** text that does not start with `[` and does not contain `[TOOL_CALLS]`
@@ -400,6 +400,16 @@ How free text excludes a call. `not_containing(*lits)` is an exact regex for str
 `llama3_json` and `mistral` put their calls at the start of the reply. For them, `"auto"` is "calls or free text", and `"required"` (or a named function) is the calls alone.
 
 **Thinking.** With `thinking`, the body is preceded by `not_containing("</think>") + "</think>" + think_sep` for qwen_xml (`oai.reply_regex`) and for every format that uses `ToolFormat.reply_regex` (hermes, mistral_v11, minicpm_xml, lfm2_python, fallback), so the reply starts inside an open think block. llama3_json, mistral and mistral_legacy override `reply_regex` and ignore `thinking`. `think_sep` is `\n\n`, or `""` for `lfm2_python`. Gemma 4 instead prefixes `thought_regex()`, an optional `<|channel>thought ... <channel|>` block, whatever the thinking setting; Flint likewise an optional `<think> ... </think>` block. When the server steers a repeated call with a text prefix, it removes that optional block from the regex.
+
+**Thinking off on a model that thinks anyway.** LFM3's template closes the think block empty with thinking off
+(`<think></think>`, with no line after it), and the model opened a block of its own all the same, or reasoned, closed a
+block it never opened and gave its answer again: 4 of 11 replies of the 4-bit build, 1 of 11 of the unquantized
+weights. Such a model thinks by default (its template does too, and LFM3 finished 15 of 18 agent tasks thinking, 10
+not). When a request turns thinking off, the server keeps its reply from the tags (`formats.thinks_when_off`): with tools,
+`reply_regex(..., sealed=True)` leaves them out of the free text; without tools or a response format, the reply gets
+`not_containing("<think>", "</think>")` as its grammar. Not with thinking on, and not for `ignore_eos`. Kept from them,
+LFM3 answered at once (a palindrome function in 274 tokens instead of 700 of thinking), and the grammar cost about
+1% of the writing speed (116 and 501 tokens/s for one and eight requests, against 116 and 506 without it).
 
 **Typed Qwen calls.** `--typed-tools` switches Qwen's XML calls to `typed_call_regex`. Every parameter name is then fixed in schema order, required parameters are mandatory, and values are typed by `_value_regex`:
 
