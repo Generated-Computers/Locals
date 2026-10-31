@@ -145,8 +145,16 @@ class Server:
     def __init__(self, model: str = DEFAULT_MODEL, engines=("locals", "mlx"), preload=("locals",), slots: int = 16,
                  temp: float = 0.2, max_tokens: int = 4096, thinking: bool = False, cache_gb: Optional[float] = None, seed: int = 0,
                  max_calls: int = 6, walk: bool = False, typed_tools: bool = False, log=None, top_p: float = 0.0, top_k: int = 0,
-                 max_context: Optional[int] = None):
+                 max_context: Optional[int] = None, blocks: Optional[int] = None):
         self.model_id = model_id(model)  # a short name (qwen, gemma) or any model id
+        # a block-diffusion model (Clover) writing blocks of this many tokens (locals/blockdiff_service.py); None: a
+        # token a step, its causal pass, on the batch engine as any model
+        self.blocks = blocks
+        if blocks:
+            from .blockdiff import is_block_diffusion
+
+            if not is_block_diffusion(self.model_id):
+                raise ValueError(f"--blocks: {self.model_id} is not a block-diffusion model (Clover); it writes a token a step")
         self._recent_systems: List[str] = []  # the system messages of recent sessions (see _session_start)
         # Prompt + reply tokens per request; longer prompts get a context_length_exceeded error (past
         # what fits, a Metal out-of-memory error would end every request in flight). None: what fits
@@ -277,11 +285,17 @@ class Server:
                 raise RuntimeError(f"engine {engine} failed to load {time.time() - failed[0]:.0f}s ago: {failed[1]}")
             from .service import BatchService
 
+            cls, extra = BatchService, {}
+            if self.blocks:  # (Clover in blocks: its own decoding on both engines, locals/blockdiff_service.py)
+                from .blockdiff_service import BlockDiffusionService as cls
+
+                extra = {"block_size": self.blocks}
             t = time.perf_counter()
             self.log(f"loading {self.model_id} on engine {engine} ...")
             try:
-                svc = BatchService(ENGINE_NAMES[engine], self.model_id, slots=self.slots, temp=self.temp, seed=self.seed,
-                                   cache_gb=self.cache_gb, walk=self.walk and engine == "locals", top_p=self.top_p, top_k=self.top_k)
+                svc = cls(ENGINE_NAMES[engine], self.model_id, slots=self.slots, temp=self.temp, seed=self.seed,
+                          cache_gb=self.cache_gb, walk=self.walk and engine == "locals", top_p=self.top_p, top_k=self.top_k,
+                          **extra)
             except Exception as e:
                 self._load_error[engine] = (time.time(), f"{type(e).__name__}: {e}")
                 raise
@@ -420,15 +434,15 @@ class Server:
             schema, regex = None, rf.get("regex") or rf.get("pattern") or req.get("guided_regex")
             if not isinstance(regex, str) or not regex:
                 raise ValueError("response_format regex needs a 'regex' string")
-        elif engine == "locals" and schema is None and tools:
+        elif engine == "locals" and schema is None and tools and getattr(svc, "constrains", True):
             tc = req.get("tool_choice", "auto")
             _check_tool_choice(tc, [t["function"]["name"] for t in tools])
             # ignore_eos (a benchmark's fixed reply length): free text past the end of turn, unless a call is required
             if not req.get("ignore_eos") or tc == "required" or isinstance(tc, dict):
                 regex = oai.reply_regex(tools, tc, thinking, typed=self.typed_tools, fmt=fmt, preamble=False,
                                         parallel=req.get("parallel_tool_calls") is not False, sealed=sealed, **seps)
-        if engine == "locals" and tools and (schema is not None or rf.get("type") == "json_object" or
-                                             rf.get("type") == "regex" or req.get("guided_regex")):
+        if engine == "locals" and tools and getattr(svc, "constrains", True) and (
+                schema is not None or rf.get("type") == "json_object" or rf.get("type") == "regex" or req.get("guided_regex")):
             tc = req.get("tool_choice", "auto")
             _check_tool_choice(tc, [t["function"]["name"] for t in tools])
             if tc != "none":
@@ -443,7 +457,7 @@ class Server:
                                         sealed=sealed, **seps)
                 schema, regex = None, ("(" + calls + "|" + out + ")" if tc == "auto" else calls)
                 output_regex = out if tc == "auto" else None
-        if sealed and regex is None and schema is None:  # (no tools: free text, without the tags)
+        if sealed and regex is None and schema is None and getattr(svc, "constrains", True):  # (no tools: free text, without the tags)
             regex = oai.not_containing(*oai.THINK_TAGS)
         cps = self._checkpoints(tok, msgs, tpl_tools, think_kw, text, prompt) if engine == "locals" and self._needs_checkpoints(engine) else []
         return {"engine": engine, "thinking": thinking, "svc": svc, "prompt": prompt, "checkpoints": cps, "text": text,
@@ -2229,6 +2243,8 @@ def _on_sigterm() -> None:
 def main(argv=None):
     import argparse
 
+    from .defaults import MAC_BLOCK as BLOCKS
+
     _on_sigterm()
 
     ap = argparse.ArgumentParser(prog="locals serve", description="OpenAI-compatible server: our engine and stock mlx-lm side by side.")
@@ -2255,6 +2271,9 @@ def main(argv=None):
     ap.add_argument("--max-calls", type=int, default=6, help="tool calls kept per reply; the reply is cut after that many")
     ap.add_argument("--walk", action="store_true", help="constraints by the walk kernel (no token tables; any grammar size)")
     ap.add_argument("--typed-tools", action="store_true", help="tool calls with parameter names and types fixed (use with --walk)")
+    ap.add_argument("--blocks", type=int, nargs="?", const=BLOCKS, default=None, help="a block-diffusion model (Clover): "
+                    f"write blocks of this many tokens by diffusion (default {BLOCKS}, the fastest on a Mac), not a token a "
+                    "step by its causal pass; requests one at a time, no grammars")
     args = ap.parse_args(argv)
     engines = tuple(e.strip() for e in args.engines.split(",") if e.strip())
     preload = () if args.preload == "none" else tuple(e.strip() for e in args.preload.split(",") if e.strip())
@@ -2272,13 +2291,20 @@ def main(argv=None):
                      "or leave out --ollama (locals answers Ollama's API on its own port too)")
     from .defaults import gguf_hint, too_big
 
+    if args.blocks:
+        from .blockdiff import is_block_diffusion
+
+        if not is_block_diffusion(args.model):
+            sys.exit(f"locals serve: --blocks is for a block-diffusion model (Clover) on this Mac; {args.model} writes a "
+                     "token a step")
     why = gguf_hint(args.model) or too_big(args.model, remote=True)  # `locals serve` downloads the model itself: checked before that
     if why:
         sys.exit(f"locals serve: {why}")
     try:
         srv = Server(args.model, engines=engines, preload=preload, slots=args.slots, temp=args.temp, max_tokens=args.max_tokens,
                      thinking=args.thinking, cache_gb=args.cache_gb, seed=args.seed, max_calls=args.max_calls, walk=args.walk,
-                     typed_tools=args.typed_tools, top_p=args.top_p, top_k=args.top_k, max_context=args.max_context)
+                     typed_tools=args.typed_tools, top_p=args.top_p, top_k=args.top_k, max_context=args.max_context,
+                     blocks=args.blocks)
     except Exception as e:  # noqa: BLE001
         why = _load_error(args.model, e)
         if why is None:

@@ -26,7 +26,8 @@ import sys
 from pathlib import Path
 
 _MODULES = ("flint",  # Recursive's Flint (mlx-lm has it from ml-explore/mlx-lm#1998, unreleased)
-            "lfm3")  # Liquid's LFM3 (no mlx-lm release has it yet)
+            "lfm3",  # Liquid's LFM3 (no mlx-lm release has it yet)
+            "clover_moe")  # DiffuSpace's Clover (its causal pass as Qwen3.5-MoE's text model; and in blocks)
 _CONFIGS = ("lfm3",)  # model types whose config.json names remote code for AutoConfig
 
 

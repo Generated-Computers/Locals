@@ -18,6 +18,12 @@ MODELS = {
 }
 
 
+# A block-diffusion model's block on a Mac (Clover's is 32; locals serve --blocks): a preview of a block costs about
+# what a prompt chunk of its size does and resolves one to three tokens whatever its size, so smaller blocks write
+# faster here. On an M4 Pro: 38 tokens/s in blocks of 8, 27 of 16, 20 of 32 (its causal pass, a token a step: 95).
+MAC_BLOCK = 8
+
+
 # Measured on a MacBook Pro with an M2 Pro (16 GB): tokens per second with 8 requests at once, stock
 # mlx-lm and locals, 256 tokens each (locals bench measures them on any Mac), and the weights in GB.
 MEASURED_M2_PRO = {

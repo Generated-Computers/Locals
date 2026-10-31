@@ -123,7 +123,7 @@ _SOURCE = r"""
     constexpr int BK_padded = (BK + 16 / sizeof(T));
     threadgroup T Xs[BM * BK_padded];
     threadgroup T Ws[BN * BK_padded];
-    locals_qmm_t_small<T, U, 64, 4, BM, BK, BN, WM, WN>(
+    locals_qmm_t_small<T, U, 64, BITS, BM, BK, BN, WM, WN>(
         w, scales, biases, x, y, Xs, Ws, K, N, M, K / SPLIT,
         threadgroup_position_in_grid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
 """
@@ -145,8 +145,8 @@ def _kernel():
 
 
 def qmm_mma(x: mx.array, w: mx.array, scales: mx.array, biases: mx.array,
-            BM: int = 8, BN: int = 64, BK: int = 32, WM: int = 1, WN: int = 4, split: int = 1) -> mx.array:
-    """y = x @ dequant(w).T, 4-bit affine, group 64. x: (M, K).
+            BM: int = 8, BN: int = 64, BK: int = 32, WM: int = 1, WN: int = 4, split: int = 1, bits: int = 4) -> mx.array:
+    """y = x @ dequant(w).T, affine, group 64, ``bits`` 4 or 8. x: (M, K).
 
     ``split`` > 1 partitions K across threadgroups (split-K) and sums the
     float32 partials, which helps small matrices fill the GPU.
@@ -160,7 +160,7 @@ def qmm_mma(x: mx.array, w: mx.array, scales: mx.array, biases: mx.array,
     (y,) = _kernel()(
         inputs=[x, w, scales, biases],
         template=[("T", x.dtype), ("U", out_dtype), ("BM", BM), ("BN", BN), ("BK", BK), ("WM", WM), ("WN", WN),
-                  ("K", K), ("N", N), ("M", M), ("SPLIT", split)],
+                  ("K", K), ("N", N), ("M", M), ("SPLIT", split), ("BITS", bits)],
         grid=(N // BN * 32 * WM * WN, m_tiles, split),
         threadgroup=(32 * WM * WN, 1, 1),
         output_shapes=[(split * M, N)],

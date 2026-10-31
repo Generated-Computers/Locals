@@ -674,6 +674,53 @@ sliding window: the same top token at every position, logits within 0.001, and t
 cache filled in two chunks. In float16 the top token is the same at 99.7% of positions, in bfloat16 at 97.4% (PyTorch's
 own bfloat16: 97.2%). Liquid's 8-bit build: 96.3%; its 4-bit build: 78.8%.
 
+## 13. DiffuSpace's Clover (M4 Pro, 24 GB)
+
+Clover-35B-A3B-Preview (35B, 3B active per token: Qwen3.6-35B-A3B's network, 256 routed experts with 8 a token and a
+shared expert, trained as a block-diffusion model) on a MacBook Pro with an M4 Pro and 24 GB, the GPU's limit raised
+to 20 GB, its MLX build from `python -m locals.convert_clover` (16.7 GB: experts at 3 bits, the output layer at 8),
+MLX 0.32.4, mlx-lm 0.32.2. Both setups run Clover's causal pass, a token a step (`models/clover_moe.Model`, which is
+mlx-lm's Qwen3.5 text model): mlx-lm as it is, and Locals; each alone on the GPU, the kernel choices this Mac's tuner
+had cached. Other applications were open (as on a Mac in use), which makes single runs swing by a few percent; the
+runs alternated, and the table has the best of each.
+
+**In the process: requests at once.** A 256-token prompt each (the package's own source), then 48 greedy steps after
+4 warm-up steps; tokens per second all rows write together:
+
+| Requests at once | mlx-lm | Locals | Locals / mlx-lm |
+|---|---|---|---|
+| 1 | 79.5 | 93.6 | 1.18x |
+| 2 | 117.5 | 146.8 | 1.25x |
+| 4 | 150.2 | 192.2 | 1.28x |
+| 8 | 179.8 | 247.9 | 1.38x |
+
+At one row the step went from 12.6 ms to 10.7: the MoE blocks from 5.1 ms to 3.9 (a block of about twenty kernels
+to eight, mlx-lm's expert choice bit for bit), the Gated DeltaNet layers from 4.3 ms to 3.8 (their b and a projections,
+8-bit next to 4-bit qkv and z, had kept them on mlx-lm's fourteen kernels a layer), and each residual add in the norm
+after it; the 8-bit output layer is 2.3 ms of the step (docs/runtime, "Qwen3.5-MoE and Clover"). From 6 rows that output layer goes
+through `mma`, 8- or 16-row tiles that read it once, where MLX's kernel takes 32-row tiles: 2.8 ms at 8 rows instead of
+4.6, 247.9 tokens/s instead of 234.2 (docs/runtime, "Wide 8-bit layers"). 16 requests at once
+were not measured: with the GPU at 20 GB of 24, a 24 GB Mac in use has little room left, and a run there ended in a
+watchdog restart of macOS.
+
+**Through the batch engine** (the server's, without HTTP): requests of 256 tokens, the end ignored, counted from the
+first token to the last; one-token steps only (`LOCALS_SOLO=0`; a request alone also gets prompt-lookup drafts by
+default): 94.6 tokens/s for one request, 180.7 for 4 at once, 223.2 for 8.
+
+**Prompts.** Read from nothing in 2,048-token chunks: mlx-lm 823 tokens/s for a 2,048-token prompt and 736 for 8,192, Locals 834 and 742 (its kernels are for few rows; a prompt's experts go through MLX's sorted gather, as mlx-lm's do).
+
+**In blocks** (`--blocks`): the four prompts of the block checks (a sentence, a Python function, 200 words of prose,
+the bat-and-ball question with thinking), greedy, one request:
+
+| Block | Stock MLX | Locals |
+|---|---|---|
+| 32 (the model's) | 14.6 tokens/s | 20.2 |
+| 16 | | 27.3 |
+| 8 (`--blocks`'s default) | | 38.1 |
+
+A block of 32 resolves 1 to 2.7 tokens a step (prose: about 1), and a step over its 32 positions costs about what a
+32-token prompt chunk does on this GPU, so smaller blocks write faster here, and the causal pass faster still.
+
 ## How the measurements were made
 
 - **Decode speed**: n requests at once, 256 tokens each with the end-of-text token

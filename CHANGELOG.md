@@ -145,6 +145,38 @@
   used instead (64 requests: 367 against mlx-lm's 291). LOCALS_MOE_KERNEL=0: MLX's kernels.
 - A model can set its own prompt passes (HybridBatchEngine.prefill_tokens).
 
+- **DiffuSpace's Clover** (Clover-35B-A3B-Preview, a block-diffusion model on Qwen3.6-35B-A3B's network: 35B, 3B
+  active per token). `python -m locals.convert_clover` makes its MLX build (16.7 GB: 3-bit experts, 4-bit down
+  projections in 20 layers, 8-bit embedding, output layer and routers, 4-bit elsewhere) from the bf16 checkpoint, a
+  file at a time, so the 69.3 GB download never sits on the disk whole. Locals runs it a token a step by its causal
+  pass, which is Qwen3.5-MoE's forward (`models/clover_moe.py`: mlx-lm's Qwen3.5 text model, the block-diffusion
+  weights left out), as any model: several requests at once, tool calls and JSON schemas under their grammars, the
+  prompt cache. On an M4 Pro with 24 GB: 94.6 tokens/s for one request and 223.2 for eight at once through the batch
+  engine; in the process 93.6 and 247.9 where mlx-lm gives 79.5 and 179.8 (docs/benchmarks, section 13). On a Mac that is
+  the faster way: DiffuSpace's own decoding, blocks of 32 masked tokens resolved a few positions a step, wrote 14.6
+  tokens/s with stock MLX. `--blocks [N]` (`locals serve`, `locals start`, `locals chat`) decodes so instead, in blocks
+  of 8 by default (38.1 tokens/s; 32: 20.2), with kernels for its preview pass: the block coreset's routing in one
+  kernel, a block's experts in tiles of slots, the Gated DeltaNet's two-sided convolution; one request at a time, no
+  grammars.
+- **Clover's causal pass** (mlx-lm's Qwen3.5-MoE network) gets a fused MoE block, its own (another Qwen3.5-MoE build
+  keeps mlx-lm's block, and every other model its kernels and bits): the router and the shared
+  expert's gate one matmul, the choice one kernel (mlx-lm's experts and weights bit for bit, ties included), the
+  experts through Flint's kernels, and a combine that adds the gated shared expert, the layer's residual and the next
+  layer's input norm; the mixer's residual add is in the post-mixer norm. Gated DeltaNet layers whose b and a
+  projections are quantized apart from qkv and z (Clover's at 8 bits) take the one-kernel decode step: before, they
+  fused nothing. Clover in the process: 93.6 tokens/s for one request instead of 81.1, 192.2 at 4 instead of 157.8.
+- Clover's output layer, kept at 8 bits (540 MB), is read once at 6 to 32 rows: the tuner times it against `mma`
+  (8- or 16-row tiles; MLX's loader takes 8-bit weights too) from 5 rows, where MLX's kernel switches to 32-row
+  tiles from 6. Clover's output layer at 8 rows: 2.8 ms instead of 4.6; decoding 247.9 tokens/s instead of 234.2 at 8
+  requests at once, 3% faster at 6. Its choices are cached under keys of their own (`...b8`); every other layer's keys
+  and choices are as they were, and Clover's layers are tuned as Flint's are (fragq, chains). `LOCALS_HEAD8=0` keeps
+  the layer on MLX's kernel.
+- For Clover's layers, the expert kernels' SwiGLU and the Gated DeltaNet decode kernel's beta, decay, convolution SiLU
+  and norms compute as MLX's own operations do: its sigmoid and softplus round each step in bf16, and its exp and
+  rsqrt are the precise ones, where the kernels round once and use fast math (in 15 to 17% of bf16 values another
+  result). A small Clover's patched decode steps give stock mlx-lm's logits bit for bit at one row; every other model
+  (Flint's experts, Qwen3.5's GDN layers) keeps its bits.
+
 ## 0.2.1 (2026-10-21)
 
 - The installer installs the release from PyPI; run again, it updates to the newest release. `LOCALS_SOURCE` set to
