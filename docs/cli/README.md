@@ -91,6 +91,7 @@ OpenCode references these ids as `<provider>/<engine>/<short>` (`oc_model`), bec
 | `locals serve` | `cmd_serve` | Holds the port's start lock, checks and downloads the model (`fetch_model`), remembers it, then `os.execv`s into `python -m locals.server` in the foreground. |
 | `locals start` | `cmd_start` | Downloads the model, then starts the server in the background (`ensure_server`). |
 | `locals stop` | `cmd_stop` | Stops the Locals server on `--port`, and only a Locals server. |
+| `locals unload` | `cmd_unload` | Takes the model out of memory (`POST /unload`), the server on `--port` still running; its next request loads the model again. |
 | `locals status` | `cmd_status` | Prints `/stats` as a table. |
 | `locals run TASK` | `harness.cmd_run` | Locals's own multi-agent harness (plan, parallel versions in copies, check, repair). |
 | `locals solve TASK` | `solve.cmd_solve` | OpenCode agents race in copies of the project. The first whose check passes wins. |

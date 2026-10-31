@@ -1,0 +1,43 @@
+{
+ "cat42_640x400.png": {
+  "answers": [
+   "Cata",
+   "Cata"
+  ]
+ },
+ "cat42_1280x800.png": {
+  "answers": [
+   "cata2",
+   "cata2"
+  ]
+ },
+ "shapes_640x480.png": {
+  "answers": [
+   "Based on the image provided, here are the shapes listed from left to right with their colours:\n\n- A red circle\n- A blue square\n- A green triangle",
+   "Based on the image provided, here are the shapes listed from left to right with their colours:\n\n- A red circle\n- A blue square\n- A green triangle"
+  ]
+ },
+ "invoice_900x500.png": {
+  "answers": [
+   "Based on the invoice provided:\n\n*   **Total:** 1,284.50 PLN\n*   **Customer:** Stefan Nowak",
+   "Based on the invoice provided:\n\n*   **Total:** 1,284.50 PLN\n*   **Customer:** Stefan Nowak"
+  ]
+ },
+ "smallfont_512x256.png": {
+  "answers": [
+   "HELLO WORLD from a small font",
+   "HELLO WORLD from a small font"
+  ]
+ },
+ "bars_768x512.png": {
+  "answers": [
+   "Based on the provided bar chart:\n\n- The bar labeled **'B'** is the **tallest**. It reaches the highest point on the vertical axis.\n- The bar labeled **'A'** is the **shortest**. It is visibly lower than both bar 'B' and",
+   "Based on the provided bar chart:\n\n- The bar labeled **'B'** is the **tallest**. It reaches the highest point on the vertical axis.\n- The bar labeled **'A'** is the **shortest**. It is visibly lower than both bar 'B' and"
+  ]
+ },
+ "_deepstack": {
+  "levels": 3,
+  "dropped": false,
+  "encode_calls": 12
+ }
+}

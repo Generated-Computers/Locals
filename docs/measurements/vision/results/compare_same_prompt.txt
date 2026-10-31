@@ -1,0 +1,9 @@
+loc_q35.json vs vlm_q35_nl.json (mlx-vlm, the same prompt): 5 of 6 the same
+  differs: cat42_1280x800.png: ours 'cat 42' / mlx-vlm 'CAT 12'
+loc_vl8.json vs vlm_vl8_nl.json (mlx-vlm, the same prompt): 6 of 6 the same
+loc_vl8_nodeep.json vs vlm_vl8_nl.json (mlx-vlm, the same prompt): 1 of 6 the same
+  differs: cat42_640x400.png: ours 'Cata 4' / mlx-vlm 'Cata'
+  differs: cat42_1280x800.png: ours 'Cata2' / mlx-vlm 'cata2'
+  differs: shapes_640x480.png: ours 'From left to right, the shapes and their colours are:\n\n- Red circle\n- Blue squar' / mlx-vlm 'Based on the image provided, here are the shapes listed from left to right with '
+  differs: invoice_900x500.png: ours 'Based on the provided invoice text, here is the information you requested:\n\n*   ' / mlx-vlm 'Based on the invoice provided:\n\n*   **Total:** 1,284.50 PLN\n*   **Customer:** St'
+  differs: bars_768x512.png: ours "Based on the provided bar chart:\n\n- The bar labeled **'B'** is the **tallest**. " / mlx-vlm "Based on the provided bar chart:\n\n- The bar labeled **'B'** is the **tallest**. "

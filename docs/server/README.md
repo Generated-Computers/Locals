@@ -82,7 +82,7 @@ Handler.do_POST
    - An Anthropic request ends with an assistant prefill (`_prefill`): the reply goes on from it.
 8. `oai.convert_messages` flattens the messages:
    - `system` and `developer` messages are merged into one at the front;
-   - content parts are joined with newlines, with an image as "[an image was attached here; this model reads text only]" and a file as "[a file was attached here; this model reads only the text of the conversation]" (`oai.IMAGE_NOTE`, `oai.FILE_NOTE`);
+   - content parts are joined with newlines, with an image as "[an image was attached here; this model reads text only]" (unless the model reads images: see Images, below) and a file as "[a file was attached here; this model reads only the text of the conversation]" (`oai.IMAGE_NOTE`, `oai.FILE_NOTE`);
    - tool-call arguments become dicts;
    - an empty user message is added when there is none, because templates require one.
 
@@ -112,6 +112,7 @@ Paths are matched with any trailing slash removed.
 | GET | `/` | a status page (`STATUS_HTML`) that polls `/stats` every second. On the `--ollama-port` listener it returns the text `Ollama is running` instead |
 | GET | `/api/version`, `/api/tags`, `/api/ps` | Ollama |
 | POST | `/api/chat`, `/api/generate`, `/api/show`, `/api/pull`, `/api/embed`, `/api/embeddings` | Ollama (see below) |
+| POST | `/unload`, `/v1/unload` | the model out of memory, the server still running (see Unloading the model) |
 | OPTIONS | any | 204 with CORS headers, after `_allowed()` |
 | HEAD | any | 200 with an empty body. No host or origin check |
 
@@ -365,7 +366,7 @@ guards and hang-up handling:
 | Messages API | Chat Completions |
 |---|---|
 | `system` (a string or text blocks) | one system message (blocks joined by a blank line) |
-| `text`, `image`, `document` blocks | text; an image as `oai.IMAGE_NOTE`; a text document as its text, another as `oai.FILE_NOTE` |
+| `text`, `image`, `document` blocks | text; an image (base64 or URL) in a user message as an `image_url` part, which a model that reads images sees and any other gets as `oai.IMAGE_NOTE`; a text document as its text, another as `oai.FILE_NOTE` |
 | assistant `thinking`, `text`, `tool_use` blocks | `reasoning_content`, `content`, `tool_calls` (ids kept, so raw replay finds the reply) |
 | user `tool_result` blocks | `tool` messages, in order, before the user's text; `is_error` as "Error: " before the result |
 | `tools` (`name`, `description`, `input_schema`) | functions; Anthropic's own server tools (web search, code execution) are left out |
@@ -411,11 +412,11 @@ Requests are translated to Chat Completions and go through the same `prepare`, b
 How requests are translated (`apis.ollama_to_chat`):
 
 - **Model names.** Any other name maps to the server's one model (`Server.chat_model`); our own names for another model (`locals/<short>`, `mlx/<short>`, `stock/<short>`) are refused (`check_model`, a 404 on Ollama's API). `mlx/...` picks the stock engine when it is enabled. A name that contains `think` turns thinking on.
-- **Load and unload.** A chat without messages, or a generate without a prompt, is Ollama's way to load a model. With `keep_alive` 0 it unloads one. Either is answered at once, with `done_reason` `load` or `unload`.
+- **Load and unload.** A chat without messages, or a generate without a prompt, is Ollama's way to load a model: the engine is loaded (if it was not) before the answer, `done_reason` `load`. With `keep_alive` 0 it unloads it (`Server.unload`, see Unloading the model), `done_reason` `unload`.
 - **Options.** `options.num_predict` (when > 0) becomes `max_tokens`. `temperature`, `top_p`, `top_k`, `stop` and `seed` are copied (for `/api/generate` with `raw` too), and all of them apply.
 - **Formats.** `format: "json"` becomes `json_object`. A schema object becomes `json_schema`.
 - **Thinking.** `think: true` or `false` becomes `chat_template_kwargs.enable_thinking`. A level string (`low`, `medium`, `high`) turns thinking on and sets `reasoning_effort`.
-- **Images.** The images are dropped. A message, or a generate prompt, that had any gets one note appended to its text: `IMAGE_NOTE`, "[an image was attached here; this model reads text only]" (`apis.ollama_to_chat`).
+- **Images.** A message's `images` (base64 strings), or a generate's, become OpenAI `image_url` parts before its text, where Ollama puts them (`apis._with_images`). A model that reads images sees them (see Images); for any other, each is `IMAGE_NOTE`, "[an image was attached here; this model reads text only]". `/api/show` lists `vision` among the capabilities when the model reads images.
 - **Tool call ids.** Ollama's tool calls have no ids, so they get stable ones (`call_<message>_<index>`), the same on every request. Random ids changed the history the template writes, so the prompt cache missed. Tool results without a `tool_call_id` are paired with the last assistant turn's calls by position.
 
 Replies have:
@@ -426,6 +427,72 @@ Replies have:
 - `prompt_eval_count`, `eval_count`, and durations in nanoseconds.
 
 In a stream, tool calls are collected and sent in the final `done` line. Errors are `{"error": "..."}`.
+
+## Images
+
+Qwen3.5 and Qwen3-VL read images on our engine (`vision_config` in `locals/models/qwen3_5_vl.py` decides, from the
+checkpoint's `config.json`: a vision tower, and an interleaved M-RoPE split that covers the rotated dims). mlx-lm keeps
+only the text half of such a checkpoint, so the tower is rebuilt from the same files (`locals/models/qwen3_5_vl.py`) and loaded with the
+first image, not at start. Any other model, and the stock engine, gets `IMAGE_NOTE` in each image's place, as before.
+
+An image is an OpenAI `image_url` part (`{"url": "data:image/png;base64,..."}`, or, on a server bound to loopback
+only, an `http(s)` URL or a file path), or `input_image` (the Responses API). A server other machines can reach fetches
+no URL and reads no file for a client: that would let the client read this Mac's files or reach its network. A fetched
+image may be up to 64 MB. Anthropic `image` blocks, also those in a `tool_result`, and Ollama's `images` are turned
+into those (above). Images in user and tool messages are read; one in a system message keeps the note (Qwen's
+template refuses it there).
+
+1. `Server.prepare` (the HTTP thread) takes the images out of the messages (`vision.take_images`): each becomes the
+   template's `<|vision_start|><|image_pad|><|vision_end|>` text. It decodes and resizes each one (`vision.load`): both
+   sides a multiple of 32 pixels, at most `LOCALS_VISION_MAX_PIXELS` pixels (default 1,048,576), as the model was
+   trained (transformers' `smart_resize`), and cuts it into 16x16-pixel patches in the order the tower's 2x2 merger
+   reads them. This is numpy, not MLX: an MLX array made in the HTTP thread belongs to that thread's stream, and the
+   engine's thread cannot compute it.
+2. The prompt is tokenized whole (not from a remembered token stream) and each `<|image_pad|>` is expanded to the
+   image's token count, one per 32x32 pixels (`vision.expand`). The context limit counts those tokens.
+3. The job carries the images and where their tokens sit (`Job.pictures`, `Job.spans`). The batch loop holds it until
+   no other row is running, then runs it alone (`BatchService._vision`): the tower turns the patches into one
+   embedding per token, the prompt's embeddings take them in the placeholders' place, and the reply is generated on
+   the synchronous engine (`Engine.generate_embedded`) with M-RoPE: each image token's position is its (frame, row,
+   column), and the full-attention layers' RoPE is swapped for `vision.MRoPE` for that one request, split over the
+   frequencies as the checkpoint says (`mrope_section`: Qwen3.5's `[11, 11, 10]` over 64 of each head's 256 dims,
+   Qwen3-VL's `[24, 20, 20]` over all 128). The batch engine cannot run such a row: its positions are token indices.
+4. Qwen3-VL's tower also merges the output of its blocks 8, 16 and 24 (`deepstack_visual_indexes`). While the prompt
+   is read, the text model adds those to the image's tokens after its layers 0, 1 and 2 (`vision.deepstack`, as
+   transformers' `_deepstack_process`). Qwen3.5 has none.
+
+Grammars (tools, `response_format`) apply as for text. Streaming and cancelling work as for text. An image request
+does not use the prompt cache, and its reply is not remembered as a token stream.
+
+Compared with mlx-vlm 0.7.11 (`mlx_vlm.generate`, greedy, 60 tokens) on six test pictures (large text, small print,
+coloured shapes, an invoice, a bar chart), on an M2 Max (32 GB) at commit `20bafe1`; each question asked twice gave the
+same answer both times, on both sides. Our prompt has a newline after the image (`oai.text_of` joins the content parts
+with one); Qwen's template has none. With that newline added to mlx-vlm's prompt, so both read the same tokens:
+
+- Qwen3-VL-8B 4-bit gave mlx-vlm's answers word for word on all six. With the deepstack features left out, five of the
+  six changed.
+- Qwen3.5-4B 4-bit gave mlx-vlm's answers on five. On the sixth, "CAT 42" in 128-pixel letters on a 1280x800 picture,
+  ours read "cat 42" and mlx-vlm "CAT 12".
+
+Both models read large text in a small picture badly, here and in mlx-vlm alike: "CAT 42" in 64-pixel letters on a
+640x400 picture came back as "cat 2" from Qwen3.5 and "Cata" from Qwen3-VL. The scripts and answers are in
+`docs/measurements/vision/`.
+
+## Unloading the model
+
+`POST /unload` (mlx-vlm's request, also `/v1/unload`), Ollama's `keep_alive: 0`, and `locals unload` take the model
+out of GPU memory while the server keeps running; the next request loads it again. `Server.unload` takes each loaded
+engine out of `Server._svc` and calls `BatchService.unload`: replies in progress or queued end as `cancelled`, the
+worker thread stops, the weights, prompt cache and vision tower are dropped, and MLX's buffer pool is emptied. The
+answer is `{"status": "unloaded", "engines": [...], "freed_mb", "gpu_active_mb"}` (`"not loaded"` when nothing was).
+A request prepared while the model was unloaded is submitted to the model loaded again (`service.Unloaded`).
+
+Measured on an M2 Max (32 GB) with Qwen3.5-4B 4-bit (`mlx-community/Qwen3.5-4B-MLX-4bit`), one server process
+(`Server` and `serve`, as `locals serve` starts them), after two image requests: the process's `phys_footprint`
+(`footprint -p`, 1 s after the answer) went from 4,308 MB to 290 MB, and the next image request, loading the model
+again, took 3.26 s. In the same process, a second unload after three more image requests left 823 MB and a third
+149 MB; each answer said `freed_mb` 3035 and `gpu_active_mb` 0, and the reload took 3.24 s
+(`docs/measurements/vision/`).
 
 ## Security
 
@@ -568,6 +635,7 @@ Expected load errors, such as a model that is not on Hugging Face, or one that i
 | `LOCALS_DEBUG_DIR` | `~/.cache/locals/requests` | where those files go |
 | `LOCALS_REPLY_CHECKPOINT` | `1` | `0` turns off the `"reply"` cache checkpoint |
 | `LOCALS_TUNE` | `background` | passed to `Runtime.load` as `tune` |
+| `LOCALS_VISION_MAX_PIXELS` | `1048576` | the most pixels an image is resized to (one token per 32x32 pixels) |
 | `LOCALS_DISK_CACHE` | `1` | `0` turns off the disk prompt cache |
 | `LOCALS_DISK_CACHE_DIR` | `~/.cache/locals/prompts` | where the disk prompt cache lives |
 | `LOCALS_DISK_CACHE_GB` | `4` | size of the disk prompt cache |

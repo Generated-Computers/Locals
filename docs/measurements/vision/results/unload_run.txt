@@ -1,0 +1,17 @@
+cycle 1: image request 1.26 s -> "The customer's name is **Stefan Nowak**."
+cycle 1: image request 1.10 s -> 'The invoice number is **7319**.'
+cycle 1: phys_footprint after two image requests: 4,308 MB (raw 4308 MB)
+cycle 1: /unload -> {'status': 'unloaded', 'model': 'mlx-community/Qwen3.5-4B-MLX-4bit', 'engines': ['locals'], 'freed_mb': 3035, 'gpu_active_mb': 0}
+cycle 1: phys_footprint after unload: 290 MB (raw 290 MB)
+cycle 1: next image request (loads the model again) 3.26 s -> 'The invoice number is **7319**.'
+cycle 1: phys_footprint after it: 4,561 MB (raw 4561 MB)
+cycle 2: image request 1.08 s -> "The customer's name is **Stefan Nowak**."
+cycle 2: image request 1.07 s -> 'The invoice number is **7319**.'
+cycle 2: phys_footprint after two image requests: 4,535 MB (raw 4535 MB)
+cycle 2: /unload -> {'status': 'unloaded', 'model': 'mlx-community/Qwen3.5-4B-MLX-4bit', 'engines': ['locals'], 'freed_mb': 3035, 'gpu_active_mb': 0}
+cycle 2: phys_footprint after unload: 823 MB (raw 823 MB)
+cycle 2: next image request (loads the model again) 3.24 s -> 'The invoice number is **7319**.'
+cycle 2: phys_footprint after it: 4,651 MB (raw 4651 MB)
+third unload, by hand after cycle 2 (the model loaded, one image request since the reload):
+  curl -X POST http://127.0.0.1:8399/unload -> {"status": "unloaded", "model": "mlx-community/Qwen3.5-4B-MLX-4bit", "engines": ["locals"], "freed_mb": 3035, "gpu_active_mb": 0}
+  footprint -p <PID>: phys_footprint 149 MB after +1 s, 149 MB after +5 s, 149 MB after +15 s

@@ -1,0 +1,44 @@
+{
+ "cat42_640x400.png": {
+  "answers": [
+   "cat 2",
+   "cat 2"
+  ],
+  "prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>\nWhat text is in the picture? Answer with the text only.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ "cat42_1280x800.png": {
+  "answers": [
+   "CAT 12",
+   "CAT 12"
+  ],
+  "prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>\nWhat text is in the picture? Answer with the text only.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ "shapes_640x480.png": {
+  "answers": [
+   "From left to right, the shapes and their colors are:\n\n1. **Red circle**  \n2. **Blue square**  \n3. **Green triangle**\n\nThis matches the visual arrangement in the image.",
+   "From left to right, the shapes and their colors are:\n\n1. **Red circle**  \n2. **Blue square**  \n3. **Green triangle**\n\nThis matches the visual arrangement in the image."
+  ],
+  "prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>\nList the shapes from left to right with their colours.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ "invoice_900x500.png": {
+  "answers": [
+   "Based on the invoice details provided:\n\n- **Total:** 1,284.50 PLN  \n- **Customer:** Stefan Nowak\n\nThis information is clearly stated in the invoice.",
+   "Based on the invoice details provided:\n\n- **Total:** 1,284.50 PLN  \n- **Customer:** Stefan Nowak\n\nThis information is clearly stated in the invoice."
+  ],
+  "prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>\nWhat is the total, and who is the customer?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ "smallfont_512x256.png": {
+  "answers": [
+   "HELLO WORLD from a small font",
+   "HELLO WORLD from a small font"
+  ],
+  "prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>\nWhat does it say? Answer with the text only.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ "bars_768x512.png": {
+  "answers": [
+   "Looking at the bar chart:\n\n- **Bar A** is the shortest.\n- **Bar B** is the tallest.\n- **Bar C** is medium height — taller than A but shorter than B.\n\n✅ So, the **tallest bar is B**, and the **short",
+   "Looking at the bar chart:\n\n- **Bar A** is the shortest.\n- **Bar B** is the tallest.\n- **Bar C** is medium height — taller than A but shorter than B.\n\n✅ So, the **tallest bar is B**, and the **short"
+  ],
+  "prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>\nWhich bar is the tallest, and which is the shortest?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ }
+}

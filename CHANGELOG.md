@@ -2,6 +2,19 @@
 
 ## 0.2.2 (unreleased)
 
+- **Images, for Qwen3.5 and Qwen3-VL.** Qwen3.5 and Qwen3-VL now read the images in a request (OpenAI `image_url` parts, Anthropic
+  `image` blocks, also in a `tool_result`, Ollama's `images`) on our engine; before, each was the note "this model reads text only", which other
+  models still get. mlx-lm drops the vision tower of these checkpoints, so it is rebuilt from the same files
+  (`locals/models/qwen3_5_vl.py`) and loaded with the first image. An image request runs alone, on the synchronous
+  engine, with M-RoPE positions (`locals/vision.py`); Qwen3-VL's deepstack features are added to the image's tokens
+  in its first three layers. On six test pictures, given the same prompt, Qwen3-VL-8B 4-bit gave
+  mlx-vlm 0.7.11's answers word for word on all six, and Qwen3.5-4B 4-bit on five (`docs/measurements/vision/`). Images are resized to at most 1M pixels
+  (`LOCALS_VISION_MAX_PIXELS`), 1,024 tokens. Qwen3.5-4B 4-bit and Qwen3-VL-8B 4-bit read the customer's name and the invoice number from a 900x500 invoice of four
+  lines (`tests/test_vision_model.py`).
+- **Unloading the model, the server still running.** `POST /unload` (as mlx-vlm's server), Ollama's `keep_alive: 0`,
+  and `locals unload` give the model's memory back; the next request loads it again. On an M2 Max, Qwen3.5-4B's
+  server went from 4,308 MB to 290 MB, and the next image request loaded it again in 3.3 s.
+
 - **Liquid's LFM3** (`--model lfm3`: LiquidAI/LFM3-1.7B-MLX-4bit, 1.0 GB). No mlx-lm release has LFM3 yet, so its code
   ships with Locals (`locals/models/lfm3.py`): LFM2's gated convolutions, 7 wide, and attention over a 256-token window
   or the whole context, with a sigmoid gate on each head, q/k norms, RoPE on half of each full-attention head's

@@ -1,0 +1,44 @@
+{
+ "cat42_640x400.png": {
+  "answers": [
+   "Cata",
+   "Cata"
+  ],
+  "prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>\nWhat text is in the picture? Answer with the text only.<|im_end|>\n<|im_start|>assistant\n"
+ },
+ "cat42_1280x800.png": {
+  "answers": [
+   "cata2",
+   "cata2"
+  ],
+  "prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>\nWhat text is in the picture? Answer with the text only.<|im_end|>\n<|im_start|>assistant\n"
+ },
+ "shapes_640x480.png": {
+  "answers": [
+   "Based on the image provided, here are the shapes listed from left to right with their colours:\n\n- A red circle\n- A blue square\n- A green triangle",
+   "Based on the image provided, here are the shapes listed from left to right with their colours:\n\n- A red circle\n- A blue square\n- A green triangle"
+  ],
+  "prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>\nList the shapes from left to right with their colours.<|im_end|>\n<|im_start|>assistant\n"
+ },
+ "invoice_900x500.png": {
+  "answers": [
+   "Based on the invoice provided:\n\n*   **Total:** 1,284.50 PLN\n*   **Customer:** Stefan Nowak",
+   "Based on the invoice provided:\n\n*   **Total:** 1,284.50 PLN\n*   **Customer:** Stefan Nowak"
+  ],
+  "prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>\nWhat is the total, and who is the customer?<|im_end|>\n<|im_start|>assistant\n"
+ },
+ "smallfont_512x256.png": {
+  "answers": [
+   "HELLO WORLD from a small font",
+   "HELLO WORLD from a small font"
+  ],
+  "prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>\nWhat does it say? Answer with the text only.<|im_end|>\n<|im_start|>assistant\n"
+ },
+ "bars_768x512.png": {
+  "answers": [
+   "Based on the provided bar chart:\n\n- The bar labeled **'B'** is the **tallest**. It reaches the highest point on the vertical axis.\n- The bar labeled **'A'** is the **shortest**. It is visibly lower than both bar 'B' and",
+   "Based on the provided bar chart:\n\n- The bar labeled **'B'** is the **tallest**. It reaches the highest point on the vertical axis.\n- The bar labeled **'A'** is the **shortest**. It is visibly lower than both bar 'B' and"
+  ],
+  "prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>\nWhich bar is the tallest, and which is the shortest?<|im_end|>\n<|im_start|>assistant\n"
+ }
+}

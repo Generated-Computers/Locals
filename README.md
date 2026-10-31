@@ -1,3 +1,22 @@
+> [!NOTE]
+> **This is a fork of [Generated-Computers/Locals](https://github.com/Generated-Computers/Locals).** It starts from
+> upstream `main` at commit `b35c46c` and adds two things:
+>
+> - **Images, for Qwen3.5 and Qwen3-VL.** Send images as your API does it: OpenAI `image_url` parts, Anthropic
+>   `image` blocks, or Ollama's `images`. Upstream Locals puts the note "this model reads text only" in place of
+>   each image. Other models still get that note. See [Images](docs/server/README.md#images).
+> - **Unload the model, the server still running.** `POST /unload` (the same request as mlx-vlm's server),
+>   Ollama's `keep_alive: 0`, or `locals unload` frees the model's memory. The next request loads it again.
+>   In upstream Locals, only stopping the server frees it. See [Unloading the model](docs/server/README.md#unloading-the-model).
+>
+> To use this fork, install it from this repository, not from PyPI:
+>
+> ```bash
+> uvx --python 3.12 --from git+https://github.com/kaziko/Locals.git locals serve --model mlx-community/Qwen3.5-4B-MLX-4bit
+> ```
+>
+> The changes are listed in the [CHANGELOG](CHANGELOG.md) (the first two entries under 0.2.2).
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/8404f6b4b32b8070facd0290d157e3ed97777623/docs/assets/logo.png#gh-light-mode-only" alt="Generated Computers" width="80%">
   <img src="https://raw.githubusercontent.com/Generated-Computers/Locals/8404f6b4b32b8070facd0290d157e3ed97777623/docs/assets/logo-dark.png#gh-dark-mode-only" alt="Generated Computers" width="80%">

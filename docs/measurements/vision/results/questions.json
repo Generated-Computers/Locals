@@ -1,0 +1,8 @@
+{
+ "cat42_640x400.png": "What text is in the picture? Answer with the text only.",
+ "cat42_1280x800.png": "What text is in the picture? Answer with the text only.",
+ "shapes_640x480.png": "List the shapes from left to right with their colours.",
+ "invoice_900x500.png": "What is the total, and who is the customer?",
+ "smallfont_512x256.png": "What does it say? Answer with the text only.",
+ "bars_768x512.png": "Which bar is the tallest, and which is the shortest?"
+}
