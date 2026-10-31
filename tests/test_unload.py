@@ -116,9 +116,9 @@ def test_an_image_prompt_stops_between_prefill_chunks_when_cancelled(monkeypatch
     monkeypatch.setattr(eng, "text_model", lambda model: type("M", (), {"model": body})())
     monkeypatch.setattr(eng, "make_prompt_cache", lambda model: [])
     monkeypatch.setattr(eng, "forward_last", lambda model, x, cache: mx.array([[0.0, 1.0, 0.0]]))
-    monkeypatch.setattr(vision, "embed_prompt", lambda body, prompt, spans, features: mx.zeros((1, len(prompt), 4)))
+    monkeypatch.setattr(vision, "embed_chunk", lambda body, prompt, spans, features, at, n: mx.zeros((1, n, 4)))
     monkeypatch.setattr(vision, "mrope", lambda model, positions, section: contextlib.nullcontext())
-    monkeypatch.setattr(vision, "deepstack", lambda model, adds: contextlib.nullcontext({}))
+    monkeypatch.setattr(vision, "deepstack", lambda model, spans, levels: contextlib.nullcontext({}))
     e = eng.Engine.__new__(eng.Engine)
     e.model, e.prefill_step = None, 2
     e.tokenizer = type("T", (), {"eos_token_ids": [0], "decode": staticmethod(lambda ids: "")})()

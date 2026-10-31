@@ -7,7 +7,8 @@
   models still get. mlx-lm drops the vision tower of these checkpoints, so it is rebuilt from the same files
   (`locals/models/qwen3_5_vl.py`) and loaded with the first image. An image request runs alone, on the synchronous
   engine, with M-RoPE positions (`locals/vision.py`). While one waits, the batch takes no new request: the replies running end, and it
-  runs next. Qwen3-VL's deepstack features are added to the image's tokens
+  runs next. Its prompt is read a chunk at a time, each chunk's embeddings made for it: a 36,691-token prompt with one image
+  peaked at 11,231 MB instead of 12,363 on Qwen3-VL-8B 4-bit (M2 Max), with the same reply. Qwen3-VL's deepstack features are added to the image's tokens
   in its first three layers. On six test pictures, given the same prompt, Qwen3-VL-8B 4-bit gave
   mlx-vlm 0.7.11's answers word for word on all six, and Qwen3.5-4B 4-bit on five (`docs/measurements/vision/`). Images are resized to at most 1M pixels
   (`LOCALS_VISION_MAX_PIXELS`), 1,024 tokens. Qwen3.5-4B 4-bit and Qwen3-VL-8B 4-bit read the customer's name and the invoice number from a 900x500 invoice of four

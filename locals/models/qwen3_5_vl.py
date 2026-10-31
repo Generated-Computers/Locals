@@ -250,15 +250,32 @@ class VisionTower(nn.Module):
         return self.merger(x), deep
 
 
+_TOWER = ("vision_tower.", "model.visual.")  # the tower's tensors: mlx-vlm's names, transformers'
+
+
+def has_tower(path: Path) -> bool:
+    """Whether a checkpoint's files hold tower tensors, read from their safetensors headers (no tensor loaded). The
+    files, not the index: an index can name a shard that is not downloaded, and _weights reads the files."""
+    for f in sorted(Path(path).glob("*.safetensors")):
+        try:
+            with open(f, "rb") as fh:
+                names = json.loads(fh.read(int.from_bytes(fh.read(8), "little")))
+        except (OSError, ValueError):
+            continue
+        if isinstance(names, dict) and any(k.startswith(_TOWER) for k in names):
+            return True
+    return False
+
+
 def _weights(path: Path) -> List[Tuple[str, mx.array]]:
-    """Every ``vision_tower.*`` tensor of a checkpoint, named as this module's parameters are."""
+    """Every tower tensor of a checkpoint, named as this module's parameters are."""
     out: List[Tuple[str, mx.array]] = []
     for f in sorted(Path(path).glob("*.safetensors")):
         for k, v in mx.load(str(f)).items():
-            if k.startswith("vision_tower."):
-                out.append((k[len("vision_tower."):], v))
-            elif k.startswith("model.visual."):
-                out.append((k[len("model.visual."):], v))
+            for prefix in _TOWER:
+                if k.startswith(prefix):
+                    out.append((k[len(prefix):], v))
+                    break
     return out
 
 

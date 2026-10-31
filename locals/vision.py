@@ -353,14 +353,18 @@ class Encoder:
         return self._dir
 
     def available(self) -> bool:
-        """Whether this checkpoint has a vision tower we can read (a config and its weights)."""
+        """Whether this checkpoint has a vision tower we can read (a config and its weights). A config that names one
+        is not enough: a checkpoint without the tower's weights said it read images, and its first image request
+        was an error where the next got the text-only note."""
         if self._tried:
             return self._tower is not None
         if self._config is None:
-            from .models.qwen3_5_vl import vision_config
+            from .models.qwen3_5_vl import has_tower, vision_config
 
             d = self.directory()
             self._config = (vision_config(d) if d is not None else None) or False
+            if self._config and not has_tower(d):
+                self._config = False
         return bool(self._config)
 
     def tower(self):
@@ -396,65 +400,61 @@ class Encoder:
         return out, levels
 
 
-def place(n: int, spans: Sequence[Tuple[int, int]], features: Sequence[mx.array]) -> mx.array:
-    """(1, n, D): each image's features at its span, zeros elsewhere (what a deepstack layer adds)."""
-    d, dt = features[0].shape[-1], features[0].dtype
-    parts, at = [], 0
+def overlay(x: mx.array, at: int, spans: Sequence[Tuple[int, int]], features: Sequence[mx.array], add: bool = False) -> mx.array:
+    """``x`` (1, n, D), the prompt's tokens ``at`` to ``at + n``: where an image's span overlaps them, its features
+    instead (or, with ``add``, added). A chunk is read at a time, so no array the length of the prompt is made."""
+    n = x.shape[1]
+    parts, i = [], 0
     for (start, end), feats in zip(spans, features):
-        if start > at:
-            parts.append(mx.zeros((start - at, d), dtype=dt))
-        parts.append(feats)
-        at = end
-    if n > at:
-        parts.append(mx.zeros((n - at, d), dtype=dt))
-    return mx.concatenate(parts, axis=0)[None]
+        s, e = max(start, at), min(end, at + n)
+        if s >= e:
+            continue
+        f = feats[s - start: e - start][None]
+        parts += [x[:, i: s - at], x[:, s - at: e - at] + f.astype(x.dtype) if add else f]
+        i = e - at
+    if not parts:
+        return x
+    parts.append(x[:, i:])
+    return mx.concatenate(parts, axis=1)
 
 
 class _Added:
-    """A text layer that adds ``add[:, at:at+n]`` to its output, ``at`` being where the chunk it runs starts."""
+    """A text layer that adds its deepstack features to the image tokens of the chunk it runs (``at``: where the
+    chunk starts in the prompt)."""
 
-    def __init__(self, layer, add: mx.array, state: dict):
-        self.layer, self.add, self.state = layer, add, state
+    def __init__(self, layer, spans, features, state: dict):
+        self.layer, self.spans, self.features, self.state = layer, spans, features, state
 
     def __call__(self, x, *a, **k):
-        out = self.layer(x, *a, **k)
-        at = self.state["at"]
-        return out + self.add[:, at: at + out.shape[1]].astype(out.dtype)
+        return overlay(self.layer(x, *a, **k), self.state["at"], self.spans, self.features, add=True)
 
     def __getattr__(self, name):  # (a layer's other attributes, read by the model's own code)
         return getattr(self.layer, name)
 
 
 @contextmanager
-def deepstack(model, adds: Sequence[mx.array]):
+def deepstack(model, spans: Sequence[Tuple[int, int]], levels: Sequence[Sequence[mx.array]]):
     """Qwen3-VL's deepstack, while a prompt is read: after text layer ``i`` its image tokens get the tower's
-    ``i``-th deepstack features (``adds[i]``, from ``place``) added, as transformers' ``_deepstack_process``.
-    Yields the state whose ``at`` the caller sets to each chunk's start; the layers are put back after."""
+    ``i``-th deepstack features (``levels[i]``, one block per image, at ``spans``) added, as transformers'
+    ``_deepstack_process``. Yields the state whose ``at`` the caller sets to each chunk's start; the layers are
+    put back after."""
     from .kernels import text_model
 
     state = {"at": 0}
     layers = text_model(model).model.layers
-    kept = [layers[i] for i in range(len(adds))]
+    kept = [layers[i] for i in range(len(levels))]
     try:
-        for i, add in enumerate(adds):
-            layers[i] = _Added(kept[i], add, state)
+        for i, level in enumerate(levels):
+            layers[i] = _Added(kept[i], spans, level, state)
         yield state
     finally:
         for i, layer in enumerate(kept):
             layers[i] = layer
 
 
-def embed_prompt(body, ids: Sequence[int], spans: Sequence[Tuple[int, int]], features: Sequence[mx.array]) -> mx.array:
-    """The prompt's input embeddings: the token embeddings, with each image's span replaced by the
-    tower's features (the text model then reads the picture where the placeholders were)."""
-    emb = body.embed_tokens(mx.array([list(ids)]))
-    if not spans:
-        return emb
-    parts = []
-    at = 0
-    for (start, end), feats in zip(spans, features):
-        parts.append(emb[:, at:start])
-        parts.append(feats[None])
-        at = end
-    parts.append(emb[:, at:])
-    return mx.concatenate(parts, axis=1)
+def embed_chunk(body, ids: Sequence[int], spans: Sequence[Tuple[int, int]], features: Sequence[mx.array],
+                at: int, n: int) -> mx.array:
+    """The input embeddings of the prompt's tokens ``at`` to ``at + n``: the token embeddings, with the image
+    spans they overlap replaced by the tower's features (the text model then reads the picture where the
+    placeholders were)."""
+    return overlay(body.embed_tokens(mx.array([list(ids[at: at + n])])), at, spans, features)

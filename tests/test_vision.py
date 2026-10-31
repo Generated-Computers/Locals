@@ -205,6 +205,27 @@ def test_only_checkpoints_this_code_computes_right_read_images(tmp_path, model_t
         assert list(got.mrope_section) == text.get("rope_parameters", text.get("rope_scaling"))["mrope_section"]
 
 
+@pytest.mark.parametrize("files, reads", [
+    ({"model.safetensors": ["language_model.model.embed_tokens.weight", "vision_tower.blocks.0.attn.qkv.weight"]}, True),
+    ({"model-00001-of-00002.safetensors": ["model.language_model.norm.weight"],  # transformers' names, the tower in
+      "model-00002-of-00002.safetensors": ["model.visual.merger.norm.weight"]}, True),  # the second shard
+    ({"model.safetensors": ["language_model.model.embed_tokens.weight"]}, False),  # a text-only conversion
+    ({}, False),
+])
+def test_a_config_that_names_a_tower_reads_images_only_with_its_weights(tmp_path, files, reads):
+    """A checkpoint whose config names a tower but whose files lack it said it read images: its first image request
+    was an error, and the next got the text-only note."""
+    import json
+
+    cfg = {"model_type": "qwen3_vl", "vision_config": {"hidden_size": 1152, "deepstack_visual_indexes": [8, 16, 24]},
+           "text_config": {"head_dim": 128, "rope_scaling": {"mrope_interleaved": True, "mrope_section": [24, 20, 20]}}}
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    for name, keys in files.items():
+        mx.save_safetensors(str(tmp_path / name), {k: mx.zeros((2,)) for k in keys})
+    enc = vision.Encoder(str(tmp_path), mx.float16)
+    assert enc.available() == reads
+
+
 def test_mrope_split_for_qwen3_vl_and_a_wrong_one():
     m = vision.MRoPE(128, 5_000_000.0, mx.zeros((3, 1, 1), dtype=mx.int32), (24, 20, 20))
     sel = [int(np.argmax([float(m._sel[a][k]) for a in range(3)])) for k in range(64)]
@@ -215,7 +236,7 @@ def test_mrope_split_for_qwen3_vl_and_a_wrong_one():
 
 
 def test_deepstack_adds_to_the_image_tokens_of_the_chunk_read():
-    # after layer i, the image's tokens of the chunk being read get adds[i]; the layers come back after
+    # after layer i, the image's tokens of the chunk being read get level i's features; the layers come back after
     class Body:
         def __init__(self):
             self.layers = [lambda x, *a: x, lambda x, *a: x * 2, lambda x, *a: x]
@@ -225,16 +246,37 @@ def test_deepstack_adds_to_the_image_tokens_of_the_chunk_read():
 
     m = Model()
     feats = [mx.ones((2, 3)), mx.full((1, 3), 5.0)]
-    add = vision.place(8, [(2, 4), (6, 7)], feats)
-    assert add.shape == (1, 8, 3) and add[0, :, 0].tolist() == [0, 0, 1, 1, 0, 0, 5, 0]
     kept = list(m.model.layers)
-    with vision.deepstack(m, [add]) as st:
+    with vision.deepstack(m, [(2, 4), (6, 7)], [feats]) as st:
         st["at"] = 4  # a chunk of tokens 4..7
         h = mx.zeros((1, 4, 3))
         for layer in m.model.layers:
             h = layer(h)
         assert h[0, :, 0].tolist() == [0, 0, 10, 0]  # added after layer 0, doubled by layer 1
     assert m.model.layers == kept
+
+
+@pytest.mark.parametrize("step", [1, 2, 3, 5, 16])
+def test_a_prompt_read_in_chunks_gets_the_whole_prompts_embeddings(step):
+    """Each chunk's embeddings, with the image features of the spans it overlaps, are the whole prompt's at its
+    tokens, however the chunks cut the images; so are the deepstack features added to it."""
+    rng = np.random.default_rng(0)
+    table = mx.array(rng.standard_normal((32, 4)).astype(np.float32))
+    body = type("Body", (), {"embed_tokens": staticmethod(lambda ids: table[ids])})()
+    ids = list(range(1, 15))
+    spans = [(2, 5), (5, 6), (9, 13)]  # two images next to each other, and one more
+    feats = [mx.array(rng.standard_normal((e - s, 4)).astype(np.float32)) for s, e in spans]
+    whole = np.array(table[mx.array(ids)])
+    deep = np.zeros_like(whole)
+    for (s, e), f in zip(spans, feats):
+        whole[s:e] = np.array(f)
+        deep[s:e] = np.array(f)
+    hidden = mx.array(rng.standard_normal(whole.shape).astype(np.float32))
+    for at in range(0, len(ids), step):
+        n = min(step, len(ids) - at)
+        assert np.array_equal(np.array(vision.embed_chunk(body, ids, spans, feats, at, n))[0], whole[at: at + n])
+        added = vision.overlay(hidden[None, at: at + n], at, spans, feats, add=True)
+        assert np.array_equal(np.array(added)[0], np.array(hidden)[at: at + n] + deep[at: at + n])
 
 
 class _Healing(eng.Controller):

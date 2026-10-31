@@ -431,7 +431,8 @@ In a stream, tool calls are collected and sent in the final `done` line. Errors 
 ## Images
 
 Qwen3.5 and Qwen3-VL read images on our engine (`vision_config` in `locals/models/qwen3_5_vl.py` decides, from the
-checkpoint's `config.json`: a vision tower, and an interleaved M-RoPE split that covers the rotated dims). mlx-lm keeps
+checkpoint's `config.json`: a vision tower, and an interleaved M-RoPE split that covers the rotated dims; and
+`has_tower`, from its safetensors files' headers: the tower's weights are in them). mlx-lm keeps
 only the text half of such a checkpoint, so the tower is rebuilt from the same files (`locals/models/qwen3_5_vl.py`) and loaded with the
 first image, not at start. Any other model, and the stock engine, gets `IMAGE_NOTE` in each image's place, as before.
 
@@ -462,6 +463,11 @@ template refuses it there).
 4. Qwen3-VL's tower also merges the output of its blocks 8, 16 and 24 (`deepstack_visual_indexes`). While the prompt
    is read, the text model adds those to the image's tokens after its layers 0, 1 and 2 (`vision.deepstack`, as
    transformers' `_deepstack_process`). Qwen3.5 has none.
+5. The prompt is read a chunk at a time, as a text prompt is, and each chunk's embeddings are made for it
+   (`vision.embed_chunk`): the image's features go only into the chunks that hold its tokens, and so do the deepstack
+   features. Made for the whole prompt at once, they were kept next to the KV cache until it was read: on an M2 Max,
+   a 36,691-token prompt with one image peaked at 12,363 MB on Qwen3-VL-8B 4-bit, and 11,231 MB a chunk at a time,
+   with the same reply (`docs/measurements/vision/results/prefill_memory.txt`).
 
 Grammars (tools, `response_format`) apply as for text. Streaming and cancelling work as for text. An image request
 does not use the prompt cache, and its reply is not remembered as a token stream.

@@ -27,3 +27,16 @@ same prompt on both sides is `results/compare_same_prompt.txt`.
 
 `unload_serve.py` starts `Server` and `serve` in Python, not `locals serve`, which saves the port and the model as
 the next default. The output is `results/unload_run.txt`; `phys_footprint` is read with `footprint -p`.
+
+## Prefill memory of a long prompt with one image (`docs/server/README.md`, Images)
+
+```
+python make_pictures.py pics
+git archive 5b6a125 locals | tar -x -C before                   # the code before, beside the working tree's
+PYTHONPATH=before <repo>/.venv/bin/python prefill_memory.py <model> pics/invoice_900x500.png mem before.json
+<repo>/.venv/bin/python prefill_memory.py <model> pics/invoice_900x500.png mem after.json
+```
+
+`prefill_memory.py` prints which `locals` it imported. `mem` puts about 36,000 tokens of text before the picture;
+`exact` asks the invoice question with `prefill_step` 256, so a chunk ends inside the image. Each process sends the
+request twice, and both peaks were the same to the MB on every side. The output is `results/prefill_memory.txt`.

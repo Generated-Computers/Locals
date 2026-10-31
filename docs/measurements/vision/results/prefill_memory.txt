@@ -1,0 +1,32 @@
+prefill_memory.py, M2 Max 32 GB, 2026-10-31. before: commit 5b6a125 (the whole prompt embedded at once);
+after: 5b6a125 plus one chunk embedded at a time (and the tower-weight check of `has_tower`). Picture: invoice_900x500.png. Two requests per process.
+peak = mx.get_peak_memory() over one Engine.generate_embedded call (weights and KV cache included), MB;
+over start = peak minus the active memory when the call began.
+
+Qwen3-VL-8B-Instruct-4bit exact: prompt 477 tokens, image at [[8, 456]], prefill_step 256
+  before #1: peak 6165  over start 657  2.29 s  52 tokens
+  before #2: peak 6165  over start 657  2.0 s  52 tokens
+  after #1: peak 6150  over start 642  2.0 s  52 tokens
+  after #2: peak 6150  over start 642  2.01 s  52 tokens
+  the same tokens in all four replies: True
+
+Qwen3-VL-8B-Instruct-4bit mem: prompt 36691 tokens, image at [[36230, 36678]], prefill_step 2048
+  before #1: peak 12363  over start 6854  113.1 s  8 tokens
+  before #2: peak 12363  over start 6854  111.91 s  8 tokens
+  after #1: peak 11231  over start 5722  111.24 s  8 tokens
+  after #2: peak 11231  over start 5722  111.32 s  8 tokens
+  the same tokens in all four replies: True
+
+Qwen3.5-4B-MLX-4bit exact: prompt 482 tokens, image at [[9, 457]], prefill_step 256
+  before #1: peak 3888  over start 991  1.12 s  54 tokens
+  before #2: peak 3888  over start 991  1.12 s  54 tokens
+  after #1: peak 3885  over start 989  1.15 s  54 tokens
+  after #2: peak 3885  over start 989  1.15 s  54 tokens
+  the same tokens in all four replies: True
+
+Qwen3.5-4B-MLX-4bit mem: prompt 38195 tokens, image at [[37730, 38178]], prefill_step 2048
+  before #1: peak 8033  over start 5137  52.49 s  8 tokens
+  before #2: peak 8033  over start 5137  53.03 s  8 tokens
+  after #1: peak 7857  over start 4960  53.01 s  8 tokens
+  after #2: peak 7857  over start 4960  52.91 s  8 tokens
+  the same tokens in all four replies: True

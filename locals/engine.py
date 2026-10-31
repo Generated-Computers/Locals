@@ -1324,28 +1324,25 @@ class Engine:
         The synchronous path on purpose: an image prompt is one request, and the batched engine's
         per-row positions are token indices, not (t, h, w). ``on_token`` streams each committed token
         and ``cancel`` is asked before every step, so a client that leaves stops the reply."""
-        from .vision import deepstack as deepstack_layers, embed_prompt, mrope, place
+        from .vision import deepstack as deepstack_layers, embed_chunk, mrope
 
         ctl = controller or Controller()
         body = text_model(self.model).model
-        emb = embed_prompt(body, prompt, spans, features)
-
-        adds = [place(len(prompt), spans, level) for level in deepstack]
 
         def prefill(cache):
-            nonlocal emb, adds
+            # each chunk's embeddings made for it, as _prefill's: the whole prompt's (and, for Qwen3-VL, one as long
+            # per deepstack level) were kept next to the KV cache until the prompt was read
             i = 0
-            n_all = emb.shape[1]
-            with deepstack_layers(self.model, adds) as state:  # (the last token, fed below, is text: nothing to add)
+            n_all = len(prompt)
+            with deepstack_layers(self.model, spans, deepstack) as state:  # (the last token, fed below, is text)
                 while n_all - i > 1:  # the last prompt token is the first step's feed, as in _prefill
                     if cancel is not None and cancel():
                         break  # (between chunks: an unload or a client gone; the decode loop ends it as cancelled)
                     n = min(self.prefill_step, n_all - 1 - i)
                     state["at"] = i
-                    body(None, cache, input_embeddings=emb[:, i: i + n])
+                    body(None, cache, input_embeddings=embed_chunk(body, prompt, spans, features, i, n))
                     mx.eval([c.state for c in cache])
                     i += n
-            emb = adds = None  # (the whole prompt's embeddings: not kept for the reply's decode)
 
         with mrope(self.model, positions, section):
             return self._generate_sync(prompt, ctl, max_tokens, temp, seed, top_p, top_k, prefill=prefill,
