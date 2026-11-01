@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -108,6 +109,16 @@ def _reads_images(svc) -> bool:
     return svc is not None and getattr(svc, "vision", lambda: None)() is not None
 
 
+@dataclass(frozen=True)
+class LoadedModel:
+    """One load of the model on one engine, as a request reads it: an unload never changes it under the request
+    that holds it. ``svc`` runs the request; an unload finishes it, and the model loaded again takes the request."""
+
+    svc: object
+    tokenizer: object
+    reads_images: bool
+
+
 def _host_ok(host_header: Optional[str], bind_host: str) -> bool:
     """The Host header of a server that listens on this machine only names this machine: a page whose
     domain was pointed at 127.0.0.1 (DNS rebinding) names its own. This machine's names: localhost and
@@ -170,6 +181,7 @@ class Server:
         self.typed_tools = typed_tools  # tool calls with parameter names and types fixed (needs walk for large tool sets)
         self.log = log or (lambda s: print(s, file=sys.stderr, flush=True))
         self._svc: Dict[str, object] = {}
+        self._handles: Dict[str, LoadedModel] = {}  # engine -> the loaded model as requests read it (see loaded)
         self._lock = threading.Lock()  # the stream and raw-reply caches
         self._loading = {e: threading.Lock() for e in self.engines}
         self._load_error: Dict[str, tuple] = {}  # engine -> (when, error) of its last failed load
@@ -310,6 +322,21 @@ class Server:
             self.log(f"engine {engine} ready in {time.perf_counter() - t:.1f}s")
             return svc
 
+    def loaded(self, engine: str) -> LoadedModel:
+        """The model as loaded on ``engine`` (loaded first if it is not), read under the lock an unload takes: an
+        unload that lands while a request is prepared never turns what the request reads into an unloaded service's
+        (no tokenizer, no vision tower: its images became a text note)."""
+        while True:
+            svc = self.service(engine)
+            h = self._handles.get(engine)
+            if h is not None and h.svc is svc:
+                return h
+            with self._loading[engine]:
+                if self._svc.get(engine) is not svc:
+                    continue  # unloaded meanwhile: the next pass loads it again
+                h = self._handles[engine] = LoadedModel(svc, svc.tokenizer, _reads_images(svc))
+                return h
+
     def unload(self) -> dict:
         """Let the model go and give its memory back, the server still running: the next request loads it
         again (Ollama's keep_alive 0, mlx-vlm's POST /unload). Replies in progress end as cancelled."""
@@ -320,6 +347,7 @@ class Server:
         for e in [e for e in self.engines if e in self._svc]:
             with self._loading[e]:  # (not while it loads)
                 svc = self._svc.pop(e, None)
+                self._handles.pop(e, None)
                 if svc is None:
                     continue
                 self.log(f"unloading {self.model_id} from engine {e} ...")
@@ -394,8 +422,8 @@ class Server:
             effort = req["reasoning"].get("effort")
         if effort == "none":
             thinking = False
-        svc = self.service(engine)
-        tok = svc.tokenizer
+        loaded = self.loaded(engine)  # (held to the end: an unload from here on changes nothing it reads)
+        svc, tok = loaded.svc, loaded.tokenizer
         self._cap_context()
         fmt, style = self.format_of(engine)
         if style in ("none", "switch"):
@@ -412,7 +440,7 @@ class Server:
 
         raw_msgs = req.get("messages") or []
         pictures = []
-        if vision.has_images(raw_msgs) and _reads_images(svc):
+        if vision.has_images(raw_msgs) and loaded.reads_images:
             # each image as the template's <|image_pad|> (expanded below to the image's own tokens); a model or engine
             # that reads text only gets the note IMAGE_NOTE in its place, from convert_messages
             raw_msgs, sources = vision.take_images(raw_msgs)
@@ -521,8 +549,8 @@ class Server:
         model = req.get("model") or f"locals/{self.short}"
         self.check_model(model)
         engine = oai.engine_of(model)
-        svc = self.service(engine)
-        tok = svc.tokenizer
+        loaded = self.loaded(engine)
+        svc, tok = loaded.svc, loaded.tokenizer
         self._cap_context()
         prompt = req.get("prompt", "")
         if isinstance(prompt, list) and prompt and all(type(t) is int for t in prompt):

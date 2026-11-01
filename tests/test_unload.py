@@ -223,3 +223,79 @@ def test_a_reply_cancelled_by_an_unload_is_remembered_with_the_tokenizer_it_was_
     job.tokens, job.text, job.finish = [7], "hi", "cancelled"
     srv._remember("locals", _chat(), job, [], prefix="ab")
     assert srv._streams["locals"] == [{"text": "qabhi", "ids": [1, 2, ord("a"), ord("b"), 7]}]
+
+
+def test_an_image_chat_prepared_across_an_unload_is_read_with_its_images_by_the_model_loaded_again():
+    """/unload lands while an image request is prepared, after the server took the model for it: the model loaded
+    again reads the request's image, not a text-only note in its place. Needs Qwen3.5-4B's tokenizer (cached)."""
+    import base64
+    import io
+
+    import pytest
+    from huggingface_hub import snapshot_download
+    from PIL import Image
+
+    model = "mlx-community/Qwen3.5-4B-MLX-4bit"
+    try:
+        path = snapshot_download(model, local_files_only=True, allow_patterns=["*.json", "*.jinja", "tokenizer*"])
+    except Exception:  # noqa: BLE001
+        pytest.skip("tokenizer not cached")
+    from mlx_lm.utils import load_tokenizer
+
+    tok = load_tokenizer(path)
+
+    class Loaded:
+        """A service that reads images, until an unload finishes it (BatchService drops its tokenizer and tower)."""
+
+        unloaded = False
+
+        @property
+        def tokenizer(self):
+            return None if self.unloaded else tok
+
+        def vision(self):
+            return None if self.unloaded else "the vision tower"
+
+        def unload(self):
+            self.unloaded = True
+            return 0.0
+
+        def submit(self, prompt, on_token=None, **k):
+            assert self.unloaded
+            raise Unloaded("the model was unloaded")
+
+    class Again(Loaded):
+        def __init__(self):
+            self.got = []
+
+        def submit(self, prompt, on_token=None, **k):
+            self.got.append((list(prompt), k.get("pictures"), k.get("spans")))
+            job = Job(prompt=list(prompt))
+            job.tokens, job.text, job.finish = [7], "a red square", "stop"
+            on_token([7])
+            job._event.set()
+            return job
+
+    srv = Server(model, engines=("locals",), preload=(), log=lambda s: None)
+    first, again = Loaded(), Again()
+    srv._svc["locals"] = first
+    cap, order = srv._cap_context, []
+
+    def unload_now():  # (prepare's first step after it took the model)
+        cap()
+        if not order:
+            order.append(srv.unload()["status"])
+            srv._svc["locals"] = again  # another request loaded the model again
+
+    srv._cap_context = unload_now
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 48), (200, 10, 10)).save(buf, "PNG")
+    url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    p = srv.prepare({"model": "locals/qwen3.5-4b", "max_tokens": 8, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "What is in the picture?"}, {"type": "image_url", "image_url": {"url": url}}]}]})
+    assert order == ["unloaded"] and first.unloaded  # the unload landed inside prepare
+    srv._active = {"k": {}}
+    srv._decode(p, "", lambda c: None, None, "k")
+    (prompt, pictures, spans), = again.got
+    assert pictures and len(pictures) == 1, "the image was dropped: the model loaded again read a text-only prompt"
+    assert spans and prompt.count(tok.convert_tokens_to_ids(vision.IMAGE_TOKEN)) > 1  # the image's own tokens
