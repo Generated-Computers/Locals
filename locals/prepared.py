@@ -1,0 +1,62 @@
+"""A prepared prompt: a rendered chat prompt as the model reads it, and what follows from its images.
+
+The server renders the conversation with the model's template; this module turns that text into the token ids the
+model reads (each image's one placeholder expanded to the image's own tokens, GLOSSARY.md "Image prompt")."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional, Sequence, Tuple
+
+from . import vision
+
+# text -> (the text of the longest remembered stream it continues, the ids the model saw for it), or None
+Remembered = Callable[[str], Optional[Tuple[str, Sequence[int]]]]
+
+
+@dataclass(frozen=True)
+class PreparedPrompt:
+    """``text`` as the model reads it: ``tokens``, with each of ``pictures``' tokens at its ``spans``."""
+
+    text: str
+    tokens: List[int]
+    pictures: tuple = ()
+    spans: tuple = ()
+    placed: Tuple[int, ...] = ()  # the tokens with one placeholder per image (no images: ``tokens``)
+    tokenizer: object = field(default=None, repr=False, compare=False)
+
+    @classmethod
+    def of(cls, text: str, tokenizer, pictures: Sequence[vision.Picture] = (),
+           remembered: Optional[Remembered] = None) -> "PreparedPrompt":
+        """``text`` (one ``<|image_pad|>`` per picture) as token ids. Without pictures it goes on from the remembered
+        stream it continues (the ids the model saw, which the text may not encode to); an image prompt reads none."""
+        hf = tokenizer._tokenizer
+        if pictures:
+            placed = list(hf.encode(text, add_special_tokens=False))
+            tokens, spans = vision.expand(placed, tokenizer.convert_tokens_to_ids(vision.IMAGE_TOKEN), pictures)
+            return cls(text, tokens, tuple(pictures), tuple(spans), tuple(placed), tokenizer)
+        seen = remembered(text) if remembered is not None else None
+        if seen is None:
+            tokens = list(hf.encode(text, add_special_tokens=False))
+        else:
+            tokens = list(seen[1]) + list(hf.encode(text[len(seen[0]):], add_special_tokens=False))
+        return cls(text, tokens, placed=tuple(tokens), tokenizer=tokenizer)
+
+    @property
+    def rememberable(self) -> bool:
+        """Whether the reply's ids may be remembered for the next request's text (PreparedPrompt.of reads them back
+        in place of the text's): not an image prompt's, whose ids hold its images' tokens."""
+        return not self.pictures
+
+    def checkpoint_at(self, prefix: str) -> Optional[int]:
+        """Where ``prefix``, a text prefix of the prompt, ends in its tokens (an image's tokens before it count: its
+        prefix costs the tower and their prefill), or None: no prefix, the whole prompt, or under 1024 tokens (a
+        short prefix is cheaper to read again than to keep)."""
+        if (len(prefix) < 2048 and not self.spans) or not self.text.startswith(prefix):
+            return None
+        ids = self.tokenizer._tokenizer.encode(prefix, add_special_tokens=False)
+        # where the prompt's tokens and these part (the last token may merge with what follows): one pass
+        # (backing off a token at a time cost seconds on a 60k-token prompt)
+        n = next((k for k, (a, b) in enumerate(zip(self.placed, ids)) if a != b), min(len(self.placed), len(ids)))
+        at = vision.expanded_at(n, self.spans)
+        return at if at >= 1024 and n < len(self.placed) else None

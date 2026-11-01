@@ -148,6 +148,13 @@ def _loaded_model(engine: str, svc) -> LoadedModel:
                        seps={"gap": formats.call_gap(tok), "think_gap": formats.think_gap(tok)}, needs_checkpoints=needs)
 
 
+def _images_of(prepared) -> dict:
+    """BatchService.submit's ``pictures`` and ``spans`` for a prepared prompt (None: none)."""
+    if prepared is None or not prepared.pictures:
+        return {"pictures": None, "spans": None}
+    return {"pictures": list(prepared.pictures), "spans": list(prepared.spans)}
+
+
 def _host_ok(host_header: Optional[str], bind_host: str) -> bool:
     """The Host header of a server that listens on this machine only names this machine: a page whose
     domain was pointed at 127.0.0.1 (DNS rebinding) names its own. This machine's names: localhost and
@@ -491,12 +498,10 @@ class Server:
             # answers at once (a short request answered nothing, every token spent thinking; JSON started in it)
             text += fmt.think_close
         text += prefill  # the reply goes on from it
-        spans = []
-        if pictures:  # (not from a remembered stream: those hold the image tokens expanded)
-            placed = list(tok._tokenizer.encode(text, add_special_tokens=False))  # (one placeholder per image)
-            prompt, spans = vision.expand(placed, tok.convert_tokens_to_ids(vision.IMAGE_TOKEN), pictures)
-        else:
-            prompt = placed = self._tokens_for(engine, tok, text)
+        from .prepared import PreparedPrompt
+
+        prepared = PreparedPrompt.of(text, tok, pictures, remembered=lambda t: self._remembered(engine, t))
+        prompt = prepared.tokens
         limit = self.limit_for(engine)
         if len(prompt) >= limit:
             raise ContextTooLong(f"This model's maximum context length is {limit} tokens. However, your messages "
@@ -548,10 +553,10 @@ class Server:
                 output_regex = out if tc == "auto" else None
         if sealed and regex is None and schema is None:  # (no tools: free text, without the tags)
             regex = oai.not_containing(*oai.THINK_TAGS)
-        cps = (self._checkpoints(tok, msgs, tpl_tools, think_kw, text, placed, spans)
+        cps = (self._checkpoints(tok, msgs, tpl_tools, think_kw, prepared)
                if engine == "locals" and loaded.needs_checkpoints else [])
         return {"engine": engine, "thinking": thinking, "svc": svc, "tok": tok, "prompt": prompt, "checkpoints": cps, "text": text,
-                "pictures": pictures, "spans": spans,
+                "prepared": prepared,
                 "tools": tools, "schema": schema, "regex": regex, "output_regex": output_regex, "max_tokens": max_tokens,
                 "model": model, "fmt": fmt, "sealed": sealed, "seps": seps,
                 "tool_choice": req.get("tool_choice", "auto"), "stop": _stops(req), "temp": _temperature(req),
@@ -765,8 +770,7 @@ class Server:
             return -1
         return sys_text.rfind("\n", 0, i) + 1 if i > 0 else 0
 
-    def _checkpoints(self, tok, msgs: List[dict], tools, think_kw: dict, text: str, prompt: List[int],
-                     spans=()) -> List[tuple]:
+    def _checkpoints(self, tok, msgs: List[dict], tools, think_kw: dict, prepared) -> List[tuple]:
         """Where to snapshot the prompt's cache on the way (a recurrent GDN
         cache cannot be cut back afterwards, so only stored prefixes are reused):
 
@@ -780,14 +784,12 @@ class Server:
 
         Both are found by rendering the conversation up to that point with the
         model's own template; a position is used only where that text is a
-        prefix of the prompt and tokenizes to the prompt's own first tokens.
-        With images, ``prompt`` has one placeholder per image and ``spans``
-        says where their tokens sit once expanded: the positions returned are
-        in the expanded prompt."""
+        prefix of the prompt and tokenizes to the prompt's own first tokens
+        (PreparedPrompt.checkpoint_at: positions in the tokens the model reads)."""
         out = []
         if not msgs:
             return out
-        hf = tok._tokenizer
+        text = prepared.text
         cands = []
         if len(msgs) >= 2 and msgs[0]["role"] == "system":
             # A template may refuse a conversation without a user message (Qwen3.5 does), so the end
@@ -837,37 +839,26 @@ class Server:
             cands.append((a[:n], "reply"))
         except Exception:  # noqa: BLE001
             pass
-        from .vision import expanded_at
-
         for t, kind in cands:
-            if (len(t) < 2048 and not spans) or not text.startswith(t):  # a short prefix is cheaper to prefill again
-                continue
-            ids = hf.encode(t, add_special_tokens=False)
-            # where the prompt's tokens and these part (the last token may merge with what follows): one pass
-            # (backing off a token at a time cost seconds on a 60k-token prompt)
-            n = next((k for k, (a, b) in enumerate(zip(prompt, ids)) if a != b), min(len(prompt), len(ids)))
-            at = expanded_at(n, spans)  # (an image's tokens count: its prefix costs the tower and their prefill)
-            if at >= 1024 and n < len(prompt) and all(at != m for m, _ in out):
+            at = prepared.checkpoint_at(t)
+            if at is not None and all(at != m for m, _ in out):
                 out.append((at, kind))
         return out
 
-    def _tokens_for(self, engine: str, tok, text: str) -> List[int]:
-        """Token ids of a rendered prompt: a remembered stream's ids where the
-        text continues one, plus the tokens of the remainder."""
+    def _remembered(self, engine: str, text: str):
+        """The longest remembered stream ``text`` continues: (its text, the ids the model saw for it), or None."""
         best = None
         with self._lock:
             for st in self._streams[engine]:
                 if text.startswith(st["text"]) and (best is None or len(st["text"]) > len(best["text"])):
                     best = st
-        hf = tok._tokenizer
-        if best is None:
-            return list(hf.encode(text, add_special_tokens=False))
-        return list(best["ids"]) + list(hf.encode(text[len(best["text"]):], add_special_tokens=False))
+        return None if best is None else (best["text"], best["ids"])
 
     def _remember(self, engine: str, p: dict, job, calls: List[dict], prefix: str = "", raw: Optional[str] = None,
                   exact: bool = True) -> None:
         raw = prefix + job.text if raw is None else raw
-        exact = exact and raw == prefix + job.text and not p.get("pictures")  # (its ids: each image's tokens expanded)
+        prepared = p.get("prepared")  # (None: a request made without one, text only)
+        exact = exact and raw == prefix + job.text and (prepared is None or prepared.rememberable)
         ids = list(p["prompt"])
         if prefix:
             ids += list(p["tok"]._tokenizer.encode(prefix, add_special_tokens=False))
@@ -900,7 +891,7 @@ class Server:
         return p["svc"].submit(p["prompt"] if prompt is None else prompt, schema=p["schema"], max_tokens=p["max_tokens"],
                                regex=p["regex"], on_token=on_token,
                                temp=p.get("temp"), ignore_eos=p.get("ignore_eos", False),
-                               checkpoints=p.get("checkpoints"), pictures=p.get("pictures"), spans=p.get("spans"),
+                               checkpoints=p.get("checkpoints"), **_images_of(p.get("prepared")),
                                **p.get("sampling", {}))
 
     def _account(self, p: dict, job, out_tokens: int, calls: int, t0: float, stopped: Optional[str] = None) -> dict:
