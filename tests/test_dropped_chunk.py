@@ -79,17 +79,62 @@ def test_a_dropped_chunk_is_read_again_and_the_prompt_ends_as_it_would_have(rows
         drops = _Drops(fail)
         got = _read(m, new(), toks, 16, drops)
         assert float(mx.abs(got - clean).max()) <= 1e-4 * (1 + float(mx.abs(clean).max())), fail
-        assert drops.calls > 70 // 16 + len(fail)  # (the chunks read again were halved)
+        assert drops.calls == 5 + len(fail)  # (70 tokens in 16s; a dropped chunk read again whole: 16 is the least)
     assert "the GPU dropped a prompt chunk" in capsys.readouterr().err
 
 
-def test_a_chunk_that_grew_a_buffer_is_not_read_again():
-    """A full-attention buffer the chunk replaced with a larger one (mlx-lm grows it 256 positions at a time) may not
-    hold what it copied from the old one: the error goes on to the engine, as before."""
+def test_a_chunk_with_no_room_in_its_buffers_is_read_again():
+    """A full-attention buffer with no room for the chunk (mlx-lm grows it 256 positions at a time) is grown before
+    the chunk, not in it: the chunk is written into the grown buffer, and read again if dropped."""
     m = _model()
     toks = mx.random.randint(0, 256, (1, 300), key=mx.random.key(6))
+    clean = _read(m, make_prompt_cache(m), toks, 100, _Drops([]))
+    drops = _Drops([3])
+    got = _read(m, make_prompt_cache(m), toks, 100, drops)  # 200 positions in a 256 buffer, then 300
+    assert float(mx.abs(got - clean).max()) <= 1e-4 * (1 + float(mx.abs(clean).max()))
+    assert drops.calls == 5  # (100, 100, the third dropped, then read again in 50s)
+
+
+def test_a_chunk_with_room_in_its_buffers_is_written_into_them():
+    """A buffer of a size mlx-lm does not grow to (an LRU row from extract, a trimmed entry) with room for the chunk
+    is not grown first: that would copy it whole."""
+    from locals.hybrid_batch import _buffers
+
+    m = _model()
+    toks = mx.random.randint(0, 256, (1, 290), key=mx.random.key(6))
+    cache = make_prompt_cache(m)
+    _read(m, cache, toks[:, :249], 100, _Drops([]))  # (250 positions with _read's last token)
+    for c in (cache[1], cache[5]):
+        c.keys, c.values = (mx.concatenate([a, mx.zeros(a.shape[:2] + (44, a.shape[3]), a.dtype)], axis=2)
+                            for a in (c.keys, c.values))  # 300 positions
+    before = _buffers(cache[1])
+    HybridBatchEngine._read_chunk(_Drops([]), cache, lambda k: m.model(toks[:, 250:250 + k], cache), 40)
+    assert cache[1].keys.shape[2] == 300 and _buffers(cache[1]) == before
+
+
+def test_a_chunk_written_into_a_copied_buffer_is_not_read_again():
+    """A full-attention buffer that something else holds is copied by the chunk, in the dropped command buffer, maybe
+    not at all: the error goes on to the engine."""
+    from locals.hybrid_batch import _buffers
+
+    m = _model()
+    toks = mx.random.randint(0, 256, (1, 32), key=mx.random.key(6))
+    cache = make_prompt_cache(m)
+    HybridBatchEngine._read_chunk(_Drops([]), cache, lambda k: m.model(toks[:, :k], cache), 16)
+    before = _buffers(cache[1])
+    held = cache[1].keys[..., :1, :]  # (a view of the buffer: MLX cannot write the chunk into it in place)
+    mx.eval(held)
     with pytest.raises(RuntimeError, match="Command buffer"):
-        _read(m, make_prompt_cache(m), toks, 100, _Drops([3]))  # 200 positions in a 256 buffer, then 300
+        HybridBatchEngine._read_chunk(_Drops([1]), cache, lambda k: m.model(toks[:, 16:16 + k], cache), 16)
+    assert _buffers(cache[1]) != before  # (the chunk was written into a copy)
+
+
+def test_a_short_chunk_read_again_counts_its_own_tokens():
+    m = _model()
+    toks = mx.random.randint(0, 256, (1, 6), key=mx.random.key(7))
+    cache = make_prompt_cache(m)
+    assert HybridBatchEngine._read_chunk(_Drops([1]), cache, lambda k: m.model(toks[:, :k], cache), 6) == 6
+    assert cache[1].offset == 6
 
 
 def test_other_errors_are_not_caught():
@@ -137,11 +182,11 @@ def test_the_marks_cost_no_copy(dtype):
 
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])  # (bfloat16, as most checkpoints: no buffer format)
-@pytest.mark.parametrize("fail", [[], [2]])
+@pytest.mark.parametrize("fail", [[], [1], [2]])
 def test_a_prompt_reads_on_from_a_reply_entry(fail, dtype):
     """A follow-up turn starts from a reply's prompt-cache entry, whose full-attention keys and values are cut back to
     where the reply starts (views of the finished row's buffers, not contiguous): its chunks are read like any other,
-    and a chunk dropped after the first is read again."""
+    and a dropped chunk is read again, the first too (its buffers, which have no room, are grown before it)."""
     from types import SimpleNamespace
 
     from locals.hybrid_batch import _keep_reply_state, _reply_entry

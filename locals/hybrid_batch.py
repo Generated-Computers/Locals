@@ -112,11 +112,17 @@ def _reserve(cache, upto: int) -> None:
         del k, v
 
 
+def _write_at(c) -> int:
+    """The position a full-attention layer's next token is written at (a batch layer's counts its left padding)."""
+    return c._idx if isinstance(c, BatchKVCache) else c.offset
+
+
 # A prompt chunk the GPU dropped: macOS ends a Metal command buffer that holds the GPU while the display needs it
 # ("Internal Error (0000000e)", kIOGPUCommandBufferCallbackErrorImpactingInteractivity; MLX leaves it to the OS). It
 # happened 10 minutes into a 245k-token prompt on an M2 Pro while the Mac was in use, and the request was read again
 # from its start; minute-long runs of 1.4 s attention calls on an idle Mac never met it. The chunk is read again from
-# where it began instead (HybridBatchEngine._read_chunk), this many times, each after a pause and in half the tokens.
+# where it began instead (HybridBatchEngine._read_chunk), this many times, each after a pause and in half the tokens
+# (16 at least).
 GPU_RETRIES = 3
 RETRY_PAUSE = 0.5  # seconds before the first try again, doubling
 
@@ -881,7 +887,13 @@ class HybridBatchEngine(BatchEngine):
 
     def _read_chunk(self, cache, feed, n: int) -> int:
         """``feed(n)``: n prompt tokens through the body, into ``cache``; evaluated. Returns the tokens read: fewer if
-        the GPU dropped the chunk (GPU_RETRIES), which is then read again from where it began."""
+        the GPU dropped the chunk (GPU_RETRIES), which is then read again from where it began. Full-attention buffers
+        with no room for the chunk are grown first (a reply's prompt-cache entry has none: _reply_entry): grown in
+        the chunk, they would be new buffers, and a dropped chunk could not be read again (_marks)."""
+        full = [c for c in cache if isinstance(c, (KVCache, BatchKVCache)) and c.keys is not None
+                and _write_at(c) + n > c.keys.shape[2]]
+        if full:  # (only these: _reserve rounds up to whole steps, and would copy a buffer of another size with room)
+            _reserve(full, _write_at(full[0]) + n)
         marks = _marks(cache)
         for attempt in range(GPU_RETRIES + 1):
             try:
@@ -896,7 +908,7 @@ class HybridBatchEngine(BatchEngine):
                 print(f"locals: the GPU dropped a prompt chunk ({e}); reading it again", file=sys.stderr, flush=True)
                 mx.clear_cache()
                 time.sleep(RETRY_PAUSE * 2 ** attempt)  # (the display's work first)
-                n = max(16, n // 2)
+                n = min(n, max(16, n // 2))  # (a last chunk under 16 tokens would count tokens it did not read)
         return n
 
     @staticmethod
