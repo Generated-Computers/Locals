@@ -406,6 +406,8 @@ def _batch_service(monkeypatch, compiled):
     monkeypatch.setattr(eng, "LocalsController", lambda c, planner, *a: ("grammar", c))
 
     class Rt:
+        engine = type("E", (), {"prefill_embedded": lambda self, *a, **k: True})()
+
         def compile(self, schema, regex=None, ready=None, recursive_ok=False):
             compiled.append(schema)
             return type("C", (), {"constraint": len(compiled), "planner": None})()
@@ -434,83 +436,137 @@ def test_an_image_job_joins_the_batch_while_rows_decode(monkeypatch):
     reqs = svc._source(rt, block=False)
     assert [r.prompt for r in reqs] == [image.prompt, text.prompt]
     assert reqs[0].controller == ("grammar", 1) and compiled == [{"type": "object"}]
-    assert reqs[0].embed is not None and reqs[1].embed is None
-    # 1 text + the image's 2 positions + 2 text: the reply's first token is at 5, its index 7, so the rope goes -2
+    assert isinstance(reqs[0].image, vision.ImagePrompt) and reqs[1].image is None
+    # the image prompt's rope delta and cache key (test_an_image_prompts_cache_key_...); a text row's are 0 and its prompt
     assert reqs[0].rope_delta == -2 and reqs[1].rope_delta == 0
-    # its prompt-cache key: each image's pad tokens as the image's own id, so its checkpoints are kept too
-    assert reqs[0].key == [1, -7, -7, -7, -7, 2, 3] and reqs[1].key is None
+    assert reqs[0].cache_key == [1, -7, -7, -7, -7, 2, 3] and reqs[1].cache_key == [2, 3]
     assert reqs[0].checkpoints == [(3, "system")] and reqs[1].checkpoints == [(1, "system")]
 
 
-def test_an_image_prompt_read_reads_the_tower_then_the_prompt(monkeypatch):
+def test_an_image_jobs_read_after_an_unload_says_the_model_reads_text_only(monkeypatch):
+    """The tower is asked for at each read, not when the job is taken: one gone meanwhile (an unload, a checkpoint
+    without its weights) ends the request with what the model cannot do."""
     svc, rt = _batch_service(monkeypatch, [])
-    read = []
-    enc = type("Enc", (), {"encode": lambda self, pics: ("features", ["deep"]), "mrope_section": (11, 11, 10)})()
-    svc.vision = lambda: enc
-    rt.engine = type("E", (), {"prefill_embedded": lambda self, cache, *a, **k: read.append((cache, a)) or True})()
-    job = _image_job()
-    svc._q.put(job)
+    svc._q.put(_image_job())
     (r,) = svc._source(rt, block=False)
-    assert r.embed("cache", 0, 6) is None
-    (cache, (prompt, spans, features, pos, deep, section)), = read
-    assert cache == "cache" and prompt == job.prompt and spans == [(1, 5)] and features == "features"
+    svc.vision = lambda: None
+    assert r.image.read(None, 0, 6) == "error: m reads text only"
+
+
+def _image_prompt(encoder=None, prefill=None, cancelled=lambda: False, **kw):
+    """The image prompt of ``_image_job`` (a 4x4-grid image at 1..5 of 7 tokens), on a stub tower and prefill."""
+    job = _image_job()
+    return vision.ImagePrompt(kw.get("prompt", job.prompt), kw.get("spans", job.spans), kw.get("pictures", job.pictures),
+                              encoder=encoder or (lambda: None), prefill=prefill or (lambda *a, **k: True),
+                              cancelled=cancelled)
+
+
+def test_an_image_prompts_cache_key_names_its_images_and_its_rope_runs_behind_its_length():
+    ip = _image_prompt()
+    # each image's pad tokens as the image's own id, so its checkpoints are kept in the prompt cache too
+    assert ip.key == [1, -7, -7, -7, -7, 2, 3]
+    # 1 text + the image's 2 positions + 2 text: the reply's first token is at 5, its index 7, so the rope goes -2
+    assert ip.rope_delta == -2
+    # an image with no id: the prompt is not cached
+    assert _image_prompt(pictures=[vision.Picture(None, (4, 4))]).key is None
+
+
+def _encoder(encode, section=(11, 11, 10)):
+    return type("Enc", (), {"encode": lambda self, pics: encode(pics), "mrope_section": section})()
+
+
+def test_an_image_prompt_read_reads_the_tower_then_the_prompt():
+    read = []
+    enc = _encoder(lambda pics: ("features", ["deep"]))
+    ip = _image_prompt(encoder=lambda: enc, prefill=lambda cache, *a, **k: read.append((cache, a, k)) or True)
+    assert ip.read("cache", 0, 6) is None
+    (cache, (prompt, spans, features, pos, deep, section), k), = read
+    assert cache == "cache" and prompt == [1, 9, 9, 9, 9, 2, 3] and spans == [(1, 5)] and features == "features"
     assert pos.shape == (3, 1, 7) and deep == ["deep"] and section == (11, 11, 10)
+    assert (k["start"], k["stop"]) == (0, 6)
 
 
-def test_an_image_prompt_read_from_a_cached_prefix_runs_the_tower_on_the_images_after_it(monkeypatch):
+def test_an_image_prompt_read_from_a_cached_prefix_runs_the_tower_on_the_images_after_it():
     """From a cached prefix (``start``), and in parts between checkpoints, the tower reads only the images the
     prefix does not hold, once, and each part of the prompt is read from where the last one stopped."""
-    svc, rt = _batch_service(monkeypatch, [])
     towered, read = [], []
-    enc = type("Enc", (), {"encode": lambda self, pics: towered.append([p.key for p in pics]) or (["f2"], [["d2"]]),
-                           "mrope_section": (11, 11, 10)})()
-    svc.vision = lambda: enc
-    rt.engine = type("E", (), {"prefill_embedded": lambda self, cache, prompt, spans, features, pos, deep, section, **k:
-                               read.append((spans, features, deep, k["start"], k["stop"])) or True})()
-    a, b = vision.Picture(None, (4, 4), key=1), vision.Picture(None, (4, 4), key=2)
-    from locals.service import Job
-
-    job = Job(prompt=[1, 9, 9, 9, 9, 2, 9, 9, 9, 9, 3, 4], pictures=[a, b], spans=[(1, 5), (6, 10)])
-    svc._q.put(job)
-    (r,) = svc._source(rt, block=False)
-    assert r.embed("cache", 5, 8) is None and r.embed("cache", 8, 11) is None
+    enc = _encoder(lambda pics: towered.append([p.key for p in pics]) or (["f2"], [["d2"]]))
+    two = dict(prompt=[1, 9, 9, 9, 9, 2, 9, 9, 9, 9, 3, 4], spans=[(1, 5), (6, 10)],
+               pictures=[vision.Picture(None, (4, 4), key=1), vision.Picture(None, (4, 4), key=2)])
+    prefill = lambda cache, prompt, spans, features, pos, deep, section, **k: (  # noqa: E731
+        read.append((spans, features, deep, k["start"], k["stop"])) or True)
+    ip = _image_prompt(encoder=lambda: enc, prefill=prefill, **two)
+    assert ip.read("cache", 5, 8) is None and ip.read("cache", 8, 11) is None
     assert towered == [[2]]
     assert read == [([(6, 10)], ["f2"], [["d2"]], 5, 8), ([(6, 10)], ["f2"], [["d2"]], 8, 11)]
     # a prefix that holds every image: no tower at all
-    svc._q.put(job)
-    (r,) = svc._source(rt, block=False)
-    assert r.embed("cache", 10, 11) is None and towered == [[2]]
+    ip = _image_prompt(encoder=lambda: enc, prefill=prefill, **two)
+    assert ip.read("cache", 10, 11) is None and towered == [[2]]
     assert read[-1] == ([], [], [], 10, 11)
 
 
-def test_an_image_request_that_fails_ends_only_itself(monkeypatch):
-    """An error reading the image prompt (memory the prefill could not get) is the request's end, returned to the
-    batch engine, not an exception out of serve(), which would fail every job in flight."""
-    svc, rt = _batch_service(monkeypatch, [])
-    enc = type("Enc", (), {"encode": lambda self, pics: (None, ()), "mrope_section": (11, 11, 10)})()
-    svc.vision = lambda: enc
-
+def test_an_image_prompt_that_fails_to_read_returns_its_error():
+    """An error reading the image prompt (memory the prefill could not get, a tower it has no weights for) is the
+    request's end, returned to the batch engine, not an exception out of serve(), which would fail every job."""
     def oom(*a, **k):
         raise RuntimeError("[metal::malloc] Attempting to allocate 9 GB")
 
-    rt.engine = type("E", (), {"prefill_embedded": staticmethod(oom)})()
-    svc._q.put(_image_job())
-    (r,) = svc._source(rt, block=False)
-    end = r.embed(None, 0, 6)
+    ip = _image_prompt(encoder=lambda: _encoder(lambda pics: (None, ())), prefill=oom)
+    end = ip.read(None, 0, 6)
     assert end.startswith("error: RuntimeError") and "allocate" in end
-    svc.vision = lambda: None  # (a checkpoint without the tower's weights)
-    assert r.embed(None, 0, 6) == "error: m reads text only"
+
+    def text_only():
+        raise ValueError("m reads text only")
+
+    assert _image_prompt(encoder=text_only).read(None, 0, 6) == "error: m reads text only"
 
 
-def test_an_image_job_cancelled_while_it_waits_does_not_run_the_tower(monkeypatch):
-    svc, rt = _batch_service(monkeypatch, [])
-    read = []
-    svc.vision = lambda: type("Enc", (), {"encode": lambda self, pics: read.append(pics)})()
-    job = _image_job()
-    svc._q.put(job)
-    (r,) = svc._source(rt, block=False)
-    job.cancel()
-    assert r.embed(None, 0, 6) == "cancelled" and read == []
+def test_an_image_prompt_cancelled_while_it_waits_does_not_run_the_tower():
+    towered = []
+    ip = _image_prompt(encoder=lambda: _encoder(lambda pics: towered.append(pics) or ([], [])),
+                       cancelled=lambda: True)
+    assert ip.read(None, 0, 6) == "cancelled" and towered == []
+
+
+def test_an_image_prompt_whose_prefill_stops_for_a_cancel_says_so():
+    ip = _image_prompt(encoder=lambda: _encoder(lambda pics: ([], [])), prefill=lambda *a, **k: False)
+    assert ip.read(None, 0, 6) == "cancelled"
+
+
+@pytest.mark.parametrize("left, second, stop, end", [  # each way ImagePrompt.read returns, past a first part
+    (False, lambda: True, 6, None),  # read to its end
+    (False, lambda: False, 3, "cancelled"),  # a cancel inside the prefill, between its chunks
+    (True, lambda: True, 3, "cancelled"),  # a cancel between two parts: the read returns before the tower
+    (False, lambda: 1 / 0, 3, "error: ZeroDivisionError: division by zero"),  # the tower's or the prefill's error
+])
+def test_an_image_prompt_lets_go_of_the_towers_features_when_its_read_ends(left, second, stop, end):
+    """The features are kept between the parts of a read (a checkpoint: the first part here), and let go of however
+    the read ends: the request (Job._req) outlives its prefill, and must not hold the images' features meanwhile."""
+    import gc
+    import weakref
+
+    class Features:
+        pass
+
+    made = []
+
+    def encode(pics):
+        made.append(Features())
+        return [made[-1]], []
+
+    outcomes = [lambda: True, second]  # the prefill's, part by part
+    gone = []
+    ip = _image_prompt(encoder=lambda: _encoder(encode), prefill=lambda *a, **k: outcomes.pop(0)(),
+                       cancelled=lambda: bool(gone))
+    assert ip.read(None, 0, 2) is None  # a part before a checkpoint
+    held = weakref.ref(made.pop())
+    gc.collect()
+    assert held() is not None
+    if left:
+        gone.append(True)  # (its client left)
+    assert ip.read(None, 2, stop) == end
+    gc.collect()
+    assert held() is None
 
 
 def test_an_image_rows_rope_past_the_prompt_is_mrope():

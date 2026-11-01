@@ -370,7 +370,7 @@ class BatchService:
 
     def _source(self, rt, block: bool) -> list:
         """The batch engine's ``source(block)``: the jobs taken now, as batch requests. An image job is one too: its
-        prompt is read alone when the batch admits it (``Request.embed``), and its reply decodes with the other rows.
+        prompt is read alone when the batch admits it (``Request.image``), and its reply decodes with the other rows.
         Run alone to its end, it held every text reply for its whole reply, and waited for an idle batch to start."""
         import mlx.core as mx
 
@@ -395,14 +395,11 @@ class BatchService:
                 continue
             r = Request(job.prompt, ctl, job.max_tokens)
             if job.pictures:
-                from .vision import cache_key
-
                 try:
-                    r.embed, r.rope_delta = self._embedder(rt, job)
+                    r.image = self._image_prompt(rt, job)
                 except Exception as e:  # noqa: BLE001  # (spans that do not fit the prompt)
                     self._finish(job, [], f"error: {_reason(e)}")
                     continue
-                r.key = cache_key(job.prompt, job.spans, job.pictures)  # (its pad tokens name no image)
             r.checkpoints = job.checkpoints
             r.on_token = job.on_token
             r.temp, r.top_p, r.top_k, r.seed = job.temp, job.top_p, job.top_k, job.seed
@@ -440,40 +437,19 @@ class BatchService:
             self._finish(job, [], f"error: {e!r}")
         return None
 
-    def _embedder(self, rt, job: Job):
-        """(embed, rope_delta) of an image job's batch request. ``embed(cache, start, stop)``, called by the batch
-        engine on its thread when it admits the request, reads ``prompt[start:stop]`` (``cache`` holds the prompt up to
-        ``start``: a cached prefix, a part read before a checkpoint): the vision tower's features go where the prompt's
-        ``<|image_pad|>`` tokens are, and the prompt is read with every token at its own M-RoPE (t, h, w) position. The
-        tower reads the images from the first ``start`` on, once. None when read, else how the job ends: one request's
-        fault (the tower's weights, an image it cannot read, a prefill out of memory) is that request's error, not the
-        batch's."""
-        from .vision import positions, rope_delta
+    def _image_prompt(self, rt, job: Job):
+        """An image job's prompt as the batch engine reads it (vision.ImagePrompt), on this model's vision tower,
+        asked for at each read: an unload in between leaves the model reading text only."""
+        from .vision import ImagePrompt
 
-        pos = positions(job.spans, [p.grid for p in job.pictures], len(job.prompt))  # (3, prompt)
-        read_from = {}  # spans, features, deepstack and M-RoPE section of the images not in the cached prefix
+        def encoder():
+            enc = self.vision()
+            if enc is None:
+                raise ValueError(f"{self.model_id} reads text only")
+            return enc
 
-        def embed(cache, start, stop):
-            if job.cancelled:  # (its client left while it waited: the tower need not read its images)
-                return "cancelled"
-            try:
-                enc = self.vision()
-                if enc is None:
-                    raise ValueError(f"{self.model_id} reads text only")
-                if not read_from:
-                    keep = [k for k, (_, end) in enumerate(job.spans) if end > start]
-                    features, deep = enc.encode([job.pictures[k] for k in keep]) if keep else ([], [])
-                    read_from.update(spans=[job.spans[k] for k in keep], features=features, deep=deep)
-                read = rt.engine.prefill_embedded(cache, job.prompt, read_from["spans"], read_from["features"],
-                                                  pos[:, None, :], read_from["deep"], enc.mrope_section,
-                                                  cancel=lambda: job.cancelled, start=start, stop=stop)
-            except Exception as e:  # noqa: BLE001
-                return f"error: {_reason(e)}"
-            if stop >= len(job.prompt) - 1:
-                read_from.clear()  # (the features, read: not kept while the reply decodes)
-            return None if read else "cancelled"
-
-        return embed, rope_delta(pos)
+        return ImagePrompt(job.prompt, job.spans, job.pictures, encoder, rt.engine.prefill_embedded,
+                           cancelled=lambda: job.cancelled)
 
     def vision(self):
         """This model's vision tower (vision.Encoder, its weights read on the first image), or None: the stock

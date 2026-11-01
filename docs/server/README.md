@@ -455,8 +455,8 @@ template refuses it there).
    image's token count, one per 32x32 pixels (`vision.expand`). The context limit counts those tokens.
 3. The job carries the images and where their tokens sit (`Job.pictures`, `Job.spans`). It becomes a batch request
    as a text job does (`BatchService._source`), and joins the running rows when there is room for it. When the batch
-   admits it, its prompt is read alone (`Request.embed`, made by `BatchService._embedder`), unless its client has
-   left: the tower turns the patches into one embedding per token, the prompt's embeddings take them in the
+   admits it, its prompt is read alone (`Request.image`, a `vision.ImagePrompt` made by `BatchService._image_prompt`), unless
+   its client has left: the tower turns the patches into one embedding per token, the prompt's embeddings take them in the
    placeholders' place, and the prompt is read with M-RoPE (`Engine.prefill_embedded`): each image token's position
    is its (frame, row, column), and the full-attention layers' RoPE is swapped for `vision.MRoPE` while the prompt is
    read, split over the frequencies as the checkpoint says (`mrope_section`: Qwen3.5's `[11, 11, 10]` over 64 of
@@ -472,9 +472,10 @@ template refuses it there).
    The prompt cache keeps image prompts under a key of their own (`vision.cache_key`): the prompt's tokens, with each
    image's pad tokens as minus the image's id, a hash of its bytes and its patch grid (`Picture.key`). Under the pad
    tokens themselves, an entry would be the next image's of the same size too. A follow-up turn about the same images
-   starts from the turn before it and reads only what it adds (`Request.embed(cache, start, stop)`): the tower runs
-   on the images past the cached prefix only. Checkpoints are found on the prompt with one placeholder per image and
-   moved past the image tokens before them (`vision.expanded_at`); the prompt is read in parts between them
+   starts from the turn before it and reads only what it adds (`ImagePrompt.read(cache, start, stop)`): the tower runs
+   on the images past the cached prefix only, and its features are let go of when the read ends, however it ends.
+   Checkpoints are found on the prompt with one placeholder per image and moved past the image tokens before them
+   (`vision.expanded_at`); the prompt is read in parts between them
    (`HybridBatchEngine._embed`), so Qwen3.5, whose recurrent layers cannot be cut back, continues from its reply
    checkpoint. On an M2 Max a second turn of 5,728 tokens about two pictures took 0.41 s where it took 7.0 s
    (Qwen3.5-4B 4-bit), and one of 5,567 tokens 0.48 s where it took 12.5 s (Qwen3-VL-8B 4-bit)

@@ -1,4 +1,4 @@
-"""An image prompt's reply decodes in the batch engine (HybridBatchEngine.serve with Request.embed and rope_delta)
+"""An image prompt's reply decodes in the batch engine (HybridBatchEngine.serve with Request.image)
 and gives the tokens of the synchronous engine's image path (Engine.generate_embedded, M-RoPE through the reply), alone
 and beside text rows; the text rows give what they give without it. A small random Qwen3 with features made up for its
 image tokens: no tower. And its prompt-cache entries, under the image's id, make a follow-up turn read only what it
@@ -60,17 +60,16 @@ def _reference(model, prompt=PROMPT):
 
 def _image_request(model, read, prompt=PROMPT, key=KEY, checkpoints=None):
     """``read`` gets each part of the prompt read, (start, stop)."""
-    feats, pos = _image(model, prompt)
+    feats, _ = _image(model, prompt)
     eng = Engine(model, _Tok())
     r = Request(list(prompt), _Free(), N)
+    enc = type("Enc", (), {"encode": lambda self, pics: (feats, []), "mrope_section": (6, 5, 5)})()
 
-    def embed(cache, start, stop):
+    def prefill(cache, *a, start, stop, **k):
         read.append((start, stop))
-        return None if eng.prefill_embedded(cache, prompt, SPANS, feats, pos[:, None, :], section=(6, 5, 5),
-                                            start=start, stop=stop) else "cancelled"
+        return eng.prefill_embedded(cache, *a, start=start, stop=stop, **k)
 
-    r.embed, r.rope_delta = embed, vision.rope_delta(pos)
-    r.key = vision.cache_key(prompt, SPANS, [vision.Picture(None, (8, 8), key=key)])
+    r.image = vision.ImagePrompt(prompt, SPANS, [vision.Picture(None, (8, 8), key=key)], lambda: enc, prefill)
     r.checkpoints = checkpoints
     return r
 
@@ -111,8 +110,8 @@ def test_beside_text_rows_the_image_row_and_the_text_rows_keep_their_tokens(mode
                   [[Request(list(TEXT), _Free(), N)], [_image_request(model, [])]],
                   [[_image_request(model, [])], [Request(list(TEXT), _Free(), N)]]):
         done = _serve(model, waves)
-        text = next(r for r in done if r.embed is None)
-        image = next(r for r in done if r.embed is not None)
+        text = next(r for r in done if r.image is None)
+        image = next(r for r in done if r.image is not None)
         assert image.out == want
         assert text.out == alone.out
 
@@ -123,8 +122,26 @@ def test_an_image_rows_prompt_cache_entry_is_under_its_key(model):
     (r,) = _serve(model, [[_image_request(model, [])]], lru=lru)
     assert len(lru) == 1
     assert lru.fetch_nearest_cache("locals", list(PROMPT[:-1]))[1] == list(PROMPT[5:-1])  # (the text before it only)
-    c, rest = lru.fetch_nearest_cache("locals", r.key + r.out)  # (the row holds the reply fed back, all N tokens)
+    c, rest = lru.fetch_nearest_cache("locals", r.cache_key + r.out)  # (the row holds the reply fed back, all N tokens)
     assert c is not None and rest == []
+
+
+@pytest.mark.parametrize("beside", [False, True])
+def test_an_image_rows_prompt_cache_entry_holds_no_rope_delta(model, beside):
+    """The entry's rope offset is its length: the row's M-RoPE delta goes when the row leaves the batch (alone, by
+    _only_row; beside a row still decoding, by mlx_lm's BatchKVCache.extract), and the next turn adds its own. A
+    cache that kept the offset instead (BatchRotatingKVCache.extract) would read a follow-up at shifted positions."""
+    from mlx_lm.models.cache import KVCache
+
+    lru = chain_cache(max_size=8, max_bytes=1 << 30)
+    image = _image_request(model, [])
+    assert image.rope_delta != 0  # (else an offset that kept it would pass too)
+    wave = [image] + ([Request(list(TEXT), _Free(), N + 4)] if beside else [])  # (the text row outlives the image row)
+    _serve(model, [wave], lru=lru)
+    c, rest = lru.fetch_nearest_cache("locals", image.cache_key + image.out)
+    assert c is not None and rest == []
+    layers = [layer for layer in c if isinstance(layer, KVCache)]
+    assert layers and all(layer.offset == layer.keys.shape[2] for layer in layers)
 
 
 def test_the_next_turn_reads_only_what_follows_the_cached_turn(model):
@@ -154,12 +171,16 @@ def test_an_image_rows_checkpoints_are_kept_under_its_key(model):
     read = []
     (r,) = _serve(model, [[_image_request(model, read, checkpoints=[(24, "user")])]], lru=lru)
     assert read == [(0, 24), (24, len(PROMPT) - 1)] and r.out == _reference(model)
-    assert kept == [(r.key[:24], "user"), (r.key[:-1] + r.fed, "assistant")]
+    assert kept == [(r.cache_key[:24], "user"), (r.cache_key[:-1] + r.fed, "assistant")]
 
 
 def test_an_image_prompt_that_ends_at_its_read_is_finished_there(model):
-    r = _image_request(model, [])
-    r.embed = lambda cache, start, stop: "error: RuntimeError: out of memory"
+    def oom(*a, **k):
+        raise RuntimeError("out of memory")
+
+    r = Request(list(PROMPT), _Free(), N)
+    r.image = vision.ImagePrompt(PROMPT, SPANS, [vision.Picture(None, (8, 8), key=KEY)],
+                                 lambda: type("Enc", (), {"encode": lambda self, pics: ([], []), "mrope_section": (6, 5, 5)})(), oom)
     text = Request(list(TEXT), _Free(), N)
     done = _serve(model, [[r, text]])
     assert r.finish == "error: RuntimeError: out of memory" and r.out == []

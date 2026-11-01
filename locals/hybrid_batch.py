@@ -213,11 +213,6 @@ def _replies(r) -> int:
     return sum(1 for _, kind in getattr(r, "checkpoints", None) or [] if kind == "reply")
 
 
-def _key(r) -> Optional[List[int]]:
-    """A request's prompt-cache key: its prompt, or an image prompt's ``key`` (None: an image prompt not cached)."""
-    return r.prompt if r.embed is None else r.key
-
-
 def _keep_reply_state(r, n: int, cache) -> None:
     """At a "reply" checkpoint (``n``: where the reply starts as the next request renders the
     conversation): keep a copy of the cache layers that cannot be cut back to a prefix (recurrent
@@ -1526,13 +1521,13 @@ class HybridBatchEngine(BatchEngine):
         return self._tab[3][id(c.c)] + c.q if isinstance(c, LocalsController) else 0
 
     def _embed(self, new: List[Request], found, on_done, lru, lru_key):
-        """Read the image prompts among ``new`` (``Request.embed``), each alone into its cached prefix (``found``) or
+        """Read the image prompts among ``new`` (``Request.image``), each alone into its cached prefix (``found``) or
         a cache of its own, stopping at each checkpoint to keep a copy there: the rows wait meanwhile, as for a
         prompt read at an admission. Returns ``new`` and ``found`` without the ones that ended there (a client gone,
         the request's error), finished through ``on_done``."""
         keep_new, keep_found = [], []
         for r, f in zip(new, found):
-            if r.embed is not None:
+            if r.image is not None:
                 c0, rest = f
                 end = len(r.prompt) - 1
                 at = end - len(rest)
@@ -1541,19 +1536,19 @@ class HybridBatchEngine(BatchEngine):
                 for cp, kind in sorted(getattr(r, "checkpoints", None) or []):
                     if kind == "reply" and lru is not None and cp == at and at > 0:
                         self._keep_reply(r, cp, c0)  # the cached prefix ends there (a regenerated reply)
-                    elif lru is not None and r.key is not None and at < cp < end:
+                    elif lru is not None and r.cache_key is not None and at < cp < end:
                         stops.setdefault(cp, kind)  # one snapshot per position, the first kind in sorted order
                 tp = time.perf_counter()
                 why = None
                 for cp, kind in sorted(stops.items()) + [(end, None)]:
-                    why = r.embed(c0, at, cp)
+                    why = r.image.read(c0, at, cp)
                     if why is not None:
                         break
                     at = cp
                     if kind == "reply":
                         self._keep_reply(r, cp, c0)
                     elif kind is not None and self._room_for_copy(lru, len(r.prompt)):
-                        lru.insert_cache(lru_key, list(r.key[:cp]), copy.deepcopy(c0), cache_type=kind)
+                        lru.insert_cache(lru_key, list(r.cache_key[:cp]), copy.deepcopy(c0), cache_type=kind)
                 self.counters["prefill_s"] += time.perf_counter() - tp
                 if why is not None:
                     r.finish = why
@@ -1614,7 +1609,7 @@ class HybridBatchEngine(BatchEngine):
             return got
 
         def retire(i, r):
-            key = _key(r)  # (an image row's: its pad tokens name no image, see vision.cache_key)
+            key = r.cache_key
             if lru is not None and key is not None:
                 if len(rows) == 1:
                     # the only row: the batch cache is dropped next, so its buffers move to the
@@ -1789,13 +1784,13 @@ class HybridBatchEngine(BatchEngine):
                     starts = []
                     found = []
                     for r in new:  # every cached prefix first: making room for one must not drop the next one's
-                        key = _key(r)  # (an image prompt: read below, from its cached prefix if any)
+                        key = r.cache_key
                         if lru is not None and key is not None and self.disk is not None:  # a system prompt saved before a restart
                             self.disk.restore(lru, lru_key, list(key[:-1]))
                         c0, rest = (lru.fetch_nearest_cache(lru_key, list(key[:-1])) if lru is not None and key is not None
                                     else (None, list(r.prompt[:-1])))
-                        if c0 is not None and r.embed is not None:
-                            rest = list(r.prompt[len(r.prompt) - 1 - len(rest):-1])  # (the prompt's tokens, not the key's)
+                        if c0 is not None:  # (the prompt's tokens, not its cache key's: an image prompt's differ)
+                            rest = list(r.prompt[len(r.prompt) - 1 - len(rest):-1])
                         r.cached_tokens = len(r.prompt) - 1 - len(rest) if c0 is not None else 0
                         found.append((c0, rest))
                     # each request's cached prefix is a lazy copy, made during the prefill: the whole prompt counts
@@ -1804,7 +1799,7 @@ class HybridBatchEngine(BatchEngine):
                                              for r, (_, rest) in zip(new, found)), 0,
                                     self._merge_tokens(rows, [len(e["r"].prompt) for e in filling] + [len(r.prompt) for r in new]),
                                     rows=len(new))
-                    if any(r.embed is not None for r in new):
+                    if any(r.image is not None for r in new):
                         new, found = self._embed(new, found, on_done, lru, lru_key)
                     if self._mix_ok and rows and sum(len(rest) for _, rest in found) > self.mix_chunk:
                         # the running rows decode on while these prompts are prefilled, a chunk in each step. Prompts
