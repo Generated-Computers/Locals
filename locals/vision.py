@@ -320,11 +320,11 @@ def rope_delta(prompt_positions: mx.array) -> int:
 
 class ImagePrompt:
     """An image prompt (GLOSSARY.md) as the batch engine reads it: ``prompt`` with each image's tokens at its
-    ``spans``. ``key`` is its cache key (None: an image has no id, the prompt is not cached) and ``rope_delta`` how
-    far its rope offset is shifted as its reply decodes. The prompt cache keeps the row without that shift (an
-    entry's offset is its length: _only_row, and mlx_lm's BatchKVCache.extract, set it so) and a follow-up turn adds
-    its own; a cache whose extract kept the offset (BatchRotatingKVCache's) would shift it twice. Made on the
-    engine's thread: its positions are MLX arrays."""
+    ``spans``. ``key`` is its cache key (None: an image has no id, the prompt is not cached), ``rope_delta`` how far
+    its rope offset is shifted as its reply decodes, and ``cancelled()`` whether its client has left. The prompt
+    cache keeps the row without that shift (an entry's offset is its length: _only_row, and mlx_lm's
+    BatchKVCache.extract, set it so) and a follow-up turn adds its own; a cache whose extract kept the offset
+    (BatchRotatingKVCache's) would shift it twice. Made on the engine's thread: its positions are MLX arrays."""
 
     def __init__(self, prompt: Sequence[int], spans: Sequence[Tuple[int, int]], pictures: Sequence[Picture],
                  encoder, prefill, cancelled=lambda: False):
@@ -332,7 +332,7 @@ class ImagePrompt:
         self._pos = positions(self.spans, [p.grid for p in self.pictures], len(self.prompt))  # (3, prompt)
         self.key = cache_key(self.prompt, self.spans, self.pictures)
         self.rope_delta = rope_delta(self._pos)
-        self._encoder, self._prefill, self._cancelled = encoder, prefill, cancelled
+        self._encoder, self._prefill, self.cancelled = encoder, prefill, cancelled
         self._read_from = {}  # spans, features and deepstack of the images not in the cached prefix
 
     def read(self, cache, start: int, stop: int) -> Optional[str]:
@@ -342,7 +342,7 @@ class ImagePrompt:
         image it cannot read, a prefill out of memory) is ``"error: ..."``, that request's alone; a cancel, asked
         before the tower and between the prefill's chunks, is ``"cancelled"``. The features are kept from one part to
         the next and let go of when the read ends, however it ends (the request outlives its prefill)."""
-        if self._cancelled():  # (its client left while it waited: the tower need not read its images)
+        if self.cancelled():  # (its client left while it waited: the tower need not read its images)
             read, why = False, "cancelled"
         else:
             try:
@@ -353,7 +353,7 @@ class ImagePrompt:
                     self._read_from.update(spans=[self.spans[k] for k in keep], features=features, deep=deep)
                 r = self._read_from
                 read = self._prefill(cache, self.prompt, r["spans"], r["features"], self._pos[:, None, :], r["deep"],
-                                     enc.mrope_section, cancel=self._cancelled, start=start, stop=stop)
+                                     enc.mrope_section, cancel=self.cancelled, start=start, stop=stop)
             except Exception as e:  # noqa: BLE001
                 from .service import _reason  # (the request errors' wording, the one the client reads for a text job)
 

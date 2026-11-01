@@ -58,8 +58,8 @@ def _reference(model, prompt=PROMPT):
     return res.tokens
 
 
-def _image_request(model, read, prompt=PROMPT, key=KEY, checkpoints=None):
-    """``read`` gets each part of the prompt read, (start, stop)."""
+def _image_request(model, read, prompt=PROMPT, key=KEY, checkpoints=None, cancelled=lambda: False):
+    """``read`` gets each part of the prompt read, (start, stop); ``cancelled()``: its client has left."""
     feats, _ = _image(model, prompt)
     eng = Engine(model, _Tok())
     r = Request(list(prompt), _Free(), N)
@@ -69,9 +69,19 @@ def _image_request(model, read, prompt=PROMPT, key=KEY, checkpoints=None):
         read.append((start, stop))
         return eng.prefill_embedded(cache, *a, start=start, stop=stop, **k)
 
-    r.image = vision.ImagePrompt(prompt, SPANS, [vision.Picture(None, (8, 8), key=key)], lambda: enc, prefill)
+    r.image = vision.ImagePrompt(prompt, SPANS, [vision.Picture(None, (8, 8), key=key)], lambda: enc, prefill,
+                                 cancelled)
     r.checkpoints = checkpoints
     return r
+
+
+def _kept(lru):
+    """The copies the prompt cache gets, as (tokens, cache type, cache)."""
+    kept = []
+    insert = lru.insert_cache
+    lru.insert_cache = lambda m, tokens, c, cache_type="assistant": kept.append((list(tokens), cache_type, c)) or insert(
+        m, tokens, c, cache_type=cache_type)
+    return kept
 
 
 def _serve(model, waves, lru=None, disk=None, room=True):
@@ -168,14 +178,11 @@ def test_an_image_rows_checkpoints_are_kept_under_its_key(model):
     """Read in parts, the prompt stops at each checkpoint (past the image here), whose copy goes into the prompt cache
     under the key; and its reply is the one of the prompt read in one part."""
     lru = chain_cache(max_size=8, max_bytes=1 << 30)
-    kept = []
-    insert = lru.insert_cache
-    lru.insert_cache = lambda m, tokens, c, cache_type="assistant": kept.append((list(tokens), cache_type)) or insert(
-        m, tokens, c, cache_type=cache_type)  # (a KV-only model's row then replaces it: it can be cut back)
+    kept = _kept(lru)  # (a KV-only model's row then replaces the checkpoint's copy: it can be cut back)
     read = []
     (r,) = _serve(model, [[_image_request(model, read, checkpoints=[(24, "user")])]], lru=lru)
     assert read == [(0, 24), (24, len(PROMPT) - 1)] and r.out == _reference(model)
-    assert kept == [(r.cache_key[:24], "user"), (r.cache_key[:-1] + r.fed, "assistant")]
+    assert [k[:2] for k in kept] == [(r.cache_key[:24], "user"), (r.cache_key[:-1] + r.fed, "assistant")]
 
 
 def test_an_image_prompts_system_checkpoints_are_saved_to_disk_under_its_key(tmp_path, model):
@@ -188,6 +195,62 @@ def test_an_image_prompts_system_checkpoints_are_saved_to_disk_under_its_key(tmp
     assert sorted(disk.index.values()) == [tuple(PROMPT[:3]), tuple(r.cache_key[:24])]
     assert -KEY in r.cache_key[:24]
 
+
+def _same_cache(a, b, n):
+    """Both caches hold the same first ``n`` positions, bit for bit."""
+    from mlx_lm.models.cache import KVCache
+
+    pairs = [(x, y) for x, y in zip(a, b) if isinstance(x, KVCache)]
+    assert pairs
+    return all(mx.array_equal(x.keys[..., :n, :], y.keys[..., :n, :]).item()
+               and mx.array_equal(x.values[..., :n, :], y.values[..., :n, :]).item() for x, y in pairs)
+
+
+def _text_made(model, n):
+    """The checkpoint at ``n`` of a text prompt that begins as PROMPT does, before its image."""
+    lru = chain_cache(max_size=8, max_bytes=1 << 30)
+    kept = _kept(lru)
+    text = Request(PROMPT[:SPANS[0][0]] + [60, 61, 62], _Free(), N)
+    text.checkpoints = [(n, "system")]
+    _serve(model, [[text]], lru=lru)
+    ((_, _, c),) = [k for k in kept if len(k[0]) == n]
+    return c
+
+
+def test_an_image_prompts_checkpoint_before_its_image_holds_what_a_text_prompts_does(model):
+    """The text before the first image is read as a text prompt's (the layers' own rope, not M-RoPE, whose rounding
+    differs), so a text request that starts from the checkpoint decodes what it would cold; the image's reply is still
+    the synchronous image path's."""
+    lru = chain_cache(max_size=8, max_bytes=1 << 30)
+    kept = _kept(lru)
+    read = []
+    (image,) = _serve(model, [[_image_request(model, read, checkpoints=[(3, "system")])]], lru=lru)
+    assert read == [(3, len(PROMPT) - 1)] and image.out == _reference(model)  # (to 3: _token_reader)
+    ((tokens, _, c_image),) = [k for k in kept if len(k[0]) == 3]
+    assert tokens == PROMPT[:3]
+    assert _same_cache(c_image, _text_made(model, 3), 3)
+
+
+
+def test_an_image_prompt_whose_client_left_reads_nothing_before_its_image(model):
+    """Its client gone while it waited: the text before the image is not read, and no checkpoint is kept."""
+    lru = chain_cache(max_size=8, max_bytes=1 << 30)
+    kept = _kept(lru)
+    read = []
+    (r,) = _serve(model, [[_image_request(model, read, checkpoints=[(3, "system")], cancelled=lambda: True)]], lru=lru)
+    assert r.finish == "cancelled" and r.out == [] and read == [] and kept == []
+
+
+def test_an_image_prompt_whose_text_before_its_image_fails_to_read_is_finished_there(model, monkeypatch):
+    """As a fault in its image's read: that request's error, not the batch's."""
+    def oom(self, cache, toks, chunk=2048, stop=None):
+        raise RuntimeError("out of memory")
+
+    monkeypatch.setattr(HybridBatchEngine, "_run", oom)
+    lru = chain_cache(max_size=8, max_bytes=1 << 30)
+    image = _image_request(model, [], checkpoints=[(3, "system")])
+    _serve(model, [[image]], lru=lru)
+    assert image.finish == "error: RuntimeError: out of memory" and image.out == []
 
 @pytest.mark.parametrize("image", [False, True])
 def test_a_system_checkpoint_is_saved_to_disk_when_its_copy_is_left_out(tmp_path, model, image):

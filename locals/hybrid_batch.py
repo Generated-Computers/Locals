@@ -1429,7 +1429,7 @@ class HybridBatchEngine(BatchEngine):
         due) to each of ``stops`` (_stops) in turn, keeping the checkpoint there (_at_checkpoint), and on to ``end`` if
         given. ``read(cache, start, stop)`` reads ``prompt[start:stop]`` into the cache and returns None, or how the
         request ends ("cancelled", "error: ..."): a text prompt's tokens (_token_reader), an image prompt
-        (vision.ImagePrompt.read). Returns the cache, how far it holds the prompt, and the reader's ending: after an
+        (_image_reader). Returns the cache, how far it holds the prompt, and the reader's ending: after an
         ending the cache may also hold part of the read that ended (the request is then given up, not read on)."""
         for cp, kind in list(stops) + ([(end, None)] if end is not None else []):
             cache = cache if cache is not None else make_prompt_cache(self.model)
@@ -1445,6 +1445,28 @@ class HybridBatchEngine(BatchEngine):
         """_checkpoint_walk's reader of a text prompt: its tokens, prefilled by _run, given up when ``stop()`` (asked
         between chunks)."""
         return lambda cache, start, end: None if self._run(cache, list(r.prompt[start:end]), stop=stop) else "cancelled"
+
+    def _image_reader(self, r):
+        """_checkpoint_walk's reader of an image prompt: vision.ImagePrompt.read, but a part that ends at or before the
+        first image (to a checkpoint there) is read as a text prompt's (_token_reader). M-RoPE gives the layers' own
+        rope there in exact numbers but not in rounding, and the checkpoint's key is the prompt's tokens, the key a
+        text prompt's has: a text request started from an image-made one decoded another reply than cold. That part
+        ends as ImagePrompt.read's would: a cancel asked before it too, a fault the request's own "error: ..."."""
+        first, text = (r.image.spans[0][0] if r.image.spans else 0), self._token_reader(r, r.image.cancelled)
+
+        def read(cache, start: int, end: int) -> Optional[str]:
+            if end > first:
+                return r.image.read(cache, start, end)
+            if r.image.cancelled():
+                return "cancelled"
+            try:
+                return text(cache, start, end)
+            except Exception as e:  # noqa: BLE001
+                from .service import _reason
+
+                return f"error: {_reason(e)}"
+
+        return read
 
     def _fill_checkpoints(self, e: dict, lru, lru_key, stop=None) -> bool:
         """Prefill a filling request up to its remaining checkpoints at once (no rows decode alongside). False if
@@ -1575,8 +1597,8 @@ class HybridBatchEngine(BatchEngine):
     def _embed(self, new: List[Request], found, on_done, lru, lru_key):
         """Read the image prompts among ``new`` (``Request.image``), each alone into its cached prefix (``found``) or
         a cache of its own, stopping at each checkpoint to keep a copy there: the rows wait meanwhile, as for a
-        prompt read at an admission. Returns ``new`` and ``found`` without the ones that ended there (a client gone,
-        the request's error), finished through ``on_done``."""
+        prompt read at an admission (_image_reader). Returns ``new`` and ``found`` without the ones that ended there (a
+        client gone, the request's error), finished through ``on_done``."""
         keep_new, keep_found = [], []
         for r, f in zip(new, found):
             if r.image is not None:
@@ -1584,8 +1606,8 @@ class HybridBatchEngine(BatchEngine):
                 end = len(r.prompt) - 1
                 at = end - len(rest)
                 tp = time.perf_counter()
-                c0, _, why = self._checkpoint_walk(r, c0, at, self._stops(r, at, end, c0, lru), r.image.read, lru, lru_key,
-                                                   end=end)
+                c0, _, why = self._checkpoint_walk(r, c0, at, self._stops(r, at, end, c0, lru), self._image_reader(r),
+                                                   lru, lru_key, end=end)
                 self.counters["prefill_s"] += time.perf_counter() - tp
                 if why is not None:
                     r.finish = why
