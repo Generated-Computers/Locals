@@ -33,7 +33,7 @@ def server():
 
 
 def test_moved_context_message_hits_the_cache_without_snapshots(server):
-    assert not server._needs_checkpoints("locals")
+    assert not server.loaded("locals").needs_checkpoints
     system = "You are a coding agent. Use the tools.\n" + "\n".join(
         f"Rule {i}: read a file before you edit it, and keep replies short ({i} of 120)." for i in range(120))
     ctx = {"role": "user", "content": "<context>Active exec sessions: none</context>"}

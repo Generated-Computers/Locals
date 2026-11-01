@@ -112,11 +112,40 @@ def _reads_images(svc) -> bool:
 @dataclass(frozen=True)
 class LoadedModel:
     """One load of the model on one engine, as a request reads it: an unload never changes it under the request
-    that holds it. ``svc`` runs the request; an unload finishes it, and the model loaded again takes the request."""
+    that holds it. ``svc`` runs the request; an unload finishes it, and the model loaded again takes the request.
+    It holds no weights: what it needs of the model is read once, when it is made (Server.loaded)."""
 
     svc: object
     tokenizer: object
     reads_images: bool
+    fmt: object  # the chat template's tool-call format (formats.detect)
+    thinking_style: str  # formats.thinking_style
+    thinks: bool  # the template has a thinking mode (formats.offers_thinking)
+    # the model thinks with thinking off (formats.thinks_when_off: LFM3 opened a block itself, or closed one it never
+    # opened and answered again after it): its requests think unless they turn it off, and a reply with thinking off
+    # is kept from writing a think block
+    sealed: bool
+    # reply_regex's ``gap`` and ``think_gap`` for Qwen3.5's calls: the newlines the template writes between two calls
+    # and after ``</think>`` (Qwen3.5's one and two, LFM3's two and none)
+    seps: dict
+    # prompt snapshots pay: only where a cached state cannot be cut back to a shorter prefix (Qwen3.5's recurrent
+    # layers, Gemma's sliding windows). A plain KV cache is trimmed to any shared prefix by the prompt cache itself,
+    # so snapshots of it would only hold the prompt's KV two more times (5 GB for a 20k-token prompt on an 8B model).
+    needs_checkpoints: bool
+
+
+def _loaded_model(engine: str, svc) -> LoadedModel:
+    """``svc``'s LoadedModel, read while no unload can finish it (Server.loaded holds the engine's load lock)."""
+    tok = svc.tokenizer
+    needs = False
+    if engine == "locals":
+        from mlx_lm.models.cache import KVCache, make_prompt_cache
+
+        model = getattr(getattr(svc, "_eng", None), "model", None)  # (None: a test's stub service)
+        needs = model is None or any(type(c) is not KVCache for c in make_prompt_cache(model))
+    return LoadedModel(svc, tok, _reads_images(svc), fmt=formats.detect(tok), thinking_style=formats.thinking_style(tok),
+                       thinks=formats.offers_thinking(tok), sealed=formats.thinks_when_off(tok),
+                       seps={"gap": formats.call_gap(tok), "think_gap": formats.think_gap(tok)}, needs_checkpoints=needs)
 
 
 def _host_ok(host_header: Optional[str], bind_host: str) -> bool:
@@ -197,14 +226,9 @@ class Server:
         # hits the prompt cache: (rendered prompt text + reply text) -> ids.
         self._streams: Dict[str, List[dict]] = {e: [] for e in self.engines}
         self._raw: Dict[str, str] = {}  # tool-call id -> the raw reply text it came from
-        self._fmt: Dict[str, tuple] = {}  # engine -> (tool-call format, thinking style), from the chat template
-        self._sealed: Dict[str, bool] = {}  # engine -> whether replies with thinking off are kept from think tags
-        self._seps: Dict[str, dict] = {}  # engine -> the newlines its template writes between calls, after </think>
-        self._ckpt: Dict[str, bool] = {}  # engine -> whether the model's cache needs prompt snapshots
         for e in preload or ():
             if e in self.engines:
-                self.service(e)
-                self.format_of(e)
+                self.loaded(e)
         self._cap_context()
 
     # -- the names other APIs' clients use ------------------------------------------------------
@@ -334,7 +358,8 @@ class Server:
             with self._loading[engine]:
                 if self._svc.get(engine) is not svc:
                     continue  # unloaded meanwhile: the next pass loads it again
-                h = self._handles[engine] = LoadedModel(svc, svc.tokenizer, _reads_images(svc))
+                h = self._handles[engine] = _loaded_model(engine, svc)
+                self.log(f"[{engine}] tool calls: {h.fmt.name}; thinking: {h.thinking_style}")
                 return h
 
     def unload(self) -> dict:
@@ -358,13 +383,6 @@ class Server:
         return {"status": "unloaded" if done else "not loaded", "model": self.model_id, "engines": done,
                 "freed_mb": round(max(0, before - after) / 1e6), "gpu_active_mb": round(after / 1e6)}
 
-    def _can_think(self, engine: str, tok) -> bool:
-        if engine not in getattr(self, "_thinks", {}):
-            from . import formats
-
-            self._thinks = {**getattr(self, "_thinks", {}), engine: formats.offers_thinking(tok)}
-        return self._thinks[engine]
-
     def models(self) -> List[dict]:
         out = []
         from . import formats
@@ -375,9 +393,10 @@ class Server:
             for suffix in ("", "-thinking") if thinks else ("",):
                 info = {"id": f"{e}/{self.short}{suffix}", "object": "model", "created": int(self.t_start), "owned_by": e,
                         "context_length": self.context_for(e), "max_model_len": self.context_for(e)}
-                if e in self._fmt:  # known once the engine is loaded
-                    info["tool_call_format"] = self._fmt[e][0].name
-                    info["parallel_tool_calls"] = self._fmt[e][0].multi
+                h = self._handles.get(e)
+                if h is not None:  # known once the engine is loaded
+                    info["tool_call_format"] = h.fmt.name
+                    info["parallel_tool_calls"] = h.fmt.multi
                 out.append(info)
         return out
 
@@ -413,7 +432,9 @@ class Server:
         engine = oai.engine_of(model)
         # a model that thinks with thinking off thinks by default (LFM3, as its template does): with thinking off it
         # reasoned in its answers, and did 10 of 18 agent tasks where it did 15 with thinking on
-        thinking = oai.thinking_of(model, self.thinking or self._seals_thinking(engine))
+        loaded = self.loaded(engine)  # (held to the end: an unload from here on changes nothing it reads)
+        svc, tok = loaded.svc, loaded.tokenizer
+        thinking = oai.thinking_of(model, self.thinking or loaded.sealed)
         kw = req.get("chat_template_kwargs") or {}
         if isinstance(kw, dict) and isinstance(kw.get("enable_thinking"), bool):  # vLLM / SGLang style switch
             thinking = kw["enable_thinking"]
@@ -422,16 +443,14 @@ class Server:
             effort = req["reasoning"].get("effort")
         if effort == "none":
             thinking = False
-        loaded = self.loaded(engine)  # (held to the end: an unload from here on changes nothing it reads)
-        svc, tok = loaded.svc, loaded.tokenizer
         self._cap_context()
-        fmt, style = self.format_of(engine)
+        fmt, style = loaded.fmt, loaded.thinking_style
         if style in ("none", "switch"):
             thinking = False  # no switch, or thoughts in a form the parser does not know
         rf0 =req.get("response_format") if isinstance(req.get("response_format"), dict) else {}
         if rf0.get("type") in ("json_object", "json_schema", "regex") or req.get("guided_regex") or oai.response_schema(req):
             thinking = False  # the grammar writes the JSON from the first token: a think block the prompt opened would hold it
-        if thinking and not self._can_think(engine, tok):
+        if thinking and not loaded.thinks:
             thinking = False  # a model without a thinking mode (Qwen3-Instruct-2507) never closes a think block
         prefill = req.get("_prefill") if isinstance(req.get("_prefill"), str) else ""  # (an Anthropic prefill)
         if prefill:
@@ -491,8 +510,8 @@ class Server:
                                  f"length of the messages.", len(prompt) + min(max_tokens, 256), limit)
         max_tokens = max(1, min(max_tokens, self.max_tokens, room))
         # (not for a benchmark's fixed-length reply, which gets no grammar for its calls either)
-        sealed = engine == "locals" and not thinking and not req.get("ignore_eos") and self._seals_thinking(engine)
-        seps = self._template_seps(engine) if engine == "locals" and tools else {}
+        sealed = engine == "locals" and not thinking and not req.get("ignore_eos") and loaded.sealed
+        seps = loaded.seps if engine == "locals" and tools else {}
         schema = oai.response_schema(req)
         regex = output_regex = None
         rf = req.get("response_format") if isinstance(req.get("response_format"), dict) else {}
@@ -530,7 +549,7 @@ class Server:
         if sealed and regex is None and schema is None:  # (no tools: free text, without the tags)
             regex = oai.not_containing(*oai.THINK_TAGS)
         cps = (self._checkpoints(tok, msgs, tpl_tools, think_kw, text, placed, spans)
-               if engine == "locals" and self._needs_checkpoints(engine) else [])
+               if engine == "locals" and loaded.needs_checkpoints else [])
         return {"engine": engine, "thinking": thinking, "svc": svc, "tok": tok, "prompt": prompt, "checkpoints": cps, "text": text,
                 "pictures": pictures, "spans": spans,
                 "tools": tools, "schema": schema, "regex": regex, "output_regex": output_regex, "max_tokens": max_tokens,
@@ -718,46 +737,8 @@ class Server:
 
     def format_of(self, engine: str):
         """The tool-call format and thinking style of the model's chat template."""
-        if engine not in self._fmt:
-            from . import formats
-
-            tok = self.service(engine).tokenizer
-            self._fmt[engine] = (formats.detect(tok), formats.thinking_style(tok))
-            self.log(f"[{engine}] tool calls: {self._fmt[engine][0].name}; thinking: {self._fmt[engine][1]}")
-        return self._fmt[engine]
-
-    def _seals_thinking(self, engine: str) -> bool:
-        """Whether the model thinks with thinking off (formats.thinks_when_off: LFM3 opened a block itself, or closed
-        one it never opened and answered again after it): its requests think unless they turn it off, and a reply
-        with thinking off is kept from writing a think block."""
-        if engine not in self._sealed:
-            from . import formats
-
-            self._sealed[engine] = formats.thinks_when_off(self.service(engine).tokenizer)
-        return self._sealed[engine]
-
-    def _template_seps(self, engine: str) -> dict:
-        """reply_regex's ``gap`` and ``think_gap`` for Qwen3.5's calls: the newlines the template writes between two
-        calls and after ``</think>`` (Qwen3.5's one and two, LFM3's two and none)."""
-        if engine not in self._seps:
-            from . import formats
-
-            tok = self.service(engine).tokenizer
-            self._seps[engine] = {"gap": formats.call_gap(tok), "think_gap": formats.think_gap(tok)}
-        return self._seps[engine]
-
-    def _needs_checkpoints(self, engine: str) -> bool:
-        """Whether prompt snapshots pay: only where a cached state cannot be cut
-        back to a shorter prefix (Qwen3.5's recurrent layers, Gemma's sliding
-        windows). A plain KV cache is trimmed to any shared prefix by the prompt
-        cache itself, so snapshots of it would only hold the prompt's KV two more
-        times (5 GB for a 20k-token prompt on an 8B model)."""
-        if engine not in self._ckpt:
-            from mlx_lm.models.cache import KVCache, make_prompt_cache
-
-            model = getattr(getattr(self.service(engine), "_eng", None), "model", None)
-            self._ckpt[engine] = model is None or any(type(c) is not KVCache for c in make_prompt_cache(model))
-        return self._ckpt[engine]
+        h = self.loaded(engine)
+        return h.fmt, h.thinking_style
 
     _SESSION_MARKERS = ("<env>", "Working directory:", "Current Working Directory", "Current working directory",
                         "Workspace root folder:", "Today's date:", "Current date:", "<CURRENT_DATETIME>",
