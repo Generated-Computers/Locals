@@ -9,7 +9,7 @@ import pytest
 from locals import vision
 
 MODEL = "mlx-community/Qwen3.5-4B-MLX-4bit"
-IMAGE = "<|vision_start|><|image_pad|><|vision_end|>"
+IMAGE = vision.IMAGE_MARK
 
 
 @pytest.fixture(scope="module")

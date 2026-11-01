@@ -14,7 +14,7 @@ Agents resend the whole conversation on every call. The engine keeps the model's
 | Disk cache | `DiskPromptCache` (`hybrid_batch.py`) | System-prompt snapshots on the SSD, kept across restarts. |
 | Shared-prefix snapshots | `HybridBatchEngine.snapshots`, at most `LOCALS_MAX_SNAPSHOTS` (default 4) | Prefixes shared by requests that arrive together. They are the first thing dropped when memory is short. |
 | Memory guard | `memory_limit`, `_fits`, `_make_room`, `_trim_for`, `_room_for_copy` | `_fits` holds back an admission that would not fit even with an empty prompt cache. The other three drop cache entries, or skip a checkpoint copy, before an allocation that would not fit. |
-| Token streams | `Server._streams`, `_tokens_for`, `_remember` (`server.py`) | Exact token ids of recent prompts and replies. |
+| Token streams | `Server._streams`, `_remembered`, `_remember` (`server.py`), `PreparedPrompt.of` (`prepared.py`) | Exact token ids of recent prompts and replies. |
 
 ## Why some caches cannot be cut back to a prefix
 
@@ -29,7 +29,7 @@ A plain attention layer (`KVCache`) stores one key and one value per position. T
 2. **Prefixes are stored on purpose.** The engine stores entries at the positions the next requests are likely to share. These are the checkpoints, described below.
 3. **Stale prefixes are not removed.** mlx-lm's `insert_cache` drops the shorter entries a new entry extends only when the cache is trimmable. For a hybrid model, every agent step would leave behind another copy of the whole history. `ChainCache` fixes this (see "Eviction" below).
 
-`Server._needs_checkpoints(engine)` turns checkpoints on only if some layer of `make_prompt_cache(model)` is not exactly a `KVCache`. A plain KV cache is already trimmed to any shared prefix by the prompt cache. Checkpoints of it would just hold the prompt's KV two more times; the docstring's example is 5 GB for a 20k-token prompt on an 8B model.
+`LoadedModel.needs_checkpoints` (`server._loaded_model`) turns checkpoints on only if some layer of `make_prompt_cache(model)` is not exactly a `KVCache`. A plain KV cache is already trimmed to any shared prefix by the prompt cache. Checkpoints of it would just hold the prompt's KV two more times; the docstring's example is 5 GB for a 20k-token prompt on an 8B model.
 
 ## How a request finds its cache and leaves one behind
 
@@ -43,11 +43,11 @@ In `HybridBatchEngine.serve`:
    - Otherwise the engine calls `_trim_for` and then `c.extract(i)`. In both cases the row's recurrent arrays are then copied with `a + 0`, because a view would pin the whole batch buffer.
    - The row is stored as an `assistant` entry under `prompt[:-1] + r.fed`, or the reply entry is stored instead (see below).
 
-**Token streams.** The server re-renders each prompt from the client's messages, so the token ids have to stay stable. Encoding the rendered text from scratch may not give back the ids the model actually produced, and the lookup would then miss. `_remember` keeps up to 64 recent `{text, ids}` pairs for replies that came back exactly. `_tokens_for` reuses the ids of the longest remembered text that the new prompt starts with, and encodes only the rest.
+**Token streams.** The server re-renders each prompt from the client's messages, so the token ids have to stay stable. Encoding the rendered text from scratch may not give back the ids the model actually produced, and the lookup would then miss. `_remember` keeps up to 64 recent `{text, ids}` pairs for replies that came back exactly. `PreparedPrompt.of` reuses the ids of the longest remembered text (`_remembered`) that the new prompt starts with, and encodes only the rest.
 
 ## Checkpoints
 
-`Server.prepare` computes `cps = self._checkpoints(...)` only for the `locals` engine, and only when `_needs_checkpoints` is true. The result is a list of `(n, kind)` pairs. It reaches the engine through `BatchService.submit(checkpoints=...)` as `Request.checkpoints`. Each position comes from rendering part of the conversation with the model's own chat template:
+`Server.prepare` computes `cps = self._checkpoints(...)` only for the `locals` engine, and only when `LoadedModel.needs_checkpoints` is true. The result is a list of `(n, kind)` pairs. It reaches the engine through `BatchService.submit(checkpoints=...)` as `Request.checkpoints`. Each position comes from rendering part of the conversation with the model's own chat template:
 
 | Kind | Position | How it is rendered | Entry type | Why |
 |---|---|---|---|---|

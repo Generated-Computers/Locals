@@ -129,7 +129,7 @@ def _conversations():
 @pytest.mark.parametrize("name", sorted(_conversations()))
 def test_agent_conversation(server, name):
     msgs, tools, options = _conversations()[name]
-    fmt, _ = server.format_of("locals")
+    fmt = server.loaded("locals").fmt
     server._raw.clear()
     if fmt.replay_raw:  # the server remembers each reply with calls it generated
         for m in msgs:

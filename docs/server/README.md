@@ -72,9 +72,9 @@ Handler.do_POST
    - A request for another model by the server's own names (`locals/<name>`, `mlx/<name>`, `stock/<name>`; an alias of the loaded model passes) is a 400 that says which model runs (`check_model`), and that the plain `locals` is always the model loaded: another locals command had switched the model under a connected agent, and the agent's requests were answered by the new model without a word. Any other name (`gpt-4o` in an app, Ollama's names) is the model loaded.
    - A bool in `chat_template_kwargs.enable_thinking` (the switch vLLM and SGLang use) overrides thinking.
    - `reasoning_effort: "none"`, or `reasoning.effort` in the Responses API shape, turns thinking off.
-4. `Server.service(engine)` loads the engine on first use. Each engine has its own lock, so the other engine keeps serving during a load. After a failed load, the engine is not loaded again for 60 s. Requests in that window get a 500 that repeats the error.
+4. `Server.loaded(engine)` gives the request the model as loaded on the engine (`LoadedModel`), and `Server.service(engine)` loads the engine on first use. Each engine has its own lock, so the other engine keeps serving during a load. After a failed load, the engine is not loaded again for 60 s. Requests in that window get a 500 that repeats the error.
 5. `_cap_context()` fixes the context limit once (see Context limits).
-6. `format_of(engine)` reads two things from the chat template, once per engine: the tool-call format (`formats.detect`) and the thinking style (`formats.thinking_style`).
+6. The `LoadedModel` holds what the request reads of the chat template, read once per load (`_loaded_model`): the tool-call format (`formats.detect`) and the thinking style (`formats.thinking_style`), among others. An unload never changes it under a request that holds it.
 7. Thinking is forced off in four cases:
    - The style is `"none"` (no switch) or `"switch"` (thoughts marked in a way the parser does not know).
    - The output is constrained (a `response_format` of type `json_object`, `json_schema` or `regex`, or `guided_regex`). The grammar writes the JSON from the first token, and an open think block would hold it.
@@ -95,7 +95,7 @@ Handler.do_POST
     - with thinking on, `reasoning_effort`. When the template lists the values it accepts, `formats.effort_for` maps the request's value to the nearest one. A template that lists only `xhigh`, `medium` and `low` raises on anything else.
 12. `_render` calls `tokenizer.apply_chat_template(..., tokenize=False)`. A Jinja error raised by the template, such as a wrong role order or a missing field, becomes a 400.
 13. With the `"always"` style and thinking off, it appends `fmt.think_close`, so the model answers at once. LFM2.5's template opens a think block whatever the switch says.
-14. `_tokens_for` turns the text into token ids. Where the text continues a stored stream, it reuses that stream's ids.
+14. `PreparedPrompt.of` (`prepared.py`) turns the text into token ids. Where the text continues a stored stream (`_remembered`), it reuses that stream's ids.
 15. It checks the context, sets `max_tokens`, picks the constraint, and, on our engine, computes the cache checkpoints.
 
 ## Endpoints
@@ -156,7 +156,7 @@ Two engines can serve the same model, and each request's model id picks one. `EN
 - `<engine>/<short>`;
 - `<engine>/<short>-thinking`, when the model can think or before any engine has loaded.
 
-Each entry carries `context_length` and `max_model_len`, both equal to `context_for(engine)`. Once `format_of` has run for the engine (at preload, or on its first chat request; an engine loaded only by a `/v1/completions` request has no format yet), each entry also carries (`server.Server.__init__`, `server.Server.models`, `server.Server.prepare`, `server.Server.prepare_text`):
+Each entry carries `context_length` and `max_model_len`, both equal to `context_for(engine)`. Once the engine has a `LoadedModel` (`Server.loaded`: at preload, or on its first request; an engine loaded only by an Ollama load request has none yet, and an unload drops it), each entry also carries (`server.Server.__init__`, `server.Server.models`, `server.Server.prepare`, `server.Server.prepare_text`):
 
 - `tool_call_format`: the format's name, such as `qwen_xml`;
 - `parallel_tool_calls`: whether the format writes several calls in one reply.
@@ -301,7 +301,7 @@ On the next turn, the client sends the conversation back and the chat template r
 
 **`_streams[engine]`** holds the last 64 finished replies. Each entry is `{"text": rendered prompt + raw reply, "ids": prompt ids + steering prefix ids + reply tokens}`.
 
-- `_tokens_for` finds the longest stored text that is a prefix of the new prompt text. It reuses that entry's ids and encodes only the rest.
+- `_remembered` finds the longest stored text that is a prefix of the new prompt text. `PreparedPrompt.of` reuses that entry's ids and encodes only the rest.
 - Only uncut replies are stored (`stopped is None`), because only an uncut reply is a token stream the model can continue.
 
 **`_raw`** maps a tool-call id to the raw reply text the call was parsed from. It keeps at most 4096 entries and drops the oldest 1024 once past that.
@@ -312,7 +312,7 @@ On the next turn, the client sends the conversation back and the chat template r
 - Only formats with `replay_raw = True` use `_raw`. That is the `ToolFormat` default. Mistral v3 and v11 and Gemma 4 set it to `False`.
 - What is stored is the reply as the client received it: cut after `max_calls`, without duplicate calls.
 
-**Cache checkpoints.** Some models have a cache that cannot be cut back to a shorter prefix, such as Qwen3.5's recurrent layers or Gemma's sliding windows. `_needs_checkpoints` detects them by checking for any cache layer that is not a plain `KVCache`. For these models, our engine also stores the prompt's cache at up to four positions computed by `_checkpoints`:
+**Cache checkpoints.** Some models have a cache that cannot be cut back to a shorter prefix, such as Qwen3.5's recurrent layers or Gemma's sliding windows. `LoadedModel.needs_checkpoints` (set in `_loaded_model`) detects them by checking for any cache layer that is not a plain `KVCache`. For these models, our engine also stores the prompt's cache at up to four positions computed by `_checkpoints`:
 
 - `"system"`: where this session's own part of the system message starts (`_session_start`: what it shares with recent sessions' system messages comes before), and its end too when that is more than 4096 characters further;
 - `"user"`: the start of the last message;

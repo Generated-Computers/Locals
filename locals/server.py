@@ -148,13 +148,6 @@ def _loaded_model(engine: str, svc) -> LoadedModel:
                        seps={"gap": formats.call_gap(tok), "think_gap": formats.think_gap(tok)}, needs_checkpoints=needs)
 
 
-def _images_of(prepared) -> dict:
-    """BatchService.submit's ``pictures`` and ``spans`` for a prepared prompt (None: none)."""
-    if prepared is None or not prepared.pictures:
-        return {"pictures": None, "spans": None}
-    return {"pictures": list(prepared.pictures), "spans": list(prepared.spans)}
-
-
 def _host_ok(host_header: Optional[str], bind_host: str) -> bool:
     """The Host header of a server that listens on this machine only names this machine: a page whose
     domain was pointed at 127.0.0.1 (DNS rebinding) names its own. This machine's names: localhost and
@@ -365,6 +358,9 @@ class Server:
             with self._loading[engine]:
                 if self._svc.get(engine) is not svc:
                     continue  # unloaded meanwhile: the next pass loads it again
+                h = self._handles.get(engine)
+                if h is not None and h.svc is svc:
+                    return h  # made by a request that held the lock first
                 h = self._handles[engine] = _loaded_model(engine, svc)
                 self.log(f"[{engine}] tool calls: {h.fmt.name}; thinking: {h.thinking_style}")
                 return h
@@ -554,7 +550,7 @@ class Server:
         if sealed and regex is None and schema is None:  # (no tools: free text, without the tags)
             regex = oai.not_containing(*oai.THINK_TAGS)
         cps = (self._checkpoints(tok, msgs, tpl_tools, think_kw, prepared)
-               if engine == "locals" and loaded.needs_checkpoints else [])
+               if loaded.needs_checkpoints else [])
         return {"engine": engine, "thinking": thinking, "svc": svc, "tok": tok, "prompt": prompt, "checkpoints": cps, "text": text,
                 "prepared": prepared,
                 "tools": tools, "schema": schema, "regex": regex, "output_regex": output_regex, "max_tokens": max_tokens,
@@ -740,11 +736,6 @@ class Server:
         fit = getattr(self, "_fit_limit", None)
         return min(self.context_for(engine), fit) if fit and engine == "locals" else self.context_for(engine)
 
-    def format_of(self, engine: str):
-        """The tool-call format and thinking style of the model's chat template."""
-        h = self.loaded(engine)
-        return h.fmt, h.thinking_style
-
     _SESSION_MARKERS = ("<env>", "Working directory:", "Current Working Directory", "Current working directory",
                         "Workspace root folder:", "Today's date:", "Current date:", "<CURRENT_DATETIME>",
                         "Your current working directory is:")
@@ -888,10 +879,12 @@ class Server:
             return submit(p["svc"])
 
     def _submit_to(self, p: dict, on_token=None, prompt: Optional[List[int]] = None):
+        pr = p.get("prepared")  # (None: a request made without one, text only)
         return p["svc"].submit(p["prompt"] if prompt is None else prompt, schema=p["schema"], max_tokens=p["max_tokens"],
                                regex=p["regex"], on_token=on_token,
                                temp=p.get("temp"), ignore_eos=p.get("ignore_eos", False),
-                               checkpoints=p.get("checkpoints"), **_images_of(p.get("prepared")),
+                               checkpoints=p.get("checkpoints"), pictures=pr.pictures if pr else None,
+                               spans=pr.spans if pr else None,
                                **p.get("sampling", {}))
 
     def _account(self, p: dict, job, out_tokens: int, calls: int, t0: float, stopped: Optional[str] = None) -> dict:

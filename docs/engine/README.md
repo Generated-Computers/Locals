@@ -127,7 +127,7 @@ Small prompts admitted while a long one is still in `filling` are prefilled at o
 - adds the new rows' start states to `g`
 - adds each new row's `prompt[-1]` to the next feed
 
-Checkpoints are only requested for models whose cache cannot be cut back to a shorter prefix. `server.py` `_needs_checkpoints` checks for this (Qwen3.5's recurrent layers, Gemma's sliding windows). `_checkpoints` places them at the end of the system part (`"system"`): the system message with its tools plus the user turn's header, found where two renderings with different user messages first differ. It also places them at the start of the last message (`"user"`), and where the reply starts as the next request will render it (`"reply"`). A candidate is used only if its rendered text is at least 2048 characters and a prefix of the prompt, and its token position n satisfies 1024 <= n < len(prompt), with one checkpoint per position.
+Checkpoints are only requested for models whose cache cannot be cut back to a shorter prefix. `LoadedModel.needs_checkpoints` (`server.py`) checks for this (Qwen3.5's recurrent layers, Gemma's sliding windows). `_checkpoints` places them at the end of the system part (`"system"`): the system message with its tools plus the user turn's header, found where two renderings with different user messages first differ. It also places them at the start of the last message (`"user"`), and where the reply starts as the next request will render it (`"reply"`). A candidate is used only if its rendered text is at least 2048 characters and a prefix of the prompt, and its token position n satisfies 1024 <= n < len(prompt), with one checkpoint per position.
 
 ## Prefill
 

@@ -22,7 +22,7 @@ class PreparedPrompt:
     tokens: List[int]
     pictures: tuple = ()
     spans: tuple = ()
-    placed: Tuple[int, ...] = ()  # the tokens with one placeholder per image (no images: ``tokens``)
+    placed: Tuple[int, ...] = ()  # an image prompt's tokens with one placeholder per image (no images: empty)
     tokenizer: object = field(default=None, repr=False, compare=False)
 
     @classmethod
@@ -40,7 +40,7 @@ class PreparedPrompt:
             tokens = list(hf.encode(text, add_special_tokens=False))
         else:
             tokens = list(seen[1]) + list(hf.encode(text[len(seen[0]):], add_special_tokens=False))
-        return cls(text, tokens, placed=tuple(tokens), tokenizer=tokenizer)
+        return cls(text, tokens, tokenizer=tokenizer)
 
     @property
     def rememberable(self) -> bool:
@@ -52,11 +52,12 @@ class PreparedPrompt:
         """Where ``prefix``, a text prefix of the prompt, ends in its tokens (an image's tokens before it count: its
         prefix costs the tower and their prefill), or None: no prefix, the whole prompt, or under 1024 tokens (a
         short prefix is cheaper to read again than to keep)."""
-        if (len(prefix) < 2048 and not self.spans) or not self.text.startswith(prefix):
+        if (len(prefix) < 2048 and not self.pictures) or not self.text.startswith(prefix):
             return None
         ids = self.tokenizer._tokenizer.encode(prefix, add_special_tokens=False)
+        placed = self.placed or self.tokens
         # where the prompt's tokens and these part (the last token may merge with what follows): one pass
         # (backing off a token at a time cost seconds on a 60k-token prompt)
-        n = next((k for k, (a, b) in enumerate(zip(self.placed, ids)) if a != b), min(len(self.placed), len(ids)))
+        n = next((k for k, (a, b) in enumerate(zip(placed, ids)) if a != b), min(len(placed), len(ids)))
         at = vision.expanded_at(n, self.spans)
-        return at if at >= 1024 and n < len(self.placed) else None
+        return at if at >= 1024 and n < len(placed) else None
