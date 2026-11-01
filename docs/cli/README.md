@@ -559,7 +559,7 @@ Variables read by the server process must be set in the environment of the comma
 | `LOCALS_GROWTH_TRIM` | `1` | `0` turns off making room in the prompt cache every 32 decode steps for the rows' KV growth. | `hybrid_batch.py` |
 | `LOCALS_MEMLOG` | unset | Prints GPU memory around each admission. | `hybrid_batch.py` |
 | `LOCALS_MIXLOG` | unset | Prints each mixed pass. | `hybrid_batch.py` |
-| `LOCALS_PREFILL_LOG` | unset | Prints prefill and checkpoint lines. | `hybrid_batch.HybridBatchEngine._prefill_batch`, `hybrid_batch.HybridBatchEngine._checkpoint`, `hybrid_batch.HybridBatchEngine.serve` |
+| `LOCALS_PREFILL_LOG` | unset | Prints prefill and checkpoint lines. | `hybrid_batch.HybridBatchEngine._prefill_batch`, `hybrid_batch.HybridBatchEngine._at_checkpoint` |
 | `LOCALS_REPLY_CHECKPOINT` | `1` | `0` turns off the "reply" prompt-cache checkpoint for follow-up turns. | `server.Server._checkpoints` |
 | `LOCALS_DISK_CACHE` | `1` | `0` turns off the system-prompt snapshots on disk, which survive server restarts. | `service.BatchService._run_locals` |
 | `LOCALS_DISK_CACHE_DIR` | `~/.cache/locals/prompts` | Where those snapshots go. | `service.BatchService._run_locals` |

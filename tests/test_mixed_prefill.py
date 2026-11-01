@@ -33,7 +33,7 @@ def _prompt(tok, topic, n):
     return tok.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False)
 
 
-def _run(svc, mix: bool, checkpoint=None):
+def _run(svc, mix: bool, checkpoint=None, kind="user"):
     from locals import mixed
 
     eng = svc._eng
@@ -53,7 +53,7 @@ def _run(svc, mix: bool, checkpoint=None):
     a = svc.submit(_prompt(tok, "warehouse", 30), max_tokens=160, on_token=on_a)
     assert started.wait(120)
     pb, pc = _prompt(tok, "kitchen", 70), _prompt(tok, "garden", 55)
-    b = svc.submit(pb, max_tokens=24, checkpoints=[(checkpoint, "user")] if checkpoint else None)
+    b = svc.submit(pb, max_tokens=24, checkpoints=[(checkpoint, kind)] if checkpoint else None)
     c = svc.submit(pc, max_tokens=24)
     for j in (a, b, c):
         j.wait(600)
@@ -80,6 +80,29 @@ def test_checkpoint_reached_in_mixed_passes(service):
     assert steps >= 4
     kinds = service._lru.stats_by_type()
     assert kinds.get("user", {}).get("n_sequences", 0) >= 1
+
+
+def test_a_system_checkpoint_in_mixed_passes_is_saved_to_disk_when_its_copy_is_left_out(service, tmp_path, monkeypatch):
+    """Memory too short for the checkpoint's copy in the prompt cache: the system prompt still goes to disk, as it
+    does for a prompt read alone."""
+    from locals.hybrid_batch import DiskPromptCache
+
+    eng = service._eng
+    disk = DiskPromptCache(tmp_path / "m", 1.0)
+    monkeypatch.setattr(eng, "disk", disk)
+    monkeypatch.setattr(eng, "_room_for_copy", lambda lru, positions: False)
+    at_save = []
+    save = disk.save
+    monkeypatch.setattr(disk, "save", lambda tokens, cache: at_save.append(eng.counters.get("mixed_steps", 0)) or save(tokens, cache))
+    service._lru.trim_to(n_bytes=0)
+    cp = 300  # inside the second prompt, past a pass boundary
+    _, steps, n = _run(service, mix=True, checkpoint=cp, kind="system")
+    assert steps >= 4 and n > cp + 50
+    # taken in a mixed pass: more passes read the rest of the prompt after it (prompts left when the rows finish are
+    # read at once, with no pass)
+    assert len(at_save) == 1 and at_save[0] < eng.counters["mixed_steps"]
+    assert len(disk.index) == 1 and len(next(iter(disk.index.values()))) == cp
+    assert service._lru.stats_by_type()["system"]["n_sequences"] == 0
 
 
 def test_a_short_prompt_is_read_before_a_long_one(service):

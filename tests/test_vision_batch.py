@@ -11,7 +11,7 @@ from mlx_lm.models import qwen3
 
 from locals import vision
 from locals.engine import Controller, Engine
-from locals.hybrid_batch import HybridBatchEngine, chain_cache
+from locals.hybrid_batch import DiskPromptCache, HybridBatchEngine, chain_cache
 from locals.packed import Request
 
 N = 12  # reply tokens
@@ -74,9 +74,13 @@ def _image_request(model, read, prompt=PROMPT, key=KEY, checkpoints=None):
     return r
 
 
-def _serve(model, waves, lru=None):
-    """Serve ``waves`` (lists of requests): the first at once, each next one when the rows have decoded 3 tokens."""
+def _serve(model, waves, lru=None, disk=None, room=True):
+    """Serve ``waves`` (lists of requests): the first at once, each next one when the rows have decoded 3 tokens.
+    ``disk``: the engine's DiskPromptCache; ``room``: False, the memory is short for every checkpoint's copy."""
     eng = HybridBatchEngine(model, _Tok(), n_slots=4, share_prefix=False)
+    eng.disk = disk
+    if not room:
+        eng._room_for_copy = lambda lru, positions: False
     waves = [list(w) for w in waves]
     first = waves[0]
     done = []
@@ -172,6 +176,33 @@ def test_an_image_rows_checkpoints_are_kept_under_its_key(model):
     (r,) = _serve(model, [[_image_request(model, read, checkpoints=[(24, "user")])]], lru=lru)
     assert read == [(0, 24), (24, len(PROMPT) - 1)] and r.out == _reference(model)
     assert kept == [(r.cache_key[:24], "user"), (r.cache_key[:-1] + r.fed, "assistant")]
+
+
+def test_an_image_prompts_system_checkpoints_are_saved_to_disk_under_its_key(tmp_path, model):
+    """As a text prompt's: a system message is text only, so its checkpoint is before the first image, where the key is
+    the prompt's tokens; one past an image (made up here) is saved under the key, with the image's id."""
+    disk = DiskPromptCache(tmp_path / "m", 1.0)
+    lru = chain_cache(max_size=8, max_bytes=1 << 30)
+    (r,) = _serve(model, [[_image_request(model, [], checkpoints=[(3, "system"), (24, "system")])]], lru=lru, disk=disk)
+    assert r.finish == "length"
+    assert sorted(disk.index.values()) == [tuple(PROMPT[:3]), tuple(r.cache_key[:24])]
+    assert -KEY in r.cache_key[:24]
+
+
+@pytest.mark.parametrize("image", [False, True])
+def test_a_system_checkpoint_is_saved_to_disk_when_its_copy_is_left_out(tmp_path, model, image):
+    """Memory too short for a checkpoint's copy in the prompt cache: the system prompt still goes to disk (a file, no
+    GPU memory), for a text prompt and an image prompt alike."""
+    disk = DiskPromptCache(tmp_path / "m", 1.0)
+    lru = chain_cache(max_size=8, max_bytes=1 << 30)
+    if image:
+        r = _image_request(model, [], checkpoints=[(3, "system")])
+    else:
+        r = Request(list(TEXT), _Free(), N)
+        r.checkpoints = [(3, "system")]
+    _serve(model, [[r]], lru=lru, disk=disk, room=False)
+    assert list(disk.index.values()) == [tuple(r.prompt[:3])]
+    assert lru.stats_by_type()["system"]["n_sequences"] == 0
 
 
 def test_an_image_prompt_that_ends_at_its_read_is_finished_there(model):

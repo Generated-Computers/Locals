@@ -475,8 +475,8 @@ template refuses it there).
    starts from the turn before it and reads only what it adds (`ImagePrompt.read(cache, start, stop)`): the tower runs
    on the images past the cached prefix only, and its features are let go of when the read ends, however it ends.
    Checkpoints are found on the prompt with one placeholder per image and moved past the image tokens before them
-   (`vision.expanded_at`); the prompt is read in parts between them
-   (`HybridBatchEngine._embed`), so Qwen3.5, whose recurrent layers cannot be cut back, continues from its reply
+   (`vision.expanded_at`); the prompt is read in parts between them, by the walk a text prompt takes too
+   (`HybridBatchEngine._embed`, `_checkpoint_walk`), so Qwen3.5, whose recurrent layers cannot be cut back, continues from its reply
    checkpoint. On an M2 Max a second turn of 5,728 tokens about two pictures took 0.41 s where it took 7.0 s
    (Qwen3.5-4B 4-bit), and one of 5,567 tokens 0.48 s where it took 12.5 s (Qwen3-VL-8B 4-bit)
    (`docs/measurements/vision/results/turn2_cost.txt`).
@@ -608,7 +608,7 @@ How the worker runs:
   - Location: `LOCALS_DISK_CACHE_DIR` (default `~/.cache/locals/prompts`), up to `LOCALS_DISK_CACHE_GB` (default 4, shared by every model's folder; 0 turns it off). A save never fails a request: a folder deleted under a running server is made again, and a snapshot that cannot be written is skipped with a line in the log.
   - Each folder is named after the model, the dtype, and a fingerprint of the weight files and the mlx-lm version.
   - Folders left from other weights of the same model are removed.
-- **Checkpoints.** `"system"` and `"user"` checkpoints are stored as copies of the cache in prompt-cache entries of their kind. A copy is skipped when `_room_for_copy` says there is no room, and `"system"` copies are also saved to the disk cache. A `"reply"` checkpoint keeps only the layers that cannot be cut back (recurrent state). When the row finishes, these are joined with the row's KV cut to that position and stored as an `"assistant"` entry. Entries are evicted in mlx-lm's balanced order between the kinds (see [Prompt cache](../prompt-cache/README.md)) (`hybrid_batch._copies`, `hybrid_batch.HybridBatchEngine._checkpoint`, `hybrid_batch.HybridBatchEngine.serve.retire`; `service.BatchService.submit`).
+- **Checkpoints.** `"system"` and `"user"` checkpoints are stored as copies of the cache in prompt-cache entries of their kind. A copy is skipped when `_room_for_copy` says there is no room. `"system"` checkpoints are also saved to the disk cache, room or not. A `"reply"` checkpoint keeps only the layers that cannot be cut back (recurrent state). When the row finishes, these are joined with the row's KV cut to that position and stored as an `"assistant"` entry. Entries are evicted in mlx-lm's balanced order between the kinds (see [Prompt cache](../prompt-cache/README.md)) (`hybrid_batch._copies`, `hybrid_batch.HybridBatchEngine._at_checkpoint`, `hybrid_batch.HybridBatchEngine.serve.retire`; `service.BatchService.submit`).
 - **Errors.** When the engine loop raises, for example on Metal out of memory, the worker:
   - fails the jobs in flight;
   - halves the prompt cache;

@@ -1384,7 +1384,8 @@ class HybridBatchEngine(BatchEngine):
                            if isinstance(a, mx.array)]
         if e["cps"] and e["pos"] == e["cps"][0][0]:
             mx.eval(out, self._fill_eval)
-            self._checkpoint(e, lru, lru_key)
+            cp, kind = e["cps"].pop(0)
+            self._at_checkpoint(r, cp, kind, c, lru, lru_key)
         if _MIXLOG:
             now = time.perf_counter()
             print(f"[mix] rows {int(x.shape[0])} + {n} prompt tokens (at {e['pos'] - n} of {e['end']}), "
@@ -1392,33 +1393,66 @@ class HybridBatchEngine(BatchEngine):
             self._mix_t = now
         return out
 
-    def _checkpoint(self, e: dict, lru, lru_key) -> None:
-        """A filling request reached its next checkpoint: keep a copy of its cache there."""
-        cp, kind = e["cps"].pop(0)
-        while e["cps"] and e["cps"][0][0] <= cp:  # one snapshot per position
-            e["cps"].pop(0)
-        r, c = e["r"], e["cache"]
+    # -- checkpoints: one walk; what reads the prompt (its tokens, an image prompt) is the walk's reader -------------
+    def _stops(self, r, done: int, end: int, cache, lru) -> List[Tuple[int, str]]:
+        """The checkpoints a read of ``r``'s prompt from ``done`` to ``end`` stops at, in order, one per position (the
+        first kind in sorted order); none without a prompt cache to keep them in. A "reply" checkpoint at ``done``,
+        where the cached prefix ``cache`` ends (a regenerated reply), keeps its state from that prefix now."""
+        if lru is None or r.cache_key is None:
+            return []
+        stops = {}
+        for cp, kind in sorted(getattr(r, "checkpoints", None) or []):
+            if kind == "reply" and cache is not None and cp == done:
+                self._keep_reply(r, cp, cache)
+            elif done < cp < end:
+                stops.setdefault(cp, kind)
+        return sorted(stops.items())
+
+    def _at_checkpoint(self, r, cp: int, kind: str, cache, lru, lru_key) -> None:
+        """``cache`` holds ``r``'s prompt read to its checkpoint at ``cp``: keep the reply state there, or a copy in
+        the prompt cache under the prompt's cache key if the memory has room for it (_room_for_copy). A system
+        prompt's goes to disk too, room or not (a file takes no GPU memory). A system message is text only, so an
+        image prompt's system checkpoint is before its first image, where the key is the prompt's tokens."""
         if kind == "reply":
-            self._keep_reply(r, cp, c)
+            self._keep_reply(r, cp, cache)
             return
-        if not self._room_for_copy(lru, len(r.prompt)):
-            return
-        lru.insert_cache(lru_key, list(r.prompt[:cp]), copy.deepcopy(c), cache_type=kind)
+        key = list(r.cache_key[:cp])
+        if self._room_for_copy(lru, len(r.prompt)):
+            lru.insert_cache(lru_key, key, copy.deepcopy(cache), cache_type=kind)
         if kind == "system" and self.disk is not None:
-            self.disk.save(list(r.prompt[:cp]), c)
+            self.disk.save(key, cache)
         if os.environ.get("LOCALS_PREFILL_LOG"):
-            print(f"[checkpoint] {kind} at {cp} (mixed; disk {'on' if self.disk is not None else 'off'})", flush=True)
+            print(f"[checkpoint] {kind} at {cp} (disk {'on' if self.disk is not None else 'off'})", flush=True)
+
+    def _checkpoint_walk(self, r, cache, done: int, stops, read, lru, lru_key, end: Optional[int] = None):
+        """Read ``r``'s prompt from ``done`` (``cache`` holds it to there; None: nothing yet, a new cache if a read is
+        due) to each of ``stops`` (_stops) in turn, keeping the checkpoint there (_at_checkpoint), and on to ``end`` if
+        given. ``read(cache, start, stop)`` reads ``prompt[start:stop]`` into the cache and returns None, or how the
+        request ends ("cancelled", "error: ..."): a text prompt's tokens (_token_reader), an image prompt
+        (vision.ImagePrompt.read). Returns the cache, how far it holds the prompt, and the reader's ending: after an
+        ending the cache may also hold part of the read that ended (the request is then given up, not read on)."""
+        for cp, kind in list(stops) + ([(end, None)] if end is not None else []):
+            cache = cache if cache is not None else make_prompt_cache(self.model)
+            why = read(cache, done, cp)
+            if why is not None:
+                return cache, done, why
+            done = cp
+            if kind is not None:
+                self._at_checkpoint(r, cp, kind, cache, lru, lru_key)
+        return cache, done, None
+
+    def _token_reader(self, r, stop=None):
+        """_checkpoint_walk's reader of a text prompt: its tokens, prefilled by _run, given up when ``stop()`` (asked
+        between chunks)."""
+        return lambda cache, start, end: None if self._run(cache, list(r.prompt[start:end]), stop=stop) else "cancelled"
 
     def _fill_checkpoints(self, e: dict, lru, lru_key, stop=None) -> bool:
         """Prefill a filling request up to its remaining checkpoints at once (no rows decode alongside). False if
         ``stop()`` (asked between chunks) gave it up."""
-        while e["cps"]:
-            cp = e["cps"][0][0]
-            if not self._run(e["cache"], list(e["r"].prompt[e["pos"]:cp]), stop=stop):
-                return False
-            e["pos"] = cp
-            self._checkpoint(e, lru, lru_key)
-        return True
+        e["cache"], e["pos"], why = self._checkpoint_walk(e["r"], e["cache"], e["pos"], e["cps"],
+                                                          self._token_reader(e["r"], stop), lru, lru_key)
+        e["cps"] = [s for s in e["cps"] if s[0] > e["pos"]]
+        return why is None
 
     def run_drip(self, requests: List[Request], temp: float = 0.0) -> BatchStats:
         """Pipelined continuous batching with one token per row per step.
@@ -1549,24 +1583,9 @@ class HybridBatchEngine(BatchEngine):
                 c0, rest = f
                 end = len(r.prompt) - 1
                 at = end - len(rest)
-                c0 = c0 if c0 is not None else make_prompt_cache(self.model)
-                stops = {}
-                for cp, kind in sorted(getattr(r, "checkpoints", None) or []):
-                    if kind == "reply" and lru is not None and cp == at and at > 0:
-                        self._keep_reply(r, cp, c0)  # the cached prefix ends there (a regenerated reply)
-                    elif lru is not None and r.cache_key is not None and at < cp < end:
-                        stops.setdefault(cp, kind)  # one snapshot per position, the first kind in sorted order
                 tp = time.perf_counter()
-                why = None
-                for cp, kind in sorted(stops.items()) + [(end, None)]:
-                    why = r.image.read(c0, at, cp)
-                    if why is not None:
-                        break
-                    at = cp
-                    if kind == "reply":
-                        self._keep_reply(r, cp, c0)
-                    elif kind is not None and self._room_for_copy(lru, len(r.prompt)):
-                        lru.insert_cache(lru_key, list(r.cache_key[:cp]), copy.deepcopy(c0), cache_type=kind)
+                c0, _, why = self._checkpoint_walk(r, c0, at, self._stops(r, at, end, c0, lru), r.image.read, lru, lru_key,
+                                                   end=end)
                 self.counters["prefill_s"] += time.perf_counter() - tp
                 if why is not None:
                     r.finish = why
@@ -1825,14 +1844,9 @@ class HybridBatchEngine(BatchEngine):
                         # meanwhile, and one batch prefills several prompts faster than passes one after another.
                         for r, (c0, rest) in zip(new, found):
                             end = len(r.prompt) - 1
-                            cps = {}  # one snapshot per position, the first kind in sorted order (as below)
-                            for cp, kind in sorted(getattr(r, "checkpoints", None) or []):
-                                if kind == "reply" and lru is not None and c0 is not None and cp == end - len(rest):
-                                    self._keep_reply(r, cp, c0)  # the cached prefix ends there (a regenerated reply)
-                                elif lru is not None and end - len(rest) < cp < end:
-                                    cps.setdefault(cp, kind)
                             filling.append({"r": r, "cache": c0 if c0 is not None else make_prompt_cache(self.model),
-                                            "pos": end - len(rest), "end": end, "reserved": 0, "cps": sorted(cps.items())})
+                                            "pos": end - len(rest), "end": end, "reserved": 0,
+                                            "cps": self._stops(r, end - len(rest), end, c0, lru)})
                         new, found = [], []
                     # every client of these prompts gone (Esc in the agent while it waits for a long prompt): the
                     # prefill stops between chunks instead of reading the prompts to their end for nobody
@@ -1841,25 +1855,10 @@ class HybridBatchEngine(BatchEngine):
                         if left_all():
                             break
                         done = len(r.prompt) - 1 - len(rest)  # (an image prompt's: read to its end by _embed)
-                        for cp, kind in sorted(getattr(r, "checkpoints", None) or []):
-                            if kind == "reply" and lru is not None and c0 is not None and cp == done:
-                                self._keep_reply(r, cp, c0)  # the cached prefix ends there (a regenerated reply)
-                                continue
-                            if lru is None or not done < cp < len(r.prompt) - 1:
-                                continue
-                            # prefill to the checkpoint, keep a copy, go on from there
-                            c0 = c0 if c0 is not None else make_prompt_cache(self.model)
-                            if not self._run(c0, list(r.prompt[done:cp]), stop=left_all):
-                                break
-                            if kind == "reply":
-                                self._keep_reply(r, cp, c0)
-                            elif self._room_for_copy(lru, len(r.prompt)):
-                                lru.insert_cache(lru_key, list(r.prompt[:cp]), copy.deepcopy(c0), cache_type=kind)
-                            if kind == "system" and self.disk is not None:
-                                self.disk.save(list(r.prompt[:cp]), c0)
-                            if os.environ.get("LOCALS_PREFILL_LOG"):
-                                print(f"[checkpoint] {kind} at {cp} (disk {'on' if self.disk is not None else 'off'})", flush=True)
-                            done, rest = cp, list(r.prompt[cp:-1])
+                        # read to each checkpoint, keep it, go on from there; the rest is read in the batch below
+                        c0, done, _ = self._checkpoint_walk(r, c0, done, self._stops(r, done, len(r.prompt) - 1, c0, lru),
+                                                            self._token_reader(r, left_all), lru, lru_key)
+                        rest = list(r.prompt[done:-1])
                         starts.append((c0, rest) if c0 is not None else None)
                     merged = None
                     found = c0 = rest = None  # (the caches are handed to the prefill in starts)

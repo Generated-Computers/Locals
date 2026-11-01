@@ -218,7 +218,7 @@ Otherwise it does the following:
 - Runs `forward` and samples the decode rows from its output.
 - Puts the filling cache's arrays in `_fill_eval`, so they are evaluated with the step (`mx.async_eval(cur, g, self._fill_eval)`).
 
-If the chunk reaches a checkpoint, the step is evaluated synchronously and `_checkpoint` stores the copy. Chunks never cross a checkpoint, so the copy is taken at exactly that position.
+If the chunk reaches a checkpoint, the step is evaluated synchronously and `_at_checkpoint` keeps the checkpoint (the rules of `_checkpoint_walk`, which every prompt read takes). Chunks never cross a checkpoint, so the copy is taken at exactly that position.
 
 **Tile alignment.** The first term, `mix_chunk - B`, makes decode rows plus prompt tokens add up to exactly `mix_chunk`. The code comment explains why this matters: "one row past a multiple of 32 or 64 costs a whole tile more, more than the decode step the pass saves". The default of 1024 is a multiple of both. A chunk cut short by a checkpoint, by the prompt's end, or by the score bound is not aligned.
 

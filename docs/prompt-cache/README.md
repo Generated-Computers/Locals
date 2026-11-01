@@ -9,7 +9,7 @@ Agents resend the whole conversation on every call. The engine keeps the model's
 | Piece | Code | What it holds |
 |---|---|---|
 | Prompt cache | `chain_cache()` returns `ChainCache`, a subclass of mlx-lm's `LRUPromptCache` (`hybrid_batch.py`). It is created in `BatchService._run_locals` with `max_size=256` and `max_bytes=cache_bytes`. | Model caches keyed by token sequence. Each entry has a type: `system`, `user` or `assistant`. |
-| Checkpoints | `Server._checkpoints` picks the positions. `HybridBatchEngine.serve` and `_checkpoint` take the copies. | Snapshots of a prompt's cache at chosen positions inside it. |
+| Checkpoints | `Server._checkpoints` picks the positions. `HybridBatchEngine._checkpoint_walk` and `_at_checkpoint` take the copies. | Snapshots of a prompt's cache at chosen positions inside it. |
 | Reply state | `_keep_reply_state`, `_reply_entry` (`hybrid_batch.py`) | The recurrent state where a reply starts, joined at retire with KV views of the finished row. |
 | Disk cache | `DiskPromptCache` (`hybrid_batch.py`) | System-prompt snapshots on the SSD, kept across restarts. |
 | Shared-prefix snapshots | `HybridBatchEngine.snapshots`, at most `LOCALS_MAX_SNAPSHOTS` (default 4) | Prefixes shared by requests that arrive together. They are the first thing dropped when memory is short. |
@@ -63,12 +63,12 @@ them. Two OpenHands sessions in different folders then share 13,714 of their 13,
 
 **Which candidates are kept.** A candidate is skipped if its text is shorter than 2048 characters ("a short prefix is cheaper to prefill again") or if the prompt text does not start with it. The candidate text is then encoded. Its position is the first index where those ids and the prompt's ids differ, because the last token may merge with what follows; this is computed in one pass. A position is kept only if it is at least 1024 tokens, lies before the prompt's end, and is not already taken.
 
-**How the engine takes them.** Checkpoints between the cached prefix and the prompt's end (`done < cp < len(r.prompt) - 1`) are taken in sorted order:
+**How the engine takes them.** `_stops` picks the checkpoints between the cached prefix and the prompt's end (`done < cp < len(r.prompt) - 1`), in sorted order, one per position. `_checkpoint_walk` takes them in that order:
 
-1. Prefill `prompt[done:cp]` with `self._run`.
-2. For a `system` or `user` checkpoint, insert `copy.deepcopy(c0)` under `prompt[:cp]` with that type, if `_room_for_copy` allows it. For a `reply` checkpoint, call `_keep_reply` instead. A `system` checkpoint is also written to disk.
+1. Read `prompt[done:cp]` with the request's reader: `_token_reader` (`self._run`) for a text prompt, `ImagePrompt.read` for an image prompt.
+2. `_at_checkpoint` keeps the checkpoint. For a `system` or `user` checkpoint, it inserts `copy.deepcopy(c0)` under the prompt's cache key, `r.cache_key[:cp]`, with that type, if `_room_for_copy` allows it. For a `reply` checkpoint, it calls `_keep_reply` instead. A `system` checkpoint is also written to disk under the same key, even when `_room_for_copy` refused the in-memory copy: a file takes no GPU memory.
 
-When a prompt is prefilled in mixed passes next to decoding rows (`mix_chunk`, `locals/mixed.py`), each chunk stops at the next checkpoint and `_checkpoint` does the same work there, with one difference. When `_room_for_copy` refuses the copy, `_checkpoint` returns before the disk save, so that `system` snapshot is not written to disk. The non-mixed path writes a `system` snapshot to disk even when it skipped the in-memory copy. If the rows finish first, `_fill_checkpoints` runs the remaining checkpoints at once.
+The same rules hold for text prompts and image prompts. A system message is text only, so an image prompt's `system` checkpoint is before its first image, and the key there is the prompt's tokens. When a prompt is prefilled in mixed passes next to decoding rows (`mix_chunk`, `locals/mixed.py`), each chunk stops at the next checkpoint and calls `_at_checkpoint` there. If the rows finish first, `_fill_checkpoints` runs `_checkpoint_walk` over the remaining checkpoints at once.
 
 **Memory cost.** `_fits` counts each `system` or `user` checkpoint (`_copies(r)`) as one more full copy of the prompt's KV (`len(r.prompt) * (1 + copies)`). `_make_room` counts each one only as a copy of the uncached part (`len(rest) * _copies(r)`). Before each copy, `_room_for_copy` asks again for the whole prompt's KV plus the room for a read (`_admit_bytes`: the most a read of as many tokens or more took, plus a sixth (1.5 GiB, `PREFILL_RESERVE`, until a read has been recorded)). Each `reply` checkpoint (`_replies(r)`) counts as `_reply_bytes`, the largest reply state kept so far.
 
@@ -205,7 +205,7 @@ According to the code's comments, `copy.deepcopy` of a cache does not duplicate 
 | `LOCALS_GROWTH_TRIM` | `1` | `0`: no trimming every 32 steps for decode growth. |
 | `LOCALS_MAX_SNAPSHOTS` | `4` | Number of shared-prefix snapshots kept. |
 | `LOCALS_MEMLOG` | unset | Any non-empty value turns it on, even `0`. Prints GPU memory before and after each admission, at every `_trim_for` call (not only the calls that trim), and when KV buffers are reserved. |
-| `LOCALS_PREFILL_LOG` | unset | Prints a `[prefill] ...` line for each batch prefill, and `[checkpoint] kind at n (disk on/off)` at each checkpoint position. In the non-mixed path the line is printed even when `_room_for_copy` skipped the copy. |
+| `LOCALS_PREFILL_LOG` | unset | Prints a `[prefill] ...` line for each batch prefill, and `[checkpoint] kind at n (disk on/off)` at each `system` or `user` checkpoint position, also when `_room_for_copy` skipped the copy. |
 
 `GET /stats` reports, under `engines.locals`:
 
