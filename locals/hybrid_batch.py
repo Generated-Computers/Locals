@@ -160,11 +160,17 @@ def _marks(cache):
 
 
 def _buffers(c) -> tuple:
-    """Where a full-attention layer's key and value buffers are in memory (() before it has any)."""
+    """Where a full-attention layer's key and value buffers are in memory (() before it has any). A buffer may be a
+    view that is not contiguous (a reply's prompt-cache entry cuts the finished row's buffers back: _reply_entry), so
+    the address is read through np.asarray, which takes strides, not np.frombuffer, which refuses them; and as
+    unsigned integers of the same size (no copy), since numpy knows no bfloat16 buffer format."""
     import numpy as np
 
     arrs = [a for kv in (c.keys, c.values) for a in (kv if isinstance(kv, tuple) else (kv,)) if a is not None]
-    return tuple(np.frombuffer(memoryview(a), dtype=np.uint8, count=1).__array_interface__["data"][0] for a in arrs)
+    return tuple(np.asarray(memoryview(a.view(_UINT[a.itemsize]))).__array_interface__["data"][0] for a in arrs)
+
+
+_UINT = {1: mx.uint8, 2: mx.uint16, 4: mx.uint32, 8: mx.uint64}
 
 
 def _rewind(cache, marks) -> bool:

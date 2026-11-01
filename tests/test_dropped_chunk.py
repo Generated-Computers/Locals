@@ -14,13 +14,13 @@ ERR = "[METAL] Command buffer execution failed: Internal Error (0000000e:Interna
 KINDS = ["conv", "full_attention", "conv", "sliding_attention", "conv", "full_attention"]
 
 
-def _model():
+def _model(kinds=KINDS, dtype=mx.float32):
     mx.random.seed(3)
     m = lfm3.Model(lfm3.ModelArgs(
-        model_type="lfm3", vocab_size=256, hidden_size=64, intermediate_size=128, num_hidden_layers=len(KINDS),
-        num_attention_heads=4, num_key_value_heads=2, head_dim=16, layer_types=KINDS, conv_L_cache=7, sliding_window=8,
+        model_type="lfm3", vocab_size=256, hidden_size=64, intermediate_size=128, num_hidden_layers=len(kinds),
+        num_attention_heads=4, num_key_value_heads=2, head_dim=16, layer_types=kinds, conv_L_cache=7, sliding_window=8,
         rope_parameters={"full_attention": {"partial_rotary_factor": 0.5, "rope_theta": 1e6}, "sliding_attention": {}}))
-    m.update(nn.utils.tree_map(lambda p: mx.random.normal(p.shape) * 0.1, m.parameters()))
+    m.update(nn.utils.tree_map(lambda p: (mx.random.normal(p.shape) * 0.1).astype(dtype), m.parameters()))
     mx.eval(m.parameters())
     return m
 
@@ -118,12 +118,13 @@ def _no_pause(monkeypatch):
     monkeypatch.setattr(hybrid_batch, "RETRY_PAUSE", 0.0)
 
 
-def test_the_marks_cost_no_copy():
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_the_marks_cost_no_copy(dtype):
     """Each chunk is written into the same full-attention buffers, marks or not (a buffer held by them would be copied
     whole at every chunk: 3 GB a chunk at 245k tokens)."""
     from locals.hybrid_batch import _buffers
 
-    m = _model()
+    m = _model(dtype=dtype)
     seen = []
 
     class Watch(_Drops):
@@ -133,3 +134,30 @@ def test_the_marks_cost_no_copy():
 
     _read(m, make_prompt_cache(m), mx.random.randint(0, 256, (1, 200), key=mx.random.key(8)), 16, Watch([]))
     assert len(seen) == 13 and len(set(seen)) == 1  # (200 positions: all in mlx-lm's first 256-position buffer)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])  # (bfloat16, as most checkpoints: no buffer format)
+@pytest.mark.parametrize("fail", [[], [2]])
+def test_a_prompt_reads_on_from_a_reply_entry(fail, dtype):
+    """A follow-up turn starts from a reply's prompt-cache entry, whose full-attention keys and values are cut back to
+    where the reply starts (views of the finished row's buffers, not contiguous): its chunks are read like any other,
+    and a chunk dropped after the first is read again."""
+    from types import SimpleNamespace
+
+    from locals.hybrid_batch import _keep_reply_state, _reply_entry
+
+    m = _model(["conv", "full_attention", "conv", "full_attention"], dtype)  # (a sliding window cannot be cut back)
+    toks = mx.random.randint(0, 256, (1, 90), key=mx.random.key(9))
+    row, r = make_prompt_cache(m), SimpleNamespace()
+    _read(m, row, toks[:, :30], 16, _Drops([]))
+    _keep_reply_state(r, 31, row)  # (_read ended with one more token)
+    _read(m, row, mx.random.randint(0, 256, (1, 20), key=mx.random.key(10)), 16, _Drops([]))  # the reply
+    entry = _reply_entry(r, row)
+    assert entry is not None and entry[1].keys.dtype == dtype
+    clean = _read(m, make_prompt_cache(m), mx.concatenate([toks[:, :30], mx.array([[7]]), toks[:, 30:]], axis=1), 16,
+                  _Drops([]))
+    drops = _Drops(fail)
+    got = _read(m, entry, toks[:, 30:], 16, drops)
+    tol = 1e-4 if dtype == mx.float32 else 2e-2  # (the chunks end at other places than in the cold read)
+    assert float(mx.abs(got - clean).max()) <= tol * (1 + float(mx.abs(clean).max()))
+    assert drops.calls == 4 + len(fail)  # (60 tokens in 16s; a dropped chunk read again whole: 16 is the least)
