@@ -35,7 +35,8 @@ from typing import List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-# The checkpoint's model_type. E2B and E4B share this tower (their text widths differ).
+# The checkpoint's model_type. E2B and E4B's vision_config blocks match (the text widths, and so the
+# projection's output, differ); only E2B has been run here.
 VISION_MODELS = ("gemma4",)
 
 # Checkpoint name -> our parameter name: vision_tower.* keeps its suffix, embed_vision.* its prefix.
@@ -132,6 +133,11 @@ def vision_config(model_dir: Path) -> Optional[VisionConfig]:
         return None  # (vision.preprocess cuts 16x16 patches pooled 3x3: other values, other tokens)
     if out.dim % 4:
         return None  # (axial RoPE splits the head into two halves of two quarters)
+    if text.get("use_bidirectional_attention") == "vision":
+        # (transformers' blockwise mask lets an image's tokens attend to each other in both directions inside its
+        # block, in the sliding-attention layers; this server prefills every prompt causally, so those checkpoints
+        # would give image features the reference never produces: read text only rather than wrong)
+        return None
     return out
 
 
@@ -305,11 +311,11 @@ class MultimodalEmbedder(nn.Module):
         return self.embedding_projection(self.embedding_pre_projection_norm(x))
 
 
-def _pool(x: mx.array, h: int, w: int, k: int, hidden: int, dtype) -> mx.array:
-    """3x3 average of the patch grid, times ``sqrt(hidden)`` in float32 (as the reference pooler)."""
+def _pool(x: mx.array, h: int, w: int, k: int, hidden: int) -> mx.array:
+    """3x3 average of the patch grid, times ``sqrt(hidden)`` in float32 (as the reference pooler, which returns
+    float32 so the magnitude survives float16: the caller standardizes and casts)."""
     y = x.astype(mx.float32).reshape(h // k, k, w // k, k, -1).mean(axis=(1, 3))
-    y = y.reshape(-1, x.shape[-1]) * (hidden**0.5)
-    return y.astype(dtype)
+    return y.reshape(-1, x.shape[-1]) * (hidden**0.5)
 
 
 class VisionTower(nn.Module):
@@ -318,6 +324,10 @@ class VisionTower(nn.Module):
         self.patch_embedder = PatchEmbedder(cfg)
         self.encoder = Encoder(cfg)
         self.embed_vision = MultimodalEmbedder(cfg)
+        self.standardize = cfg.standardize
+        if cfg.standardize:  # (the checkpoint's std_bias / std_scale, applied after the pool)
+            self.std_bias = mx.zeros((cfg.hidden_size,), dtype=mx.float32)
+            self.std_scale = mx.ones((cfg.hidden_size,), dtype=mx.float32)
         self.feature_scale = cfg.feature_scale
 
     def image(self, pixels: mx.array, grid: Tuple[int, int]) -> Tuple[mx.array, List[mx.array]]:
@@ -329,9 +339,10 @@ class VisionTower(nn.Module):
         x = self.patch_embedder(pixels.astype(mx.float32), positions)
         dtype = x.dtype
         x = self.encoder(x, self.encoder.rope(h, w, dtype))
-        x = _pool(x, h, w, self.cfg.pooling_kernel_size, self.cfg.hidden_size, dtype)
-        # (the reference standardizes here only if its config says so; these checkpoints do not)
-        return self.embed_vision(x), []
+        pooled = _pool(x, h, w, self.cfg.pooling_kernel_size, self.cfg.hidden_size)  # (float32)
+        if self.standardize:  # (as transformers, in float32 before the cast to the working dtype)
+            pooled = (pooled - self.std_bias) * self.std_scale
+        return self.embed_vision(pooled.astype(dtype)), []
 
 
 # -- reading a checkpoint ----------------------------------------------------------------------
@@ -422,12 +433,20 @@ def _embed_layout(cfg: VisionConfig, weights) -> VisionConfig:
 def load_tower(model_dir: Path, dtype, cfg: VisionConfig) -> Optional[VisionTower]:
     """The tower for a checkpoint (``cfg``: its vision_config), its floating weights cast to the text model's
     dtype (None: the files hold no vision weights). What the configuration alone cannot say -- whether the
-    projection is quantized, at which bits, and whether the linears clamp -- comes from the tensors."""
+    projection is quantized, at which bits, and whether the linears clamp or the features are standardized --
+    comes from the tensors, so a conversion that dropped a part of them still loads."""
+    from dataclasses import replace
+
     weights = _weights(model_dir)
     if not weights:
         return None
     cfg = _embed_layout(cfg, weights)
-    if not cfg.use_clipped_linears:  # (a checkpoint that clamps none carries no bounds to load)
+    names = {k for k, _ in weights}
+    if cfg.use_clipped_linears and not any(k.endswith(_CLAMPS) for k in names):
+        cfg = replace(cfg, use_clipped_linears=False)  # (a conversion that kept no bounds)
+    if cfg.standardize and "std_bias" not in names:
+        cfg = replace(cfg, standardize=False)  # (likewise, no std_bias / std_scale)
+    if not cfg.use_clipped_linears:  # (a tower with no bounds has no tensors to load)
         weights = [(k, v) for k, v in weights if not k.endswith(_CLAMPS)]
     tower = VisionTower(cfg)
     cast = []

@@ -437,7 +437,10 @@ patches over two frames merged 2x2: the only ones `vision.preprocess` cuts for i
 that covers the rotated dims). For either, `has_tower` reads the checkpoint's safetensors headers: the tower's
 weights are in them. mlx-lm keeps only the text half of such a checkpoint (its `sanitize` drops the tower), so the
 tower is rebuilt from the same files and loaded with the first image, not at start. Any other model, and the stock
-engine, gets `IMAGE_NOTE` in each image's place, as before.
+engine, gets `IMAGE_NOTE` in each image's place, as before. So does a Gemma 4 checkpoint whose text config asks for
+bidirectional attention over an image's tokens (`use_bidirectional_attention: "vision"`): transformers gives them a
+blockwise mask, and this server reads every prompt causally, so it reads such a model as text only rather than giving
+it image features the reference never produces.
 
 An image is an OpenAI `image_url` part (`{"url": "data:image/png;base64,..."}`, or, on a server bound to loopback
 only, an `http(s)` URL or a file path), or `input_image` (the Responses API). A server other machines can reach fetches
@@ -545,7 +548,7 @@ Both models read large text in a small picture badly, here and in mlx-vlm alike:
 Gemma 4 E2B 5-bit read the invoice picture above ("Customer: Stefan Nowak" answered with the name), two cards in one
 request (the blue square's number, not the red circle's), and a follow-up turn about the same two pictures from the
 prompt cache (533 of its 550 prompt tokens cached, 38 tok/s), on an M2 Max: `tests/test_gemma_vision_model.py`. Its
-tower (300 MB, read out of the 3.9 GB shard without loading it) takes 0.27 s to load and read a 900x500 picture's 264
+tower (300 MB, read out of the 4.1 GB shard without loading it) takes 0.27 s to load and read a 900x500 picture's 264
 soft tokens with the first image, 0.17 s warm. It has not been compared word for word with transformers'
 `Gemma4ForConditionalGeneration`, which needs torch: its tower's arithmetic is checked against the reference's own
 formulas and its processor's resize and patch order (`tests/test_gemma_vision.py`), and the text path against the

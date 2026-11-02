@@ -5,6 +5,7 @@ Needs no weights: the checkpoint's ``config.json`` and tokenizer alone (cached w
 tiny tower whose numbers a reference computes beside it."""
 
 import io
+import json
 import math
 
 import mlx.core as mx
@@ -370,31 +371,27 @@ def test_load_tower_reads_a_quantized_projection_at_its_own_bits(tmp_path):
     proj = loaded.embed_vision.embedding_projection
     assert isinstance(proj, nn.QuantizedLinear) and (proj.bits, proj.group_size) == (4, 32)
 
-def test_per_layer_chunk_uses_the_pad_token_at_an_image():
-    class Body:
-        class config:
-            pad_token_id = 0
-            num_hidden_layers = 2
-            hidden_size_per_layer_input = 3
+def test_a_ple_chunk_hands_the_model_the_pad_token_at_an_image():
+    """Gemma 4's text model builds its per-layer embeddings from the ids it is given (mlx-lm's
+    _get_per_layer_inputs), so the chunk carries the pad id where an image's features go -- what transformers
+    passes as llm_input_ids -- and the model's own code does the lookup, the scale and the reshape."""
+    from mlx_lm.models import gemma4_text
 
-        embed_tokens_per_layer_scale = 2.0
-
-        def __init__(self):
-            self.table = mx.arange(10 * 6, dtype=mx.float32).reshape(10, 6)
-            self.seen = None
-
-        def embed_tokens_per_layer(self, ids):
-            self.seen = np.array(ids)
-            return self.table[ids]
-
-    body = Body()
-    ids = [4, 5, 6, 7, 8]
-    x = vision.per_layer_chunk(body, ids, [(1, 4)], 0, 5)
-    assert body.seen.tolist() == [[4, 0, 0, 0, 8]]  # the image's three positions take the pad token
-    assert x.shape == (1, 5, 2, 3)
-    # the scale is applied before the unflatten (2.0 * the token's row)
-    assert np.allclose(np.array(x[0, 0]), 2.0 * np.arange(24, 30).reshape(2, 3))
-    assert np.allclose(np.array(x[0, 4]), 2.0 * np.arange(48, 54).reshape(2, 3))
+    args = gemma4_text.ModelArgs.from_dict({
+        "hidden_size": 32, "num_hidden_layers": 2, "intermediate_size": 64, "num_attention_heads": 2,
+        "head_dim": 16, "global_head_dim": 16, "num_key_value_heads": 1, "num_kv_shared_layers": 0,
+        "hidden_size_per_layer_input": 8, "vocab_size_per_layer_input": 64, "vocab_size": 64,
+        "sliding_window": 8, "layer_types": ["full_attention", "full_attention"],
+        "rope_parameters": {"full_attention": {"rope_theta": 10000.0, "rope_type": "default"},
+                            "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}},
+        "pad_token_id": 0})
+    body = gemma4_text.Model(args).model
+    ids = vision.ple_ids(body, [4, 5, 6, 7, 8], [(1, 4)], 0, 5)
+    assert np.array(ids).tolist() == [[4, 0, 0, 0, 8]]  # the image's three positions take the pad token
+    emb = mx.random.normal((1, 5, 32)).astype(mx.float32)
+    a = body(ids, None, input_embeddings=emb)  # the model's own PLE from the ids
+    b = body(None, None, input_embeddings=emb, per_layer_inputs=body._get_per_layer_inputs(ids, emb))
+    assert float(mx.abs(a - b).max()) == 0.0
 
 
 def test_the_axial_rope_rotates_each_axis_half_within_itself():
@@ -430,10 +427,86 @@ def test_the_pool_averages_3x3_blocks_and_scales():
 
     rng = np.random.default_rng(0)
     x = mx.array(rng.standard_normal((6 * 3, 5)).astype(np.float32))  # 6 rows, 3 columns of patches
-    out = np.array(_pool(x, 6, 3, 3, 5, mx.float32))
+    out = np.array(_pool(x, 6, 3, 3, 5))
     assert out.shape == (2 * 1, 5)  # (6/3) * (3/3) blocks
+    assert out.dtype == np.float32  # (the reference pooler hands float32 on: the caller standardizes and casts)
     want = np.array(x).reshape(2, 3, 1, 3, 5).mean(axis=(1, 3)) * math.sqrt(5)
     assert np.allclose(out, want.reshape(2, 5))
+
+
+def test_a_checkpoint_whose_text_model_attends_bidirectionally_over_an_image_reads_text_only(tmp_path):
+    """transformers gives an image's tokens a bidirectional block mask when the text config says
+    use_bidirectional_attention == "vision" (the blockwise overlay in the sliding-attention layers); this server
+    prefills causally, so such a checkpoint is refused rather than read with wrong features."""
+    from locals import vision
+    from locals.models.gemma4_vl import vision_config
+
+    cfg = {"model_type": "gemma4", "text_config": {"hidden_size": 64, "pad_token_id": 0},
+           "vision_config": {"hidden_size": 16, "num_hidden_layers": 1, "num_attention_heads": 2, "head_dim": 8,
+                             "intermediate_size": 32, "patch_size": 16, "pooling_kernel_size": 3}}
+    (tmp_path / "config.json").write_text(json.dumps({**cfg, "text_config": {**cfg["text_config"],
+                                                                             "use_bidirectional_attention": None}}))
+    assert vision_config(tmp_path) is not None and vision.family(tmp_path) == vision.GEMMA
+    (tmp_path / "config.json").write_text(json.dumps({**cfg, "text_config": {**cfg["text_config"],
+                                                                             "use_bidirectional_attention": "vision"}}))
+    assert vision_config(tmp_path) is None  # (the encoder then reads text only, with the note)
+
+
+def test_a_standardizing_checkpoint_scales_the_pooled_features(tmp_path):
+    """transformers applies (h - std_bias) * std_scale after the pool, in float32, when the config says
+    standardize: the tower holds those two tensors and applies them there, as the reference does."""
+    from locals.models.gemma4_vl import VisionConfig, VisionTower, load_tower
+
+    cfg = VisionConfig(hidden_size=48, num_hidden_layers=1, num_attention_heads=4, head_dim=12,
+                       intermediate_size=96, position_embedding_size=32, text_hidden_size=40,
+                       use_clipped_linears=False, embed_quantized=False, standardize=True)
+    tower = VisionTower(cfg)
+    assert "std_bias" in tower.parameters() and "std_scale" in tower.parameters()
+    tower.std_bias = mx.full((48,), 0.25, dtype=mx.float32)
+    tower.std_scale = mx.full((48,), 2.0, dtype=mx.float32)
+    _save_tower(tmp_path, tower)
+
+    loaded = load_tower(tmp_path, mx.float32, cfg)
+    assert float(loaded.std_bias[0]) == 0.25 and float(loaded.std_scale[0]) == 2.0
+    pixels = mx.array(np.random.default_rng(11).random((18, 3 * 16 * 16)).astype(np.float32))
+
+    def arr(m):
+        return np.array(m, dtype=np.float32)
+
+    def rms(x):
+        y = x.astype(np.float32)
+        return y / np.sqrt((y**2).mean(-1, keepdims=True) + cfg.rms_norm_eps)
+
+    # the tower's own pooled features, then the reference's standardize, RMSNorm and projection
+    from locals.models.gemma4_vl import _pool
+    x = tower.patch_embedder(pixels, mx.stack([mx.tile(mx.arange(6, dtype=mx.int32), 3),
+                                               mx.repeat(mx.arange(3, dtype=mx.int32), 6)], axis=-1))
+    x = tower.encoder(x, tower.encoder.rope(3, 6, x.dtype))
+    want = rms((arr(_pool(x, 3, 6, 3, 48)) - 0.25) * 2.0) @ arr(tower.embed_vision.embedding_projection.weight).T
+    got = np.array(loaded.image(pixels, (3, 6))[0], dtype=np.float32)
+    assert np.allclose(got, want, atol=1e-5) and not np.allclose(got, got * 0 + 0.0)
+    # (a tower whose config does not standardize carries neither tensor)
+    assert "std_bias" not in VisionTower(VisionConfig(hidden_size=48, num_hidden_layers=1,
+                                                     num_attention_heads=4, head_dim=12,
+                                                     intermediate_size=96)).parameters()
+
+
+def test_load_tower_takes_a_config_that_asks_for_bounds_the_file_has_not(tmp_path):
+    """A conversion that kept no clamp or standardize tensors must still load: the config's switches are checked
+    against what the file holds, not trusted on their own."""
+    from locals.models.gemma4_vl import VisionConfig, VisionTower, load_tower
+
+    plain = VisionConfig(hidden_size=48, num_hidden_layers=1, num_attention_heads=4, head_dim=12,
+                         intermediate_size=96, position_embedding_size=32, text_hidden_size=40,
+                         use_clipped_linears=False, embed_quantized=False)
+    _save_tower(tmp_path, VisionTower(plain))
+    # the config says both, the file has neither
+    asks = VisionConfig(**{**plain.__dict__, "use_clipped_linears": True, "standardize": True})
+    tower = load_tower(tmp_path, mx.float32, asks)
+    assert not tower.cfg.use_clipped_linears and not tower.cfg.standardize
+    assert "std_bias" not in tower.parameters() and "input_min" not in tower.encoder.layers[0].mlp.gate_proj.parameters()
+    pixels = mx.array(np.random.default_rng(13).random((18, 3 * 16 * 16)).astype(np.float32))
+    assert tower.image(pixels, (3, 6))[0].shape == (2, 40)
 
 
 # -- the engine's side: PLE with an image, and no M-RoPE -------------------------------------------
@@ -479,22 +552,24 @@ def _engine(body, monkeypatch, prefill_step=2):
     return e
 
 
-def test_an_image_prompt_feeds_gemma_its_per_layer_inputs(monkeypatch):
+def test_an_image_prompt_hands_gemma_the_ids_its_ple_reads(monkeypatch):
+    """The chunk's ids go to the text model (which builds the per-layer embeddings from them itself), the pad id at
+    the image's positions; its per-layer inputs are not passed in separately."""
     body = _Body()
     e = _engine(body, monkeypatch)
     feats = mx.zeros((2, 3))
     assert e.prefill_embedded([_Cache()], [1, 2, 3, 4, 5], [(1, 3)], [feats], None) is True
-    assert [(c[0], c[1], c[2]) for c in body.calls] == [
-        (None, (1, 2, 3), (1, 2, 2, 2)),  # the soft tokens of the image at 1..3 take the pad id, not an id of their own
-        (None, (1, 2, 3), (1, 2, 2, 2)),
+    assert [(np.array(c[0]).tolist(), c[1], c[2]) for c in body.calls] == [
+        ([[1, 0]], (1, 2, 3), None),  # the image's tokens (positions 1 and 2) take the pad id, not one of their own
+        ([[0, 4]], (1, 2, 3), None),
     ]
 
 
-def test_a_text_model_without_ple_gets_no_per_layer_inputs(monkeypatch):
+def test_a_text_model_without_ple_is_fed_no_ids(monkeypatch):
     body = _Body(per_layer=False)
     e = _engine(body, monkeypatch)
     assert e.prefill_embedded([_Cache()], [1, 2, 3, 4, 5], (), [], None) is True
-    assert [c[2] for c in body.calls] == [None, None]
+    assert [(c[0], c[2]) for c in body.calls] == [(None, None), (None, None)]
 
 
 def test_generate_embedded_without_positions_skips_mrope(monkeypatch):

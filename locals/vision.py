@@ -31,7 +31,7 @@ import mlx.core as mx
 from .defaults import cached_snapshot
 from .models.qwen3_5_vl import rotate_half
 from .oai import GEMMA_IMAGE_MARK, IMAGE_MARK as QWEN_IMAGE_MARK  # (what the chat template writes for one image)
-from .oai import IMAGE_MARKS, IMAGE_PARTS
+from .oai import IMAGE_PARTS
 
 QWEN, GEMMA = "qwen", "gemma"  # the two vision towers this server knows
 IMAGE_MARK = QWEN_IMAGE_MARK  # (the Qwen mark, under the name callers knew)
@@ -51,10 +51,10 @@ GEMMA_PATCH, GEMMA_POOL, GEMMA_MAX_SOFT_TOKENS = 16, 3, 280
 
 @dataclass
 class Picture:
-    """One image, preprocessed: ``patches`` (patches, 16*16*3) pixels (numpy, float32; None when only counted),
-    the (h, w) patch grid, and ``key``, the image's id in prompt-cache keys (``cache_key``: None, not cached).
-    ``family`` says whose tower reads it and ``merge`` how many patches make one text token (Qwen: 2 frames of
-    16x16 pixels a patch, merged 2x2; Gemma: one frame, pooled 3x3)."""
+    """One image, preprocessed: ``patches`` (numpy, float32; None when only counted), one row of 16*16*3 pixels a
+    patch, or 2*16*16*3 for Qwen's two frames; the (h, w) patch grid; and ``key``, the image's id in prompt-cache
+    keys (``cache_key``: None, not cached). ``family`` says whose tower reads it and ``merge`` how many patches make
+    one text token (Qwen merges 2x2, Gemma pools 3x3)."""
 
     patches: object
     grid: Tuple[int, int]
@@ -672,8 +672,7 @@ def deepstack(model, spans: Sequence[Tuple[int, int]], levels: Sequence[Sequence
         yield state
         return
     lm = text_model(model)
-    body = getattr(lm, "model", None) or lm  # (mlx-lm's Gemma 4 wrapper's language model is the body itself)
-    layers = body.layers
+    layers = lm.model.layers  # (the decoder body under mlx-lm's Model wrapper)
     kept = [layers[i] for i in range(len(levels))]
     try:
         for i, level in enumerate(levels):
@@ -692,16 +691,14 @@ def embed_chunk(body, ids: Sequence[int], spans: Sequence[Tuple[int, int]], feat
     return overlay(body.embed_tokens(mx.array([list(ids[at: at + n])])), at, spans, features)
 
 
-def per_layer_chunk(body, ids: Sequence[int], spans: Sequence[Tuple[int, int]], at: int, n: int) -> mx.array:
-    """Gemma 4's per-layer token inputs (PLE) of the prompt's tokens ``at`` to ``at + n``, shape
-    (1, n, layers, hidden_per_layer). At an image's soft tokens the id is the pad token: transformers gives the
-    text model ``llm_input_ids``, which hold the pad id where the image's features go (they are input embeddings,
-    not a vocabulary token), so the per-layer table is looked up with it there and with the token elsewhere."""
+def ple_ids(body, ids: Sequence[int], spans: Sequence[Tuple[int, int]], at: int, n: int) -> mx.array:
+    """The ids of the prompt's tokens ``at`` to ``at + n``, with the pad token where an image's features go.
+    Gemma 4's text model looks its per-layer embeddings (PLE) up from the ids it is given, so they go with the
+    chunk's input embeddings: transformers hands its text model ``llm_input_ids``, which hold the pad id at those
+    positions (they carry the tower's features, not a vocabulary token's), and the model does the rest itself."""
     chunk = list(ids[at: at + n])
-    pad = getattr(getattr(body, "config", None), "pad_token_id", 0)
+    pad = body.config.pad_token_id
     for start, end in spans:
         for k in range(max(start, at), min(end, at + n)):
             chunk[k - at] = pad
-    cfg = body.config
-    x = body.embed_tokens_per_layer(mx.array([chunk])) * body.embed_tokens_per_layer_scale
-    return x.reshape(1, len(chunk), cfg.num_hidden_layers, cfg.hidden_size_per_layer_input)
+    return mx.array([chunk])

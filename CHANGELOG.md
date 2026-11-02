@@ -2,7 +2,8 @@
 
 ## 0.2.2 (unreleased)
 
-- **Images, for Gemma 4 too.** Gemma 4's checkpoints (E2B and E4B) read images as Qwen's do: `vision.family` reads
+- **Images, for Gemma 4 too.** Gemma 4 checkpoints read images as Qwen's do (E2B was run here; E4B's vision_config
+  matches its tower, but its weights were never downloaded): `vision.family` reads
   `model_type` `gemma4` from the config, and the tower is rebuilt from the same files in `locals/models/gemma4_vl.py`
   (transformers' `Gemma4VisionModel` step for step: 16x16 patches, a learned 2-D position table, 16 bidirectional blocks
   with an axial RoPE over the whole head and scale 1, a 3x3 average pool times `sqrt(hidden_size)` in float32, then an

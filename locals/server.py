@@ -104,9 +104,11 @@ def _origin_ok(origin: str) -> bool:
     return u.scheme in _APP_SCHEMES
 
 
-def _reads_images(svc) -> bool:
-    """Whether a loaded service reads this model's images (the test fakes have no ``vision``)."""
-    return svc is not None and getattr(svc, "vision", lambda: None)() is not None
+def _vision_encoder(svc):
+    """``svc``'s vision encoder if it reads this model's images, else None: asked once, and both facts a request
+    needs of it (whether it reads them, and which tower) come from the one Encoder (the test fakes have no
+    ``vision``)."""
+    return getattr(svc, "vision", lambda: None)() if svc is not None else None
 
 
 @dataclass(frozen=True)
@@ -142,8 +144,8 @@ class LoadedModel:
         """``svc``'s LoadedModel, read while no unload can finish it (made by Server.loaded, under the engine's load
         lock)."""
         tok = svc.tokenizer
-        enc = svc.vision() if hasattr(svc, "vision") else None
-        return cls(svc, tok, _reads_images(svc), fmt=formats.detect(tok), thinking_style=formats.thinking_style(tok),
+        enc = _vision_encoder(svc)  # (one Encoder: its family is read from the same config that says it reads images)
+        return cls(svc, tok, enc is not None, fmt=formats.detect(tok), thinking_style=formats.thinking_style(tok),
                    thinks=formats.offers_thinking(tok), sealed=formats.thinks_when_off(tok),
                    seps={"gap": formats.call_gap(tok), "think_gap": formats.think_gap(tok)},
                    needs_checkpoints=svc.needs_checkpoints,

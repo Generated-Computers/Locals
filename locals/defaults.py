@@ -32,7 +32,7 @@ MEASURED_M2_PRO = {
 # Models the M2 Pro's 16 GB cannot hold, measured as above on the Mac named ("on")
 MEASURED_ELSEWHERE = {
     "flint": {"weights_gb": 16.6, "mlx": 202, "locals": 319, "on": "an M4 Pro (24 GB)"},
-    "gemma-4-e2b": {"weights_gb": 3.9, "mlx": 187, "locals": 256, "on": "an M2 Max (32 GB)"},
+    "gemma-4-e2b": {"weights_gb": 3.8, "mlx": 187, "locals": 256, "on": "an M2 Max (32 GB)"},
 }
 SHORT = {"qwen3.5-4b": "qwen", "qwen3.5-2b": "qwen3.5-2b", "gemma-4-e4b": "gemma", "gemma-4-e2b": "gemma-4-e2b",
          "lfm2.5-2.6b": "lfm", "minicpm5-2b": "minicpm", "lfm3-1.7b": "lfm3", "flint": "flint"}

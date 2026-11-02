@@ -1328,12 +1328,12 @@ class Engine:
                                        len(prompt) - 1 if stop is None else stop)
 
     def _read_embedded(self, cache, prompt, spans, features, deepstack, cancel, start: int = 0, stop: Optional[int] = None) -> bool:
-        from .vision import deepstack as deepstack_layers, embed_chunk, per_layer_chunk
+        from .vision import deepstack as deepstack_layers, embed_chunk, ple_ids
 
-        body = text_model(self.model)
-        body = getattr(body, "model", None) or body  # (Gemma 4's language model is the body itself)
-        # Gemma 4's text model adds a per-layer token embedding to every position (PLE): it is fed here rather
-        # than looked up from the input embeddings, which at an image's positions are the tower's, not a token's
+        body = text_model(self.model).model  # (the decoder body: the wrapper's .model, as _prefill's own call)
+        # Gemma 4's text model adds a per-layer token embedding to every position (PLE) looked up from the token
+        # ids, not from the input embeddings, which at an image's positions are the tower's features: the chunk's
+        # ids go with them, the pad token where an image's features are, as transformers feeds llm_input_ids
         per_layer = getattr(body, "embed_tokens_per_layer", None) is not None
         # each chunk's embeddings made for it, as _prefill's: the whole prompt's (and, for Qwen3-VL, one as long
         # per deepstack level) were kept next to the KV cache until the prompt was read
@@ -1345,10 +1345,8 @@ class Engine:
                     return False  # (between chunks: an unload or a client gone)
                 n = min(self.prefill_step, stop - i)
                 state["at"] = i
-                kw = {"input_embeddings": embed_chunk(body, prompt, spans, features, i, n)}
-                if per_layer:
-                    kw["per_layer_inputs"] = per_layer_chunk(body, prompt, spans, i, n)
-                body(None, cache, **kw)
+                ids = ple_ids(body, prompt, spans, i, n) if per_layer else None
+                body(ids, cache, input_embeddings=embed_chunk(body, prompt, spans, features, i, n))
                 mx.eval([c.state for c in cache])
                 i += n
         return True
