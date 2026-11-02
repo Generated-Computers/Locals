@@ -113,3 +113,12 @@ def test_only_a_text_prompts_reply_is_remembered(tok, picture):
 
     assert PreparedPrompt.of("Hello there.", tok).rememberable
     assert not PreparedPrompt.of("Look: " + IMAGE, tok, (picture,)).rememberable
+
+
+def test_a_prompt_given_as_token_ids_is_not_remembered_and_has_no_checkpoint():
+    """A /v1/completions prompt of token ids has no text: nothing for a later prompt to continue, or to cut at."""
+    from locals.prepared import PreparedPrompt
+
+    ids = PreparedPrompt(None, list(range(3000)))
+    assert not ids.rememberable
+    assert ids.checkpoint_at("x" * 4096) is None

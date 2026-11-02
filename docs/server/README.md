@@ -72,9 +72,9 @@ Handler.do_POST
    - A request for another model by the server's own names (`locals/<name>`, `mlx/<name>`, `stock/<name>`; an alias of the loaded model passes) is a 400 that says which model runs (`check_model`), and that the plain `locals` is always the model loaded: another locals command had switched the model under a connected agent, and the agent's requests were answered by the new model without a word. Any other name (`gpt-4o` in an app, Ollama's names) is the model loaded.
    - A bool in `chat_template_kwargs.enable_thinking` (the switch vLLM and SGLang use) overrides thinking.
    - `reasoning_effort: "none"`, or `reasoning.effort` in the Responses API shape, turns thinking off.
-4. `Server.loaded(engine)` gives the request the model as loaded on the engine (`LoadedModel`), and `Server.service(engine)` loads the engine on first use. Each engine has its own lock, so the other engine keeps serving during a load. After a failed load, the engine is not loaded again for 60 s. Requests in that window get a 500 that repeats the error.
+4. `Server.loaded(engine)` gives the request the model as loaded on the engine (`LoadedModel`), and loads the engine on first use. `Server._svc` holds one `LoadedModel` per loaded engine, made in the load; `Server.service(engine)` is its service. Each engine has its own lock, so the other engine keeps serving during a load. After a failed load, the engine is not loaded again for 60 s. Requests in that window get a 500 that repeats the error.
 5. `_cap_context()` fixes the context limit once (see Context limits).
-6. The `LoadedModel` holds what the request reads of the chat template, read once per load (`_loaded_model`): the tool-call format (`formats.detect`) and the thinking style (`formats.thinking_style`), among others. An unload never changes it under a request that holds it.
+6. The `LoadedModel` holds what the request reads of the chat template, read once per load (`LoadedModel.of`): the tool-call format (`formats.detect`) and the thinking style (`formats.thinking_style`), among others. An unload never changes it under a request that holds it.
 7. Thinking is forced off in four cases:
    - The style is `"none"` (no switch) or `"switch"` (thoughts marked in a way the parser does not know).
    - The output is constrained (a `response_format` of type `json_object`, `json_schema` or `regex`, or `guided_regex`). The grammar writes the JSON from the first token, and an open think block would hold it.
@@ -312,7 +312,7 @@ On the next turn, the client sends the conversation back and the chat template r
 - Only formats with `replay_raw = True` use `_raw`. That is the `ToolFormat` default. Mistral v3 and v11 and Gemma 4 set it to `False`.
 - What is stored is the reply as the client received it: cut after `max_calls`, without duplicate calls.
 
-**Cache checkpoints.** Some models have a cache that cannot be cut back to a shorter prefix, such as Qwen3.5's recurrent layers or Gemma's sliding windows. `LoadedModel.needs_checkpoints` (set in `_loaded_model`) detects them by checking for any cache layer that is not a plain `KVCache`. For these models, our engine also stores the prompt's cache at up to four positions computed by `_checkpoints`:
+**Cache checkpoints.** Some models have a cache that cannot be cut back to a shorter prefix, such as Qwen3.5's recurrent layers or Gemma's sliding windows. `LoadedModel.needs_checkpoints` (`BatchService.needs_checkpoints`) detects them by checking for any cache layer that is not a plain `KVCache`. For these models, our engine also stores the prompt's cache at up to four positions computed by `_checkpoints`:
 
 - `"system"`: where this session's own part of the system message starts (`_session_start`: what it shares with recent sessions' system messages comes before), and its end too when that is more than 4096 characters further;
 - `"user"`: the start of the last message;
@@ -521,8 +521,11 @@ takes (an image prompt's prefill stops at its next chunk): let go before, the mo
 and a request loading it again, which waits for the engine's load lock that `unload` holds, would make a second
 copy. The answer is `{"status": "unloaded", "engines": [...], "freed_mb", "gpu_active_mb"}` (`"not loaded"` when
 nothing was). A request prepared while the model was unloaded, a chat or a `/v1/completions` one, is submitted to the
-model loaded again (`service.Unloaded`, `Server._retry_unloaded`). Its reply is read with the tokenizer it was
-prepared with (`p["tok"]`), never with its service's: an unload drops that one.
+model loaded again (`service.Unloaded`, `Server._retry_unloaded`): the request then holds the new load's
+`LoadedModel` (`p["loaded"]`) and runs on its service. What the request was built with stays: its reply is read with
+the tokenizer it was prepared with (`p["prepared"].tokenizer`), never with its service's (an unload drops that one),
+and its tool-call format, grammar and checkpoints are the ones read from the first load. A server serves one model, so
+both loads read the same.
 
 Measured on an M2 Max (32 GB) with Qwen3.5-4B 4-bit (`mlx-community/Qwen3.5-4B-MLX-4bit`), one server process
 (`Server` and `serve`, as `locals serve` starts them), after two image requests: the process's `phys_footprint`

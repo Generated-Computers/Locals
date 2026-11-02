@@ -59,14 +59,14 @@ def test_batch_walk_matches_tables(rt):
 
 
 def test_server_typed_tools(rt):
-    from locals.server import Server
+    from locals.server import LoadedModel, Server
 
     tools = [{"type": "function", "function": {"name": "read", "description": "Read a file.", "parameters": {"type": "object", "properties": {
         "filePath": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["filePath"]}}},
              {"type": "function", "function": {"name": "bash", "description": "Run a command.", "parameters": {"type": "object", "properties": {
                  "command": {"type": "string"}, "timeout": {"type": "integer"}, "background": {"type": "boolean"}}, "required": ["command"]}}}]
     srv = Server(MODEL, engines=("locals",), preload=(), slots=4, temp=0.0, walk=True, typed_tools=True, log=lambda s: None)
-    srv._svc["locals"] = __import__("locals.service", fromlist=["BatchService"]).BatchService("locals", MODEL, slots=4, temp=0.0, walk=True)
+    srv._svc["locals"] = LoadedModel.of(__import__("locals.service", fromlist=["BatchService"]).BatchService("locals", MODEL, slots=4, temp=0.0, walk=True))
     try:
         for ask in ("Show the first 20 lines of /tmp/app/main.py", "List the files in /tmp/app with a shell command, 5 second timeout, in the background"):
             r = srv.complete({"model": f"locals/{SHORT}", "tools": tools, "max_tokens": 120,
@@ -82,5 +82,5 @@ def test_server_typed_tools(rt):
                     t = spec["properties"][k]["type"]
                     assert (t == "string" and isinstance(v, str)) or (t == "integer" and isinstance(v, int)) or (t == "boolean" and isinstance(v, bool)), (k, v)
     finally:
-        for svc in srv._svc.values():
-            svc.close()
+        for h in srv._svc.values():
+            h.svc.close()

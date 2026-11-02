@@ -13,6 +13,8 @@ DATA = json.loads((Path(__file__).parent / "data" / "opencode_requests.json").re
 
 
 class _Svc:
+    needs_checkpoints = True  # (Qwen3.5's recurrent layers, Gemma's sliding windows)
+
     def __init__(self, tok):
         self.tokenizer = tok
 
@@ -27,10 +29,10 @@ def server():
         pytest.skip("tokenizer not cached")
     from mlx_lm.utils import load_tokenizer
 
-    from locals.server import Server
+    from locals.server import LoadedModel, Server
 
     srv = Server(MODEL, engines=("locals",), preload=(), log=lambda s: None)
-    srv._svc["locals"] = _Svc(load_tokenizer(snapshot_download(MODEL, local_files_only=True)))
+    srv._svc["locals"] = LoadedModel.of(_Svc(load_tokenizer(snapshot_download(MODEL, local_files_only=True))))
     return srv
 
 
@@ -47,11 +49,11 @@ def _systems(p):
 def test_two_projects_share_a_checkpoint_before_the_folder(server):
     a = server.prepare(_request("/Users/me/code/alpha"))
     b = server.prepare(_request("/Users/me/work/beta-service"))
-    shared = len(os.path.commonprefix([a["prompt"], b["prompt"]]))
+    shared = len(os.path.commonprefix([a["prepared"].tokens, b["prepared"].tokens]))
     common = set(_systems(a)) & set(_systems(b))
     assert common, (_systems(a), _systems(b))
     assert max(common) <= shared and max(common) > 0.95 * shared  # the whole shared part, up to the <env> line
-    assert max(common) > 0.9 * len(a["prompt"])  # nearly the whole first request
+    assert max(common) > 0.9 * len(a["prepared"].tokens)  # nearly the whole first request
 
 
 def test_a_system_prompt_without_markers_is_split_where_sessions_differ(server):
@@ -60,7 +62,7 @@ def test_a_system_prompt_without_markers_is_split_where_sessions_differ(server):
     p1 = server.prepare(_request("/x", system=base + "\nSession notes: project alpha, branch main."))
     p2 = server.prepare(_request("/x", system=base + "\nSession notes: project beta, branch dev."))
     p3 = server.prepare(_request("/x", system=base + "\nSession notes: project gamma, branch fix."))
-    shared = len(os.path.commonprefix([p2["prompt"], p3["prompt"]]))
+    shared = len(os.path.commonprefix([p2["prepared"].tokens, p3["prepared"].tokens]))
     assert set(_systems(p2)) & set(_systems(p3)), (_systems(p1), _systems(p2), _systems(p3))
     assert max(set(_systems(p2)) & set(_systems(p3))) > 0.95 * shared
 
@@ -81,8 +83,8 @@ def test_the_next_turn_continues_the_previous_request(server, monkeypatch):
         "type": "object", "properties": {"filePath": {"type": "string"}}, "required": ["filePath"]}}}]
 
     def prompts():
-        a = server.prepare({"model": "locals/qwen3.5-4b", "messages": turn, "tools": tools})["text"]
-        b = server.prepare({"model": "locals/qwen3.5-4b", "messages": nxt, "tools": tools})["text"]
+        a = server.prepare({"model": "locals/qwen3.5-4b", "messages": turn, "tools": tools})["prepared"].text
+        b = server.prepare({"model": "locals/qwen3.5-4b", "messages": nxt, "tools": tools})["prepared"].text
         return a, b
 
     a, b = prompts()
@@ -102,9 +104,9 @@ def test_a_timestamp_in_the_middle_of_the_system_message_goes_to_its_end(server)
 
     a = server.prepare(_request("/x", system=system("2026-10-17T17:33:08.829311")))
     b = server.prepare(_request("/x", system=system("2026-10-17T17:33:47.825302")))
-    shared = len(os.path.commonprefix([a["prompt"], b["prompt"]]))
-    assert shared > 0.95 * len(a["prompt"])
-    assert "2026-10-17T17:33:08.829311" in a["text"]  # the model still reads it
+    shared = len(os.path.commonprefix([a["prepared"].tokens, b["prepared"].tokens]))
+    assert shared > 0.95 * len(a["prepared"].tokens)
+    assert "2026-10-17T17:33:08.829311" in a["prepared"].text  # the model still reads it
     common = set(_systems(a)) & set(_systems(b))
     assert common and max(common) > 0.95 * shared
 
@@ -121,9 +123,9 @@ def test_the_folder_in_a_tool_description_moves_to_the_system_message(server):
         return r
 
     a, b = server.prepare(req("/Users/me/alpha")), server.prepare(req("/Users/me/beta"))
-    shared = len(os.path.commonprefix([a["prompt"], b["prompt"]]))
-    assert shared > 0.97 * len(a["prompt"]) and "/Users/me/alpha" in a["text"]
-    assert a["text"].index("/Users/me/alpha") > a["text"].index("<tools>")  # now after the tools
+    shared = len(os.path.commonprefix([a["prepared"].tokens, b["prepared"].tokens]))
+    assert shared > 0.97 * len(a["prepared"].tokens) and "/Users/me/alpha" in a["prepared"].text
+    assert a["prepared"].text.index("/Users/me/alpha") > a["prepared"].text.index("<tools>")  # now after the tools
 
 
 def test_thinking_on_the_reply_checkpoint_is_where_the_next_request_continues(server):
@@ -140,8 +142,8 @@ def test_thinking_on_the_reply_checkpoint_is_where_the_next_request_continues(se
     req = lambda msgs: {"model": "locals/qwen3.5-4b-thinking", "messages": msgs, "tools": DATA["tools"]}  # noqa: E731
     a, b = server.prepare(req(first)), server.prepare(req(second))
     replies = [n for n, kind in a["checkpoints"] if kind == "reply"]
-    shared = len(os.path.commonprefix([a["prompt"], b["prompt"]]))
-    assert replies and replies[0] <= shared and replies[0] > shared - 8, (a["checkpoints"], shared, len(a["prompt"]))
+    shared = len(os.path.commonprefix([a["prepared"].tokens, b["prepared"].tokens]))
+    assert replies and replies[0] <= shared and replies[0] > shared - 8, (a["checkpoints"], shared, len(a["prepared"].tokens))
 
 
 def test_gemma_keeps_the_thoughts_of_earlier_turns():
@@ -156,10 +158,10 @@ def test_gemma_keeps_the_thoughts_of_earlier_turns():
         pytest.skip("Gemma 4's tokenizer not cached")
     from mlx_lm.utils import load_tokenizer
 
-    from locals.server import Server
+    from locals.server import LoadedModel, Server
 
     srv = Server(gemma, engines=("locals",), preload=(), log=lambda s: None)
-    srv._svc["locals"] = _Svc(load_tokenizer(path))
+    srv._svc["locals"] = LoadedModel.of(_Svc(load_tokenizer(path)))
     call = {"id": "c1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "todo.py"})}}
     turn = [{"role": "system", "content": "You are a coding agent."}, {"role": "user", "content": "Read todo.py."},
             {"role": "assistant", "content": "", "reasoning_content": "I should read the file first.", "tool_calls": [call]},
@@ -169,5 +171,5 @@ def test_gemma_keeps_the_thoughts_of_earlier_turns():
         "type": "object", "properties": {"filePath": {"type": "string"}}, "required": ["filePath"]}}}]
     a = srv.prepare({"model": "locals/gemma-4-e4b-it", "messages": turn, "tools": tools})
     b = srv.prepare({"model": "locals/gemma-4-e4b-it", "messages": nxt, "tools": tools})
-    assert b["text"].startswith(a["text"]), (a["text"][-300:], b["text"][len(a["text"]) - 300:len(a["text"]) + 100])
-    assert "I should read the file first." in b["text"]
+    assert b["prepared"].text.startswith(a["prepared"].text), (a["prepared"].text[-300:], b["prepared"].text[len(a["prepared"].text) - 300:len(a["prepared"].text) + 100])
+    assert "I should read the file first." in b["prepared"].text

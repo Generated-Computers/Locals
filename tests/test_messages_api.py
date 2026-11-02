@@ -122,6 +122,8 @@ class _Job(SimpleNamespace):
 class _Svc:
     """Writes a fixed reply (as the model's tokens), a few tokens every 10 ms."""
 
+    needs_checkpoints = True  # (what a stub with no engine was given before stubs said it)
+
     def __init__(self, tok, reply):
         self.tokenizer, self.reply = tok, reply
         self.prompts = []
@@ -163,10 +165,10 @@ def tokenizer():
 
 
 def _serve(tokenizer, reply):
-    from locals.server import Server, _HTTPServer, make_handler
+    from locals.server import LoadedModel, Server, _HTTPServer, make_handler
 
     srv = Server(MODEL, engines=("locals",), preload=(), log=lambda s: None)
-    srv._svc["locals"] = svc = _Svc(tokenizer, reply)
+    srv._svc["locals"] = LoadedModel.of(svc := _Svc(tokenizer, reply))
     httpd = _HTTPServer(("127.0.0.1", 0), make_handler(srv))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd, svc

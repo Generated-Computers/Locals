@@ -3,6 +3,7 @@ construction is exact, the reply grammar accepts what the template
 describes and rejects malformed calls, replies parse and stream."""
 
 import itertools
+from types import SimpleNamespace
 import json
 import re
 import random
@@ -10,6 +11,7 @@ import random
 import pytest
 
 from locals import oai
+from locals.prepared import PreparedPrompt
 from locals.regex import compile_dfa
 
 TOOLS = [
@@ -271,7 +273,8 @@ def _scripted_server(monkeypatch, fmt, replies, thinking):
     tools = [{"type": "function", "function": {"name": n, "parameters": {"type": "object", "properties": {k: {"type": "string"}},
                                                                              "required": [k]}}} for n, k in (("bash", "command"), ("read", "filePath"))]
     tools = oai.tool_specs(tools)
-    p = {"engine": "locals", "thinking": thinking, "svc": svc, "tok": svc.tokenizer, "prompt": [1, 2, 3], "checkpoints": [], "text": "<prompt>", "tools": tools,
+    p = {"engine": "locals", "thinking": thinking, "loaded": SimpleNamespace(svc=svc), "checkpoints": [],
+         "prepared": PreparedPrompt("<prompt>", [1, 2, 3], tokenizer=svc.tokenizer), "tools": tools,
          "schema": None, "regex": oai.reply_regex(tools, "auto", thinking, fmt=fmt, preamble=False), "max_tokens": 4096,
          "model": "locals/x", "fmt": fmt, "tool_choice": "auto", "stop": [], "temp": None}
     prev = {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function",
@@ -454,7 +457,8 @@ def test_ignore_eos_and_usage_chunk_on_text_completions():
                                                  "forced_tokens", "passes", "decode_s", "tool_calls")}}
     for include in (True, False):
         svc = Svc()
-        p = {"engine": "locals", "svc": svc, "tok": svc.tokenizer, "prompt": [1, 2, 3], "max_tokens": 5, "model": "locals/m", "stop": [],
+        p = {"engine": "locals", "loaded": SimpleNamespace(svc=svc), "prepared": PreparedPrompt(None, [1, 2, 3], tokenizer=svc.tokenizer),
+             "max_tokens": 5, "model": "locals/m", "stop": [],
              "temp": 0.0, "ignore_eos": True, "include_usage": include, "regex": None, "schema": None}
         out = []
         srv.text_completion({}, p, write=out.append)
@@ -514,7 +518,7 @@ def test_keepalive_is_a_blank_line(monkeypatch):
     srv.per_engine = {"locals": {k: 0 for k in ("requests", "prompt_tokens", "cached_tokens", "completion_tokens",
                                                  "forced_tokens", "passes", "decode_s", "tool_calls")}}
     svc = Svc()
-    p = {"engine": "locals", "svc": svc, "tok": svc.tokenizer, "prompt": [1], "max_tokens": 2, "model": "locals/m", "stop": [], "temp": 0.0,
+    p = {"engine": "locals", "loaded": SimpleNamespace(svc=svc), "prepared": PreparedPrompt(None, [1], tokenizer=svc.tokenizer), "max_tokens": 2, "model": "locals/m", "stop": [], "temp": 0.0,
          "ignore_eos": False, "include_usage": True, "regex": None, "schema": None}
     out = []
     srv.text_completion({}, p, write=out.append)
@@ -552,7 +556,7 @@ def test_context_limit_is_what_fits_in_memory(monkeypatch):
         s.log, s.model_id, s.engines = (lambda m: None), "m", ("locals",)
         s._auto_context = max_context is None
         s.max_context = max_context or 65536
-        s._svc = {"locals": SimpleNamespace(context_fit=lambda: fit_tokens)}
+        s._svc = {"locals": SimpleNamespace(svc=SimpleNamespace(context_fit=lambda: fit_tokens))}
         monkeypatch.setattr(srv_mod, "native_context", lambda model: native)
         s._cap_context()
         return s.max_context
@@ -563,14 +567,14 @@ def test_context_limit_is_what_fits_in_memory(monkeypatch):
     s = Server.__new__(Server)  # the stock engine (no memory guard) keeps the old limit
     s.log, s.model_id, s.engines = (lambda m: None), "m", ("locals", "mlx")
     s._auto_context, s.max_context, s._stock_context = True, 65536, 65536
-    s._svc = {"locals": SimpleNamespace(context_fit=lambda: fit)}
+    s._svc = {"locals": SimpleNamespace(svc=SimpleNamespace(context_fit=lambda: fit))}
     s._cap_context()
     assert s.context_for("locals") == fit and s.context_for("mlx") == 65536
     assert server(None, 262144, 20480) == 65536  # a small Mac: never below what it was, as tools are told
     s = Server.__new__(Server)  # but a request past what fits is refused (alone, nothing else checks its memory)
     s.log, s.model_id, s.engines = (lambda m: None), "m", ("locals",)
     s._auto_context, s.max_context = True, 65536
-    s._svc = {"locals": SimpleNamespace(context_fit=lambda: 20480)}
+    s._svc = {"locals": SimpleNamespace(svc=SimpleNamespace(context_fit=lambda: 20480))}
     s._cap_context()
     assert s.context_for("locals") == 65536 and s.limit_for("locals") == 20480
     assert server(40000, 262144, fit) == 40000  # asked for

@@ -131,21 +131,18 @@ class LoadedModel:
     # prompt snapshots pay: only where a cached state cannot be cut back to a shorter prefix (Qwen3.5's recurrent
     # layers, Gemma's sliding windows). A plain KV cache is trimmed to any shared prefix by the prompt cache itself,
     # so snapshots of it would only hold the prompt's KV two more times (5 GB for a 20k-token prompt on an 8B model).
+    # (BatchService.needs_checkpoints)
     needs_checkpoints: bool
 
-
-def _loaded_model(engine: str, svc) -> LoadedModel:
-    """``svc``'s LoadedModel, read while no unload can finish it (Server.loaded holds the engine's load lock)."""
-    tok = svc.tokenizer
-    needs = False
-    if engine == "locals":
-        from mlx_lm.models.cache import KVCache, make_prompt_cache
-
-        model = getattr(getattr(svc, "_eng", None), "model", None)  # (None: a test's stub service)
-        needs = model is None or any(type(c) is not KVCache for c in make_prompt_cache(model))
-    return LoadedModel(svc, tok, _reads_images(svc), fmt=formats.detect(tok), thinking_style=formats.thinking_style(tok),
-                       thinks=formats.offers_thinking(tok), sealed=formats.thinks_when_off(tok),
-                       seps={"gap": formats.call_gap(tok), "think_gap": formats.think_gap(tok)}, needs_checkpoints=needs)
+    @classmethod
+    def of(cls, svc) -> "LoadedModel":
+        """``svc``'s LoadedModel, read while no unload can finish it (made by Server.loaded, under the engine's load
+        lock)."""
+        tok = svc.tokenizer
+        return cls(svc, tok, _reads_images(svc), fmt=formats.detect(tok), thinking_style=formats.thinking_style(tok),
+                   thinks=formats.offers_thinking(tok), sealed=formats.thinks_when_off(tok),
+                   seps={"gap": formats.call_gap(tok), "think_gap": formats.think_gap(tok)},
+                   needs_checkpoints=svc.needs_checkpoints)
 
 
 def _host_ok(host_header: Optional[str], bind_host: str) -> bool:
@@ -209,8 +206,7 @@ class Server:
         self.walk = walk  # constraints by the walk kernel: no token tables, any grammar size
         self.typed_tools = typed_tools  # tool calls with parameter names and types fixed (needs walk for large tool sets)
         self.log = log or (lambda s: print(s, file=sys.stderr, flush=True))
-        self._svc: Dict[str, object] = {}
-        self._handles: Dict[str, LoadedModel] = {}  # engine -> the loaded model as requests read it (see loaded)
+        self._svc: Dict[str, LoadedModel] = {}  # engine -> its load (an engine not in it is not loaded)
         self._lock = threading.Lock()  # the stream and raw-reply caches
         self._loading = {e: threading.Lock() for e in self.engines}
         self._load_error: Dict[str, tuple] = {}  # engine -> (when, error) of its last failed load
@@ -277,23 +273,22 @@ class Server:
         family = self.short.split("-")[0].split(".")[0]
         out = []
         for e in self.engines:
-            if running and e not in self._svc:
+            h = self._svc.get(e)  # (once: an unload may take it meanwhile)
+            if running and h is None:
                 continue
             m = apis.ollama_model_entry(self.ollama_name(e), self.short, family, self.context_for(e))
             if running:
                 m["expires_at"] = "2099-01-01T00:00:00Z"
                 # the weights, all in GPU memory: `ollama ps` showed "100% CPU" and 0 B for size_vram 0
-                m["size"] = m["size_vram"] = int(getattr(self._svc.get(e), "weights_bytes", 0) or 0)
+                m["size"] = m["size_vram"] = int(getattr(h.svc, "weights_bytes", 0) or 0)
             out.append(m)
         return out
 
     def ollama_show(self, name: str) -> dict:
-        from . import formats
-
         family = self.short.split("-")[0].split(".")[0]
         caps = ["completion", "tools"]
         loaded = list(self._svc.values())
-        if loaded and formats.offers_thinking(loaded[0].tokenizer):
+        if loaded and loaded[0].thinks:
             caps.append("thinking")
         if self.reads_images():
             caps.append("vision")
@@ -309,9 +304,9 @@ class Server:
         that asked /api/show before the first request, or after an unload, was told the model reads text only."""
         if "locals" not in self.engines:
             return False
-        svc = self._svc.get("locals")
-        if svc is not None:
-            return _reads_images(svc)
+        h = self._svc.get("locals")
+        if h is not None:
+            return h.reads_images
         if getattr(self, "_checkpoint_reads_images", None) is None:  # (read from the files once: config and headers)
             from . import vision
 
@@ -320,15 +315,22 @@ class Server:
 
     # -- engines ------------------------------------------------------------------------------
     def service(self, engine: str):
+        """The service that runs ``engine``'s requests (loaded first if it is not)."""
+        return self.loaded(engine).svc
+
+    def loaded(self, engine: str) -> LoadedModel:
+        """The model as loaded on ``engine`` (loaded first if it is not). It is made in the load, under the lock an
+        unload takes: an unload that lands while a request is prepared never turns what the request reads into an
+        unloaded service's (no tokenizer, no vision tower: its images became a text note)."""
         if engine not in self.engines:
             raise ValueError(f"engine {engine!r} is not enabled on this server (enabled: {', '.join(self.engines)})")
-        svc = self._svc.get(engine)
-        if svc is not None:
-            return svc
+        h = self._svc.get(engine)
+        if h is not None:
+            return h
         with self._loading[engine]:  # one load per engine; requests for the other engine go on meanwhile
-            svc = self._svc.get(engine)
-            if svc is not None:
-                return svc
+            h = self._svc.get(engine)
+            if h is not None:
+                return h
             failed = self._load_error.get(engine)
             if failed and time.time() - failed[0] < 60:
                 raise RuntimeError(f"engine {engine} failed to load {time.time() - failed[0]:.0f}s ago: {failed[1]}")
@@ -342,28 +344,18 @@ class Server:
             except Exception as e:
                 self._load_error[engine] = (time.time(), f"{type(e).__name__}: {e}")
                 raise
-            self._svc[engine] = svc
+            try:
+                h = LoadedModel.of(svc)
+            except Exception as e:
+                # loaded, but not readable as requests need it: its weights go now, or each request after this one
+                # would load another copy beside them
+                self._load_error[engine] = (time.time(), f"{type(e).__name__}: {e}")
+                svc.unload()
+                raise
+            self._svc[engine] = h
             self.log(f"engine {engine} ready in {time.perf_counter() - t:.1f}s")
-            return svc
-
-    def loaded(self, engine: str) -> LoadedModel:
-        """The model as loaded on ``engine`` (loaded first if it is not), read under the lock an unload takes: an
-        unload that lands while a request is prepared never turns what the request reads into an unloaded service's
-        (no tokenizer, no vision tower: its images became a text note)."""
-        while True:
-            svc = self.service(engine)
-            h = self._handles.get(engine)
-            if h is not None and h.svc is svc:
-                return h
-            with self._loading[engine]:
-                if self._svc.get(engine) is not svc:
-                    continue  # unloaded meanwhile: the next pass loads it again
-                h = self._handles.get(engine)
-                if h is not None and h.svc is svc:
-                    return h  # made by a request that held the lock first
-                h = self._handles[engine] = _loaded_model(engine, svc)
-                self.log(f"[{engine}] tool calls: {h.fmt.name}; thinking: {h.thinking_style}")
-                return h
+            self.log(f"[{engine}] tool calls: {h.fmt.name}; thinking: {h.thinking_style}")
+            return h
 
     def unload(self) -> dict:
         """Let the model go and give its memory back, the server still running: the next request loads it
@@ -374,12 +366,11 @@ class Server:
         done = []
         for e in [e for e in self.engines if e in self._svc]:
             with self._loading[e]:  # (not while it loads)
-                svc = self._svc.pop(e, None)
-                self._handles.pop(e, None)
-                if svc is None:
+                h = self._svc.pop(e, None)
+                if h is None:
                     continue
                 self.log(f"unloading {self.model_id} from engine {e} ...")
-                s = svc.unload()
+                s = h.svc.unload()
                 done.append(e)
                 self.log(f"engine {e} unloaded in {s:.1f}s")
         after = mx.get_active_memory()
@@ -388,15 +379,13 @@ class Server:
 
     def models(self) -> List[dict]:
         out = []
-        from . import formats
-
-        loaded = [svc for svc in self._svc.values()]
-        thinks = not loaded or formats.offers_thinking(loaded[0].tokenizer)  # a "-thinking" id only where the model can think
+        loaded = list(self._svc.values())
+        thinks = not loaded or loaded[0].thinks  # a "-thinking" id only where the model can think
         for e in self.engines:
             for suffix in ("", "-thinking") if thinks else ("",):
                 info = {"id": f"{e}/{self.short}{suffix}", "object": "model", "created": int(self.t_start), "owned_by": e,
                         "context_length": self.context_for(e), "max_model_len": self.context_for(e)}
-                h = self._handles.get(e)
+                h = self._svc.get(e)
                 if h is not None:  # known once the engine is loaded
                     info["tool_call_format"] = h.fmt.name
                     info["parallel_tool_calls"] = h.fmt.multi
@@ -416,10 +405,10 @@ class Server:
                "active": list(self._active.values()), "memory": mem, "engines": {}}
         for e in self.engines:
             d = dict(self.per_engine[e])
-            svc = self._svc.get(e)
-            d["loaded"] = svc is not None
-            if svc is not None:
-                d.update({k: v for k, v in svc.stats().items() if k != "engine"})
+            h = self._svc.get(e)
+            d["loaded"] = h is not None
+            if h is not None:
+                d.update({k: v for k, v in h.svc.stats().items() if k != "engine"})
             out["engines"][e] = d
         return out
 
@@ -436,7 +425,7 @@ class Server:
         # a model that thinks with thinking off thinks by default (LFM3, as its template does): with thinking off it
         # reasoned in its answers, and did 10 of 18 agent tasks where it did 15 with thinking on
         loaded = self.loaded(engine)  # (held to the end: an unload from here on changes nothing it reads)
-        svc, tok = loaded.svc, loaded.tokenizer
+        tok = loaded.tokenizer
         thinking = oai.thinking_of(model, self.thinking or loaded.sealed)
         kw = req.get("chat_template_kwargs") or {}
         if isinstance(kw, dict) and isinstance(kw.get("enable_thinking"), bool):  # vLLM / SGLang style switch
@@ -551,8 +540,7 @@ class Server:
             regex = oai.not_containing(*oai.THINK_TAGS)
         cps = (self._checkpoints(tok, msgs, tpl_tools, think_kw, prepared)
                if loaded.needs_checkpoints else [])
-        return {"engine": engine, "thinking": thinking, "svc": svc, "tok": tok, "prompt": prompt, "checkpoints": cps, "text": text,
-                "prepared": prepared,
+        return {"engine": engine, "thinking": thinking, "loaded": loaded, "prepared": prepared, "checkpoints": cps,
                 "tools": tools, "schema": schema, "regex": regex, "output_regex": output_regex, "max_tokens": max_tokens,
                 "model": model, "fmt": fmt, "sealed": sealed, "seps": seps,
                 "tool_choice": req.get("tool_choice", "auto"), "stop": _stops(req), "temp": _temperature(req),
@@ -570,11 +558,11 @@ class Server:
         self.check_model(model)
         engine = oai.engine_of(model)
         loaded = self.loaded(engine)
-        svc, tok = loaded.svc, loaded.tokenizer
+        tok = loaded.tokenizer
         self._cap_context()
         prompt = req.get("prompt", "")
         if isinstance(prompt, list) and prompt and all(type(t) is int for t in prompt):
-            ids = list(prompt)  # token ids, which must be the tokenizer's (an id past the vocabulary reads past the embedding)
+            ids, text = list(prompt), None  # token ids, which must be the tokenizer's (an id past the vocabulary reads past the embedding)
             n_vocab = len(tok._tokenizer)
             if any(t < 0 or t >= n_vocab for t in ids):
                 raise ValueError(f"token ids must be between 0 and {n_vocab - 1}")
@@ -587,7 +575,7 @@ class Server:
                 raise ValueError("prompt must be a string, a list with one string, or a list of token ids")
             from . import formats
 
-            ids = list(tok.encode(prompt))
+            ids, text = list(tok.encode(prompt)), prompt
             bos = getattr(tok, "bos_token_id", None)
             if ids and bos is not None and ids[0] != bos and "bos_token" in formats.chat_template(tok):
                 ids.insert(0, bos)  # the model saw every sequence start with it (Gemma 4, Ministral: encode leaves it out)
@@ -600,7 +588,10 @@ class Server:
         asked = _whole(req.get("max_tokens"), "max_tokens")
         max_tokens = asked if asked is not None and asked > 0 else 256
         max_tokens = max(1, min(max_tokens, self.max_tokens, limit - len(ids)))
-        return {"engine": engine, "thinking": False, "svc": svc, "tok": tok, "prompt": ids, "checkpoints": [], "text": None, "tools": [],
+        from .prepared import PreparedPrompt
+
+        return {"engine": engine, "thinking": False, "loaded": loaded, "prepared": PreparedPrompt(text, ids, tokenizer=tok),
+                "checkpoints": [], "tools": [],
                 "schema": None, "regex": None, "max_tokens": max_tokens, "model": model, "fmt": None, "stop": _stops(req),
                 "temp": _temperature(req), "sampling": _sampling(req), "ignore_eos": bool(req.get("ignore_eos")),
                 "include_usage": _include_usage(req)}
@@ -622,12 +613,13 @@ class Server:
             write(("data: " + json.dumps(d, ensure_ascii=False) + "\n\n").encode())
 
         key = uuid.uuid4().hex[:8]
-        self._active[key] = {"engine": p["engine"], "prompt_tokens": len(p["prompt"]), "tokens": 0, "started": time.time()}
+        pr = p["prepared"]
+        self._active[key] = {"engine": p["engine"], "prompt_tokens": len(pr.tokens), "tokens": 0, "started": time.time()}
         q: "queue.Queue[List[int]]" = queue.Queue()
         job = self._retry_unloaded(p, lambda svc: svc.submit(
-            p["prompt"], max_tokens=p["max_tokens"], on_token=q.put, temp=p.get("temp"),
+            pr.tokens, max_tokens=p["max_tokens"], on_token=q.put, temp=p.get("temp"),
             ignore_eos=p.get("ignore_eos", False), **p.get("sampling", {})))
-        tok = p["tok"]
+        tok = pr.tokenizer
         toks: List[int] = []
         sent, stopped, last_emit = 0, None, time.perf_counter()
         last_probe = last_emit
@@ -703,12 +695,12 @@ class Server:
             self._stock_context = min(getattr(self, "_stock_context", self.max_context), n)
         auto = getattr(self, "_auto_context", False) and "locals" in self.engines
         if auto:
-            svc = self._svc.get("locals")
-            if svc is None:
+            h = self._svc.get("locals")
+            if h is None:
                 if n and n < self.max_context:
                     self.max_context = n
                 return  # the fit: again when our engine is loaded
-            fit = svc.context_fit() if hasattr(svc, "context_fit") else None
+            fit = h.svc.context_fit() if hasattr(h.svc, "context_fit") else None
             if fit and fit > self.max_context:
                 self.max_context = fit
             elif fit:
@@ -848,11 +840,11 @@ class Server:
     def _remember(self, engine: str, p: dict, job, calls: List[dict], prefix: str = "", raw: Optional[str] = None,
                   exact: bool = True) -> None:
         raw = prefix + job.text if raw is None else raw
-        prepared = p.get("prepared")  # (None: a request made without one, text only)
-        exact = exact and raw == prefix + job.text and (prepared is None or prepared.rememberable)
-        ids = list(p["prompt"])
+        pr = p["prepared"]
+        exact = exact and raw == prefix + job.text and pr.rememberable
+        ids = list(pr.tokens)
         if prefix:
-            ids += list(p["tok"]._tokenizer.encode(prefix, add_special_tokens=False))
+            ids += list(pr.tokenizer._tokenizer.encode(prefix, add_special_tokens=False))
         with self._lock:
             for c in calls:
                 self._raw[oai.id_key(c["id"])] = raw
@@ -861,37 +853,39 @@ class Server:
                     del self._raw[k]
             if exact:
                 st = self._streams[engine]
-                st.append({"text": p["text"] + raw, "ids": ids + list(job.tokens)})
+                st.append({"text": pr.text + raw, "ids": ids + list(job.tokens)})
                 del st[:-64]
 
     def _submit(self, p: dict, on_token=None, prompt: Optional[List[int]] = None):
         """``p``'s job (``prompt``: its prompt and the reply's prefix, written already)."""
-        return self._retry_unloaded(p, lambda svc: self._submit_to(p, on_token, prompt))
+        return self._retry_unloaded(p, lambda svc: self._submit_to(svc, p, on_token, prompt))
 
     def _retry_unloaded(self, p: dict, submit):
-        """``submit(p["svc"])``; unloaded while this request was prepared, the same model, loaded again, takes it."""
+        """``submit`` on the service of ``p``'s load; unloaded while this request was prepared, the same model, loaded
+        again, takes it: the request then holds the new load (p["loaded"]: its service, from the handle that also holds
+        its facts). What the request was made with stays: its tokens and tokenizer (p["prepared"]), and the tool-call
+        format, grammar and checkpoints read from the first load, which its prompt and grammar were built on (one
+        model id per server: both loads read the same)."""
         from .service import Unloaded
 
         try:
-            return submit(p["svc"])
+            return submit(p["loaded"].svc)
         except Unloaded:
-            p["svc"] = self.service(p["engine"])
-            return submit(p["svc"])
+            p["loaded"] = self.loaded(p["engine"])
+            return submit(p["loaded"].svc)
 
-    def _submit_to(self, p: dict, on_token=None, prompt: Optional[List[int]] = None):
-        pr = p.get("prepared")  # (None: a request made without one, text only)
-        return p["svc"].submit(p["prompt"] if prompt is None else prompt, schema=p["schema"], max_tokens=p["max_tokens"],
-                               regex=p["regex"], on_token=on_token,
-                               temp=p.get("temp"), ignore_eos=p.get("ignore_eos", False),
-                               checkpoints=p.get("checkpoints"), pictures=pr.pictures if pr else None,
-                               spans=pr.spans if pr else None,
-                               **p.get("sampling", {}))
+    def _submit_to(self, svc, p: dict, on_token=None, prompt: Optional[List[int]] = None):
+        pr = p["prepared"]
+        return svc.submit(pr.tokens if prompt is None else prompt, schema=p["schema"], max_tokens=p["max_tokens"],
+                          regex=p["regex"], on_token=on_token, temp=p.get("temp"), ignore_eos=p.get("ignore_eos", False),
+                          checkpoints=p.get("checkpoints"), pictures=pr.pictures, spans=pr.spans, **p.get("sampling", {}))
 
     def _account(self, p: dict, job, out_tokens: int, calls: int, t0: float, stopped: Optional[str] = None) -> dict:
         r = getattr(job, "_req", None)
         d = self.per_engine[p["engine"]]
         d["requests"] += 1
-        d["prompt_tokens"] += len(p["prompt"])
+        n_prompt = len(p["prepared"].tokens)
+        d["prompt_tokens"] += n_prompt
         d["cached_tokens"] += job.cached
         d["completion_tokens"] += out_tokens
         d["forced_tokens"] += getattr(r, "forced", 0) or 0
@@ -899,11 +893,11 @@ class Server:
         d["decode_s"] += max(0.0, job.t_done - job.t_submit)
         d["tool_calls"] += calls
         dt = max(1e-9, job.t_done - job.t_submit)
-        usage = {"prompt_tokens": len(p["prompt"]), "completion_tokens": out_tokens, "total_tokens": len(p["prompt"]) + out_tokens,
+        usage = {"prompt_tokens": n_prompt, "completion_tokens": out_tokens, "total_tokens": n_prompt + out_tokens,
                  "prompt_tokens_details": {"cached_tokens": job.cached},
                  "locals": {"engine": p["engine"], "forced_tokens": getattr(r, "forced", 0) or 0, "passes": getattr(r, "passes", 0) or 0,
                            "constrained": p["regex"] is not None or p["schema"] is not None, "wall_s": time.perf_counter() - t0}}
-        self.log(f"[{p['engine']}] prompt {len(p['prompt'])} ({job.cached} cached)  out {out_tokens} tok"
+        self.log(f"[{p['engine']}] prompt {n_prompt} ({job.cached} cached)  out {out_tokens} tok"
                  f"{'  forced ' + str(getattr(r, 'forced', 0)) if getattr(r, 'forced', 0) else ''}  {out_tokens / dt:.0f} tok/s"
                  f"  {calls} call(s)  finish={job.finish}" + (f"  stopped={stopped}" if stopped else ""))
         return usage
@@ -973,7 +967,7 @@ class Server:
             write(("data: " + json.dumps(d, ensure_ascii=False) + "\n\n").encode())
 
         key = uuid.uuid4().hex[:8]
-        self._active[key] = {"engine": p["engine"], "prompt_tokens": len(p["prompt"]), "tokens": 0, "started": time.time()}
+        self._active[key] = {"engine": p["engine"], "prompt_tokens": len(p["prepared"].tokens), "tokens": 0, "started": time.time()}
         prefix = ""
         job = None
         try:
@@ -1156,13 +1150,14 @@ class Server:
         """Generate one reply after ``prefix`` (assistant text already
         written), streaming deltas through ``chunk``; returns (job, reply
         text including the prefix, why it was stopped early or None)."""
-        tok = p["tok"]  # (not p["svc"]'s: an unload drops it, and the model loaded again takes the request)
-        prompt = list(p["prompt"])
+        pr = p["prepared"]
+        tok = pr.tokenizer  # (not the service's: an unload drops it, and the model loaded again takes the request)
+        prompt = list(pr.tokens)
         if prefix:
             prompt += list(tok._tokenizer.encode(prefix, add_special_tokens=False))
         q: "queue.Queue[List[int]]" = queue.Queue()
         job = self._submit(p, q.put, prompt)
-        job.prefix_tokens = len(prompt) - len(p["prompt"])
+        job.prefix_tokens = len(prompt) - len(pr.tokens)
         toks: List[int] = []
         rs = oai.ReplyStream(p["thinking"] and (not prefix or _in_think(p)), p.get("fmt"),
                              calls=bool(p["tools"]) and p.get("tool_choice") != "none")
@@ -1661,7 +1656,7 @@ def make_handler(server: Server, ollama_root: bool = False):
                 traceback.print_exc()
                 return fail(f"{type(e).__name__}: {e}", 500, "api_error")
             if path.endswith("/count_tokens"):
-                return self._json({"input_tokens": len(p["prompt"])})
+                return self._json({"input_tokens": len(p["prepared"].tokens)})
             server.requests += 1
             shown = name or p["model"]
             p["alive"] = self._alive
@@ -1679,7 +1674,7 @@ def make_handler(server: Server, ollama_root: bool = False):
 
             write = self._part
 
-            out = apis.AnthropicStream(write, shown, len(p["prompt"]))
+            out = apis.AnthropicStream(write, shown, len(p["prepared"].tokens))
             self._stream_start("text/event-stream; charset=utf-8")
             try:
                 out.start()  # at once: the client knows the request is in, before a long prompt is read
@@ -2289,8 +2284,8 @@ def serve(server: Server, host: str = "127.0.0.1", port: int = 8321, ollama_port
         pass
     finally:
         httpd.server_close()
-        for svc in server._svc.values():
-            svc.close()
+        for h in server._svc.values():
+            h.svc.close()
 
 
 def _on_sigterm() -> None:

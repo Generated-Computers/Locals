@@ -451,6 +451,16 @@ class BatchService:
         return ImagePrompt(job.prompt, job.spans, job.pictures, encoder, rt.engine.prefill_embedded,
                            cancelled=lambda: job.cancelled)
 
+    @property
+    def needs_checkpoints(self) -> bool:
+        """Whether a prompt's cache pays to be snapshot on the way (LoadedModel.needs_checkpoints): our engine, on a
+        model whose cache is not all plain KV (Qwen3.5's recurrent layers, Gemma's sliding windows)."""
+        if self.engine != "locals" or getattr(self, "_eng", None) is None:  # (None: unloaded)
+            return False
+        from mlx_lm.models.cache import KVCache, make_prompt_cache
+
+        return any(type(c) is not KVCache for c in make_prompt_cache(self._eng.model))
+
     def vision(self):
         """This model's vision tower (vision.Encoder, its weights read on the first image), or None: the stock
         engine, or a checkpoint without one."""

@@ -73,6 +73,8 @@ def model_reply(fmt, content, calls):
 
 
 class _Svc:
+    needs_checkpoints = True  # (what a stub with no engine was given before stubs said it)
+
     def __init__(self, tok):
         self.tokenizer = tok
 
@@ -88,11 +90,11 @@ def server(request):
     from mlx_lm.utils import load_tokenizer
 
     from locals.models import register
-    from locals.server import Server
+    from locals.server import LoadedModel, Server
 
     register()  # (LFM3: transformers would ask whether to run Liquid's code)
     srv = Server(request.param, engines=("locals",), preload=(), log=lambda s: None)
-    srv._svc["locals"] = _Svc(load_tokenizer(request.param))
+    srv._svc["locals"] = LoadedModel.of(_Svc(load_tokenizer(request.param)))
     return srv
 
 
@@ -140,7 +142,7 @@ def test_agent_conversation(server, name):
     if tools:
         req["tools"] = tools
     p = server.prepare(req)
-    text = p["text"]
+    text = p["prepared"].text
     at = 0
     for m in msgs[1:]:
         content = oai.text_of(m.get("content"))
@@ -148,7 +150,7 @@ def test_agent_conversation(server, name):
             i = _appears(content, text, at)
             assert i >= 0, (name, m["role"], content[:80], text[-1500:])
             at = i
-    assert len(p["prompt"]) < server.max_context
+    assert len(p["prepared"].tokens) < server.max_context
     # the model's turn is open: a prompt that ends its turn gets an empty reply (Gemma 4's
     # template closed the turn after an assistant message with text and calls)
     if msgs[-1]["role"] != "assistant":
@@ -159,7 +161,7 @@ def test_hermes_title_request(server):
     """Hermes names a session with a JSON-schema response and no tools."""
     t = OTHERS["hermes"]["title_request"]
     p = server.prepare(dict(t, model=f"locals/{server.short}", max_tokens=64))
-    assert p["schema"] is not None and _appears(oai.text_of(t["messages"][-1]["content"]), p["text"]) >= 0
+    assert p["schema"] is not None and _appears(oai.text_of(t["messages"][-1]["content"]), p["prepared"].text) >= 0
 
 
 def test_title_request(server):
@@ -167,7 +169,7 @@ def test_title_request(server):
     msgs = DATA["title_request"]
     p = server.prepare({"model": f"locals/{server.short}", "messages": msgs, "max_tokens": 64, "stream": True})
     for m in msgs[1:]:
-        assert _appears(m["content"], p["text"]) >= 0
+        assert _appears(m["content"], p["prepared"].text) >= 0
 
 
 def test_regex_response_format(server):

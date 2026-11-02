@@ -18,7 +18,7 @@ Remembered = Callable[[str], Optional[Tuple[str, Sequence[int]]]]
 class PreparedPrompt:
     """``text`` as the model reads it: ``tokens``, with each of ``pictures``' tokens at its ``spans``."""
 
-    text: str
+    text: Optional[str]  # (None: a /v1/completions prompt given as token ids)
     tokens: List[int]
     pictures: tuple = ()
     spans: tuple = ()
@@ -45,14 +45,14 @@ class PreparedPrompt:
     @property
     def rememberable(self) -> bool:
         """Whether the reply's ids may be remembered for the next request's text (PreparedPrompt.of reads them back
-        in place of the text's): not an image prompt's, whose ids hold its images' tokens."""
-        return not self.pictures
+        in place of the text's): not an image prompt's, whose ids hold its images' tokens, nor one with no text."""
+        return not self.pictures and self.text is not None
 
     def checkpoint_at(self, prefix: str) -> Optional[int]:
         """Where ``prefix``, a text prefix of the prompt, ends in its tokens (an image's tokens before it count: its
         prefix costs the tower and their prefill), or None: no prefix, the whole prompt, or under 1024 tokens (a
         short prefix is cheaper to read again than to keep)."""
-        if (len(prefix) < 2048 and not self.pictures) or not self.text.startswith(prefix):
+        if self.text is None or (len(prefix) < 2048 and not self.pictures) or not self.text.startswith(prefix):
             return None
         ids = self.tokenizer._tokenizer.encode(prefix, add_special_tokens=False)
         placed = self.placed or self.tokens

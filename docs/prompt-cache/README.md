@@ -29,7 +29,7 @@ A plain attention layer (`KVCache`) stores one key and one value per position. T
 2. **Prefixes are stored on purpose.** The engine stores entries at the positions the next requests are likely to share. These are the checkpoints, described below.
 3. **Stale prefixes are not removed.** mlx-lm's `insert_cache` drops the shorter entries a new entry extends only when the cache is trimmable. For a hybrid model, every agent step would leave behind another copy of the whole history. `ChainCache` fixes this (see "Eviction" below).
 
-`LoadedModel.needs_checkpoints` (`server._loaded_model`) turns checkpoints on only if some layer of `make_prompt_cache(model)` is not exactly a `KVCache`. A plain KV cache is already trimmed to any shared prefix by the prompt cache. Checkpoints of it would just hold the prompt's KV two more times; the docstring's example is 5 GB for a 20k-token prompt on an 8B model.
+`LoadedModel.needs_checkpoints` (`BatchService.needs_checkpoints`) turns checkpoints on only if some layer of `make_prompt_cache(model)` is not exactly a `KVCache`. A plain KV cache is already trimmed to any shared prefix by the prompt cache. Checkpoints of it would just hold the prompt's KV two more times; the docstring's example is 5 GB for a 20k-token prompt on an 8B model.
 
 ## How a request finds its cache and leaves one behind
 

@@ -172,13 +172,14 @@ def _tokenizer(repo):
 
 @pytest.fixture(scope="module")
 def server():
-    from locals.server import Server
+    from locals.server import LoadedModel, Server
 
     class Svc:
         tokenizer = _tokenizer(LFM3)
+        needs_checkpoints = True  # (what a stub with no engine was given before stubs said it)
 
     srv = Server(LFM3, engines=("locals",), preload=(), log=lambda s: None)
-    srv._svc["locals"] = Svc()
+    srv._svc["locals"] = LoadedModel.of(Svc())
     return srv
 
 
@@ -222,10 +223,10 @@ def test_lfm3_thinks_unless_told_not_to(server):
     """As its template does: with thinking off it reasoned in its answers (10 of 18 agent tasks done, 15 thinking)."""
     req = {"model": "locals/lfm3-1.7b", "messages": [{"role": "user", "content": "Hi"}]}
     assert server.prepare(req)["thinking"] and server.prepare(dict(req, model="locals/lfm3-1.7b-thinking"))["thinking"]
-    assert server.prepare(req)["text"].endswith("<think>")
+    assert server.prepare(req)["prepared"].text.endswith("<think>")
     for off in ({"chat_template_kwargs": {"enable_thinking": False}}, {"reasoning_effort": "none"}):
         p = server.prepare(dict(req, **off))
-        assert not p["thinking"] and p["text"].endswith("<think></think>")
+        assert not p["thinking"] and p["prepared"].text.endswith("<think></think>")
 
 
 OFF = {"chat_template_kwargs": {"enable_thinking": False}}
@@ -262,12 +263,12 @@ def test_a_thinking_conversation_stays_a_prefix_of_the_next_request(server):
     server._raw.clear()
     server._raw[oai.id_key("toolu_1")] = raw
     task = [{"role": "system", "content": "You are a coding agent."}, {"role": "user", "content": "Weather in Paris?"}]
-    first = server.prepare({"model": "locals/lfm3-1.7b-thinking", "messages": task, "tools": TOOLS})["text"]
+    first = server.prepare({"model": "locals/lfm3-1.7b-thinking", "messages": task, "tools": TOOLS})["prepared"].text
     turn = [{"role": "assistant", "content": "", "tool_calls": [{"id": "toolu_1", "type": "function",
                                                                "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}}]},
             {"role": "tool", "tool_call_id": "toolu_1", "content": "sunny"},
             {"role": "user", "content": "<system-reminder>Keep going.</system-reminder>"}]
-    second = server.prepare({"model": "locals/lfm3-1.7b-thinking", "messages": task + turn, "tools": TOOLS})["text"]
+    second = server.prepare({"model": "locals/lfm3-1.7b-thinking", "messages": task + turn, "tools": TOOLS})["prepared"].text
     assert first.endswith("<think>") and second.startswith(first + raw)
-    off = server.prepare({"model": "locals/lfm3-1.7b", "messages": task + turn, "tools": TOOLS, **OFF})["text"]
+    off = server.prepare({"model": "locals/lfm3-1.7b", "messages": task + turn, "tools": TOOLS, **OFF})["prepared"].text
     assert "The user wants the weather." not in off  # thinking off: as the template writes it (no switch)

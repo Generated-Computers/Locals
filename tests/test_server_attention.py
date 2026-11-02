@@ -28,8 +28,8 @@ def server():
 
     srv = Server(MODEL, engines=("locals",), preload=("locals",), slots=4, temp=0.0, log=lambda s: None)
     yield srv
-    for svc in srv._svc.values():
-        svc.close()
+    for h in srv._svc.values():
+        h.svc.close()
 
 
 def test_moved_context_message_hits_the_cache_without_snapshots(server):

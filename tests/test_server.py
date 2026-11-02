@@ -33,8 +33,8 @@ def server():
 
     srv = Server(MODEL, engines=("locals",), preload=("locals",), slots=4, temp=0.0, log=lambda s: None)
     yield srv
-    for svc in srv._svc.values():
-        svc.close()
+    for h in srv._svc.values():
+        h.svc.close()
 
 
 def test_tool_call_grammar(server):
@@ -151,8 +151,8 @@ def test_ignore_eos_on_the_stock_engine():
         assert srv.complete(dict(req))["usage"]["completion_tokens"] < 40
         assert srv.complete(dict(req, ignore_eos=True))["usage"]["completion_tokens"] == 40
     finally:
-        for svc in srv._svc.values():
-            svc.close()
+        for h in srv._svc.values():
+            h.svc.close()
 
 
 def test_follow_up_turn_continues_from_the_reply_start(server):

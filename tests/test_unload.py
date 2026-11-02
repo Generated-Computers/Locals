@@ -8,7 +8,8 @@ import mlx.core as mx
 
 from locals import engine as eng
 from locals import vision
-from locals.server import Server
+from locals.prepared import PreparedPrompt
+from locals.server import LoadedModel, Server
 from locals.service import BatchService, Job, Unloaded
 
 
@@ -147,13 +148,14 @@ def test_a_text_completion_prepared_before_an_unload_goes_to_the_model_loaded_ag
 
     srv = Server.__new__(Server)
     srv._active = {}
-    srv.service = lambda engine: New()
+    again = _handle(New())
+    srv.loaded = lambda engine: again
     monkeypatch.setattr(Server, "_account", lambda self, p, job, n, calls, t0, stopped=None: {"completion_tokens": n})
-    p = {"engine": "locals", "svc": Old(), "tok": New.tokenizer, "prompt": [1, 2], "max_tokens": 5, "model": "m",
-         "stop": []}
+    p = {"engine": "locals", "loaded": _handle(Old()), "prepared": PreparedPrompt(None, [1, 2], tokenizer=New.tokenizer),
+         "max_tokens": 5, "model": "m", "stop": []}
     out = srv.text_completion({}, p)
     assert out["choices"][0]["text"] == "hi"
-    assert isinstance(p["svc"], New)
+    assert p["loaded"] is again
 
 
 class _Tok:
@@ -187,16 +189,41 @@ class _Loaded:
         return job
 
 
+class _OtherTok:
+    """The tokenizer of the model loaded again: never the one a prepared request decodes with."""
+
+    decode = staticmethod(lambda ids: "not the prepared tokenizer")
+
+
+def _handle(svc, tokenizer=None) -> LoadedModel:
+    """``svc``'s load, with the facts a text-only stub model has."""
+    return LoadedModel(svc, tokenizer if tokenizer is not None else svc.tokenizer, False, fmt=None, thinking_style="none",
+                       thinks=False, sealed=False, seps={}, needs_checkpoints=False)
+
+
 def _chat_server(new):
     srv = Server.__new__(Server)
     srv._active = {"k": {}}
-    srv.service = lambda engine: new
+    again = _handle(new, _OtherTok())
+    srv.loaded = lambda engine: again
     return srv
 
 
 def _chat():
-    return {"engine": "locals", "svc": _Unloaded(), "tok": _Tok(), "prompt": [1, 2], "max_tokens": 5, "schema": None,
-            "regex": None, "thinking": False, "tools": [], "stop": [], "ignore_eos": True, "text": "q"}
+    return {"engine": "locals", "loaded": _handle(_Unloaded()), "prepared": PreparedPrompt("q", [1, 2], tokenizer=_Tok()),
+            "max_tokens": 5, "schema": None, "regex": None, "thinking": False, "tools": [], "stop": [], "ignore_eos": True}
+
+
+def test_a_chat_prepared_before_an_unload_takes_the_load_that_runs_it():
+    """Retried on the model loaded again, the request holds that load's handle (its service and its facts, from one
+    place), and still reads its tokens with the tokenizer it was prepared with."""
+    new = _Loaded()
+    srv, out = _chat_server(new), []
+    p = _chat()
+    job, text, _ = srv._decode(p, "", out.append, None, "k")
+    assert p["loaded"] is srv.loaded("locals") and p["loaded"].svc is new
+    assert new.prompts == [[1, 2]]
+    assert text == "hi" and job.finish == "stop"  # (_OtherTok would read it as another text)
 
 
 def test_a_chat_reply_prepared_before_an_unload_is_written_by_the_model_loaded_again():
@@ -248,6 +275,7 @@ def test_an_image_chat_prepared_across_an_unload_is_read_with_its_images_by_the_
         """A service that reads images, until an unload finishes it (BatchService drops its tokenizer and tower)."""
 
         unloaded = False
+        needs_checkpoints = True  # (Qwen3.5's recurrent layers)
 
         @property
         def tokenizer(self):
@@ -278,14 +306,14 @@ def test_an_image_chat_prepared_across_an_unload_is_read_with_its_images_by_the_
 
     srv = Server(model, engines=("locals",), preload=(), log=lambda s: None)
     first, again = Loaded(), Again()
-    srv._svc["locals"] = first
+    srv._svc["locals"] = LoadedModel.of(first)
     cap, order = srv._cap_context, []
 
     def unload_now():  # (prepare's first step after it took the model)
         cap()
         if not order:
             order.append(srv.unload()["status"])
-            srv._svc["locals"] = again  # another request loaded the model again
+            srv._svc["locals"] = LoadedModel.of(again)  # another request loaded the model again
 
     srv._cap_context = unload_now
     buf = io.BytesIO()
@@ -299,3 +327,75 @@ def test_an_image_chat_prepared_across_an_unload_is_read_with_its_images_by_the_
     (prompt, pictures, spans), = again.got
     assert pictures and len(pictures) == 1, "the image was dropped: the model loaded again read a text-only prompt"
     assert spans and prompt.count(tok.convert_tokens_to_ids(vision.IMAGE_TOKEN)) > 1  # the image's own tokens
+
+
+def test_a_model_loaded_by_an_ollama_load_request_lists_its_tool_call_format(monkeypatch):
+    """An engine loaded only through Server.service (Ollama's load request, the retry after an unload) has its
+    LoadedModel too: /v1/models names its tool-call format, as after a chat request. Needs Qwen3.5-4B's tokenizer."""
+    import pytest
+    from huggingface_hub import snapshot_download
+
+    from locals import service
+
+    model = "mlx-community/Qwen3.5-4B-MLX-4bit"
+    try:
+        path = snapshot_download(model, local_files_only=True, allow_patterns=["*.json", "*.jinja", "tokenizer*"])
+    except Exception:  # noqa: BLE001
+        pytest.skip("tokenizer not cached")
+    from mlx_lm.utils import load_tokenizer
+
+    tok = load_tokenizer(path)
+
+    class Loads:
+        """BatchService as the server makes it: loaded once made."""
+
+        needs_checkpoints = True
+
+        def __init__(self, engine, model_id, **kw):
+            self.tokenizer = tok
+
+        def vision(self):
+            return None
+
+    monkeypatch.setattr(service, "BatchService", Loads)
+    srv = Server(model, engines=("locals",), preload=(), log=lambda s: None)
+    srv.service("locals")
+    listed = srv.models()
+    assert listed and all(m.get("tool_call_format") == "qwen_xml" and m.get("parallel_tool_calls") for m in listed)
+
+
+def test_a_load_whose_model_cannot_be_read_lets_the_weights_go(monkeypatch):
+    """The service loaded, but reading what requests need of it failed: its weights go at once, and the next request
+    gets the load error (as after a failed load) instead of loading a second copy beside them."""
+    import pytest
+
+    from locals import service
+
+    made = []
+
+    class Loads:
+        def __init__(self, engine, model_id, **kw):
+            self.unloaded = False
+            made.append(self)
+
+        @property
+        def tokenizer(self):
+            raise ValueError("a template this server cannot read")
+
+        def unload(self):
+            self.unloaded = True
+            return 0.0
+
+    monkeypatch.setattr(service, "BatchService", Loads)
+    srv = Server("m", engines=("locals",), preload=(), log=lambda s: None)
+    with pytest.raises(ValueError, match="cannot read"):
+        srv.service("locals")
+    assert len(made) == 1 and made[0].unloaded
+    with pytest.raises(RuntimeError, match="failed to load"):
+        srv.service("locals")
+    assert len(made) == 1
+
+
+def test_an_unloaded_service_needs_no_checkpoints():
+    """Asked after an unload (no engine left), not an AttributeError."""
+    assert _service(_eng=None).needs_checkpoints is False
