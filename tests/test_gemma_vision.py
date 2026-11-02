@@ -202,22 +202,30 @@ def test_encoder_detects_gemma_and_divides_features_by_the_embed_scale(tmp_path,
     assert out[0].shape == (1, 8) and np.allclose(np.array(out[0]), 0.25)
 
 
-def test_the_tower_matches_a_numpy_reference_built_from_transformers_formulas():
-    """Patch embedder, the 16 blocks and the pool, against the same weights read through numpy in the order
-    transformers' Gemma4VisionModel runs them (norm placements, scale 1 attention over every patch, the axial RoPE,
-    the 3x3 pool times sqrt(hidden) in float32). torch is not installed here, so the reference is numpy."""
-    from locals.models.gemma4_vl import Encoder, PatchEmbedder, VisionConfig, _pool
+def test_the_tower_matches_a_numpy_reference_of_the_transformers_formulas():
+    """The whole tower (patch embedder, the blocks, the pool, ``embed_vision``) against the same weights read through
+    numpy in the order transformers' ``Gemma4VisionModel`` + ``get_image_features`` run them: the clamps on every
+    linear's input and output, the norm placements, scale 1 attention over every patch, the axial RoPE per axis half,
+    the 3x3 pool times sqrt(hidden) in float32, then the RMSNorm (no scale) and the projection. torch is not installed
+    here, so the reference is numpy. It does not cover what only the real checkpoint exercises: padding to 280 soft
+    tokens (transformers masks it out; one image here has none), the quantized projection, and the multi-head KV
+    expansion (the tower is 12 heads to 12 here)."""
+    from locals.models.gemma4_vl import VisionConfig, VisionTower
 
     cfg = VisionConfig(hidden_size=48, num_hidden_layers=2, num_attention_heads=4, head_dim=12,
-                       intermediate_size=96, position_embedding_size=32, text_hidden_size=40)
-    pe, enc = PatchEmbedder(cfg), Encoder(cfg)
+                       intermediate_size=96, position_embedding_size=32, text_hidden_size=40,
+                       use_clipped_linears=True, embed_quantized=False)
+    tower = VisionTower(cfg)
+    # the checkpoint's bounds are finite; these are too, so the clamps bite (asserted below)
+    for layer in tower.encoder.layers:
+        for lin in (layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj, layer.self_attn.o_proj,
+                    layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj):
+            lin.input_min, lin.input_max = mx.array(-0.6, dtype=mx.float32), mx.array(0.6, dtype=mx.float32)
+            lin.output_min, lin.output_max = mx.array(-1.2, dtype=mx.float32), mx.array(1.2, dtype=mx.float32)
     h, w = 3, 6  # 18 patches, two 3x3 pool rows
     rng = np.random.default_rng(7)
     pixels = rng.random((h * w, 3 * 16 * 16)).astype(np.float32) * 0.5 + 0.25
-    positions = mx.stack([mx.tile(mx.arange(w, dtype=mx.int32), h),
-                          mx.repeat(mx.arange(h, dtype=mx.int32), w)], axis=-1)
-    rope = enc.rope(h, w, mx.float32)
-    got = np.array(_pool(enc(pe(mx.array(pixels), positions), rope), h, w, 3, cfg.hidden_size, mx.float32))
+    got = np.array(tower.image(mx.array(pixels), (h, w))[0], dtype=np.float32)
 
     def arr(m):
         return np.array(m, dtype=np.float32)
@@ -230,45 +238,137 @@ def test_the_tower_matches_a_numpy_reference_built_from_transformers_formulas():
     def rotate(part, cos, sin):  # rotate_half within a part; its cos/sin are the axis's frequencies, twice
         q = part.shape[-1] // 2
         a, b = part[..., :q], part[..., q:]
-        c = cos[:, None, :]
-        s = sin[:, None, :]
+        c, s = cos[:, None, :], sin[:, None, :]
         return np.concatenate([a * c - b * s, b * c + a * s], axis=-1)
 
-    # the patch embedder: 2 * (pixel - 0.5), one linear, the learned (x, y) position embeddings added
-    x = 2 * (pixels - 0.5)
-    x = x @ arr(pe.input_proj.weight).T
-    table = arr(pe.position_embedding_table)
-    xs = np.tile(np.arange(w), h)
-    ys = np.repeat(np.arange(h), w)
-    x = x + table[0][xs] + table[1][ys]
+    def clampin(x, lin):  # transformers' Gemma4ClippableLinear, input side
+        return np.clip(x, arr(lin.input_min), arr(lin.input_max)) if cfg.use_clipped_linears else x
 
-    cos_x, sin_x, cos_y, sin_y = (arr(t) for t in rope)
-    for layer in enc.layers:
-        attn = layer.self_attn
+    def proj(x, lin):  # ... and its output side, around the plain linear
+        y = clampin(x, lin) @ arr(lin.linear.weight).T
+        return np.clip(y, arr(lin.output_min), arr(lin.output_max)) if cfg.use_clipped_linears else y
+
+    # the patch embedder: 2 * (pixel - 0.5), one linear (the reference clamps none there), the (x, y) positions added
+    x = 2 * (pixels - 0.5) @ arr(tower.patch_embedder.input_proj.weight).T
+    table = arr(tower.patch_embedder.position_embedding_table)
+    x = x + table[0][np.tile(np.arange(w), h)] + table[1][np.repeat(np.arange(h), w)]
+
+    cos_x, sin_x, cos_y, sin_y = (arr(t) for t in tower.encoder.rope(h, w, mx.float32))
+    for layer in tower.encoder.layers:
+        attn, mlp = layer.self_attn, layer.mlp
         r = x
         y = rms(x, arr(layer.input_layernorm.weight))
-        q = rms((y @ arr(attn.q_proj.linear.weight).T).reshape(h * w, 4, 12), arr(attn.q_norm.weight))
-        k = rms((y @ arr(attn.k_proj.linear.weight).T).reshape(h * w, 4, 12), arr(attn.k_norm.weight))
-        v = rms((y @ arr(attn.v_proj.linear.weight).T).reshape(h * w, 4, 12))  # (no scale)
-        q = rotate(q[..., :6], cos_x, sin_x), rotate(q[..., 6:], cos_y, sin_y)
-        k = rotate(k[..., :6], cos_x, sin_x), rotate(k[..., 6:], cos_y, sin_y)
-        q, k = np.concatenate(q, axis=-1), np.concatenate(k, axis=-1)
+        q = rms((clampin(y, attn.q_proj) @ arr(attn.q_proj.linear.weight).T).reshape(-1, 4, 12),
+                arr(attn.q_norm.weight))
+        k = rms((clampin(y, attn.k_proj) @ arr(attn.k_proj.linear.weight).T).reshape(-1, 4, 12),
+                arr(attn.k_norm.weight))
+        v = rms((clampin(y, attn.v_proj) @ arr(attn.v_proj.linear.weight).T).reshape(-1, 4, 12))  # (no scale)
+        q = np.concatenate([rotate(q[..., :6], cos_x, sin_x), rotate(q[..., 6:], cos_y, sin_y)], axis=-1)
+        k = np.concatenate([rotate(k[..., :6], cos_x, sin_x), rotate(k[..., 6:], cos_y, sin_y)], axis=-1)
         scores = np.einsum("thd,shd->hts", q, k) * 1.0  # (the reference's scaling: none)
         scores = np.exp(scores - scores.max(-1, keepdims=True))
         scores /= scores.sum(-1, keepdims=True)
-        out = np.einsum("hts,shd->thd", scores, v).reshape(h * w, 48)
-        x = r + rms(out @ arr(attn.o_proj.linear.weight).T, arr(layer.post_attention_layernorm.weight))
+        attn_out = np.einsum("hts,shd->thd", scores, v).reshape(-1, 48)
+        x = r + rms(proj(attn_out, attn.o_proj), arr(layer.post_attention_layernorm.weight))
         r = x
         y = rms(x, arr(layer.pre_feedforward_layernorm.weight))
-        gate = y @ arr(layer.mlp.gate_proj.linear.weight).T
-        up = y @ arr(layer.mlp.up_proj.linear.weight).T
+        gate, up = proj(y, mlp.gate_proj), proj(y, mlp.up_proj)
         act = 0.5 * gate * (1 + np.tanh(np.sqrt(2 / np.pi) * (gate + 0.044715 * gate**3)))  # gelu_pytorch_tanh
-        x = r + rms((act * up) @ arr(layer.mlp.down_proj.linear.weight).T,
-                    arr(layer.post_feedforward_layernorm.weight))
-    want = x.reshape(h // 3, 3, w // 3, 3, -1).mean(axis=(1, 3)) * np.sqrt(cfg.hidden_size)
-    assert got.shape == (2, 48)
+        x = r + rms(proj(act * up, mlp.down_proj), arr(layer.post_feedforward_layernorm.weight))
+    pooled = x.reshape(h // 3, 3, w // 3, 3, -1).mean(axis=(1, 3)) * np.sqrt(cfg.hidden_size)
+    want = rms(pooled).reshape(2, -1) @ arr(tower.embed_vision.embedding_projection.weight).T
+
+    assert got.shape == (2, 40)
     assert np.allclose(got, want, atol=2e-4), np.abs(got - want).max()
 
+
+def test_the_clamps_on_the_tower_linears_bite():
+    """The same tower and pixels, with and without finite bounds: the features differ, so a tower that dropped the
+    checkpoint's clamps cannot pass the reference above by accident."""
+    from locals.models.gemma4_vl import VisionConfig, VisionTower
+
+    cfg = VisionConfig(hidden_size=48, num_hidden_layers=2, num_attention_heads=4, head_dim=12,
+                       intermediate_size=96, position_embedding_size=32, text_hidden_size=40,
+                       use_clipped_linears=True, embed_quantized=False)
+    tower = VisionTower(cfg)
+    pixels = mx.array(np.random.default_rng(3).random((18, 3 * 16 * 16)).astype(np.float32))
+    before = np.array(tower.image(pixels, (3, 6))[0])
+    for layer in tower.encoder.layers:
+        for lin in (layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj, layer.self_attn.o_proj,
+                    layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj):
+            lin.input_min, lin.input_max = mx.array(-0.05, dtype=mx.float32), mx.array(0.05, dtype=mx.float32)
+            lin.output_min, lin.output_max = mx.array(-0.1, dtype=mx.float32), mx.array(0.1, dtype=mx.float32)
+    after = np.array(tower.image(pixels, (3, 6))[0])
+    assert not np.allclose(before, after), "the tower ignored the bounds it was given"
+
+
+def test_a_clipped_linear_clamps_its_input_then_its_output():
+    from locals.models.gemma4_vl import ClippedLinear, VisionConfig
+
+    lin = ClippedLinear(VisionConfig(use_clipped_linears=True), 3, 2)
+    lin.linear.weight = mx.array([[2.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=mx.float32)  # (out, in)
+    lin.input_min, lin.input_max = mx.array(-1.0, dtype=mx.float32), mx.array(1.0, dtype=mx.float32)
+    lin.output_min, lin.output_max = mx.array(-1.5, dtype=mx.float32), mx.array(1.5, dtype=mx.float32)
+    out = np.array(lin(mx.array([[3.0, -3.0, 0.5]])), dtype=np.float32)
+    # (3, -3) clamp to (1, -1), the linear makes (2, -1), the output clamp makes (1.5, -1)
+    assert np.allclose(out, [[1.5, -1.0]]), out
+    # a checkpoint that does not clamp carries no bounds at all (its file has none to load)
+    plain = ClippedLinear(VisionConfig(use_clipped_linears=False), 3, 2)
+    assert "input_min" not in plain.parameters()
+    assert np.array(plain(mx.array([[3.0, -3.0, 0.5]]))).shape == (1, 2)
+
+
+def _save_tower(tmp_path, tower):
+    """``tower``'s parameters in a checkpoint file's names (vision_tower.*, embed_vision.*), as mlx-community's
+    conversions hold them."""
+    from mlx.utils import tree_flatten
+
+    mx.save_safetensors(str(tmp_path / "model.safetensors"),
+                        {k if k.startswith("embed_vision.") else "vision_tower." + k: v
+                         for k, v in tree_flatten(tower.parameters())})
+
+
+def test_load_tower_reads_a_plain_projection_and_the_clamp_bounds(tmp_path):
+    """A checkpoint whose ``embed_vision`` projection is not quantized holds a plain weight, and its linear bounds
+    are tensors: both are read from the file, not assumed from the config."""
+    import mlx.nn as nn
+
+    from locals.models.gemma4_vl import VisionConfig, VisionTower, load_tower
+
+    cfg = VisionConfig(hidden_size=48, num_hidden_layers=2, num_attention_heads=4, head_dim=12,
+                       intermediate_size=96, position_embedding_size=32, text_hidden_size=40,
+                       use_clipped_linears=True, embed_quantized=False)
+    tower = VisionTower(cfg)
+    tower.encoder.layers[0].mlp.gate_proj.input_min = mx.array(-0.75, dtype=mx.float32)
+    tower.encoder.layers[1].self_attn.o_proj.output_max = mx.array(1.25, dtype=mx.float32)
+    _save_tower(tmp_path, tower)
+
+    loaded = load_tower(tmp_path, mx.float32, cfg)
+    assert isinstance(loaded.embed_vision.embedding_projection, nn.Linear)
+    assert not isinstance(loaded.embed_vision.embedding_projection, nn.QuantizedLinear)
+    assert float(loaded.encoder.layers[0].mlp.gate_proj.input_min) == -0.75
+    assert float(loaded.encoder.layers[1].self_attn.o_proj.output_max) == 1.25
+    pixels = mx.array(np.random.default_rng(5).random((18, 3 * 16 * 16)).astype(np.float32))
+    assert np.allclose(np.array(loaded.image(pixels, (3, 6))[0]), np.array(tower.image(pixels, (3, 6))[0]))
+
+
+def test_load_tower_reads_a_quantized_projection_at_its_own_bits(tmp_path):
+    """A quantized checkpoint: bits, group size and mode come from its tensors, not from the config's defaults."""
+    import mlx.nn as nn
+
+    from locals.models.gemma4_vl import VisionConfig, VisionTower, load_tower
+
+    cfg = VisionConfig(hidden_size=64, num_hidden_layers=1, num_attention_heads=4, head_dim=16,
+                       intermediate_size=64, position_embedding_size=16, text_hidden_size=32,
+                       use_clipped_linears=False, embed_quantized=True, quant_bits=4, quant_group_size=32)
+    tower = VisionTower(cfg)
+    _save_tower(tmp_path, tower)
+
+    # the config passed in says 8 bits, group 64: the file's tensors say 4 and 32
+    wrong = VisionConfig(**{**cfg.__dict__, "quant_bits": 8, "quant_group_size": 64})
+    loaded = load_tower(tmp_path, mx.float32, wrong)
+    proj = loaded.embed_vision.embedding_projection
+    assert isinstance(proj, nn.QuantizedLinear) and (proj.bits, proj.group_size) == (4, 32)
 
 def test_per_layer_chunk_uses_the_pad_token_at_an_image():
     class Body:

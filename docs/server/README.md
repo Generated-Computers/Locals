@@ -511,10 +511,15 @@ template refuses it there).
 Gemma 4's tower (`locals/models/gemma4_vl.py`) is transformers' `Gemma4VisionModel` step for step: 16x16 patches
 through one linear plus a learned 2-D position table, 16 bidirectional pre-norm blocks whose attention rotates an
 axial (H-H-W-W) RoPE over the whole head with scale 1, a 3x3 average pool times `sqrt(hidden_size)` in float32, then
-the `embed_vision` RMSNorm (no scale) and its 5-bit quantized projection to the text width. The checkpoint's clamp
-tensors (`input_min`/`output_min` and the rest) are not used, as mlx-lm drops them too. Its weights are read one
+the `embed_vision` RMSNorm (no scale) and its quantized projection to the text width. Each tower linear clamps its
+input and its output to the bounds the checkpoint stores (`input_min`/`input_max`/`output_min`/`output_max`, finite
+in these files: layer 0's gate projection holds [-2.45, 2.44]), as transformers' `Gemma4ClippableLinear` does: on
+the E2B checkpoint, leaving them out moved an image's features by 34% on average. Whether that projection is
+quantized, at which bits and group size, comes from the tensors themselves, so an unquantized conversion loads
+too. Its weights are read one
 tensor at a time, straight from the safetensors header's offsets: loading the 4.1 GB shard whole would hold the text
-weights a second time on a 16 GB Mac. E2B's and E4B's towers are the same; only the projection's output width differs.
+weights a second time on a 16 GB Mac. E2B's and E4B's towers have the same architecture (the files say so: their
+`vision_config` blocks match outside the projection's width); only E2B has been run here.
 
 Grammars (tools, `response_format`) apply as for text. Streaming and cancelling work as for text. An image request
 does not use the prompt cache, and its reply is not remembered as a token stream.

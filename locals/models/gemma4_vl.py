@@ -41,7 +41,7 @@ VISION_MODELS = ("gemma4",)
 # Checkpoint name -> our parameter name: vision_tower.* keeps its suffix, embed_vision.* its prefix.
 _TOWER = "vision_tower."
 _EMBED = "embed_vision."
-_CLAMPS = ("input_max", "input_min", "output_max", "output_min")  # (mlx-lm drops these too: see load_tower)
+_CLAMPS = ("input_max", "input_min", "output_max", "output_min")  # (a tower linear's bounds: ClippedLinear)
 
 
 @dataclass
@@ -61,6 +61,9 @@ class VisionConfig:
     rope_theta: float = 100.0
     hidden_activation: str = "gelu_pytorch_tanh"
     standardize: bool = False
+    use_clipped_linears: bool = True
+    # the embed_vision projection's layout, as the checkpoint's tensors have it (load_tower fills this in)
+    embed_quantized: bool = False
     # text side
     text_hidden_size: int = 1536
     pad_token_id: int = 0
@@ -149,15 +152,28 @@ class RMSNorm(nn.Module):
 
 
 class ClippedLinear(nn.Module):
-    """``Gemma4ClippableLinear`` without its clamps: the checkpoint's clamps are not used by mlx-lm either
-    (sanitize drops ``input_min`` / ``input_max`` / ``output_min`` / ``output_max``), and the values in these
-    files are not the ones the reference was trained with."""
+    """``Gemma4ClippableLinear``: the checkpoint bounds each tower linear's input and output
+    (``use_clipped_linears``: ``input_min`` / ``input_max`` / ``output_min`` / ``output_max``, finite in these
+    files: layer 0's gate projection holds [-2.45, 2.44], layer 15's o_projection [-2.27, 2.25]), and transformers
+    clamps with them, so an activation past one is a feature the reference never produces. A checkpoint that says
+    no carries no such tensors, and then this is a plain linear (``linear`` is the module's name in both)."""
 
-    def __init__(self, in_dim: int, out_dim: int):
+    def __init__(self, cfg: VisionConfig, in_dim: int, out_dim: int):
         self.linear = nn.Linear(in_dim, out_dim, bias=False)
+        self.clipped = cfg.use_clipped_linears
+        if self.clipped:
+            inf = float("inf")
+            self.input_min = mx.array(-inf, dtype=mx.float32)
+            self.input_max = mx.array(inf, dtype=mx.float32)
+            self.output_min = mx.array(-inf, dtype=mx.float32)
+            self.output_max = mx.array(inf, dtype=mx.float32)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.linear(x)
+        if not self.clipped:
+            return self.linear(x)
+        x = mx.clip(x, self.input_min.astype(x.dtype), self.input_max.astype(x.dtype))
+        y = self.linear(x)
+        return mx.clip(y, self.output_min.astype(y.dtype), self.output_max.astype(y.dtype))
 
 
 class PatchEmbedder(nn.Module):
@@ -195,10 +211,10 @@ class Attention(nn.Module):
         self.num_heads = cfg.num_attention_heads
         self.kv_heads = cfg.kv_heads
         self.head_dim = cfg.dim
-        self.q_proj = ClippedLinear(cfg.hidden_size, self.num_heads * self.head_dim)
-        self.k_proj = ClippedLinear(cfg.hidden_size, self.kv_heads * self.head_dim)
-        self.v_proj = ClippedLinear(cfg.hidden_size, self.kv_heads * self.head_dim)
-        self.o_proj = ClippedLinear(self.num_heads * self.head_dim, cfg.hidden_size)
+        self.q_proj = ClippedLinear(cfg, cfg.hidden_size, self.num_heads * self.head_dim)
+        self.k_proj = ClippedLinear(cfg, cfg.hidden_size, self.kv_heads * self.head_dim)
+        self.v_proj = ClippedLinear(cfg, cfg.hidden_size, self.kv_heads * self.head_dim)
+        self.o_proj = ClippedLinear(cfg, self.num_heads * self.head_dim, cfg.hidden_size)
         self.q_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
         self.v_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps, with_scale=False)
@@ -222,9 +238,9 @@ class Attention(nn.Module):
 
 class MLP(nn.Module):
     def __init__(self, cfg: VisionConfig):
-        self.gate_proj = ClippedLinear(cfg.hidden_size, cfg.intermediate_size)
-        self.up_proj = ClippedLinear(cfg.hidden_size, cfg.intermediate_size)
-        self.down_proj = ClippedLinear(cfg.intermediate_size, cfg.hidden_size)
+        self.gate_proj = ClippedLinear(cfg, cfg.hidden_size, cfg.intermediate_size)
+        self.up_proj = ClippedLinear(cfg, cfg.hidden_size, cfg.intermediate_size)
+        self.down_proj = ClippedLinear(cfg, cfg.intermediate_size, cfg.hidden_size)
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.down_proj(nn.gelu_approx(self.gate_proj(x)) * self.up_proj(x))
@@ -272,13 +288,18 @@ class Encoder(nn.Module):
 
 
 class MultimodalEmbedder(nn.Module):
-    """``Gemma4MultimodalEmbedder``: RMSNorm without scale, then the (quantized) projection to text width."""
+    """``Gemma4MultimodalEmbedder``: RMSNorm without scale, then the projection to the text model's width. The
+    projection is quantized in mlx-community's conversions and plain in an unquantized one (or at other bits than
+    the file's default): ``cfg.embed_quantized``, which ``load_tower`` reads from the tensors."""
 
     def __init__(self, cfg: VisionConfig):
         self.embedding_pre_projection_norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps, with_scale=False)
-        self.embedding_projection = nn.QuantizedLinear(cfg.hidden_size, cfg.text_hidden_size, bias=False,
-                                                       group_size=cfg.quant_group_size, bits=cfg.quant_bits,
-                                                       mode=cfg.quant_mode)
+        if cfg.embed_quantized:
+            self.embedding_projection = nn.QuantizedLinear(cfg.hidden_size, cfg.text_hidden_size, bias=False,
+                                                           group_size=cfg.quant_group_size, bits=cfg.quant_bits,
+                                                           mode=cfg.quant_mode)
+        else:
+            self.embedding_projection = nn.Linear(cfg.hidden_size, cfg.text_hidden_size, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.embedding_projection(self.embedding_pre_projection_norm(x))
@@ -362,7 +383,7 @@ def _weights(path: Path) -> List[Tuple[str, mx.array]]:
             if not isinstance(header, dict):
                 continue
             for k, meta in header.items():
-                if k == "__metadata__" or any(c in k for c in _CLAMPS):
+                if k == "__metadata__":
                     continue
                 if k.startswith(_TOWER):
                     out.append((k[len(_TOWER):], _tensor(fh, header_len, meta)))
@@ -371,12 +392,43 @@ def _weights(path: Path) -> List[Tuple[str, mx.array]]:
     return out
 
 
+def _embed_layout(cfg: VisionConfig, weights) -> VisionConfig:
+    """``cfg`` with the ``embed_vision`` projection's layout as the checkpoint's tensors have it: mlx-lm's rule
+    (``f"{path}.scales" in weights``), so an unquantized conversion loads as a plain linear and one packed at other
+    bits than the file's default loads at its own. The shape of the packed weight and of the scales say the bits and
+    the group size, and the scales' dtype says the mode (only affine keeps them in the weight's own dtype)."""
+    from dataclasses import replace
+
+    w = dict(weights)
+    prefix = _EMBED + "embedding_projection."
+    if prefix + "scales" not in w:
+        return replace(cfg, embed_quantized=False)
+    in_dim = cfg.hidden_size
+    group_size = in_dim // w[prefix + "scales"].shape[-1]
+    bits = (w[prefix + "weight"].shape[-1] * 32) // in_dim
+    if w[prefix + "scales"].dtype != mx.uint8:
+        mode = "affine"
+    elif (bits, group_size) == (4, 16):
+        mode = "nvfp4"
+    elif (bits, group_size) == (4, 32):
+        mode = "mxfp4"
+    elif (bits, group_size) == (8, 32):
+        mode = "mxfp8"
+    else:
+        raise ValueError(f"{prefix} is packed at {bits} bits with group size {group_size}, which mlx cannot read")
+    return replace(cfg, embed_quantized=True, quant_bits=bits, quant_group_size=group_size, quant_mode=mode)
+
+
 def load_tower(model_dir: Path, dtype, cfg: VisionConfig) -> Optional[VisionTower]:
     """The tower for a checkpoint (``cfg``: its vision_config), its floating weights cast to the text model's
-    dtype (None: the files hold no vision weights)."""
+    dtype (None: the files hold no vision weights). What the configuration alone cannot say -- whether the
+    projection is quantized, at which bits, and whether the linears clamp -- comes from the tensors."""
     weights = _weights(model_dir)
     if not weights:
         return None
+    cfg = _embed_layout(cfg, weights)
+    if not cfg.use_clipped_linears:  # (a checkpoint that clamps none carries no bounds to load)
+        weights = [(k, v) for k, v in weights if not k.endswith(_CLAMPS)]
     tower = VisionTower(cfg)
     cast = []
     for k, v in weights:

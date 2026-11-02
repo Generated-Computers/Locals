@@ -6,8 +6,9 @@
   `model_type` `gemma4` from the config, and the tower is rebuilt from the same files in `locals/models/gemma4_vl.py`
   (transformers' `Gemma4VisionModel` step for step: 16x16 patches, a learned 2-D position table, 16 bidirectional blocks
   with an axial RoPE over the whole head and scale 1, a 3x3 average pool times `sqrt(hidden_size)` in float32, then an
-  RMSNorm without scale and the 5-bit quantized projection to the text width; the checkpoint's clamp tensors are not
-  used). Two Gemma details the text path needed: its prompt's `<|image|>` expands to `<|image>` + 280-or-fewer soft
+  RMSNorm without scale and the quantized projection to the text width, with every tower linear clamped to the bounds
+  the checkpoint holds, as transformers' `Gemma4ClippableLinear` does; leaving the clamps out moved an image's features
+  by 34% on average). Two Gemma details the text path needed: its prompt's `<|image|>` expands to `<|image>` + 280-or-fewer soft
   tokens + `<image|>`, and its text model's per-layer token embeddings (PLE, its "E" in E2B) are looked up from the token
   ids, so the engine now feeds `per_layer_inputs` for each chunk's tokens, the pad token's row where an image's features
   go. Its tower's features are divided by the text model's `embed_scale` (`sqrt(text hidden_size)`) first, and its text
