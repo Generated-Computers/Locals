@@ -12,8 +12,12 @@ def _svc():
     return s
 
 
-def test_tuning_while_idle_waits_for_the_other_engine(monkeypatch):
+def test_tuning_while_idle_waits_for_the_other_engine(tmp_path, monkeypatch):
     tuned = []
+    # the tuner also waits for another locals server on this machine (locals.kernels.others_busy), reading the
+    # real busy-<pid> markers and taking the real tuning.lock: give it a directory of its own, or a server working
+    # while the suite runs keeps the other engine's ``_inflight`` from being the thing under test
+    monkeypatch.setattr("locals.kernels._BUSY_DIR", str(tmp_path))
     monkeypatch.setattr("locals.kernels.tune_one", lambda mod, M: tuned.append(M))
     ours, stock = _svc(), _svc()
     monkeypatch.setattr(service, "_SERVICES", service.weakref.WeakSet([ours, stock]))
