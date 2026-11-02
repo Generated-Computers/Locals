@@ -625,11 +625,12 @@ To re-tune from scratch, stop every Locals server, delete the cache file (or poi
 | `qwen3.5-4b` | `mlx-community/Qwen3.5-4B-MLX-4bit` |
 | `qwen3.5-2b` | `mlx-community/Qwen3.5-2B-MLX-4bit` |
 | `gemma-4-e4b` | `mlx-community/gemma-4-e4b-it-4bit` |
+| `gemma-4-e2b` | `mlx-community/gemma-4-e2b-it-5bit` (4.1 GB; the E2B's own 5-bit build) |
 | `lfm2.5-2.6b` | `LiquidAI/LFM2.5-2.6B-MLX-4bit` (1.6 GB: 8 GB Macs) |
 | `minicpm5-2b` | `mlx-community/MiniCPM5-2B-mlx-4Bit` (1.4 GB) |
 | `lfm3-1.7b` | `LiquidAI/LFM3-1.7B-MLX-4bit` (1.0 GB; its code ships with Locals, `locals/models/lfm3.py`) |
 
-`ALIASES` maps more names onto these: `qwen` and `qwen3.5` to the 4B; `gemma`, `gemma4`, `gemma-4`, `gemma4-e4b` and `gemma-4-e4b-it` to Gemma 4 E4B; `lfm` and `lfm2.5`; `lfm3`; `minicpm` and `minicpm5` (`defaults.py`).
+`ALIASES` maps more names onto these: `qwen` and `qwen3.5` to the 4B; `gemma`, `gemma4`, `gemma-4`, `gemma4-e4b` and `gemma-4-e4b-it` to Gemma 4 E4B; `gemma4-e2b`, `gemma-4-e2b-it` and `gemma4-e2b-it` to Gemma 4 E2B; `lfm` and `lfm2.5`; `lfm3`; `minicpm` and `minicpm5` (`defaults.py`).
 
 - **`default_model()`** reads the Mac's memory with `sysctl -n hw.memsize`. It picks `qwen3.5-2b` when memory is known and below 12 GB, and `qwen3.5-4b` otherwise, including when memory is unknown (`defaults.memory_gb`, `defaults.default_model`). The 4B (3 GB of weights, 64k context) and its prompt cache do not fit next to macOS in 8 GB. `DEFAULT_MODEL` is computed once, at import (`defaults.py`).
 - **`model_id(name)`** resolves a `--model` value; every command uses it as the argparse `type` (for example `server.main`). Resolution order (`defaults.model_id`):

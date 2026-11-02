@@ -430,12 +430,14 @@ In a stream, tool calls are collected and sent in the final `done` line. Errors 
 
 ## Images
 
-Qwen3.5 and Qwen3-VL read images on our engine (`vision_config` in `locals/models/qwen3_5_vl.py` decides, from the
-checkpoint's `config.json`: a vision tower with Qwen's patch values (16x16 patches over two frames, merged 2x2: the
-only ones `vision.preprocess` cuts), and an interleaved M-RoPE split that covers the rotated dims; and
-`has_tower`, from its safetensors files' headers: the tower's weights are in them). mlx-lm keeps
-only the text half of such a checkpoint, so the tower is rebuilt from the same files (`locals/models/qwen3_5_vl.py`) and loaded with the
-first image, not at start. Any other model, and the stock engine, gets `IMAGE_NOTE` in each image's place, as before.
+Qwen3.5, Qwen3-VL and Gemma 4 read images on our engine. `vision.family` reads the checkpoint's `config.json`:
+`model_type` `gemma4` is Gemma's tower (`vision_config` in `locals/models/gemma4_vl.py`), anything else Qwen's
+(`locals/models/qwen3_5_vl.py`, which also decides from the config: a vision tower with Qwen's patch values, 16x16
+patches over two frames merged 2x2: the only ones `vision.preprocess` cuts for it, and an interleaved M-RoPE split
+that covers the rotated dims). For either, `has_tower` reads the checkpoint's safetensors headers: the tower's
+weights are in them. mlx-lm keeps only the text half of such a checkpoint (its `sanitize` drops the tower), so the
+tower is rebuilt from the same files and loaded with the first image, not at start. Any other model, and the stock
+engine, gets `IMAGE_NOTE` in each image's place, as before.
 
 An image is an OpenAI `image_url` part (`{"url": "data:image/png;base64,..."}`, or, on a server bound to loopback
 only, an `http(s)` URL or a file path), or `input_image` (the Responses API). A server other machines can reach fetches
@@ -445,14 +447,20 @@ into those (above). Images in user and tool messages are read; one in a system m
 template refuses it there).
 
 1. `Server.prepare` (the HTTP thread) takes the images out of the messages (`vision.take_images`): each becomes the
-   template's `<|vision_start|><|image_pad|><|vision_end|>` text. It decodes and resizes each one (`vision.load`): both
-   sides a multiple of 32 pixels, at most `LOCALS_VISION_MAX_PIXELS` pixels (default 1,048,576), as the model was
-   trained (transformers' `smart_resize`), and cuts it into 16x16-pixel patches in the order the tower's 2x2 merger
-   reads them. This is numpy, not MLX: an MLX array made in the HTTP thread belongs to that thread's stream, and the
-   engine's thread cannot compute it. For `count_tokens` it reads only each image's size from its header
-   (`vision.measure`): the same count, with no pixels decoded.
-2. The prompt is tokenized whole (not from a remembered token stream) and each `<|image_pad|>` is expanded to the
-   image's token count, one per 32x32 pixels (`vision.expand`). The context limit counts those tokens.
+   template's mark for one image, `<|vision_start|><|image_pad|><|vision_end|>` for Qwen and `<|image|>` for Gemma
+   (`vision.MARKS`). It decodes and resizes each one (`vision.load`): for Qwen, both sides a multiple of 32 pixels, at
+   most `LOCALS_VISION_MAX_PIXELS` pixels (default 1,048,576), as the model was trained (transformers'
+   `smart_resize`), cut into 16x16-pixel patches in the order the tower's 2x2 merger reads them. For Gemma, both sides
+   a multiple of 48 (pool 3 x patch 16), the aspect ratio kept within 280 soft tokens, and 16x16 patches in raster
+   order, channels last inside a patch, rescaled to [0, 1] (`vision.gemma_resize`, transformers'
+   `get_aspect_ratio_preserving_size`; its patch embedder applies `2 * (pixel - 0.5)` itself). This is numpy, not
+   MLX: an MLX array made in the HTTP thread belongs to that thread's stream, and the engine's thread cannot compute
+   it. For `count_tokens` it reads only each image's size from its header (`vision.measure`): the same count, with no
+   pixels decoded.
+2. The prompt is tokenized whole (not from a remembered token stream) and each placeholder is expanded to the image's
+   token count: one token per 32x32 pixels for Qwen, per 48x48 for Gemma (280 at most) (`vision.expand`). Gemma's
+   `<|image|>` becomes `<|image>` + the soft tokens + `<image|>`; only the soft ones take the tower's features. The
+   context limit counts those tokens.
 3. The job carries the images and where their tokens sit (`Job.pictures`, `Job.spans`). It becomes a batch request
    as a text job does (`BatchService._source`), and joins the running rows when there is room for it. When the batch
    admits it, its prompt is read alone (`Request.image`, a `vision.ImagePrompt` made by `BatchService._image_prompt`), unless
@@ -460,7 +468,9 @@ template refuses it there).
    placeholders' place, and the prompt is read with M-RoPE (`Engine.prefill_embedded`): each image token's position
    is its (frame, row, column), and the full-attention layers' RoPE is swapped for `vision.MRoPE` while the prompt is
    read, split over the frequencies as the checkpoint says (`mrope_section`: Qwen3.5's `[11, 11, 10]` over 64 of
-   each head's 256 dims, Qwen3-VL's `[24, 20, 20]` over all 128). The running rows wait while it is read, as they
+   each head's 256 dims, Qwen3-VL's `[24, 20, 20]` over all 128). Gemma 4 has no M-RoPE: its image tokens take
+   ordinary positions, so its `ImagePrompt` carries no positions, `prefill_embedded` skips the swap, and its reply's
+   rope delta is 0. The running rows wait while it is read, as they
    wait for a text prompt read at an admission. The reply then decodes in the batch with the other rows. Past the
    prompt, a token's three positions are one number, its index plus a fixed delta (`vision.rope_delta`, negative:
    an image takes fewer positions than tokens), and M-RoPE with equal positions is the layer's own RoPE. So the row's
@@ -482,12 +492,29 @@ template refuses it there).
    (`docs/measurements/vision/results/turn2_cost.txt`).
 4. Qwen3-VL's tower also merges the output of its blocks 8, 16 and 24 (`deepstack_visual_indexes`). While the prompt
    is read, the text model adds those to the image's tokens after its layers 0, 1 and 2 (`vision.deepstack`, as
-   transformers' `_deepstack_process`). Qwen3.5 has none.
+   transformers' `_deepstack_process`). Qwen3.5 and Gemma 4 have none, so `vision.deepstack` leaves the text model's
+   layers alone for them.
 5. The prompt is read a chunk at a time, as a text prompt is, and each chunk's embeddings are made for it
    (`vision.embed_chunk`): the image's features go only into the chunks that hold its tokens, and so do the deepstack
    features. Made for the whole prompt at once, they were kept next to the KV cache until it was read: on an M2 Max,
    a 36,691-token prompt with one image peaked at 12,363 MB on Qwen3-VL-8B 4-bit, and 11,231 MB a chunk at a time,
    with the same reply (`docs/measurements/vision/results/prefill_memory.txt`).
+6. Gemma 4's text model adds a per-layer token embedding to every position (PLE: its "E" in E2B/E4B, effective
+   parameters). Those are looked up from the token ids, not from the input embeddings, which at an image's positions
+   are the tower's features, so each chunk also carries `vision.per_layer_chunk`: the per-layer table's rows for the
+   chunk's tokens, the pad token's row where an image's features go (transformers feeds its text model the pad id
+   there too). `Engine._read_embedded` passes them as `per_layer_inputs` when the text model has an
+   `embed_tokens_per_layer` table. The tower's features are divided by the text model's `embed_scale`
+   (`sqrt(text hidden_size)`, `VisionTower.feature_scale`) first: mlx-lm multiplies every input embedding by it and
+   transformers does not scale image features.
+
+Gemma 4's tower (`locals/models/gemma4_vl.py`) is transformers' `Gemma4VisionModel` step for step: 16x16 patches
+through one linear plus a learned 2-D position table, 16 bidirectional pre-norm blocks whose attention rotates an
+axial (H-H-W-W) RoPE over the whole head with scale 1, a 3x3 average pool times `sqrt(hidden_size)` in float32, then
+the `embed_vision` RMSNorm (no scale) and its 5-bit quantized projection to the text width. The checkpoint's clamp
+tensors (`input_min`/`output_min` and the rest) are not used, as mlx-lm drops them too. Its weights are read one
+tensor at a time, straight from the safetensors header's offsets: loading the 4.1 GB shard whole would hold the text
+weights a second time on a 16 GB Mac. E2B's and E4B's towers are the same; only the projection's output width differs.
 
 Grammars (tools, `response_format`) apply as for text. Streaming and cancelling work as for text. An image request
 does not use the prompt cache, and its reply is not remembered as a token stream.
@@ -509,6 +536,15 @@ own prompt, Qwen3-VL-8B then gave the same answers on four of the six and Qwen3.
 Both models read large text in a small picture badly, here and in mlx-vlm alike: "CAT 42" in 64-pixel letters on a
 640x400 picture came back as "cat 2" from Qwen3.5 and "c at a" from Qwen3-VL. The scripts and answers are in
 `docs/measurements/vision/`.
+
+Gemma 4 E2B 5-bit read the invoice picture above ("Customer: Stefan Nowak" answered with the name), two cards in one
+request (the blue square's number, not the red circle's), and a follow-up turn about the same two pictures from the
+prompt cache (533 of its 550 prompt tokens cached, 38 tok/s), on an M2 Max: `tests/test_gemma_vision_model.py`. Its
+tower (300 MB, read out of the 3.9 GB shard without loading it) takes 0.27 s to load and read a 900x500 picture's 264
+soft tokens with the first image, 0.17 s warm. It has not been compared word for word with transformers'
+`Gemma4ForConditionalGeneration`, which needs torch: its tower's arithmetic is checked against the reference's own
+formulas and its processor's resize and patch order (`tests/test_gemma_vision.py`), and the text path against the
+model's own answers.
 
 ## Unloading the model
 

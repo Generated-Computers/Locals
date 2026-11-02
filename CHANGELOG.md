@@ -2,6 +2,22 @@
 
 ## 0.2.2 (unreleased)
 
+- **Images, for Gemma 4 too.** Gemma 4's checkpoints (E2B and E4B) read images as Qwen's do: `vision.family` reads
+  `model_type` `gemma4` from the config, and the tower is rebuilt from the same files in `locals/models/gemma4_vl.py`
+  (transformers' `Gemma4VisionModel` step for step: 16x16 patches, a learned 2-D position table, 16 bidirectional blocks
+  with an axial RoPE over the whole head and scale 1, a 3x3 average pool times `sqrt(hidden_size)` in float32, then an
+  RMSNorm without scale and the 5-bit quantized projection to the text width; the checkpoint's clamp tensors are not
+  used). Two Gemma details the text path needed: its prompt's `<|image|>` expands to `<|image>` + 280-or-fewer soft
+  tokens + `<image|>`, and its text model's per-layer token embeddings (PLE, its "E" in E2B) are looked up from the token
+  ids, so the engine now feeds `per_layer_inputs` for each chunk's tokens, the pad token's row where an image's features
+  go. Its tower's features are divided by the text model's `embed_scale` (`sqrt(text hidden_size)`) first, and its text
+  model has no M-RoPE: an image prompt carries no positions, the prefill skips the swap, and its reply's rope delta is 0.
+  Gemma's images are resized as its processor does (aspect ratio kept, both sides a multiple of 48, 280 soft tokens at
+  most) and cut in raster order. mlx-community/gemma-4-e2b-it-5bit read "Stefan Nowak" from a 900x500 invoice, told
+  two cards' numbers apart in one request, and answered a follow-up turn about them from the prompt cache (533 of 550
+  prompt tokens cached, 38 tok/s; an M2 Max). Its tower takes 0.27 s to load and read a 264-token picture the first
+  time, 0.17 s warm (`tests/test_gemma_vision_model.py`); its arithmetic and processor's resize are checked against
+  transformers' formulas without torch (`tests/test_gemma_vision.py`).
 - **Images, for Qwen3.5 and Qwen3-VL.** Qwen3.5 and Qwen3-VL now read the images in a request (OpenAI `image_url` parts, Anthropic
   `image` blocks, also in a `tool_result`, Ollama's `images`) on our engine; before, each was the note "this model reads text only", which other
   models still get. mlx-lm drops the vision tower of these checkpoints, so it is rebuilt from the same files
