@@ -44,6 +44,8 @@ IMAGE_NOTE = "[an image was attached here; this model reads text only]"
 FILE_NOTE = "[a file was attached here; this model reads only the text of the conversation]"
 IMAGE_PARTS = ("image_url", "image", "input_image")  # an image content part: OpenAI's, the Responses API's
 IMAGE_MARK = "<|vision_start|><|image_pad|><|vision_end|>"  # what Qwen's chat template writes for one image (vision.py)
+GEMMA_IMAGE_MARK = "<|image|>"  # what Gemma 4's chat template writes for one image (vision.py)
+IMAGE_MARKS = (IMAGE_MARK, GEMMA_IMAGE_MARK)
 
 def text_of(content) -> str:
     """The text of an OpenAI message content (a string or a list of parts)."""
@@ -65,7 +67,7 @@ def text_of(content) -> str:
     # neighbours as the template joins it, with nothing between: a newline after it changed Qwen3-VL's answers
     text = ""
     for i, piece in enumerate(out):
-        text += piece if i == 0 or piece == IMAGE_MARK or out[i - 1] == IMAGE_MARK else "\n" + piece
+        text += piece if i == 0 or piece in IMAGE_MARKS or out[i - 1] in IMAGE_MARKS else "\n" + piece
     return text
 
 

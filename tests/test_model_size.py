@@ -84,6 +84,7 @@ def test_ollamas_names_for_the_models():
     """Someone coming from Ollama types its names: qwen3.5:4b, gemma4:e4b, qwen3.5 (its latest)."""
     assert d.model_id("qwen3.5:4b") == d.MODELS["qwen3.5-4b"] and d.model_id("qwen3.5:2b") == d.MODELS["qwen3.5-2b"]
     assert d.model_id("gemma4:e4b") == d.MODELS["gemma-4-e4b"] and d.model_id("qwen3.5:latest") == d.MODELS["qwen3.5-4b"]
+    assert d.model_id("gemma4:e2b") == d.MODELS["gemma-4-e2b"] and d.model_id("gemma4:e2b-it") == d.MODELS["gemma-4-e2b"]
     assert d.model_id("llama3.2:3b") == "llama3.2:3b"  # not one of these: as given (and refused with a reason)
 
 

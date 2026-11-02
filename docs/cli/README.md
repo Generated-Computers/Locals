@@ -61,6 +61,7 @@ The `type=model_id` converter in `locals/defaults.py` resolves names as follows:
   | `qwen3.5-4b` | `qwen`, `qwen3.5` | `mlx-community/Qwen3.5-4B-MLX-4bit` |
   | `qwen3.5-2b` | | `mlx-community/Qwen3.5-2B-MLX-4bit` |
   | `gemma-4-e4b` | `gemma`, `gemma4`, `gemma-4`, `gemma4-e4b`, `gemma-4-e4b-it` | `mlx-community/gemma-4-e4b-it-4bit` |
+  | `gemma-4-e2b` | `gemma4-e2b`, `gemma-4-e2b-it`, `gemma4-e2b-it` | `mlx-community/gemma-4-e2b-it-5bit` |
   | `lfm2.5-2.6b` | `lfm`, `lfm2.5` | `LiquidAI/LFM2.5-2.6B-MLX-4bit` |
   | `minicpm5-2b` | `minicpm`, `minicpm5` | `mlx-community/MiniCPM5-2B-mlx-4Bit` |
   | `lfm3-1.7b` | `lfm3` | `LiquidAI/LFM3-1.7B-MLX-4bit` |

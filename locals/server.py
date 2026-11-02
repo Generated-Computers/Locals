@@ -104,9 +104,11 @@ def _origin_ok(origin: str) -> bool:
     return u.scheme in _APP_SCHEMES
 
 
-def _reads_images(svc) -> bool:
-    """Whether a loaded service reads this model's images (the test fakes have no ``vision``)."""
-    return svc is not None and getattr(svc, "vision", lambda: None)() is not None
+def _vision_encoder(svc):
+    """``svc``'s vision encoder if it reads this model's images, else None: asked once, and both facts a request
+    needs of it (whether it reads them, and which tower) come from the one Encoder (the test fakes have no
+    ``vision``)."""
+    return getattr(svc, "vision", lambda: None)() if svc is not None else None
 
 
 @dataclass(frozen=True)
@@ -133,16 +135,21 @@ class LoadedModel:
     # so snapshots of it would only hold the prompt's KV two more times (5 GB for a 20k-token prompt on an 8B model).
     # (BatchService.needs_checkpoints)
     needs_checkpoints: bool
+    # which vision tower reads this model's images (vision.family: "qwen" or "gemma"), for the prompt's placeholder,
+    # its boi/eoi and how its images are preprocessed; "qwen" for a load whose service has no vision
+    vision_family: str = "qwen"
 
     @classmethod
     def of(cls, svc) -> "LoadedModel":
         """``svc``'s LoadedModel, read while no unload can finish it (made by Server.loaded, under the engine's load
         lock)."""
         tok = svc.tokenizer
-        return cls(svc, tok, _reads_images(svc), fmt=formats.detect(tok), thinking_style=formats.thinking_style(tok),
+        enc = _vision_encoder(svc)  # (one Encoder: its family is read from the same config that says it reads images)
+        return cls(svc, tok, enc is not None, fmt=formats.detect(tok), thinking_style=formats.thinking_style(tok),
                    thinks=formats.offers_thinking(tok), sealed=formats.thinks_when_off(tok),
                    seps={"gap": formats.call_gap(tok), "think_gap": formats.think_gap(tok)},
-                   needs_checkpoints=svc.needs_checkpoints)
+                   needs_checkpoints=svc.needs_checkpoints,
+                   vision_family=getattr(enc, "family", "qwen") if enc is not None else "qwen")
 
 
 def _host_ok(host_header: Optional[str], bind_host: str) -> bool:
@@ -452,10 +459,11 @@ class Server:
         raw_msgs = req.get("messages") or []
         pictures = []
         if vision.has_images(raw_msgs) and loaded.reads_images:
-            # each image as the template's <|image_pad|> (expanded below to the image's own tokens); a model or engine
+            # each image as the template's mark for one (expanded below to the image's own tokens); a model or engine
             # that reads text only gets the note IMAGE_NOTE in its place, from convert_messages
-            raw_msgs, sources = vision.take_images(raw_msgs)
-            pictures = vision.load(sources, local=self.bind_host in _LOOPBACK, count=count)
+            raw_msgs, sources = vision.take_images(raw_msgs, loaded.vision_family)
+            pictures = vision.load(sources, local=self.bind_host in _LOOPBACK, count=count,
+                                   family=loaded.vision_family)
         msgs = oai.convert_messages(raw_msgs, raw=self._raw if fmt.replay_raw else None)
         tools = oai.tool_specs(req.get("tools"))
         _volatile_to_end(msgs, tools)

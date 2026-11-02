@@ -8,6 +8,7 @@ known tokens costs one weight-streaming pass instead of m decode steps.
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
 
@@ -1316,19 +1317,24 @@ class Engine:
                          cancel=None, start: int = 0, stop: Optional[int] = None) -> bool:
         """Read ``prompt[start:stop]`` (default ``prompt[:-1]``) into ``cache``, which holds ``prompt[:start]``, with its
         input embeddings given (``generate_embedded`` says what the arguments hold; ``positions`` needs to cover only
-        the prompt; ``spans`` and ``features`` only the images from ``start`` on), with M-RoPE for this call only. The
+        the prompt; ``spans`` and ``features`` only the images from ``start`` on), with M-RoPE for this call only
+        (``positions`` None: the model has none, as Gemma 4; its image tokens take ordinary positions). The
         last prompt token is left for the first decode step, as ``_prefill`` leaves it. False if ``cancel()``, asked
         between chunks, stopped it."""
         from .vision import mrope
 
-        with mrope(self.model, positions, section):
+        with (nullcontext() if positions is None else mrope(self.model, positions, section)):
             return self._read_embedded(cache, prompt, spans, features, deepstack, cancel, start,
                                        len(prompt) - 1 if stop is None else stop)
 
     def _read_embedded(self, cache, prompt, spans, features, deepstack, cancel, start: int = 0, stop: Optional[int] = None) -> bool:
-        from .vision import deepstack as deepstack_layers, embed_chunk
+        from .vision import deepstack as deepstack_layers, embed_chunk, ple_ids
 
-        body = text_model(self.model).model
+        body = text_model(self.model).model  # (the decoder body: the wrapper's .model, as _prefill's own call)
+        # Gemma 4's text model adds a per-layer token embedding to every position (PLE) looked up from the token
+        # ids, not from the input embeddings, which at an image's positions are the tower's features: the chunk's
+        # ids go with them, the pad token where an image's features are, as transformers feeds llm_input_ids
+        per_layer = getattr(body, "embed_tokens_per_layer", None) is not None
         # each chunk's embeddings made for it, as _prefill's: the whole prompt's (and, for Qwen3-VL, one as long
         # per deepstack level) were kept next to the KV cache until the prompt was read
         i = start
@@ -1339,7 +1345,8 @@ class Engine:
                     return False  # (between chunks: an unload or a client gone)
                 n = min(self.prefill_step, stop - i)
                 state["at"] = i
-                body(None, cache, input_embeddings=embed_chunk(body, prompt, spans, features, i, n))
+                ids = ple_ids(body, prompt, spans, i, n) if per_layer else None
+                body(ids, cache, input_embeddings=embed_chunk(body, prompt, spans, features, i, n))
                 mx.eval([c.state for c in cache])
                 i += n
         return True
@@ -1350,8 +1357,9 @@ class Engine:
         """Generate from a prompt whose input embeddings are given: ``spans`` says where each image's
         tokens sit in ``prompt`` and ``features`` holds the vision tower's block for it. ``positions``
         (3, 1, len(prompt) + max_tokens) is the M-RoPE position of every token, prompt and reply, split over the
-        frequencies by ``section``. ``deepstack`` (Qwen3-VL) holds, per layer, each image's features that the text
-        model adds to the image's tokens after that layer while the prompt is read.
+        frequencies by ``section`` (``positions`` None: the model has no M-RoPE, as Gemma 4). ``deepstack``
+        (Qwen3-VL) holds, per layer, each image's features that the text model adds to the image's tokens after
+        that layer while the prompt is read.
 
         One request on the synchronous engine, with M-RoPE through the reply too: the reference the batch engine's
         image rows are tested against (they decode with the layers' own rope and a per-row offset,
@@ -1364,6 +1372,6 @@ class Engine:
         def prefill(cache):  # (stopped by cancel: the decode loop ends it as cancelled)
             self._read_embedded(cache, prompt, spans, features, deepstack, cancel)
 
-        with mrope(self.model, positions, section):
+        with (nullcontext() if positions is None else mrope(self.model, positions, section)):
             return self._generate_sync(prompt, ctl, max_tokens, temp, seed, top_p, top_k, prefill=prefill,
                                        on_token=on_token, cancel=cancel)

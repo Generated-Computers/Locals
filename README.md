@@ -2,7 +2,7 @@
 > **Locals-Qwen-Vision is a fork of [Generated-Computers/Locals](https://github.com/Generated-Computers/Locals).** It starts from
 > upstream `main` at commit `b35c46c` and adds two things:
 >
-> - **Images, for Qwen3.5 and Qwen3-VL.** Send images as your API does it: OpenAI `image_url` parts, Anthropic
+> - **Images, for Qwen3.5, Qwen3-VL and Gemma 4.** Send images as your API does it: OpenAI `image_url` parts, Anthropic
 >   `image` blocks, or Ollama's `images`. Upstream Locals puts the note "this model reads text only" in place of
 >   each image. Other models still get that note. A follow-up turn about the same images starts from the prompt
 >   cache: on an M2 Max, a second turn of about 5,700 tokens about two pictures took 0.41 s instead of 7.0 s
@@ -14,7 +14,7 @@
 > **Why vision?** I build a local agent app, and in my tests Locals ran it faster than anything else I tried,
 > Ollama included. But an agent also needs to see: screenshots, photos, scanned pages. That left me with two choices. The first
 > was a separate vision model next to Locals: on a busy Mac that is a lot of extra memory, and on a 16 GB Mac there is
-> simply no room for it. The second was to let Locals read images itself. Qwen3.5 and Qwen3-VL already carry a
+> simply no room for it. The second was to let Locals read images itself. Qwen3.5, Qwen3-VL and Gemma 4 already carry a
 > vision tower in their checkpoint files, but Locals loads its models through mlx-lm, which reads only the text part,
 > so the images had nowhere to go. This fork rebuilds that tower from the same files and loads it with the first
 > image. It is still one model in memory, and text requests run on the same fast engine as before. An image

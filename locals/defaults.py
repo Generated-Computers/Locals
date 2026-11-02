@@ -8,6 +8,7 @@ MODELS = {
     "qwen3.5-4b": "mlx-community/Qwen3.5-4B-MLX-4bit",
     "qwen3.5-2b": "mlx-community/Qwen3.5-2B-MLX-4bit",
     "gemma-4-e4b": "mlx-community/gemma-4-e4b-it-4bit",
+    "gemma-4-e2b": "mlx-community/gemma-4-e2b-it-5bit",  # 4.1 GB (the E2B's own 5-bit build)
     "lfm2.5-2.6b": "LiquidAI/LFM2.5-2.6B-MLX-4bit",  # 1.6 GB: 8 GB Macs
     "minicpm5-2b": "mlx-community/MiniCPM5-2B-mlx-4Bit",  # 1.4 GB
     "lfm3-1.7b": "LiquidAI/LFM3-1.7B-MLX-4bit",  # 1.0 GB (models/lfm3.py until mlx-lm has it)
@@ -31,9 +32,10 @@ MEASURED_M2_PRO = {
 # Models the M2 Pro's 16 GB cannot hold, measured as above on the Mac named ("on")
 MEASURED_ELSEWHERE = {
     "flint": {"weights_gb": 16.6, "mlx": 202, "locals": 319, "on": "an M4 Pro (24 GB)"},
+    "gemma-4-e2b": {"weights_gb": 3.8, "mlx": 187, "locals": 256, "on": "an M2 Max (32 GB)"},
 }
-SHORT = {"qwen3.5-4b": "qwen", "qwen3.5-2b": "qwen3.5-2b", "gemma-4-e4b": "gemma", "lfm2.5-2.6b": "lfm",
-         "minicpm5-2b": "minicpm", "lfm3-1.7b": "lfm3", "flint": "flint"}
+SHORT = {"qwen3.5-4b": "qwen", "qwen3.5-2b": "qwen3.5-2b", "gemma-4-e4b": "gemma", "gemma-4-e2b": "gemma-4-e2b",
+         "lfm2.5-2.6b": "lfm", "minicpm5-2b": "minicpm", "lfm3-1.7b": "lfm3", "flint": "flint"}
 # Agent tasks done in the end-to-end suite (tests/e2e: real agent tools on real coding tasks, an M2 Pro), the same
 # eight for each (OpenCode's four, Hermes's and OpenClaw's two; Qwen3.5-4B also did all 18 with eight tools):
 # Gemma 4 E4B repeats itself on the longer ones (the server's loop guard cuts it) and gives up early (2 to 3 of 8).
@@ -350,12 +352,13 @@ def default_model() -> str:
 DEFAULT_MODEL = default_model()
 ALIASES = {"qwen": "qwen3.5-4b", "qwen3.5": "qwen3.5-4b", "gemma": "gemma-4-e4b", "gemma4": "gemma-4-e4b",
            "gemma-4": "gemma-4-e4b", "gemma4-e4b": "gemma-4-e4b", "gemma-4-e4b-it": "gemma-4-e4b",
+           "gemma4-e2b": "gemma-4-e2b", "gemma-4-e2b-it": "gemma-4-e2b", "gemma4-e2b-it": "gemma-4-e2b",
            "lfm": "lfm2.5-2.6b", "lfm2.5": "lfm2.5-2.6b", "minicpm": "minicpm5-2b", "minicpm5": "minicpm5-2b",
            "lfm3": "lfm3-1.7b",
            "flint-40b": "flint", "flint-3bit": "flint"}
 MODEL_HELP = ("model: qwen (Qwen3.5-4B, the default from 16 GB of memory), qwen3.5-2b (the default below), gemma (Gemma 4 "
-              "E4B), lfm (LFM2.5-2.6B), lfm3 (LFM3-1.7B), minicpm (MiniCPM5-2B), flint (Recursive's Flint, 24 GB Macs and up), or any "
-              "mlx-lm model id or local path")
+              "E4B), gemma-4-e2b (Gemma 4 E2B), lfm (LFM2.5-2.6B), lfm3 (LFM3-1.7B), minicpm (MiniCPM5-2B), flint "
+              "(Recursive's Flint, 24 GB Macs and up), or any mlx-lm model id or local path")
 
 
 def short_name(model: str) -> str:

@@ -32,8 +32,10 @@ class PreparedPrompt:
         stream it continues (the ids the model saw, which the text may not encode to); an image prompt reads none."""
         hf = tokenizer._tokenizer
         if pictures:
+            fam = pictures[0].family
             placed = list(hf.encode(text, add_special_tokens=False))
-            tokens, spans = vision.expand(placed, tokenizer.convert_tokens_to_ids(vision.IMAGE_TOKEN), pictures)
+            token, boi, eoi = vision.prompt_tokens(tokenizer, fam)
+            tokens, spans = vision.expand(placed, token, pictures, boi, eoi)
             return cls(text, tokens, tuple(pictures), tuple(spans), tuple(placed), tokenizer)
         seen = remembered(text) if remembered is not None else None
         if seen is None:
@@ -59,5 +61,5 @@ class PreparedPrompt:
         # where the prompt's tokens and these part (the last token may merge with what follows): one pass
         # (backing off a token at a time cost seconds on a 60k-token prompt)
         n = next((k for k, (a, b) in enumerate(zip(placed, ids)) if a != b), min(len(placed), len(ids)))
-        at = vision.expanded_at(n, self.spans)
+        at = vision.expanded_at(n, self.spans, self.pictures)
         return at if at >= 1024 and n < len(placed) else None
