@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.2 (unreleased)
+## 0.2.2 (2026-11-04)
 
 - **Qwenputer**, in two versions (`--model qwenputer` and `--model qwenputer-cpu`: divagr1925/Qwen3.5-4B-Qwenputer):
   Qwen3.5-4B with a RISC-V computer compiled into 11 layers before Qwen's own, which runs the model's `calc` tool
