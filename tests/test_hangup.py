@@ -117,3 +117,19 @@ def test_alive_reads_a_closed_socket_as_gone(ready):
         assert not srv_mod._alive_socket(a)
     a.close()
     b.close()
+
+
+def test_a_finished_job_wakes_its_handler_at_once():
+    """The service hands a finished job's token callback an empty batch: the handler waiting on its queue (a look every
+    0.25 s) writes the reply now."""
+    from locals import service
+
+    svc = service.BatchService.__new__(service.BatchService)
+    svc._inflight, svc.tokenizer = {}, SimpleNamespace(decode=lambda t: "")
+    got = []
+    job = service.Job([1], on_token=got.append)
+    svc._finish(job, [5], "stop")
+    assert job.done and job.tokens == [5] and got == [[]]
+    job = service.Job([1], on_token=lambda t: 1 / 0)  # (a callback that fails does not fail the finish)
+    svc._finish(job, [5], "stop")
+    assert job.done

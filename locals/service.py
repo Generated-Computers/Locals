@@ -365,6 +365,13 @@ class BatchService:
         job.t_done = time.perf_counter()
         self._inflight.pop(id(job), None)
         job._event.set()
+        if job.on_token is not None:
+            # the handler waiting on the job's tokens hears now that it is done, not at its next look, up to 0.25 s
+            # later (a gap every reply's client waited out, and with it the client's next request)
+            try:
+                job.on_token([])
+            except Exception:  # noqa: BLE001
+                pass
 
     def _main(self):
         try:
