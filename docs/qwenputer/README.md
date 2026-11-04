@@ -189,6 +189,29 @@ trace tokens (1 to 2 s on a core) for most of them; `stats` of 8 numbers 37,000,
 about 90 trace tokens a step: a loop of 100 rounds is 63,000 (15 s), and at its 1,250 steps a run is at most about
 215,000, whatever the program does (measured on the reference machine).
 
+## What made the tools cheaper
+
+A tool's time on the computer is the length of its run: every trace token is one step through all 11 layers, about
+0.3 ms on a core. These changes made the runs shorter, in trace tokens (measured on the reference machine when each
+change was made):
+
+| Tool | What changed | Before | After |
+|---|---|---|---|
+| `calc` under the toolbox | a call whose first rows are calc's goes on in calc's code at once, checked a word at a time, instead of the dispatcher reading its name a byte at a time and saving every register | 473 more than calc's own | 52 more |
+| `count`, 1,100 characters | letters folded with a table, not a call a byte | 38,000 | 16,000 |
+| `count_letters`, 1,100 characters | the same, and the letters as a 26-bit mask | 63,000 | 20,000 |
+| `sort`, 201 numbers | a Shell sort | 206,000 | 88,000 |
+| `stats`, 120 numbers | sorted, summed and squared in machine words where the numbers fit 62 bits; big division a word at a time (Knuth's algorithm D) | 369,000 | 141,000 |
+| `run_python`, a 20-line program | names found through first-letter chains, not by going through each list; operators by precedence climbing, not a call for each of six levels | 139,000 | 92,000 |
+| `run_python`, a 36-line program | the same | 240,000 | 151,000 |
+
+Measured in the computer's instructions (a trace token is about 1.3 of them), on inputs of about 950 tokens: `json_get`
+of `[*].name` 137,000 to 104,000, `column_stats` 224,000 to 95,000 (row numbers in the table's own memory, 24-byte rows,
+the median by selection instead of a sort), `table_totals` 139,000 to 115,000, `table_filter` 108,000 to 89,000. On
+such inputs `regex_find` of `\d+` (it ran out of steps) and `regex_replace` (it ran out of memory) now finish: a greedy
+one-character repeat is one instruction of the regex machine, a class's first byte is skipped to, and a pattern that
+starts with `\b` starts only at word boundaries. Finding where a parameter ends reads 4 bytes a step.
+
 ## The computer's own checks
 
 `qwenputer-cpu`'s (they are programs of its toolbox):
