@@ -511,6 +511,28 @@ def chain_cache(max_size: int, max_bytes: int):
     return ChainCache(max_size=max_size, max_bytes=max_bytes)
 
 
+_SLOT_WAIT = 4  # steps a finished row's slot waits for a request (its client's next one comes about a step later)
+
+
+class _FreedSlot:
+    """A finished row's slot, kept in the batch for a request to take in place (the parked rows' engine): the batch
+    cache is then written one row, instead of copied without the old row and again with the new one. Held as a
+    parked row meanwhile; dropped after _SLOT_WAIT steps, or when no other row is left."""
+
+    class _Held:
+        parked = True
+        eos_ids = ()
+
+        def release(self):
+            return None
+
+    def __init__(self):
+        self.controller = self._Held()
+        self.prompt, self.out, self.fed, self.pend = [], [], [], []
+        self.cancel = False
+        self.max_tokens, self.passes, self.forced, self.parked_steps = 1 << 30, 0, 0, 0
+
+
 class HybridBatchEngine(BatchEngine):
     def __init__(self, model, tokenizer, n_slots: int = 16, share_prefix: bool = True, min_share: int = 64, tail_ok: int = 32):
         # rows of a mixed pass, decode rows and prompt tokens (locals/mixed.py; 0: a new prompt is prefilled
@@ -554,6 +576,10 @@ class HybridBatchEngine(BatchEngine):
         self._next_trim = 0  # the step of the next growth trim (_growth_trim)
         self._reads: Dict[int, int] = {}  # tokens per prefill pass (power of 2) -> most bytes one needed
         self.disk = None  # a DiskPromptCache: system-prompt snapshots kept across restarts
+        self.parks = False  # some controllers park their rows (see "parked rows" below): set by the service
+        import threading
+
+        self._woken = threading.Event()
 
     # -- prefill with prefix snapshots -------------------------------------------------
     def _prefill(self, tokens: List[int], others: List[List[int]], tail_ok: int = 0):
@@ -1026,7 +1052,7 @@ class HybridBatchEngine(BatchEngine):
     # rejected ones are rewound. Without a span or a draft, the row goes back to the pipelined steps.
 
     def _solo_ok(self, r, cache) -> bool:
-        if not _SOLO or cache is None or getattr(self, "_walk", None) is not None:
+        if not _SOLO or cache is None or getattr(self, "_walk", None) is not None or getattr(r.controller, "parked", False):
             return False
         if any(type(c) not in (BatchKVCache, ArraysCache) for c in cache):
             # sliding-window layers (Gemma, Flint) and 8-bit ones (locals/qkv.py) are not rewound, which a draft needs
@@ -1075,6 +1101,8 @@ class HybridBatchEngine(BatchEngine):
         prompt every step); its width follows the recent acceptance."""
         constrained = isinstance(r.controller, LocalsController)
         if (hasattr(r.controller, "step_config") and not constrained) or not self._solo_drafts_ok(cache):
+            return []
+        if not getattr(r.controller, "drafts", True):  # (a controller that takes no drafts: Qwenputer's)
             return []
         if len(r.out) < getattr(r, "solo_resume", 0):  # recent drafts were rejected: plain pipelined steps for a while
             return []
@@ -1184,6 +1212,10 @@ class HybridBatchEngine(BatchEngine):
         arrived meanwhile, the next token to feed, its constraint state); x None: the row is done."""
         t_r = temp if getattr(r, "temp", None) is None else r.temp
         constrained = isinstance(r.controller, LocalsController)
+        if self.parks:
+            for c in cache:
+                if isinstance(c, ArraysCache):
+                    c.held = None
         while True:
             got = arrive(False)
             if got:
@@ -1265,6 +1297,181 @@ class HybridBatchEngine(BatchEngine):
             x = nxt
             r.fed.append(x)
             g = self._advance([r], mx.array([x], dtype=mx.int32), g_after) if constrained else g
+
+    # -- parked rows -------------------------------------------------------------------
+    # A controller may park its row (``parked``: a Qwenputer reply waiting for its computer's run, made in another
+    # thread). The row stays in the batch and its steps read nothing: its recurrent layers keep their state (the
+    # fused single-token step's held flag, gdn_kernel), and the slots its attention layers take in those steps,
+    # which it never reads, become left padding when it goes on (``_settle``: its keys and values rolled once).
+    # ``release()`` gives the tokens it goes on with (fed as a forced span), or None while it waits; ``wake()``
+    # tells a batch whose rows are all parked that one may go on. A reply parked so leaves no prompt-cache entry and
+    # comes back with no prefill (it left the batch and came back as a new request before: 0.2 s of every row's time
+    # an exchange). Only with ``parks`` set.
+
+    def wake(self) -> None:
+        self._woken.set()
+
+    def can_park(self) -> bool:
+        """Whether this model's rows can be parked: attention caches that grow and fused recurrent layers."""
+        from . import fuse
+
+        if not fuse.USE_GDN_KERNEL or any(type(c) not in (KVCache, ArraysCache) for c in make_prompt_cache(self.model)):
+            return False
+        lin = [getattr(l, "linear_attn", None) for l in getattr(self.lm.model, "layers", [])]
+        lin = [m for m in lin if m is not None]
+        return bool(lin) and all(getattr(m, "_gdn_ok", False) for m in lin)
+
+    def _hold(self, cache, rows, reading=()) -> Optional[List[bool]]:
+        """The rows held in the step about to be launched: the parked ones, but one (in ``reading``) that still reads
+        the token that parked it. Sets every recurrent layer's ``held`` flags (None: none held) and counts the slots
+        each held row's attention layers take (to settle)."""
+        held = [bool(getattr(r.controller, "parked", False)) and id(r) not in reading for r in rows]
+        flags = mx.array(held, dtype=mx.int32) if any(held) else None
+        for c in cache:
+            if isinstance(c, ArraysCache):
+                c.held = flags
+        if flags is None:
+            return None
+        for r, h in zip(rows, held):
+            if h:
+                r.parked_steps = getattr(r, "parked_steps", 0) + 1
+        return held
+
+    def _release(self, cache, rows, dead: set) -> None:
+        """Parked rows whose controllers let them go on: their slots settled, the span they go on with to feed. An
+        empty span: the row goes on from what it sampled after the token that parked it (kept: ``park_next``),
+        committed and read next, as a row whose forced span is empty does."""
+        for i, r in enumerate(rows):
+            if not getattr(r.controller, "parked", False) or id(r) in dead:
+                continue
+            span = r.controller.release()
+            if span is None:
+                continue
+            nxt, r.park_next = getattr(r, "park_next", None), None
+            if span:
+                r.out.extend(span)
+                r.forced += len(span)
+                self.tokens_out += len(span)
+                # read in the slots the parked steps took, in a pass of the row's own, but the last token (read next
+                # in the batch, as an admitted prompt's last); the rest a token a step if there were fewer slots
+                a = self._absorb(cache, i, r, span[:min(len(span) - 1, getattr(r, "parked_steps", 0))])
+                r.pend = list(span[a:])
+                continue
+            self._settle(cache, i, r)
+            if nxt is not None:
+                n0 = len(r.out)
+                if self._commit_drip(r, nxt):
+                    r.text = self.tokenizer.decode(r.out)
+                    dead.add(id(r))
+                else:
+                    r.pend = [nxt] + r.pend  # (read next, then its forced span if it made one)
+                self.tokens_out += len(r.out) - n0
+                self._after_commit(r, n0, dead)
+
+    def _absorb(self, cache, i: int, r, span: List[int]) -> int:
+        """Row i reads ``span`` (no more tokens than it has parked slots) in one pass of its own: the row alone, as it
+        was when it parked (its keys and values without the parked slots, its recurrent state), reads the span; its
+        keys and values go in the last of the parked slots, the slots before them become left padding, and its
+        recurrent state is the pass's. Returns how many it read."""
+        E = len(span)
+        k = getattr(r, "parked_steps", 0)
+        if E == 0 or E > k:
+            self._settle(cache, i, r)
+            return 0
+        row = []
+        for c in cache:
+            if isinstance(c, BatchKVCache):
+                pad, n = int(c.left_padding[i].item()), c._idx
+                kv = KVCache()
+                kv.keys, kv.values = c.keys[i:i + 1, :, pad:n - k, :], c.values[i:i + 1, :, pad:n - k, :]
+                kv.offset = n - k - pad
+                row.append(kv)
+            else:
+                a = ArraysCache(len(c.cache))
+                a.cache = [None if x is None else x[i:i + 1] for x in c.cache]
+                row.append(a)
+        self.lm.model(mx.array([span], dtype=mx.int32), row)
+        r.parked_steps = k - E  # (the slots before the span's: left padding)
+        self._settle(cache, i, r, keep_last=E)
+        for c, rc in zip(cache, row):
+            if isinstance(c, BatchKVCache):
+                n = c._idx
+                c.keys[i:i + 1, :, n - E:n, :] = rc.keys[..., rc.offset - E:rc.offset, :]
+                c.values[i:i + 1, :, n - E:n, :] = rc.values[..., rc.offset - E:rc.offset, :]
+            else:
+                for j, x in enumerate(rc.cache):
+                    if x is not None:
+                        c.cache[j][i:i + 1] = x
+        self.counters["absorbed"] = self.counters.get("absorbed", 0) + E
+        return E
+
+    @staticmethod
+    def _settle(cache, i: int, r, keep_last: int = 0) -> None:
+        """Row i's attention slots of its parked steps (the last ones it holds, before the ``keep_last`` slots at its
+        end) rolled to the front of its keys and values and made left padding, its positions back where they were."""
+        k = getattr(r, "parked_steps", 0)
+        r.parked_steps = 0
+        if not k:
+            return
+        for c in cache:
+            if isinstance(c, BatchKVCache) and c.keys is not None:
+                n = c._idx - keep_last
+                c.keys[i:i + 1, :, :n, :] = mx.roll(c.keys[i:i + 1, :, :n, :], k, axis=2)
+                c.values[i:i + 1, :, :n, :] = mx.roll(c.values[i:i + 1, :, :n, :], k, axis=2)
+                one = mx.where(mx.arange(c.left_padding.shape[0]) == i, k, 0)
+                c.left_padding = c.left_padding + one.astype(c.left_padding.dtype)
+                c.offset = c.offset - one.astype(c.offset.dtype)
+
+    @staticmethod
+    def _place(cache, i: int, merged, j: int) -> bool:
+        """Row j of ``merged`` (prefilled requests' caches) into slot i of the batch cache, in place: its keys and
+        values at the batch's end (as an appended row's: the slot's positions before them are left padding), its
+        recurrent states as they are. False, with nothing written, if it is longer than the batch."""
+        for c, m in zip(cache, merged):
+            if isinstance(c, BatchKVCache):
+                if c.keys is None or m.keys is None or int(m.offset[j].item()) > c._idx:
+                    return False
+            elif not isinstance(c, ArraysCache):
+                return False
+        for c, m in zip(cache, merged):
+            if isinstance(c, BatchKVCache):
+                n, p, e = int(m.offset[j].item()), int(m.left_padding[j].item()), c._idx
+                c.keys[i:i + 1, :, e - n:e, :] = m.keys[j:j + 1, :, p:p + n, :]
+                c.values[i:i + 1, :, e - n:e, :] = m.values[j:j + 1, :, p:p + n, :]
+                one = mx.arange(c.left_padding.shape[0]) == i
+                c.left_padding = mx.where(one, e - n, c.left_padding).astype(c.left_padding.dtype)
+                c.offset = mx.where(one, n, c.offset).astype(c.offset.dtype)
+            else:
+                for k, a in enumerate(m.cache):
+                    if a is not None:
+                        c.cache[k][i:i + 1] = a[j:j + 1]
+        return True
+
+    @staticmethod
+    def _compact(cache) -> None:
+        """The batch's left padding every row has (a reused slot's row is shorter than the one it replaced: no
+        filter shifts the rows left), cut once it is a buffer step."""
+        for c in cache:
+            if isinstance(c, BatchKVCache) and c.keys is not None:
+                m = int(mx.min(c.left_padding).item())
+                if m >= BatchKVCache.step:
+                    c.keys, c.values = c.keys[..., m:, :], c.values[..., m:, :]
+                    c._idx -= m
+                    c.left_padding = c.left_padding - m
+
+    def _skip_parked(self, r, from_held: bool, dead: set, y: int) -> bool:
+        """Whether a row's sample is to be dropped: it is parked, or the step held it (what it sampled follows
+        nothing it read). What it sampled after the token that parked it is kept (``_release``). A parked row's client
+        gone: it is retired, as at a commit."""
+        if not (from_held or getattr(r.controller, "parked", False)):
+            return False
+        if not from_held and getattr(r, "park_next", None) is None:
+            r.park_next = y
+        if getattr(r, "cancel", False) and id(r) not in dead:
+            r.finish = getattr(r, "cb_error", None) or "cancelled"
+            r.text = self.tokenizer.decode(r.out)
+            dead.add(id(r))
+        return True
 
     # -- drip mode ---------------------------------------------------------------------
     def _commit_drip(self, r, y) -> bool:
@@ -1577,6 +1784,8 @@ class HybridBatchEngine(BatchEngine):
                 for c in row:  # own copies: a row view would pin the whole batch buffer
                     if isinstance(c, ArraysCache):
                         c.cache = [None if a is None else a + 0 for a in c.cache]
+                        if self.parks:
+                            c.held = None  # (a parked step's flags: not the prompt cache's)
                 mx.eval([c.state for c in row])
                 reply = _reply_entry(r, row)
                 if reply is None:
@@ -1598,10 +1807,22 @@ class HybridBatchEngine(BatchEngine):
                 offs = self._tab[3]
                 g = g + mx.array([offs[id(r.controller.c)] - old[id(r.controller.c)]
                                   if isinstance(r.controller, LocalsController) else 0 for r in rows], dtype=g.dtype)
+            put = {}  # new row -> the freed slot it takes in place (parked rows' engine: see "parked rows")
             if cache is None:
                 cache = merged
             else:
-                _append_rows(cache, merged)
+                free = [i for i, r in enumerate(rows) if isinstance(r, _FreedSlot)]
+                for j in range(len(new)):
+                    if free and self._place(cache, free[0], merged, j):
+                        put[j] = free.pop(0)
+                if put:
+                    self._compact(cache)
+                    self.counters["slots_reused"] = self.counters.get("slots_reused", 0) + len(put)
+                rest = [j for j in range(len(new)) if j not in put]
+                if rest and put:
+                    _filter(merged, mx.array(rest))
+                if rest:
+                    _append_rows(cache, merged)
             mx.eval([c.state for c in cache])
             prefill_s += time.perf_counter() - tp
             self.counters["prefill_s"] += time.perf_counter() - tp
@@ -1613,15 +1834,23 @@ class HybridBatchEngine(BatchEngine):
                 _reset_peak()
             if count:  # (mixed passes count their chunks as they go)
                 self.counters["prefill_tokens"] += sum(len(r.prompt) - 1 - getattr(r, "cached_tokens", 0) for r in new)
-            gn = mx.array([self._gstate(r) for r in new], dtype=mx.int32)
-            g = gn if g is None else mx.concatenate([g, gn])
-            rows = rows + new
-            xs = xs + [r.prompt[-1] for r in new]
-            for r in new:
-                r.fed.append(r.prompt[-1])
+            for j, i in put.items():
+                if g is not None:
+                    g[i] = self._gstate(new[j])
+                rows[i], xs[i] = new[j], new[j].prompt[-1]
+                new[j].fed.append(new[j].prompt[-1])
+            new = [r for j, r in enumerate(new) if j not in put]
+            if new:
+                gn = mx.array([self._gstate(r) for r in new], dtype=mx.int32)
+                g = gn if g is None else mx.concatenate([g, gn])
+                rows = rows + new
+                xs = xs + [r.prompt[-1] for r in new]
+                for r in new:
+                    r.fed.append(r.prompt[-1])
 
         xs: List[int] = []
         solo_next = False  # the only row has a forced span or a draft: a boundary, then steps of several tokens
+        cur_held = None  # the rows the step in flight held (parked rows: see "parked rows")
         while True:
             queue += arrive(False)
             if not rows and not queue and cur is None and not filling:
@@ -1634,17 +1863,27 @@ class HybridBatchEngine(BatchEngine):
                     break
                 queue += got
             self.active = len(rows)
-            boundary = cur is None or dead or solo_next or (queue and len(rows) + len(filling) < self.n_slots) or (
+            all_parked = self.parks and rows and all(getattr(r.controller, "parked", False) for r in rows)
+            freed = [r for r in rows if isinstance(r, _FreedSlot)] if self.parks else ()
+            boundary = cur is None or dead or solo_next or all_parked or (queue and len(rows) - len(freed) + len(filling) < self.n_slots) or (
+                any(r.parked_steps >= _SLOT_WAIT for r in freed)) or (
                 filling and any(e["pos"] >= e["end"] or getattr(e["r"], "cancel", False) for e in filling))
             solo_next = False
             if boundary:
+                if self.parks:
+                    self._release(cache, rows, dead)
                 ys = cur.tolist() if cur is not None else []
+                if self.parks and cur is None and rows:  # (after a wait with every row parked: no step in flight;
+                    ys, cur_held = [0] * len(rows), [True] * len(rows)  # nothing sampled, as a held step's)
                 # Feeds are decided before committing, as in a chained step: a
                 # live sample is fed now and its forced span follows later.
                 live = [not r.pend for r in rows]
                 xs = [r.pend.pop(0) if r.pend else yv for r, yv in zip(rows, ys)]
-                for r, yv, lv in zip(rows, ys, live):
+                reading = set()  # rows this commit parks: the next step still reads the token that parked them
+                for i, (r, yv, lv) in enumerate(zip(rows, ys, live)):
                     if lv and id(r) not in dead:
+                        if self.parks and self._skip_parked(r, bool(cur_held and i < len(cur_held) and cur_held[i]), dead, yv):
+                            continue
                         r.passes += 1
                         n0 = len(r.out)
                         if self._commit_drip(r, yv):
@@ -1652,22 +1891,32 @@ class HybridBatchEngine(BatchEngine):
                             dead.add(id(r))
                         self.tokens_out += len(r.out) - n0
                         self._after_commit(r, n0, dead)
+                        if self.parks and getattr(r.controller, "parked", False):
+                            reading.add(id(r))
+                cur_held = None
                 keep = [i for i, r in enumerate(rows) if id(r) not in dead]
                 if len(keep) != len(rows):
                     for i, r in enumerate(rows):
                         if id(r) in dead:
+                            if self.parks:
+                                self._settle(cache, i, r)  # (its cache as it read it, for the prompt cache)
                             retire(i, r)
-                    if keep:
+                    if keep and self.parks:
+                        # a request takes these slots in place, now or in a few steps (_FreedSlot)
+                        rows = [_FreedSlot() if id(r) in dead else r for r in rows]
+                    elif keep:
                         idx = mx.array(keep)
                         _filter(cache, idx)
                         g = g[idx] if g is not None else None
                     else:
                         cache, g = None, None
-                    xs = [xs[i] for i in keep]
-                    rows = [rows[i] for i in keep]
+                    if not any(isinstance(r, _FreedSlot) for r in rows):
+                        xs = [xs[i] for i in keep]
+                        rows = [rows[i] for i in keep]
                     dead.clear()
                 for r, x in zip(rows, xs):
-                    r.fed.append(x)
+                    if not (self.parks and getattr(r.controller, "parked", False) and id(r) not in reading):
+                        r.fed.append(x)  # (a parked row reads nothing)
                 if rows and g is not None:
                     g = self._advance(rows, mx.array(xs, dtype=mx.int32), g)
                 for q in [q for q in queue if getattr(q, "cancel", False)]:  # its client went away while it waited:
@@ -1716,7 +1965,7 @@ class HybridBatchEngine(BatchEngine):
                         [e["r"].prompt[:-1] for e in ready], [], starts=[(e.pop("cache"), []) for e in ready]), tp, count=False)
                     del ready
                 new = []
-                while queue and len(rows) + len(filling) + len(new) < self.n_slots:
+                while queue and sum(not isinstance(r, _FreedSlot) for r in rows) + len(filling) + len(new) < self.n_slots:
                     # a request that would not fit next to the running rows waits for one to finish
                     held0 = self._merge_tokens(rows, [len(e["r"].prompt) for e in filling] + [len(q.prompt) for q in new + [queue[0]]])
                     if (rows or new or filling) and not self._fits(lru, queue[0], held0 + sum(len(q.prompt) for q in new),
@@ -1805,7 +2054,25 @@ class HybridBatchEngine(BatchEngine):
                     # the per-request prefill caches: merged copies now live in the batch (a name left bound here
                     # would hold its request's whole KV next to the batch's copy for as long as it decodes)
                     starts = found = c0 = rest = None
+                alone = bool(rows) and all(isinstance(r, _FreedSlot) for r in rows)
+                keep = [i for i, r in enumerate(rows) if not (isinstance(r, _FreedSlot) and (alone or r.parked_steps >= _SLOT_WAIT))]
+                if len(keep) < len(rows):  # (slots no request took in time, or no other row left)
+                    if keep:
+                        idx = mx.array(keep)
+                        _filter(cache, idx)
+                        g = g[idx] if g is not None else None
+                    else:
+                        cache, g = None, None
+                    xs = [xs[i] for i in keep]
+                    rows = [rows[i] for i in keep]
                 if not rows:
+                    cur = None
+                    continue
+                if (self.parks and not queue and not filling
+                        and all(getattr(r.controller, "parked", False) and id(r) not in reading for r in rows)):
+                    # every row waits for its controller: no step until one may go on (or a request comes)
+                    self._woken.wait(0.05)
+                    self._woken.clear()
                     cur = None
                     continue
                 if g is None:
@@ -1821,6 +2088,7 @@ class HybridBatchEngine(BatchEngine):
                 # A row's next committed sample follows exactly the tokens it has
                 # fed after its prompt, so out has len(fed) - 1 tokens then.
                 left = [r.max_tokens - (len(r.fed) - 1) for r in rows]
+                cur_held = self._hold(cache, rows, reading) if self.parks else None
                 cur = self._launch(cache, mx.array(xs, dtype=mx.int32), None if free else g, temp, (rows, left), filling, lru, lru_key)
                 mx.async_eval(cur, g, self._fill_eval)
                 steps += 1
@@ -1830,6 +2098,8 @@ class HybridBatchEngine(BatchEngine):
                 self._growth_trim(len(rows))  # (every step is a boundary while a request waits for memory)
                 continue
             # Chained step: launch s+1 before reading s.
+            if self.parks:
+                self._release(cache, rows, dead)
             live = [not r.pend for r in rows]
             hm = [bool(r.pend) for r in rows]
             if any(hm):
@@ -1840,6 +2110,7 @@ class HybridBatchEngine(BatchEngine):
                 x = cur.astype(mx.int32)
             g2 = g if free else self._advance(rows, x, g)
             left = [r.max_tokens - len(r.fed) for r in rows]  # this step's feed is appended below
+            held_next = self._hold(cache, rows) if self.parks else None
             nxt = self._launch(cache, x, None if free else g2, temp, (rows, left), filling, lru, lru_key)
             mx.async_eval(nxt, g2, self._fill_eval)
             steps += 1
@@ -1849,8 +2120,11 @@ class HybridBatchEngine(BatchEngine):
             self._growth_trim(len(rows))
             ys = cur.tolist()
             for i, (r, yv, lv) in enumerate(zip(rows, ys, live)):
-                r.fed.append(hv[i] if hm[i] else yv)
+                if not (held_next and held_next[i]):
+                    r.fed.append(hv[i] if hm[i] else yv)
                 if lv and id(r) not in dead:
+                    if self.parks and self._skip_parked(r, bool(cur_held and cur_held[i]), dead, yv):
+                        continue
                     r.passes += 1
                     n0 = len(r.out)
                     if self._commit_drip(r, yv):
@@ -1859,6 +2133,7 @@ class HybridBatchEngine(BatchEngine):
                     self.tokens_out += len(r.out) - n0
                     self._after_commit(r, n0, dead)
             cur, g = nxt, g2
+            cur_held = held_next
             if _SOLO and len(rows) == 1 and not queue and not filling and not dead and self._solo_ok(rows[0], cache):
                 # entering costs about a step (the pipeline drains): a forced span of 3 or more tokens, or a draft (the
                 # padding read, which waits for the GPU, only with a span: the pipeline drains for it anyway)

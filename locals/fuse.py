@@ -225,6 +225,9 @@ class FusedGatedDeltaNet(nn.Module):
         from mlx_lm.models.gated_delta import gated_delta_update
 
         B, S, _ = proj.shape
+        held = getattr(cache, "held", None)  # (rows parked this step: hybrid_batch; their state stays as it is)
+        if held is not None and (S != 1 or held.shape[0] != B):
+            raise RuntimeError("parked rows are held in a single token's step of the whole batch only")
         if (
             USE_GDN_KERNEL
             and (S <= _GDN_MAX_S or (getattr(cache, "want_states", False) and S <= 16))
@@ -243,6 +246,7 @@ class FusedGatedDeltaNet(nn.Module):
             outs = gdn_decode(
                 proj, cache[0], self._conv_w, self.A_log, self.dt_bias, cache[1], self.norm.weight,
                 self.num_k_heads, self.num_v_heads, self.head_k_dim, self.head_v_dim, states=want,
+                held=held,
             )
             y = outs[0]
             if want:
@@ -253,6 +257,8 @@ class FusedGatedDeltaNet(nn.Module):
             cache[0], cache[1] = outs[1], outs[2]
             cache.advance(S)
             return y
+        if held is not None:
+            raise RuntimeError("a parked row needs the fused single-token step (hybrid_batch's park)")
         c, v = self.conv_dim, self.value_dim
         qkv = proj[..., :c]
         z = proj[..., c : c + v].reshape(B, S, self.num_v_heads, self.head_v_dim)
