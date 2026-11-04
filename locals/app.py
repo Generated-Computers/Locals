@@ -2309,7 +2309,8 @@ def cmd_models(args) -> None:
     limit, here = gpu_limit_gb(), load_bench()
     print(f"Models for {chip() or 'this Mac'} with {memory_gb():.0f} GB of memory"
           + (f" (the GPU can use {limit:.1f} GB)" if limit else "") + ":\n")
-    print(f"  {'name':12s} {'download':>8s} {'needs':>7s}  {'on this Mac':30s} speed with 8 requests at once")
+    nw = max(12, *(len(SHORT[k]) for k in MODELS))  # (the name column: qwenputer-cpu is 13 wide)
+    print(f"  {'name':{nw}s} {'download':>8s} {'needs':>7s}  {'on this Mac':30s} speed with 8 requests at once")
     for key, mid in MODELS.items():
         m = MEASURED_M2_PRO.get(key) or MEASURED_ELSEWHERE[key]
         local = cached_snapshot(hf_repo(mid), ["*.json", "*.safetensors"])
@@ -2326,7 +2327,7 @@ def cmd_models(args) -> None:
             speed = f"{mine['locals']['8']:.0f} tps, measured here" + (f" (mlx-lm {mine['mlx']['8']:.0f})" if "8" in (mine.get("mlx") or {}) else "")
         else:
             speed = f"{m['locals']} tps on {m.get('on', 'an M2 Pro')} (mlx-lm {m['mlx']})"
-        print(f"  {SHORT[key]:12s} {w:>5.1f} GB {need:>4.1f} GB  {', '.join(notes):30s} {speed}")
+        print(f"  {SHORT[key]:{nw}s} {w:>5.1f} GB {need:>4.1f} GB  {', '.join(notes):30s} {speed}")
     from .defaults import AGENT_TASKS
 
     q, g = AGENT_TASKS["qwen3.5-4b"], AGENT_TASKS["gemma-4-e4b"]
