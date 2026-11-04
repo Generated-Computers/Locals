@@ -446,6 +446,27 @@ how to raise that, until the next restart. For long work, `LOCALS_KV_BITS=8`
 keeps Flint's keys and values in 8 bits: requests up to 67,584 tokens instead of
 about 35,800, writing 4 to 13% slower.
 
+`--model qwenputer` runs [Qwenputer](docs/qwenputer/README.md), Qwen3.5-4B with a
+RISC-V computer compiled into its weights that runs the model's `calc` tool
+exactly, inside the model (`locals/qwen3.5-4b-qwenputer` in your editor). Its
+first start makes the computer from the 18.8 GB checkpoint, with its authors'
+package installed. Then it writes as fast as Qwen3.5-4B (68 tokens/s on the M2
+Pro, one request at a time) and answers a calc question in about 2.5 seconds;
+the computer's runs are made on the CPU's performance cores, while Qwen keeps
+the GPU, so 8 calc questions at once go through at about 155 tokens/s in total.
+
+`--model qwenputer-cpu` is the same model with its computer also doing work a
+client's tools would do on the Mac's CPU, slower (107 tokens/s for the same 8 calc
+questions at once). It counts letters and words, reverses text, sorts numbers,
+converts bases and does date arithmetic for the model (a toolbox of its own
+programs), so those questions are answered exactly, without a client running
+tools for it: 80 of 80 such questions right, where Qwen3.5-4B alone gets 38.
+Sixty tools in all: JSON, tables, statistics, money, primes, units, regular
+expressions, logic, text, times, check digits, hashes, notes and a small Python
+(40 of 45 such questions right, Qwen3.5-4B alone 31). It also checks each call
+of your tools against its schema before your client gets it, and each long
+number its answer copies from the computer's results.
+
 Each model also has a thinking mode, in which it reasons before it answers: add
 `-thinking` to the name, for example `locals/lfm2.5-2.6b-thinking`. LFM3 thinks
 by default, as its own template does: with thinking off it reasoned in its

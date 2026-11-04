@@ -2,6 +2,28 @@
 
 ## 0.2.2 (unreleased)
 
+- **Qwenputer**, in two versions (`--model qwenputer` and `--model qwenputer-cpu`: divagr1925/Qwen3.5-4B-Qwenputer):
+  Qwen3.5-4B with a RISC-V computer compiled into 11 layers before Qwen's own, which runs the model's `calc` tool
+  exactly (integers and fractions of up to 62 digits). Qwen's 32 layers are Qwen3.5-4B's own weights and run as that
+  model does. The computer is made once from the 18.8 GB checkpoint into a 123 MB pack (`~/.locals/qwenputer`);
+  loading its firmware needs the authors' package (`docs/qwenputer`). A calc exchange the model runs before its
+  answer comes back as `reasoning_content`. The computer reads and writes only the rows of its recurrent state a token
+  touches (one written, at most two read, of 128) and makes every token of a run itself, nothing drafted: on a CPU
+  performance core, in C built with the Mac's clang (3,300 trace tokens/s on an M2 Pro, where MLX operations one
+  token at a time made 142), or else stepped on the GPU. A reply that calls calc stays in the batch, parked, while the
+  run is made, and a finished reply's slot is taken in place by the next request. Every value equals transformers'
+  layers, and every run the reference machine's.
+  - `qwenputer` runs calc alone, on the authors' firmware: 60 arithmetic questions, 59 right at 155 tokens/s in total 8 at a time (Qwen3.5-4B: 5).
+  - `qwenputer-cpu`'s computer also does work a client's tools would do on the Mac's CPU, slower: a toolbox of 60
+    tools (counting, lengths, reversing, sorting, dates and weekdays, bases; and in C, compiled for the computer and
+    checked against Python's own: JSON, tables, versions and lists, logic and regular expressions, statistics, money,
+    primes, units, numerals, text, times, check digits, hashes, notes, and a small Python, `run_python`, within 1,250
+    steps), offered to a request whose question asks for them; a call of up to about 1,000 tokens goes to it in parts.
+    It checks each call of the client's tools against its schema before the client gets it (a wrong one goes back to
+    the model), and each long number the answer copies from its results. 80 toolbox questions: 80 right in 59 s, against
+    38 for `qwenputer` and for Qwen3.5-4B, and 197 s for Qwen3.5-4B with the same tools run by the client; 45 of the C
+    tools' kinds: 40 right, Qwen3.5-4B 31; 60 arithmetic questions: 60 right at 107 tokens/s (151 without its copy
+    checks).
 - **A request's handler hears at once that its job is done**: the reply was written at the handler's next look at its
   queue, up to 0.25 s later.
 - **A conversation's next turn no longer restarts the engine** when its first prompt chunk is marked: the turn read

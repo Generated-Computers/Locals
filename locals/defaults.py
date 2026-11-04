@@ -35,8 +35,8 @@ MEASURED_M2_PRO = {
     "minicpm5-2b": {"weights_gb": 1.3, "mlx": 160, "locals": 478},
     "lfm3-1.7b": {"weights_gb": 1.0, "mlx": 207, "locals": 620},
     # (downloads its 18.8 GB checkpoint once, to make the computer from: see models/qwenputer.py)
-    "qwenputer-4b": {"weights_gb": 2.95, "download_gb": 21.6, "note": "QWENPUTER_FAST"},
-    "qwenputer-4b-cpu": {"weights_gb": 2.95, "download_gb": 21.6, "note": "QWENPUTER_CPU"},
+    "qwenputer-4b": {"weights_gb": 2.95, "download_gb": 21.6, "note": "calc on CPU cores; 155 tps for 8 calc questions on an M2 Pro"},
+    "qwenputer-4b-cpu": {"weights_gb": 2.95, "download_gb": 21.6, "note": "60 tools on its computer; 107 tps for 8 calc questions, M2 Pro"},
 }
 # Models the M2 Pro's 16 GB cannot hold, measured as above on the Mac named ("on")
 MEASURED_ELSEWHERE = {
