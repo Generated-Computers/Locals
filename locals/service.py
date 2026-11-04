@@ -404,6 +404,8 @@ class BatchService:
                 time.sleep(0.05)
 
     def _run_locals(self):
+        import sys  # (for the whole function: the except at its end imports it too, which makes it local here)
+
         import mlx.core as mx
 
         from .engine import Controller, LocalsController
