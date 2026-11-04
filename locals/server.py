@@ -413,14 +413,16 @@ class Server:
             ours = [t for t in ours if t["function"]["name"] not in have]
             tpl_tools = list(tpl_tools or []) + ours
             internal = tuple(t["function"]["name"] for t in ours)
-            # the computer's other work: checking each call of the client's tools before the client gets it (with
-            # their schemas), the notes of the conversation's earlier replies, and the numbers the answer copies
-            computer = {"copy": os.environ.get("LOCALS_QWENPUTER_COPY", "1") != "0", "notes": notes}
-            if tools and os.environ.get("LOCALS_QWENPUTER_CHECK_CALLS", "1") != "0":
-                try:
-                    computer["tools"], computer["checks"] = _check_schemas(tools)
-                except Exception:  # noqa: BLE001  # (a schema it cannot read: the client's calls go unchecked)
-                    pass
+            # the computer's other work, with its toolbox (qwenputer-cpu): checking each call of the client's tools
+            # before the client gets it (with their schemas), the notes of the conversation's earlier replies, and the
+            # numbers the answer copies
+            if getattr(svc, "qwenputer_tools", ()):
+                computer = {"copy": os.environ.get("LOCALS_QWENPUTER_COPY", "1") != "0", "notes": notes}
+                if tools and os.environ.get("LOCALS_QWENPUTER_CHECK_CALLS", "1") != "0":
+                    try:
+                        computer["tools"], computer["checks"] = _check_schemas(tools)
+                    except Exception:  # noqa: BLE001  # (a schema it cannot read: the client's calls go unchecked)
+                        pass
         think_kw = {} if style == "none" else {"enable_thinking": thinking}
         if thinking and "preserve_thinking" in formats.chat_template(tok):
             # earlier replies keep their reasoning, as the model wrote it: LFM3's template drops it from every reply
@@ -645,7 +647,9 @@ class Server:
         if getattr(self, "_context_capped", False):
             return
         if not hasattr(self, "_native_ctx"):
-            self._native_ctx = native_context(self.model_id)  # once (it may ask Hugging Face)
+            from .defaults import hf_repo
+
+            self._native_ctx = native_context(hf_repo(self.model_id))  # once (it may ask Hugging Face)
         n = self._native_ctx
         if n:  # the model's own limit applies at once, whatever the rest waits for
             self._stock_context = min(getattr(self, "_stock_context", self.max_context), n)

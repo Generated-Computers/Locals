@@ -635,15 +635,15 @@ def check_model(model: str) -> None:
     """Exit with what to do if ``model`` cannot run here: a GGUF model, too big for this Mac, or a name that
     is neither a folder nor a model on Hugging Face (a typo). Nothing is downloaded; offline, a model not
     downloaded yet passes (its download says what is wrong)."""
-    from .defaults import cached_snapshot, gguf_hint, ollama_hint, too_big
+    from .defaults import cached_snapshot, gguf_hint, hf_repo, ollama_hint, too_big
 
     remembered = _load_saved().get("model") == model
     hint = (f" ({model} is the model locals remembered from an earlier command; choose one with --model, e.g. "
             f"--model qwen)") if remembered else ""
-    why = gguf_hint(model) or ollama_hint(model) or too_big(model, remote=True)  # before a download that cannot run
+    why = gguf_hint(hf_repo(model)) or ollama_hint(model) or too_big(model, remote=True)  # before a download that cannot run
     if why:
         sys.exit(f"locals: {why}{hint}")
-    if Path(model).expanduser().exists() or cached_snapshot(model, _MODEL_FILES) is not None:
+    if Path(model).expanduser().exists() or cached_snapshot(hf_repo(model), _MODEL_FILES) is not None:
         return
     if model.startswith(("/", "~", ".")):
         sys.exit(f"locals: no such folder: {model}{hint}")
@@ -651,7 +651,7 @@ def check_model(model: str) -> None:
         from huggingface_hub import HfApi
         from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
 
-        HfApi().model_info(model, timeout=10)
+        HfApi().model_info(hf_repo(model), timeout=10)
     except GatedRepoError:  # (it was "not a model on Hugging Face", with another model suggested)
         sys.exit(f"locals: {model} is gated on Hugging Face: accept its license at https://huggingface.co/{model}, sign "
                  f"in on this Mac (hf auth login, or set HF_TOKEN), then run this again{hint}")
@@ -674,14 +674,14 @@ def fetch_model(model: str) -> None:
         return
     from huggingface_hub import snapshot_download
 
-    from .defaults import cached_snapshot
+    from .defaults import cached_snapshot, hf_repo
 
-    patterns = _MODEL_FILES
-    if cached_snapshot(model, patterns) is not None:
+    patterns, repo = _MODEL_FILES, hf_repo(model)
+    if cached_snapshot(repo, patterns) is not None:
         return
-    print(f"downloading {model} (first run only) ...", flush=True)
+    print(f"downloading {repo} (first run only) ...", flush=True)
     try:
-        snapshot_download(model, allow_patterns=patterns)
+        snapshot_download(repo, allow_patterns=patterns)
     except KeyboardInterrupt:
         sys.exit("\nstopped the download; run the command again to go on where it stopped")
     except Exception as e:  # noqa: BLE001
@@ -2304,7 +2304,7 @@ def cmd_models(args) -> None:
     """The tested models: their size, the memory they need, whether they fit this Mac, and their speed with
     8 requests at once (measured here by locals bench, else on an M2 Pro)."""
     from .defaults import (DEFAULT_MODEL, HEADROOM_GB, MEASURED_ELSEWHERE, MEASURED_M2_PRO, MODELS, SHORT,
-                           cached_snapshot, chip, gpu_limit_gb, memory_gb)
+                           cached_snapshot, chip, gpu_limit_gb, hf_repo, memory_gb)
 
     limit, here = gpu_limit_gb(), load_bench()
     print(f"Models for {chip() or 'this Mac'} with {memory_gb():.0f} GB of memory"
@@ -2312,7 +2312,7 @@ def cmd_models(args) -> None:
     print(f"  {'name':12s} {'download':>8s} {'needs':>7s}  {'on this Mac':30s} speed with 8 requests at once")
     for key, mid in MODELS.items():
         m = MEASURED_M2_PRO.get(key) or MEASURED_ELSEWHERE[key]
-        local = cached_snapshot(mid, ["*.json", "*.safetensors"])
+        local = cached_snapshot(hf_repo(mid), ["*.json", "*.safetensors"])
         w = sum(f.stat().st_size for f in local.glob("*.safetensors")) / 2**30 if local is not None and any(local.glob("*.safetensors")) else m["weights_gb"]
         if "download_gb" in m:  # (Qwenputer: what it downloads is not what it runs)
             w = m["download_gb"]

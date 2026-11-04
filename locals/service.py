@@ -432,7 +432,7 @@ class BatchService:
         from .packed import Request
         from .runtime import Runtime
 
-        from .defaults import is_qwenputer
+        from .defaults import is_qwenputer, qwenputer_cpu
 
         calc = None  # Qwenputer: its computer's device (shared by every conversation's computer)
         if is_qwenputer(self.model_id):
@@ -441,8 +441,10 @@ class BatchService:
 
             say = lambda m: print(m, file=sys.stderr, flush=True)  # noqa: E731
             pack = QP.ensure_pack(log=say)
-            # its toolbox (LOCALS_QWENPUTER_TOOLS=0: calc alone): more tools the computer runs in place of the client
-            tools = os.environ.get("LOCALS_QWENPUTER_TOOLS", "1") != "0" and QP.ensure_tools(pack, log=say)
+            # its toolbox, with qwenputer-cpu (LOCALS_QWENPUTER_TOOLS=1 or 0 says otherwise): more tools the computer
+            # runs in place of the client, and its checks; without it, calc alone on the authors' firmware
+            default = "1" if qwenputer_cpu(self.model_id) else "0"
+            tools = os.environ.get("LOCALS_QWENPUTER_TOOLS", default) != "0" and QP.ensure_tools(pack, log=say)
             calc = Device(QP.Chip(pack, tools=tools))
             self.qwenputer_tools = calc.chip.tools
         rt = Runtime.load(QP.BASE if calc else self.model_id, tune=os.environ.get("LOCALS_TUNE", "background"))

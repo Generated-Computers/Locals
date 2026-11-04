@@ -24,10 +24,16 @@ RUN = json.loads((Path(__file__).parent / "data" / "qwenputer_calc_run.json").re
 
 
 def test_names():
-    from locals.defaults import model_id
+    """Two versions: qwenputer (calc on the authors' firmware) and qwenputer-cpu (its computer also doing CPU work),
+    whose id names no repository: its files are Qwenputer's. Other models' ids are their own."""
+    from locals.defaults import hf_repo, model_id, qwenputer_cpu, short_name
 
-    assert model_id("qwenputer") == Q.REPO and Q.is_qwenputer(model_id("qwenputer"))
-    assert not Q.is_qwenputer(model_id("qwen"))
+    fast, cpu = model_id("qwenputer"), model_id("qwenputer-cpu")
+    assert fast == Q.REPO and Q.is_qwenputer(fast) and not qwenputer_cpu(fast) and hf_repo(fast) == Q.REPO
+    assert Q.is_qwenputer(cpu) and qwenputer_cpu(cpu) and hf_repo(cpu) == Q.REPO and cpu != fast
+    assert (short_name(fast), short_name(cpu)) == ("qwen3.5-4b-qwenputer", "qwen3.5-4b-qwenputer-cpu")
+    for other in ("qwen", "gemma", "lfm3", "flint", "mlx-community/Qwen3.5-4B-MLX-4bit", "/tmp/my-cpu"):
+        assert not Q.is_qwenputer(model_id(other)) and hf_repo(model_id(other)) == model_id(other)
 
 
 # -- the reply as the client reads it ------------------------------------------------------------------------------
@@ -442,6 +448,21 @@ def test_the_server_offers_the_toolbox_and_gives_a_turn_its_exchange_back(tok):
     # a reply as the conversation's last message (a prefill) is left as sent: it is written with its reasoning
     assert ask([q, {"role": "assistant", "content": answer}])["text"] == ask([q, {"role": "assistant", "content": answer,
                                                                                 "reasoning_content": ""}])["text"]
+
+
+def test_qwenputer_without_its_toolbox_offers_calc_alone_and_no_checks(tok):
+    """The fast version (qwenputer: its computer's firmware calc's alone): calc is offered whatever the question asks,
+    and the computer has no other work (no checks of the client's calls, no copy checks, no notes)."""
+    from locals.server import Server
+
+    srv = Server("qwenputer", engines=("locals",), preload=(), log=lambda s: None)
+    srv._svc["locals"] = SimpleNamespace(tokenizer=tok, qwenputer_tools=())
+    tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {
+        "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+    for q in ("How many r's are in the word strawberry?", "What is 12345 * 6789?"):
+        p = srv.prepare(dict(model="locals/qwen3.5-4b-qwenputer", max_tokens=64, tools=tools,
+                             messages=[{"role": "user", "content": q}]))
+        assert p["internal"] == ("calc",) and p["computer"] is None and '"name": "count"' not in p["text"]
 
 
 def test_a_reply_with_a_computers_exchange_leaves_no_request_in_flight(tok):
