@@ -2,6 +2,12 @@
 
 ## 0.2.2 (unreleased)
 
+- **A request's handler hears at once that its job is done**: the reply was written at the handler's next look at its
+  queue, up to 0.25 s later.
+- **A conversation's next turn no longer restarts the engine** when its first prompt chunk is marked: the turn read
+  the previous reply's keys and values, strided views, and the engine dropped its prompt cache and read the turn
+  from its start.
+- `LOCALS_DISK_CACHE_GB` that is not a number is a warning again (4 GB), not a model that does not load.
 - **Liquid's LFM3** (`--model lfm3`: LiquidAI/LFM3-1.7B-MLX-4bit, 1.0 GB). No mlx-lm release has LFM3 yet, so its code
   ships with Locals (`locals/models/lfm3.py`): LFM2's gated convolutions, 7 wide, and attention over a 256-token window
   or the whole context, with a sigmoid gate on each head, q/k norms, RoPE on half of each full-attention head's
