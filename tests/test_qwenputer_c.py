@@ -526,12 +526,27 @@ def test_run_python_review_fixes(host):
         "error (line 4: TimeoutError")
 
 
+def _age(b, d):
+    """dateutil's relativedelta(d, b) in years, months and days (d not before b): a month on from the 31st is the
+    next month's last day."""
+    import calendar
+    import datetime as dt
+
+    def months_on(day, n):
+        y, m = divmod(day.month - 1 + n, 12)
+        y, m = day.year + y, m + 1
+        return dt.date(y, m, min(day.day, calendar.monthrange(y, m)[1]))
+
+    n = (d.year - b.year) * 12 + d.month - b.month
+    while months_on(b, n) > d:
+        n -= 1
+    return n // 12, n % 12, (d - months_on(b, n)).days
+
+
 def test_tools_review_fixes(host):
     import datetime as dt
     import statistics
     from collections import Counter
-
-    from dateutil.relativedelta import relativedelta
 
     # (memory and arithmetic at the edges)
     assert one(host, "truth_table", expression=" -> ".join(["p"] * 65)).endswith("true in 2 of 2 rows: a tautology (always true)")
@@ -554,10 +569,10 @@ def test_tools_review_fixes(host):
     for _ in range(300):
         b = dt.date(1950, 1, 1) + dt.timedelta(days=rnd.randint(0, 25000))
         d = b + dt.timedelta(days=rnd.randint(0, 3000))
-        r = relativedelta(d, b)
+        years, months, days = _age(b, d)
         got = one(host, "age", birth_date=b.isoformat(), on_date=d.isoformat())
-        assert got.startswith(f"{r.years} year{'s' if r.years != 1 else ''}, {r.months} month{'s' if r.months != 1 else ''} and "
-                              f"{r.days} day{'s' if r.days != 1 else ''} ("), (b, d, got)
+        assert got.startswith(f"{years} year{'s' if years != 1 else ''}, {months} month{'s' if months != 1 else ''} and "
+                              f"{days} day{'s' if days != 1 else ''} ("), (b, d, got)
     assert one(host, "age", birth_date="2000-01-31", on_date="2000-03-01") == "0 years, 1 month and 1 day (30 days)"
     # versions of more than 9 digits; roman numerals not written the standard way; a table's unclosed quote
     assert one(host, "sort_versions", versions="5000000000, 999999999, 1.0, 0010000000000") == "1.0, 999999999, 5000000000, 0010000000000"
