@@ -2097,13 +2097,18 @@ def _stop_which(text: str, stops: List[str]) -> Optional[str]:
 
 
 def native_context(model_id: str) -> Optional[int]:
-    """The model's context length from its config (max_position_embeddings), if known."""
+    """The model's context length from its config (max_position_embeddings), if known. A downloaded model's
+    config is read from the cache: Hugging Face is asked only for a model not downloaded (asking moves the
+    cache's ``refs/main`` to the newest revision, whose weights are not there: the model would count as not
+    downloaded, and an offline start would fail)."""
     try:
         path = Path(model_id)
         if not path.exists():
             from huggingface_hub import snapshot_download
 
-            path = Path(snapshot_download(model_id, allow_patterns=["config.json"]))
+            from .defaults import cached_snapshot
+
+            path = cached_snapshot(model_id, ["config.json"]) or Path(snapshot_download(model_id, allow_patterns=["config.json"]))
         cfg = json.loads((path / "config.json").read_text())
     except Exception:
         return None

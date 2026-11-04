@@ -29,6 +29,10 @@
 - **A conversation's next turn no longer restarts the engine** when its first prompt chunk is marked: the turn read
   the previous reply's keys and values, strided views, and the engine dropped its prompt cache and read the turn
   from its start.
+- **A downloaded model's context length is read from the cache**: the server asked Hugging Face for the model's
+  `config.json` on every start, and when the model's repository had a newer revision, the cache's `refs/main` moved
+  to it, without the weights: the model counted as not downloaded, the next start downloaded it again, and an
+  offline start failed.
 - `LOCALS_DISK_CACHE_GB` that is not a number is a warning again (4 GB), not a model that does not load.
 - **Liquid's LFM3** (`--model lfm3`: LiquidAI/LFM3-1.7B-MLX-4bit, 1.0 GB). No mlx-lm release has LFM3 yet, so its code
   ships with Locals (`locals/models/lfm3.py`): LFM2's gated convolutions, 7 wide, and attention over a 256-token window

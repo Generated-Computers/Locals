@@ -575,6 +575,43 @@ def test_context_limit_is_what_fits_in_memory(monkeypatch):
     assert server(40000, 262144, fit) == 40000  # asked for
 
 
+def test_a_downloaded_models_context_is_read_from_the_cache(monkeypatch, tmp_path):
+    """A downloaded model's context length is read from its cached config without asking Hugging Face: asking
+    moved the cache's refs/main to a newer revision without the weights (LFM3, 2026-11-04), so the model counted
+    as not downloaded. A model not downloaded is still asked for."""
+    import huggingface_hub
+    from huggingface_hub import constants
+
+    from locals.defaults import cached_snapshot
+    from locals.server import native_context
+
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path))
+
+    def snapshot(repo_id, rev, files):  # a revision in the cache, and refs/main naming it
+        d = tmp_path / ("models--" + repo_id.replace("/", "--"))
+        (d / "snapshots" / rev).mkdir(parents=True)
+        (d / "refs").mkdir(exist_ok=True)
+        (d / "refs" / "main").write_text(rev)
+        for name, text in files.items():
+            (d / "snapshots" / rev / name).write_text(text)
+        return d / "snapshots" / rev
+
+    old = snapshot("org/m", "a" * 40, {"config.json": json.dumps({"max_position_embeddings": 32768}), "model.safetensors": ""})
+    real, asked = huggingface_hub.snapshot_download, []
+
+    def snapshot_download(repo_id, **kw):
+        if kw.get("local_files_only"):
+            return real(repo_id, **kw)
+        asked.append(repo_id)  # Hugging Face: the newest revision's config only
+        return str(snapshot(repo_id, "b" * 40, {"config.json": json.dumps({"max_position_embeddings": 65536})}))
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot_download)
+    assert native_context("org/m") == 32768 and asked == []
+    assert (old.parents[1] / "refs" / "main").read_text() == "a" * 40
+    assert cached_snapshot("org/m", ["*.json", "*.safetensors"]) == old
+    assert native_context("org/new") == 65536 and asked == ["org/new"]
+
+
 def test_a_repetition_asked_for_gets_its_grace():
     """Without tools and inside a call a repetition may be wanted ("the line 50 times", a file of identical lines):
     it is cut only after LOOP_GRACE more tokens of it, and a repetition that ends is not cut at all."""
