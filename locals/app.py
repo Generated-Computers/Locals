@@ -2314,11 +2314,15 @@ def cmd_models(args) -> None:
         m = MEASURED_M2_PRO.get(key) or MEASURED_ELSEWHERE[key]
         local = cached_snapshot(mid, ["*.json", "*.safetensors"])
         w = sum(f.stat().st_size for f in local.glob("*.safetensors")) / 2**30 if local is not None and any(local.glob("*.safetensors")) else m["weights_gb"]
-        need = w + HEADROOM_GB
+        if "download_gb" in m:  # (Qwenputer: what it downloads is not what it runs)
+            w = m["download_gb"]
+        need = m["weights_gb"] + HEADROOM_GB if "download_gb" in m else w + HEADROOM_GB
         fit = "fits" if not limit or need <= limit else "too big"
         notes = [fit] + (["the default"] if mid == DEFAULT_MODEL else []) + (["downloaded"] if local is not None else [])
         mine = here.get(mid) or {}
-        if "8" in (mine.get("locals") or {}):
+        if "note" in m:
+            speed = m["note"]
+        elif "8" in (mine.get("locals") or {}):
             speed = f"{mine['locals']['8']:.0f} tps, measured here" + (f" (mlx-lm {mine['mlx']['8']:.0f})" if "8" in (mine.get("mlx") or {}) else "")
         else:
             speed = f"{m['locals']} tps on {m.get('on', 'an M2 Pro')} (mlx-lm {m['mlx']})"

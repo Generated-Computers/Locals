@@ -56,7 +56,7 @@ build-backend = "setuptools.build_meta"
 packages = ["locals", "locals.models", "locals.presets"]
 
 [tool.setuptools.package-data]
-locals = ["presets/*.json"]
+locals = ["presets/*.json", "models/*.s"]
 "locals.presets" = ["*.json"]
 
 [tool.pytest.ini_options]

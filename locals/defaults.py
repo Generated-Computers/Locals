@@ -15,6 +15,10 @@ MODELS = {
     # raised (too_big says how); Recursive's own 4-bit build (RecursiveSI/flint-int4, 22.6 GB) runs on 16 GB Macs too,
     # its experts read from its files as tokens need them (models/flint_streamed.py)
     "flint": "mlx-community/flint-mixed-3-4bit",
+    # Qwen3.5-4B with a RISC-V computer compiled into 11 layers before Qwen's, which runs its calc tool exactly
+    # (models/qwenputer.py): Qwen's part is qwen3.5-4b's weights; the computer comes from the 18.8 GB checkpoint,
+    # converted on first use into a 123 MB pack (its firmware needs the authors' package: models.qwenputer.INSTALL)
+    "qwenputer-4b": "divagr1925/Qwen3.5-4B-Qwenputer",
 }
 
 
@@ -27,13 +31,15 @@ MEASURED_M2_PRO = {
     "lfm2.5-2.6b": {"weights_gb": 1.5, "mlx": 144, "locals": 404},
     "minicpm5-2b": {"weights_gb": 1.3, "mlx": 160, "locals": 478},
     "lfm3-1.7b": {"weights_gb": 1.0, "mlx": 207, "locals": 620},
+    # (downloads its 18.8 GB checkpoint once, to make the computer from: see models/qwenputer.py)
+    "qwenputer-4b": {"weights_gb": 2.95, "download_gb": 21.6, "note": "calc runs on CPU cores; 68 tps on an M2 Pro"},
 }
 # Models the M2 Pro's 16 GB cannot hold, measured as above on the Mac named ("on")
 MEASURED_ELSEWHERE = {
     "flint": {"weights_gb": 16.6, "mlx": 202, "locals": 319, "on": "an M4 Pro (24 GB)"},
 }
 SHORT = {"qwen3.5-4b": "qwen", "qwen3.5-2b": "qwen3.5-2b", "gemma-4-e4b": "gemma", "lfm2.5-2.6b": "lfm",
-         "minicpm5-2b": "minicpm", "lfm3-1.7b": "lfm3", "flint": "flint"}
+         "minicpm5-2b": "minicpm", "lfm3-1.7b": "lfm3", "flint": "flint", "qwenputer-4b": "qwenputer"}
 # Agent tasks done in the end-to-end suite (tests/e2e: real agent tools on real coding tasks, an M2 Pro), the same
 # eight for each (OpenCode's four, Hermes's and OpenClaw's two; Qwen3.5-4B also did all 18 with eight tools):
 # Gemma 4 E4B repeats itself on the longer ones (the server's loop guard cuts it) and gives up early (2 to 3 of 8).
@@ -185,10 +191,19 @@ def _resident_gb(path: Path) -> "float | None":
         return None
 
 
+def is_qwenputer(model) -> bool:
+    """Whether ``model`` is Qwenputer (models/qwenputer.py: served by code of its own; every other model is not)."""
+    return str(model).rstrip("/").split("/")[-1].lower() in ("qwen3.5-4b-qwenputer", "qwenputer", "qwenputer-4b")
+
+
 def weights_gb(model: str, remote: bool = False) -> "float | None":
     """The model's weights in GB: its local files (a folder, or the Hugging Face cache), else, with
     ``remote``, the sizes Hugging Face lists. None if unknown. A model whose experts stay in its files
-    (``streamed``) counts what stays in GPU memory."""
+    (``streamed``) counts what stays in GPU memory; Qwenputer, Qwen3.5-4B's and its computer's (its 18.8 GB
+    checkpoint is only read once, into a pack)."""
+    if is_qwenputer(model):
+        base = weights_gb(MODELS["qwen3.5-4b"], remote)
+        return None if base is None else base + 0.15
     path = Path(model).expanduser()
     if not path.exists():
         path = cached_snapshot(model, ["*.json", "*.safetensors"])
@@ -352,10 +367,10 @@ ALIASES = {"qwen": "qwen3.5-4b", "qwen3.5": "qwen3.5-4b", "gemma": "gemma-4-e4b"
            "gemma-4": "gemma-4-e4b", "gemma4-e4b": "gemma-4-e4b", "gemma-4-e4b-it": "gemma-4-e4b",
            "lfm": "lfm2.5-2.6b", "lfm2.5": "lfm2.5-2.6b", "minicpm": "minicpm5-2b", "minicpm5": "minicpm5-2b",
            "lfm3": "lfm3-1.7b",
-           "flint-40b": "flint", "flint-3bit": "flint"}
+           "flint-40b": "flint", "flint-3bit": "flint", "qwenputer": "qwenputer-4b"}
 MODEL_HELP = ("model: qwen (Qwen3.5-4B, the default from 16 GB of memory), qwen3.5-2b (the default below), gemma (Gemma 4 "
-              "E4B), lfm (LFM2.5-2.6B), lfm3 (LFM3-1.7B), minicpm (MiniCPM5-2B), flint (Recursive's Flint, 24 GB Macs and up), or any "
-              "mlx-lm model id or local path")
+              "E4B), lfm (LFM2.5-2.6B), lfm3 (LFM3-1.7B), minicpm (MiniCPM5-2B), flint (Recursive's Flint, 24 GB Macs and up), qwenputer "
+              "(Qwen3.5-4B with a computer in its weights that runs its calc tool), or any mlx-lm model id or local path")
 
 
 def short_name(model: str) -> str:

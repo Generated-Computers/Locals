@@ -49,6 +49,8 @@ class Job:
     top_k: Optional[int] = None
     seed: Optional[int] = None  # its own seed: the same reply for the same request alone (None: unseeded)
     ignore_eos: bool = False  # run to max_tokens: end-of-sequence tokens do not end the reply (a benchmark option)
+    internal: Tuple[str, ...] = ("calc",)  # (Qwenputer) the tools its computer runs for this request
+    computer: Optional[dict] = None  # (Qwenputer) the server's work for its computer (CalcController's ``computer``)
     _event: threading.Event = field(default_factory=threading.Event)
     _req: object = None
 
@@ -67,6 +69,16 @@ class Job:
     @property
     def done(self) -> bool:
         return self._event.is_set()
+
+
+def _performance_cores() -> int:
+    """The Mac's performance cores (all its cores where that is not known)."""
+    import subprocess
+
+    try:
+        return int(subprocess.run(["sysctl", "-n", "hw.perflevel0.physicalcpu"], capture_output=True, text=True, timeout=5).stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return os.cpu_count() or 4
 
 
 def _llg_grammar(llguidance, regex: str, specials: dict):
@@ -225,7 +237,8 @@ class BatchService:
     def submit(self, prompt: List[int], schema: Optional[dict] = None, max_tokens: int = 512, regex: Optional[str] = None,
                on_token: Optional[Callable[[List[int]], None]] = None, checkpoints: Optional[List[Tuple[int, str]]] = None,
                temp: Optional[float] = None, ignore_eos: bool = False, top_p: Optional[float] = None,
-               top_k: Optional[int] = None, seed: Optional[int] = None) -> Job:
+               top_k: Optional[int] = None, seed: Optional[int] = None, internal: Optional[Tuple[str, ...]] = None,
+               computer: Optional[dict] = None) -> Job:
         """Queue a generation; the output matches ``schema`` (JSON Schema) or ``regex`` if given.
         ``on_token`` streams committed tokens (called from the worker thread). For
         each ``(n, kind)`` in ``checkpoints`` the cache of ``prompt[:n]`` is also kept
@@ -234,12 +247,14 @@ class BatchService:
         request that shares only that much. ``temp``: this request's sampling
         temperature (0: greedy), else the service's; ``top_p``, ``top_k`` likewise; ``seed``: its draws come
         from that seed (our engine: the same reply for the same request alone). ``ignore_eos``: generate ``max_tokens``
-        tokens whatever the model ends with (benchmarks' fixed output lengths, as vLLM's option)."""
+        tokens whatever the model ends with (benchmarks' fixed output lengths, as vLLM's option). ``internal``
+        (Qwenputer): the tools its computer runs for this request (default: calc); ``computer``: the server's other
+        work for it (checks of the client's calls, the conversation's notes, copy checks: CalcController)."""
         if not prompt:
             raise ValueError("empty prompt")
         job = Job(list(prompt), schema, max_tokens, regex, t_submit=time.perf_counter(), on_token=on_token,
                   checkpoints=list(checkpoints or []), temp=temp, ignore_eos=ignore_eos, top_p=top_p, top_k=top_k,
-                  seed=seed)
+                  seed=seed, internal=tuple(internal) if internal is not None else ("calc",), computer=computer)
         rt = getattr(self, "_rt", None)
         if rt is not None and not self.walk and (schema is not None or regex is not None):
             # its grammar is made in a thread of its own, and the job queued once it is: made in the batch loop, a
@@ -380,6 +395,10 @@ class BatchService:
             mx.random.seed(self.seed)
             if not _POOL_PLANNED:  # (loaded after ours, the stock engine set it back to 1 GB under ours's margin)
                 mx.set_cache_limit(1 << 30)  # MLX keeps freed buffers up to the whole memory limit by default
+            from .defaults import is_qwenputer
+
+            if is_qwenputer(self.model_id) and self.engine != "locals":
+                raise ValueError("Qwenputer runs on the locals engine only")
             (self._run_locals if self.engine == "locals" else self._run_stock)()
         except BaseException as e:  # surface load errors to the constructor, others to clients
             import sys
@@ -413,7 +432,20 @@ class BatchService:
         from .packed import Request
         from .runtime import Runtime
 
-        rt = Runtime.load(self.model_id, tune=os.environ.get("LOCALS_TUNE", "background"))
+        from .defaults import is_qwenputer
+
+        calc = None  # Qwenputer: its computer's device (shared by every conversation's computer)
+        if is_qwenputer(self.model_id):
+            from .models import qwenputer as QP
+            from .models.qwenputer_walk import Device
+
+            say = lambda m: print(m, file=sys.stderr, flush=True)  # noqa: E731
+            pack = QP.ensure_pack(log=say)
+            # its toolbox (LOCALS_QWENPUTER_TOOLS=0: calc alone): more tools the computer runs in place of the client
+            tools = os.environ.get("LOCALS_QWENPUTER_TOOLS", "1") != "0" and QP.ensure_tools(pack, log=say)
+            calc = Device(QP.Chip(pack, tools=tools))
+            self.qwenputer_tools = calc.chip.tools
+        rt = Runtime.load(QP.BASE if calc else self.model_id, tune=os.environ.get("LOCALS_TUNE", "background"))
         self._rt = rt
         store = getattr(rt.model, "expert_store", None)
         if store is not None:  # (experts read from the files as tokens need them: their GPU slots are made now, so
@@ -433,6 +465,9 @@ class BatchService:
             eos_ids = ()
 
         eng = HybridBatchEngine(rt.model, rt.tokenizer, n_slots=self.slots)
+        # Qwenputer: a reply at a calc call stays in the batch, reading nothing, while its run is made (hybrid_batch's
+        # parked rows); else (LOCALS_QWENPUTER_PARK=0, or layers that cannot be held) it leaves and comes back
+        eng.parks = bool(calc) and os.environ.get("LOCALS_QWENPUTER_PARK", "1") != "0" and eng.can_park()
         try:
             disk_gb = float(os.environ.get("LOCALS_DISK_CACHE_GB") or 4)
         except ValueError:
@@ -473,12 +508,300 @@ class BatchService:
         lru = chain_cache(max_size=256, max_bytes=self.cache_bytes)
         self._lru = lru
         owner = {}
+        work = give = None  # Qwenputer: the computer's thread's queue, and what puts work in it
+        if calc:
+            work = queue.Queue()
+
+            def give(item):
+                self._tune_after = float("inf")  # no kernel tuning while the computer works: it shares the GPU
+                work.put(item)
+
+            def end_reply(job, ctl, why):
+                """The reply ends: now, or once the computer has checked a number of its answer's (``finish_after``)."""
+                def end():
+                    if job.done:  # (an engine error ended it meanwhile)
+                        return
+                    rest = ctl.finish()
+                    if rest and job.on_token is not None:
+                        job.on_token(rest)
+                    self._finish(job, ctl.shown, why)
+
+                if why == "cancelled" or not ctl.finish_after(end):
+                    end()
+
+            def go_on(job, r, ctl, echo, upto):
+                """The reply goes on after ``echo`` as a request that continues the row (its first ``upto`` tokens)."""
+                ctl.used += upto + len(echo)
+                left = job.max_tokens - ctl.used
+                if left <= 0 or job.cancelled:
+                    end_reply(job, ctl, "cancelled" if job.cancelled else "length")
+                    return
+                nr = Request(list(r.prompt) + r.out[:upto] + echo, ctl, left)
+                nr.on_token, nr.checkpoints = r.on_token, []
+                nr.reply_state = getattr(r, "kept_reply", None)  # (see the hold in source)
+                nr.temp, nr.top_p, nr.top_k, nr.seed = r.temp, r.top_p, r.top_k, r.seed
+                job._req = nr
+                nr.cancel = job.cancelled
+                job._resume = nr
+                self._q.put(job)
+
+            cpu = None  # the computer's runs on CPU cores (models/qwenputer_cpu.py), where its C can be built
+            if os.environ.get("LOCALS_QWENPUTER_CPU", "1") != "0":
+                from .models.qwenputer_cpu import CPU, shared
+
+                try:
+                    cpu = CPU.make(calc, pack)
+                except Exception as e:  # noqa: BLE001
+                    print(f"locals: Qwenputer's computer stays on the GPU ({e!r})", file=sys.stderr, flush=True)
+                if cpu is None:
+                    print("locals: Qwenputer's computer runs on the GPU (its CPU code is built with clang: "
+                          "xcode-select --install)", file=sys.stderr, flush=True)
+
+            def computer():
+                """Qwenputer's computer, alongside the batch: each reply at a calc call has the call read (on the GPU,
+                in this thread: MLX gives it a stream of its own), its run made on a CPU core (several at once: Qwen
+                keeps the GPU) or else stepped with the other runs as one batch on the GPU (models/
+                qwenputer_walk.Pool). A parked reply (its row in the batch, reading nothing) then goes on with the
+                echo; a held one (its row out of the batch) as a request that continues its row."""
+                import numpy as np
+
+                from .models.qwenputer_walk import Pool
+
+                log = bool(os.environ.get("LOCALS_QWENPUTER_LOG"))
+                pool = Pool(calc)
+                cores = None
+                if cpu is not None:
+                    from concurrent.futures import ThreadPoolExecutor
+
+                    n = int(os.environ.get("LOCALS_QWENPUTER_CPUS") or 0) or _performance_cores() - 2
+                    ncores = max(1, min(n, 6))
+                    cores = ThreadPoolExecutor(max_workers=ncores, thread_name_prefix="qwenputer-cpu")
+                running = 0  # runs on the cores
+
+                def on_cores(job, x, first, bufs, t0, threads):
+                    try:
+                        res = cpu.run(*bufs[0], first, threads=threads)[0]
+                    except Exception as e:  # noqa: BLE001
+                        res = e
+                    work.put(("ran", job, x, (first, res, bufs, t0)))
+
+                # copy checks (copy_check) on computers of their own, as many at once as there are cores for them (one
+                # each): the reply's row goes on meanwhile
+                from .models.qwenputer_walk import Computer, _parts
+
+                scratch = []  # the checks' computers (None: one that failed, made again when needed)
+                idle = []  # those not checking
+                checks = []  # (job, controller, (results, number)) waiting
+
+                def fresh():
+                    comp = Computer(calc)
+                    comp.start(rt.tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False))
+                    return comp
+
+                def copy_check(job, ctl, results, number, parts=None, k=None):
+                    """The run of copy_check on a scratch computer (``k``, else one free), a part at a time (``_parts``: a
+                    long number's digits are a token each): on a core (each part's run comes back as "copied"), or
+                    stepped on the GPU here. A check that fails lets the number go as written."""
+                    nonlocal running
+                    try:
+                        if k is None and ctl.in_prompt(number):  # (one the question wrote: nothing to check)
+                            return copied(job, ctl, [], None)
+                        if k is None:
+                            if not idle:
+                                j = scratch.index(None) if None in scratch else len(scratch)
+                                scratch[j:j + 1] = [fresh()]
+                                idle.append(j)
+                            k = idle.pop()
+                        comp = scratch[k]
+                        tco, tcc = calc.chip.info["tool_call"]
+                        while True:
+                            if parts is None:
+                                body = (f"\n<function=copy_check>\n<parameter=results>\n{results}\n</parameter>\n"
+                                        f"<parameter=written>\n{number}\n</parameter>\n</function>\n")
+                                parts = _parts(rt.tokenizer, rt.tokenizer.encode(body, add_special_tokens=False))
+                            part, parts = parts[0], parts[1:]
+                            first = int(comp.read([tco] + part + [tcc])[-1])
+                            if first < 0:
+                                return copied(job, ctl, None, k)
+                            if cores is not None:
+                                break
+                            run = [first] + comp.step(first)
+                            if not parts:
+                                return copied(job, ctl, run, k)
+                        mx.eval(comp.s, comp.c, comp.mk)
+                        mx.synchronize()
+                        views = shared([(comp.s, np.float32), (comp.c, np.float32), (comp.mk, np.uint32)])
+                        bufs = (views, True) if views else ([np.array(a) for a in (comp.s, comp.c, comp.mk)], False)
+                    except Exception as e:  # noqa: BLE001  # (the number goes as written; the computer is made again)
+                        print(f"locals: Qwenputer's copy check: {e!r}", file=sys.stderr, flush=True)
+                        return copied(job, ctl, None, k)
+                    running += 1
+
+                    def go():
+                        try:
+                            res = cpu.run(*bufs[0], first, threads=1)[0]
+                        except Exception as e:  # noqa: BLE001
+                            res = e
+                        work.put(("copied", job, ctl, (first, res, bufs, results, number, parts, k)))
+
+                    cores.submit(go)
+
+                def copied(job, ctl, run, k):
+                    """copy_check's answer for the reply (a run that failed, or none: the number as written); its
+                    computer free again (made again after a run that failed: the firmware may be mid-program)."""
+                    fixed = None
+                    if run and run[-1] >= 0:
+                        value = ctl._value([t for t in run if t < calc.chip.v0])
+                        if value.startswith("fix\n"):
+                            fixed = value[4:]
+                    try:
+                        ctl.copied(fixed)
+                        if not job.done:
+                            ctl.drain(job.on_token)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"locals: Qwenputer's copy check: {e!r}", file=sys.stderr, flush=True)
+                    if k is not None:
+                        if run is None or (run and run[-1] < 0):
+                            scratch[k] = None
+                        else:
+                            idle.append(k)
+
+                def ctl_of(x):  # (a parked reply's item is its controller, a held one's its request)
+                    return x if hasattr(x, "release") and not hasattr(x, "controller") else x.controller
+
+                def fail(job, x, e):
+                    print(f"locals: Qwenputer's computer: {e!r}", file=sys.stderr, flush=True)
+                    ctl = ctl_of(x)
+                    if getattr(ctl, "checking", None) is not None:  # (checking the client's call: it goes as written)
+                        try:
+                            echo = ctl.unchecked()
+                            ctl.drain(job.on_token)
+                            go_on_with(job, x, ctl, echo)
+                            return
+                        except Exception as e2:  # noqa: BLE001
+                            e = e2
+                    if ctl.park:  # (its row leaves the batch at the next step: the reply ends with the error)
+                        ctl.error = f"error: {e!r}"
+                        if job._req is not None:
+                            job._req.cancel = True
+                        eng.wake()
+                    else:
+                        self._finish(job, ctl.shown, f"error: {e!r}")
+
+                def go_on_with(job, x, ctl, echo):
+                    if ctl.park:  # the row, parked in the batch, goes on with the echo
+                        ctl.ready = echo
+                        eng.wake()
+                    else:
+                        go_on(job, x, ctl, echo, len(x.out))
+
+                def finish_run(job, x, run, t0):
+                    ctl = ctl_of(x)
+                    if log:
+                        dt = time.perf_counter() - t0
+                        where = "a CPU core" if cores is not None else f"the GPU, {len(pool)} other runs going on"
+                        print(f"[qwenputer] run of {len(run)} tokens in {dt:.2f}s ({len(run) / dt:.0f} tokens/s, on {where})",
+                              file=sys.stderr, flush=True)
+                    try:
+                        echo = ctl.ran(run)
+                    except Exception as e:  # noqa: BLE001
+                        fail(job, x, e)
+                        return
+                    if ctl.parts:  # (a part of a long toolbox call: the computer reads the next)
+                        work.put(("part", job, x))
+                        return
+                    ctl.drain(job.on_token)
+                    go_on_with(job, x, ctl, echo)
+
+                while True:
+                    got = [] if len(pool) else [work.get()]
+                    while not work.empty():
+                        got.append(work.get())
+                    self._tune_after = float("inf")
+                    try:
+                        for item in got:
+                            if item[0] == "copy":  # (a number of an answer's: checked in turn)
+                                checks.append(item[1:])
+                                continue
+                            if item[0] == "copied":
+                                _, job, ctl, (first, res, bufs, results, number, parts, k) = item
+                                running -= 1
+                                if not bufs[1]:
+                                    scratch[k].s, scratch[k].c, scratch[k].mk = (mx.array(a) for a in bufs[0])
+                                if parts and not isinstance(res, Exception):  # (the number's next part)
+                                    copy_check(job, ctl, results, number, parts, k)
+                                    continue
+                                if log:
+                                    print(f"[qwenputer] copy check of {number[:40]}: {len(res) if isinstance(res, list) else res!r} "
+                                          "tokens", file=sys.stderr, flush=True)
+                                copied(job, ctl, None if isinstance(res, Exception) else [first] + res, k)
+                                continue
+                            if item[0] == "ran":  # (a run made on a core)
+                                _, job, x, (first, res, bufs, t0) = item
+                                running -= 1
+                                if isinstance(res, Exception):
+                                    fail(job, x, res)
+                                    continue
+                                comp = ctl_of(x).comp
+                                if not bufs[1]:  # (copies: the state goes back to the device)
+                                    comp.s, comp.c, comp.mk = (mx.array(a) for a in bufs[0])
+                                if not job.done:
+                                    finish_run(job, x, [first] + res, t0)
+                                continue
+                            # ("held", job, its request) or ("park", job, its controller); ("part", job, either): a
+                            # long toolbox call's next part
+                            _, job, x = item
+                            if job.done:  # (an engine error failed it meanwhile)
+                                continue
+                            ctl = ctl_of(x)
+                            try:
+                                first = ctl.read_call()
+                            except Exception as e:  # noqa: BLE001  # (this reply's error)
+                                fail(job, x, e)
+                                continue
+                            if first < 0:  # (no run: the reply goes on after the call)
+                                go_on_with(job, x, ctl, ctl.ran([]))
+                                continue
+                            if cores is not None:  # (host copies of its state: the core writes them)
+                                comp = ctl.comp
+                                # a run alone shares its attention layers out to a few cores; with others, a core each
+                                threads = 1 if running else min(4, ncores)
+                                running += 1
+                                # the core works on the computer's own buffers, where the GPU left them (one memory:
+                                # nothing copied out or back), once the GPU's passes that wrote them are done
+                                mx.eval(comp.s, comp.c, comp.mk)
+                                mx.synchronize()
+                                views = shared([(comp.s, np.float32), (comp.c, np.float32), (comp.mk, np.uint32)])
+                                bufs = (views, True) if views else ([np.array(a) for a in (comp.s, comp.c, comp.mk)], False)
+                                cores.submit(on_cores, job, x, first, bufs, time.perf_counter(), threads)
+                            else:
+                                pool.add(ctl.comp, first, (job, x, time.perf_counter()))
+                        for (job, x, t0), run in pool.advance():
+                            finish_run(job, x, run, t0)
+                        while checks and (idle or None in scratch or len(scratch) < (ncores if cores is not None else 1)):
+                            job, ctl, (results, number) = checks.pop(0)
+                            copy_check(job, ctl, results, number)
+                    except Exception as e:  # noqa: BLE001  # (the batch of runs failed: every run in it)
+                        for _, _, (job, x, _) in pool.rows + [(None, None, t) for _, _, t in pool.new]:
+                            fail(job, x, e)
+                        pool = Pool(calc)
+                    finally:
+                        if work.empty() and not len(pool) and not running and not checks:
+                            self._tune_after = time.time() + 1.0  # (and not while a reply comes back)
+
+            threading.Thread(target=computer, name="qwenputer-computer", daemon=True).start()
         self._ready.set()
 
         def source(block):
             jobs = self._take(block)
             reqs = []
             for job in jobs:
+                nr = getattr(job, "_resume", None)
+                if nr is not None:  # a Qwenputer reply going on after its calc call
+                    job._resume = None
+                    owner[id(nr)] = (job, nr)
+                    reqs.append(nr)
+                    continue
                 # One request's fault (a regex that does not compile, a schema too large or recursive)
                 # is that request's error: it used to escape serve(), fail every request in flight and
                 # leave this one waiting forever.
@@ -504,6 +827,16 @@ class BatchService:
                             c = rt.compile(job.schema, regex=job.regex, ready=getattr(job, "_ready", None), recursive_ok=False)
                             job._ready = None
                             ctl = LocalsController(c.constraint, c.planner, True, True)
+                    elif calc:
+                        from .models.qwenputer_walk import CalcController
+
+                        ctl = CalcController(calc, job.prompt, rt.tokenizer, eos, endless=job.ignore_eos,
+                                             split=os.environ.get("LOCALS_QWENPUTER_SPLIT", "1") != "0",
+                                             cuts=[n for n, _ in job.checkpoints or []], park=eng.parks,
+                                             internal=job.internal, computer=job.computer)
+                        ctl.used = 0  # the reply's tokens before the request that continues it
+                        ctl.on_park = lambda job=job, ctl=ctl: give(("park", job, ctl))
+                        ctl.on_copy = lambda c, results, number, job=job: give(("copy", job, c, (results, number)))
                     else:
                         ctl = Endless() if job.ignore_eos else Free()
                 except _REQUEST_ERRORS as e:  # the request's grammar: a 400
@@ -514,6 +847,16 @@ class BatchService:
                     continue
                 r = Request(job.prompt, ctl, job.max_tokens)
                 r.on_token = job.on_token
+                if calc and hasattr(ctl, "drain"):  # (Qwenputer: the tokens its presenter shows)
+                    def shown(new, ctl=ctl, cb=job.on_token, r=r):
+                        if ctl.held and getattr(r, "reply_state", None) is not None:
+                            # the row stops at a calc call: its whole cache is kept for the request that continues
+                            # it (retire keeps only the reply-start entry of a row with one); that request keeps it
+                            r.kept_reply, r.reply_state = r.reply_state, None
+                        if cb is not None and ctl.shown[ctl.sent:]:
+                            ctl.drain(cb)
+
+                    r.on_token = shown
                 r.checkpoints = job.checkpoints
                 r.temp, r.top_p, r.top_k, r.seed = job.temp, job.top_p, job.top_k, job.seed
                 job._req = r  # before reading job.cancelled: a cancel in between sets r.cancel itself
@@ -525,8 +868,21 @@ class BatchService:
 
         def done(r):
             job, _ = owner.pop(id(r))
-            job.cached = getattr(r, "cached_tokens", 0)
-            self.cached_tokens += job.cached
+            if calc and hasattr(r.controller, "drain") and r.controller.used:
+                pass  # (a request that continues a reply: its prompt was the reply's own so far)
+            else:
+                job.cached = getattr(r, "cached_tokens", 0)
+                self.cached_tokens += job.cached
+            ctl = r.controller
+            if calc and getattr(ctl, "held", False) and r.finish == "stop" and not r.cancel:
+                give(("held", job, r))  # the computer's thread makes the call's run
+                return
+            if calc and getattr(ctl, "error", None):  # (its computer failed while the row was parked)
+                self._finish(job, ctl.shown, ctl.error)
+                return
+            if calc and hasattr(r.controller, "drain"):
+                end_reply(job, r.controller, r.finish)  # (a number of the answer's being checked: the end waits)
+                return
             self._finish(job, r.out, r.finish)
 
         orig_launch = eng._launch
