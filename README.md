@@ -26,6 +26,16 @@
   <a href="https://arxiv.org/abs/2610.09139"><b>Paper</b></a>
 </p>
 
+> **New: Qwenputer runs in Locals.** [Qwenputer](docs/qwenputer/README.md) is
+> Qwen3.5-4B with a RISC-V computer compiled into its weights that runs the
+> model's `calc` tool exactly. Locals runs that computer in C on the Mac's
+> performance cores, 23 times faster than with MLX operations (3,300 against
+> 142 of its tokens per second), while Qwen keeps the GPU: 8 calc questions at
+> once go through at 155 tokens/s in total, 3.8 times our first version (41),
+> with 59 of 60 right (Qwen3.5-4B alone: 5). `--model qwenputer-cpu` also gives
+> the computer work a client's tools would do on the CPU (60 tools, call checks,
+> a small Python): 80 of 80 toolbox questions right, at 107 tokens/s. M2 Pro, 16 GB.
+
 > **New: Liquid's LFM3 runs in Locals.** LFM3-1.7B is a 1 GB model for agents
 > that mixes short convolutions with attention. No mlx-lm release can load it
 > yet; Locals ships its code: `locals code ~/my-project --model lfm3`. On a
