@@ -480,8 +480,10 @@ class BatchService:
 
             from .hybrid_batch import DiskPromptCache
 
-            tag = (self.model_id.strip("/").replace("/", "--")[-80:] + "--" + str(getattr(rt, "dtype", "")).split(".")[-1]
-                   + "--" + _weights_fingerprint(self.model_id))
+            # (Qwenputer on another Qwen part, LOCALS_QWENPUTER_BASE: its cached states kept apart from the 4B's)
+            cache_id = self.model_id if not calc or QP.BASE == QP.DEFAULT_BASE else self.model_id + "@" + Path(QP.BASE).name
+            tag = (cache_id.strip("/").replace("/", "--")[-80:] + "--" + str(getattr(rt, "dtype", "")).split(".")[-1]
+                   + "--" + _weights_fingerprint(QP.BASE if calc else self.model_id))
             root = Path(os.environ.get("LOCALS_DISK_CACHE_DIR") or Path.home() / ".cache" / "locals" / "prompts")
             try:
                 eng.disk = DiskPromptCache(root / tag, disk_gb)
