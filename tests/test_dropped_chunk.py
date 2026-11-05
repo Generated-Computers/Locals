@@ -2,8 +2,6 @@
 again from where it began: hybrid_batch._marks and _rewind, HybridBatchEngine._read_chunk; on a small random LFM3,
 whose caches are of all three kinds (full attention, a sliding window, a convolution's state), alone and in a batch."""
 
-import os
-
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
@@ -13,11 +11,6 @@ from locals.hybrid_batch import HybridBatchEngine, _merge_layerwise
 from locals.models import lfm3
 
 ERR = "[METAL] Command buffer execution failed: Internal Error (0000000e:Internal Error)."
-# On GitHub's macOS runners (virtual GPUs) MLX now and then copies a full-attention buffer a chunk could have been
-# written into, so its address changes and a dropped chunk is, rightly, not read again (_rewind). These tests count on
-# the buffer staying (on Macs it always has), so they are skipped there.
-ON_CI = pytest.mark.skipif(os.environ.get("GITHUB_ACTIONS") == "true",
-                           reason="MLX sometimes copies the buffer on GitHub's runners (see ON_CI)")
 KINDS = ["conv", "full_attention", "conv", "sliding_attention", "conv", "full_attention"]
 
 
@@ -55,6 +48,7 @@ class _Drops:
         self.calls += 1
         mx.eval([c.state for c in cache])
         if self.calls in self.fail:
+            mx.synchronize()  # (else MLX may still hold a buffer, and the spoiling write copy it: see _read_chunk)
             for c in cache:
                 _spoil(c)
             raise RuntimeError(ERR)
@@ -76,7 +70,6 @@ def _batch_cache(model, rows):
     return cache
 
 
-@ON_CI
 @pytest.mark.parametrize("rows", [1, 2])
 def test_a_dropped_chunk_is_read_again_and_the_prompt_ends_as_it_would_have(rows, capsys):
     m = _model()
@@ -150,7 +143,6 @@ def _no_pause(monkeypatch):
     monkeypatch.setattr(hybrid_batch, "RETRY_PAUSE", 0.0)
 
 
-@ON_CI
 def test_the_marks_cost_no_copy():
     """Each chunk is written into the same full-attention buffers, marks or not (a buffer held by them would be copied
     whole at every chunk: 3 GB a chunk at 245k tokens)."""
@@ -166,3 +158,21 @@ def test_the_marks_cost_no_copy():
 
     _read(m, make_prompt_cache(m), mx.random.randint(0, 256, (1, 200), key=mx.random.key(8)), 16, Watch([]))
     assert len(seen) == 13 and len(set(seen)) == 1  # (200 positions: all in mlx-lm's first 256-position buffer)
+
+
+def test_a_chunk_read_at_once_after_an_eval_is_written_in_place():
+    """mx.eval returns before MLX lets go of the buffers its command buffers read (in their completion handlers, on
+    another thread): a chunk written into one still held would copy it whole. _read_chunk waits for them first
+    (without that wait this failed 30 times in 30 on an M2 Pro)."""
+    from locals.hybrid_batch import _buffers
+
+    m = _model()
+    cache, new = make_prompt_cache(m), mx.zeros((1, 2, 1, 16))
+    toks = mx.random.randint(0, 256, (1, 8), key=mx.random.key(11))
+    for _ in range(20):
+        m.model(toks, cache)  # a chunk read the plain way: its command buffers read the buffers, through views of them
+        mx.eval([c.state for c in cache])
+        kv = cache[1]
+        before = _buffers(kv)
+        HybridBatchEngine._read_chunk(_Drops([]), [kv], lambda k: kv.update_and_fetch(new, new), 1)  # (one layer: soon)
+        assert _buffers(kv) == before

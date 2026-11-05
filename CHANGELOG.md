@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.3 (unreleased)
+
+- On a busy Mac, a prompt chunk now and then went into a copy of the cache's key and value buffers instead of the
+  buffers themselves: MLX writes into a buffer only when nothing else holds it, and the GPU's command buffers of the
+  chunk before let go of theirs a moment after it was done (later while the CPU is busy). Each copy was a whole buffer,
+  and a chunk the GPU then dropped could not be read again from where it began. Each chunk now waits for them first
+  (about 30 µs; prompt reading is as fast).
+
 ## 0.2.2 (2026-11-04)
 
 - **Qwenputer**, in two versions (`--model qwenputer` and `--model qwenputer-cpu`: divagr1925/Qwen3.5-4B-Qwenputer):

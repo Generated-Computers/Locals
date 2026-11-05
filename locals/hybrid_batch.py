@@ -898,6 +898,12 @@ class HybridBatchEngine(BatchEngine):
         marks = _marks(cache)
         for attempt in range(GPU_RETRIES + 1):
             try:
+                # mx.eval returns at its last command buffer's signal, and MLX lets go of the arrays a command buffer
+                # read (here the cache's buffers, through their views) only in its completion handler, which runs
+                # later on another thread. A chunk's write into a buffer still held there is a copy of the whole
+                # buffer (a new address: _rewind could not read a dropped chunk again). On a loaded Mac, and on
+                # GitHub's virtual ones, the next chunk often came first; after synchronize it never has.
+                mx.synchronize()
                 feed(n)
                 self._sync(cache)
                 return n
