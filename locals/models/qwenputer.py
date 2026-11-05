@@ -48,8 +48,11 @@ BASE = "mlx-community/Qwen3.5-4B-MLX-4bit"  # Qwen's part: its 32 layers, quanti
 # The authors' reference package (their RV32 machine, circuit compiler, text bridge): it loads the firmware into a
 # chip pack, and drafts the computer's runs while Locals serves (``chipformer()``).
 CHIPFORMER = "ca13310e2f9f788d1dd3feeea8213c1b0c23913c"
-INSTALL = (f'pip install "chipformer @ git+https://github.com/divagr18/qwenputer@{CHIPFORMER}'
-           '#subdirectory=experimental/riscv"')
+CHIPFORMER_REQ = f"chipformer @ git+https://github.com/divagr18/qwenputer@{CHIPFORMER}#subdirectory=experimental/riscv"
+INSTALL = f'pip install "{CHIPFORMER_REQ}"'
+# Locals installed with uv tool install (the README's way, and install.sh's) has an environment of its own that pip
+# does not reach: the package goes in with --with, which a later uv tool upgrade keeps
+UV_INSTALL = f'uv tool install --python 3.12 locals --with "{CHIPFORMER_REQ}"'
 FIRMWARE_URL = ("https://raw.githubusercontent.com/divagr18/qwenputer/" + CHIPFORMER
                 + "/experimental/riscv/tests/data/rv/calc-bridge.elf")  # the calc firmware, built with -DBRIDGE
 FIRMWARE_SHA256 = "b643ad61291a947fa6c7498de9170b1d4da062dc1f34810feba9c4eebdec862d"
@@ -227,9 +230,15 @@ def convert(src, out) -> dict:
 
 
 # -- the chip pack on this Mac -----------------------------------------------------------------------------------
+def install_command() -> str:
+    """How to install the authors' package into this Locals: uv's command in a uv tool environment (it has a
+    uv-receipt.toml), else pip's."""
+    return UV_INSTALL if (Path(sys.prefix) / "uv-receipt.toml").exists() else INSTALL
+
+
 def chipformer():
-    """The authors' package if it can be imported (installed: ``INSTALL``; or a checkout's experimental/riscv folder
-    named by LOCALS_CHIPFORMER), else None."""
+    """The authors' package if it can be imported (installed: ``install_command()``; or a checkout's
+    experimental/riscv folder named by LOCALS_CHIPFORMER), else None."""
     path = os.environ.get("LOCALS_CHIPFORMER")
     if path and path not in sys.path:
         sys.path.append(path)
@@ -253,7 +262,8 @@ def ensure_pack(log=print) -> Path:
     if all((d / f).exists() for f in ("chip.safetensors", "chip.json", "snapshot.safetensors", "calc-bridge.elf")):
         return d
     if chipformer() is None:
-        raise RuntimeError("Qwenputer's firmware is loaded by its authors' package, which is not installed: " + INSTALL)
+        raise RuntimeError("Qwenputer's firmware is loaded by its authors' package, which is not installed: "
+                           + install_command())
     import hashlib
     import shutil
     import tempfile

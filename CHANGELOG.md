@@ -7,6 +7,9 @@
   chunk before let go of theirs a moment after it was done (later while the CPU is busy). Each copy was a whole buffer,
   and a chunk the GPU then dropped could not be read again from where it began. Each chunk now waits for them first
   (about 30 µs; prompt reading is as fast).
+- Qwenputer's first start, without its authors' package, gives the command that installs it where Locals is: with
+  Locals installed by `uv tool install` (or the install script), `uv tool install ... --with "chipformer @ ..."`,
+  since pip does not reach uv's environment; otherwise `pip install`. The Qwenputer docs give both.
 
 ## 0.2.2 (2026-11-04)
 

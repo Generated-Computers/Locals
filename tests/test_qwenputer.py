@@ -36,6 +36,18 @@ def test_names():
         assert not Q.is_qwenputer(model_id(other)) and hf_repo(model_id(other)) == model_id(other)
 
 
+
+def test_the_install_command_fits_how_locals_was_installed(tmp_path, monkeypatch):
+    """In a uv tool environment (uv-receipt.toml in its prefix) pip does not reach Locals: the package goes in with
+    uv tool install --with; anywhere else, pip install."""
+    monkeypatch.setattr(Q.sys, "prefix", str(tmp_path))
+    assert Q.install_command() == Q.INSTALL and Q.INSTALL.startswith('pip install "chipformer @ git+')
+    (tmp_path / "uv-receipt.toml").write_text("[tool]\n")
+    assert Q.install_command() == Q.UV_INSTALL
+    assert Q.UV_INSTALL == f'uv tool install --python 3.12 locals --with "{Q.CHIPFORMER_REQ}"'
+    assert Q.CHIPFORMER in Q.CHIPFORMER_REQ
+
+
 # -- the reply as the client reads it ------------------------------------------------------------------------------
 @pytest.fixture(scope="module")
 def tok():

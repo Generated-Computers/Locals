@@ -29,13 +29,21 @@ done by the model's own computer instead, exactly, at the cost of speed.
 
 The first start downloads the 18.8 GB checkpoint and makes a 123 MB pack of the computer from it, in about 30 seconds.
 The pack goes in `~/.locals/qwenputer/` (`LOCALS_HOME`), and the checkpoint can be deleted afterwards. Loading the
-firmware into the pack needs the authors' package, once:
+firmware into the pack needs the authors' package, once. With Locals installed by `uv tool install` or the install
+script, it goes into Locals' own environment:
+
+```
+uv tool install --python 3.12 locals --with "chipformer @ git+https://github.com/divagr18/qwenputer@ca13310e2f9f788d1dd3feeea8213c1b0c23913c#subdirectory=experimental/riscv"
+```
+
+With Locals installed by pip, into the same environment:
 
 ```
 pip install "chipformer @ git+https://github.com/divagr18/qwenputer@ca13310e2f9f788d1dd3feeea8213c1b0c23913c#subdirectory=experimental/riscv"
 ```
 
-(`LOCALS_CHIPFORMER` may name a checkout's `experimental/riscv` folder instead.) Both versions read the same
+If it is missing, the first start says which of the two to run. (`LOCALS_CHIPFORMER` may name a checkout's
+`experimental/riscv` folder instead.) Both versions read the same
 checkpoint and pack. The `calc` tool is always offered to it, and the client never sees a call of it: a calc exchange the
 model runs before its answer comes back as `reasoning_content`, the answer as `content`. Calls of the client's own
 tools are the client's, as with any model.
