@@ -48,6 +48,7 @@ class _Drops:
         self.calls += 1
         mx.eval([c.state for c in cache])
         if self.calls in self.fail:
+            mx.synchronize()  # (else MLX may still hold a buffer, and the spoiling write copy it: see _read_chunk)
             for c in cache:
                 _spoil(c)
             raise RuntimeError(ERR)
@@ -137,6 +138,30 @@ def test_a_short_chunk_read_again_counts_its_own_tokens():
     assert cache[1].offset == 6
 
 
+def test_a_prefix_cut_from_a_longer_buffer_is_read_on():
+    """A conversation's next turn goes on from where the previous reply began: the finished row's key and value
+    buffers cut to that position (hybrid_batch._reply_entry), strided views. The marks find them, and the turn's
+    prompt is read on from them (the marks once failed on such a view: the engine restarted, and every prompt-cache
+    entry was lost)."""
+    from types import SimpleNamespace
+
+    from locals.hybrid_batch import _keep_reply_state, _marks, _reply_entry, _rewind
+
+    m = _model()
+    toks = mx.random.randint(0, 256, (1, 90), key=mx.random.key(9))
+    clean = _read(m, make_prompt_cache(m), toks, 16, _Drops([]))
+    cache, r = make_prompt_cache(m), SimpleNamespace()
+    m.model(toks[:, :40], cache)
+    _keep_reply_state(r, 40, cache)
+    m.model(mx.random.randint(0, 256, (1, 20), key=mx.random.key(10)), cache)  # the reply
+    mx.eval([c.state for c in cache])
+    entry = _reply_entry(r, cache)
+    assert not memoryview(entry[1].keys).c_contiguous
+    assert _rewind(entry, _marks(entry))  # (nothing read in between: the same buffers)
+    got = _read(m, entry, toks[:, 40:], 16, _Drops([]))
+    assert float(mx.abs(got - clean).max()) <= 1e-4 * (1 + float(mx.abs(clean).max()))
+
+
 def test_other_errors_are_not_caught():
     m = _model()
 
@@ -206,3 +231,21 @@ def test_a_prompt_reads_on_from_a_reply_entry(fail, dtype):
     tol = 1e-4 if dtype == mx.float32 else 2e-2  # (the chunks end at other places than in the cold read)
     assert float(mx.abs(got - clean).max()) <= tol * (1 + float(mx.abs(clean).max()))
     assert drops.calls == 4 + len(fail)  # (60 tokens in 16s; a dropped chunk read again whole: 16 is the least)
+
+
+def test_a_chunk_read_at_once_after_an_eval_is_written_in_place():
+    """mx.eval returns before MLX lets go of the buffers its command buffers read (in their completion handlers, on
+    another thread): a chunk written into one still held would copy it whole. _read_chunk waits for them first
+    (without that wait this failed 30 times in 30 on an M2 Pro)."""
+    from locals.hybrid_batch import _buffers
+
+    m = _model()
+    cache, new = make_prompt_cache(m), mx.zeros((1, 2, 1, 16))
+    toks = mx.random.randint(0, 256, (1, 8), key=mx.random.key(11))
+    for _ in range(20):
+        m.model(toks, cache)  # a chunk read the plain way: its command buffers read the buffers, through views of them
+        mx.eval([c.state for c in cache])
+        kv = cache[1]
+        before = _buffers(kv)
+        HybridBatchEngine._read_chunk(_Drops([]), [kv], lambda k: kv.update_and_fetch(new, new), 1)  # (one layer: soon)
+        assert _buffers(kv) == before

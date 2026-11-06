@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+from collections import OrderedDict
 import re
 import sys
 import threading
@@ -35,7 +36,7 @@ import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from . import apis, formats, oai
@@ -206,7 +207,13 @@ class Server:
         # the stock engine (mlx/...) has no memory guard: never sized from our engine's memory model
         self._stock_context = max_context or 65536
         self.short = short_name(self.model_id)
-        self.engines = tuple(engines)
+        from .defaults import is_qwenputer
+
+        # Qwenputer (models/qwenputer.py): a computer in the model runs its calc tool; our engine only (the stock one
+        # would load the 18.8 GB checkpoint as it is)
+        self.qwenputer = is_qwenputer(self.model_id)
+        self.engines = ("locals",) if self.qwenputer else tuple(engines)
+        preload = ("locals",) if self.qwenputer and preload else preload
         self.slots, self.temp, self.max_tokens, self.thinking, self.cache_gb, self.seed = slots, temp, max_tokens, thinking, cache_gb, seed
         self.max_calls = max_calls
         self.top_p, self.top_k = top_p, top_k  # sampling filters at temp > 0 (Qwen3.5 thinking: temp 0.6, top_p 0.95, top_k 20)
@@ -229,6 +236,14 @@ class Server:
         # hits the prompt cache: (rendered prompt text + reply text) -> ids.
         self._streams: Dict[str, List[dict]] = {e: [] for e in self.engines}
         self._raw: Dict[str, str] = {}  # tool-call id -> the raw reply text it came from
+        # (Qwenputer) the replies where its computer ran a tool, by a digest of their content: one a client sends back
+        # without its reasoning, as an earlier turn, is written as one with reasoning (the template leaves an earlier
+        # turn's reasoning out, and _stable_template keeps an empty think block before a turn that had none: after
+        # one, Qwen answered the next question without its tools, and wrote a word backwards wrong). Only that it had
+        # some is kept: no reasoning goes from one conversation into another's prompt.
+        self._exchanges: "OrderedDict[bytes, None]" = OrderedDict()
+        # (Qwenputer) the notes calls (remember, forget) its computer ran in a reply, by the reply's digest
+        self._notes: "OrderedDict[bytes, list]" = OrderedDict()
         for e in preload or ():
             if e in self.engines:
                 self.loaded(e)
@@ -465,11 +480,47 @@ class Server:
             pictures = vision.load(sources, local=self.bind_host in _LOOPBACK, count=count,
                                    family=loaded.vision_family)
         msgs = oai.convert_messages(raw_msgs, raw=self._raw if fmt.replay_raw else None)
+        turns = notes = None
+        if self.qwenputer:
+            # the conversation before each message (Server._notes's keys, with a reply), and its notes so far
+            turns = _turn_digests(msgs)
+            notes = self._notes_for(msgs, turns)
+            # (the last question, as the template finds it: a user turn that is not a tool's result)
+            last = max((i for i, m in enumerate(msgs) if m["role"] == "user" and not (
+                isinstance(m.get("content"), str) and m["content"].strip().startswith("<tool_response>")
+                and m["content"].strip().endswith("</tool_response>"))), default=0)
+            with self._lock:
+                for m in msgs[:last]:  # (the turns the template writes without their reasoning)
+                    if (m["role"] == "assistant" and "reasoning_content" not in m and not m.get("tool_calls")
+                            and isinstance(m.get("content"), str) and _digest(m["content"]) in self._exchanges):
+                        m["reasoning_content"] = "<tool_response>"  # (left out: the turn had reasoning)
         tools = oai.tool_specs(req.get("tools"))
         _volatile_to_end(msgs, tools)
         if tools:
             _cwd_hint(msgs)
         msgs, tpl_tools = fmt.prepare(msgs, tools)
+        internal = computer = None
+        if self.qwenputer:
+            from .models.qwenputer import CALC_TOOL, TOOL_SPECS, tools_for
+
+            # the tools the model's computer runs itself (calc, and those of its toolbox the question asks for): never a
+            # call for the client; one the client defines under the same name is the client's
+            have = {t["function"]["name"] for t in tools}
+            asked = tools_for(_last_user_text(msgs), getattr(loaded.svc, "qwenputer_tools", ()))
+            ours = [CALC_TOOL] + [t for t in TOOL_SPECS if t["function"]["name"] in asked]
+            ours = [t for t in ours if t["function"]["name"] not in have]
+            tpl_tools = list(tpl_tools or []) + ours
+            internal = tuple(t["function"]["name"] for t in ours)
+            # the computer's other work, with its toolbox (qwenputer-cpu): checking each call of the client's tools
+            # before the client gets it (with their schemas), the notes of the conversation's earlier replies, and the
+            # numbers the answer copies
+            if getattr(loaded.svc, "qwenputer_tools", ()):
+                computer = {"copy": os.environ.get("LOCALS_QWENPUTER_COPY", "1") != "0", "notes": notes}
+                if tools and os.environ.get("LOCALS_QWENPUTER_CHECK_CALLS", "1") != "0":
+                    try:
+                        computer["tools"], computer["checks"] = _check_schemas(tools)
+                    except Exception:  # noqa: BLE001  # (a schema it cannot read: the client's calls go unchecked)
+                        pass
         think_kw = {} if style == "none" else {"enable_thinking": thinking}
         if thinking and "preserve_thinking" in formats.chat_template(tok):
             # earlier replies keep their reasoning, as the model wrote it: LFM3's template drops it from every reply
@@ -521,7 +572,7 @@ class Server:
             schema, regex = None, rf.get("regex") or rf.get("pattern") or req.get("guided_regex")
             if not isinstance(regex, str) or not regex:
                 raise ValueError("response_format regex needs a 'regex' string")
-        elif engine == "locals" and schema is None and tools:
+        elif engine == "locals" and schema is None and tools and not self.qwenputer:
             tc = req.get("tool_choice", "auto")
             _check_tool_choice(tc, [t["function"]["name"] for t in tools])
             # ignore_eos (a benchmark's fixed reply length): free text past the end of turn, unless a call is required
@@ -548,11 +599,17 @@ class Server:
             regex = oai.not_containing(*oai.THINK_TAGS)
         cps = (self._checkpoints(tok, msgs, tpl_tools, think_kw, prepared)
                if loaded.needs_checkpoints else [])
+        if self.qwenputer and not thinking:
+            import copy
+
+            fmt = copy.copy(fmt)
+            fmt.opens_thinking = True  # (a reply may open with a think block: the calc exchanges the model ran first)
         return {"engine": engine, "thinking": thinking, "loaded": loaded, "prepared": prepared, "checkpoints": cps,
                 "tools": tools, "schema": schema, "regex": regex, "output_regex": output_regex, "max_tokens": max_tokens,
-                "model": model, "fmt": fmt, "sealed": sealed, "seps": seps,
+                "model": model, "fmt": fmt, "sealed": sealed, "seps": seps, "turn": turns[-1] if turns else None,
                 "tool_choice": req.get("tool_choice", "auto"), "stop": _stops(req), "temp": _temperature(req),
-                "sampling": _sampling(req), "ignore_eos": bool(req.get("ignore_eos")), "include_usage": _include_usage(req)}
+                "sampling": _sampling(req), "ignore_eos": bool(req.get("ignore_eos")), "include_usage": _include_usage(req),
+                "internal": internal, "computer": computer}
 
     def prepare_text(self, req: dict) -> dict:
         """A /v1/completions request: a raw prompt (no chat template), as mlx-lm's server encodes it."""
@@ -697,7 +754,9 @@ class Server:
         if getattr(self, "_context_capped", False):
             return
         if not hasattr(self, "_native_ctx"):
-            self._native_ctx = native_context(self.model_id)  # once (it may ask Hugging Face)
+            from .defaults import hf_repo
+
+            self._native_ctx = native_context(hf_repo(self.model_id))  # once (it may ask Hugging Face)
         n = self._native_ctx
         if n:  # the model's own limit applies at once, whatever the rest waits for
             self._stock_context = min(getattr(self, "_stock_context", self.max_context), n)
@@ -806,6 +865,15 @@ class Server:
                     cands.append((end, "system"))
             except Exception:  # noqa: BLE001
                 pass
+        if self.qwenputer and msgs[0]["role"] != "system" and tools:
+            # Qwenputer: the system turn its calc tool makes, the same before every conversation without a system
+            # message (found as above)
+            try:
+                a = _render(tok, [{"role": "user", "content": "\x01A"}], tools, add_generation_prompt=False, **think_kw)
+                b = _render(tok, [{"role": "user", "content": "\x02B"}], tools, add_generation_prompt=False, **think_kw)
+                cands.append((a[:next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))], "system"))
+            except Exception:  # noqa: BLE001
+                pass
         if len(msgs) > 2 or (len(msgs) == 2 and msgs[0]["role"] != "system"):
             try:
                 cands.append((_render(tok, msgs[:-1], tools, add_generation_prompt=False, **think_kw), "user"))
@@ -830,11 +898,36 @@ class Server:
             cands.append((a[:n], "reply"))
         except Exception:  # noqa: BLE001
             pass
+        # a short prefix is cheaper to prefill again; on Qwenputer, whose questions are short and asked many at a
+        # time, the calc tool's 360 tokens are most of each prompt
+        chars, least = (256, 64) if self.qwenputer else (2048, 1024)
         for t, kind in cands:
-            at = prepared.checkpoint_at(t)
+            at = prepared.checkpoint_at(t, chars, least)
             if at is not None and all(at != m for m, _ in out):
                 out.append((at, kind))
         return out
+
+    def _notes_for(self, msgs, turns) -> str:
+        """(Qwenputer) the notes the conversation's earlier replies left, as the computer replays them (``_notes_state``):
+        from the notes calls (remember, forget) its computer ran in replies this server made (by the conversation
+        before the reply and the reply's content, ``turns``), else those the client sent back in a reply's
+        reasoning."""
+        import re
+
+        from .models.qwenputer_walk import _note_op, _notes_state
+
+        ops = []
+        for m, before in zip(msgs, turns):
+            if m.get("role") != "assistant":
+                continue
+            content = m.get("content") if isinstance(m.get("content"), str) else ""
+            with self._lock:
+                kept = self._notes.get(_turn_key(before, content))
+            if kept is None:
+                text = m.get("reasoning_content") if isinstance(m.get("reasoning_content"), str) else ""
+                kept = [_note_op(fn, body) for fn, body in re.findall(r"<function=(remember|forget)>(.*?)</function>", text, re.S)]
+            ops += kept
+        return _notes_state(ops)
 
     def _remembered(self, engine: str, text: str):
         """The longest remembered stream ``text`` continues: (its text, the ids the model saw for it), or None."""
@@ -886,7 +979,8 @@ class Server:
         pr = p["prepared"]
         return svc.submit(pr.tokens if prompt is None else prompt, schema=p["schema"], max_tokens=p["max_tokens"],
                           regex=p["regex"], on_token=on_token, temp=p.get("temp"), ignore_eos=p.get("ignore_eos", False),
-                          checkpoints=p.get("checkpoints"), pictures=pr.pictures, spans=pr.spans, **p.get("sampling", {}))
+                          checkpoints=p.get("checkpoints"), pictures=pr.pictures, spans=pr.spans, internal=p.get("internal"),
+                          computer=p.get("computer"), **p.get("sampling", {}))
 
     def _account(self, p: dict, job, out_tokens: int, calls: int, t0: float, stopped: Optional[str] = None) -> dict:
         r = getattr(job, "_req", None)
@@ -1066,6 +1160,21 @@ class Server:
                 {"index": i, "id": c["id"], "type": "function",
                  "function": {"name": c["function"]["name"], "arguments": c["function"]["arguments"]}} for i, c in enumerate(calls)]
             self._remember(p["engine"], p, job, calls, prefix, raw=text, exact=stopped is None)
+            if self.qwenputer and reasoning and "<tool_response>" in reasoning and content.strip():
+                with self._lock:
+                    dk = _digest(content)  # (not `key`: the request's, which `finally` takes out of _active)
+                    self._exchanges[dk] = None
+                    self._exchanges.move_to_end(dk)
+                    while len(self._exchanges) > 4096:
+                        self._exchanges.popitem(last=False)
+            ops = getattr(getattr(getattr(job, "_req", None), "controller", None), "note_ops", None)
+            if self.qwenputer and ops and p.get("turn") is not None:  # (the notes its computer kept: the next request's)
+                with self._lock:
+                    nk = _turn_key(p["turn"], content)
+                    self._notes[nk] = list(ops)
+                    self._notes.move_to_end(nk)
+                    while len(self._notes) > 4096:
+                        self._notes.popitem(last=False)
             for d in ends:
                 chunk({"tool_calls": [d]})
             usage = self._account(p, job, len(job.tokens), len(calls), t0, stopped)
@@ -2072,13 +2181,18 @@ def _stop_which(text: str, stops: List[str]) -> Optional[str]:
 
 
 def native_context(model_id: str) -> Optional[int]:
-    """The model's context length from its config (max_position_embeddings), if known."""
+    """The model's context length from its config (max_position_embeddings), if known. A downloaded model's
+    config is read from the cache: Hugging Face is asked only for a model not downloaded (asking moves the
+    cache's ``refs/main`` to the newest revision, whose weights are not there: the model would count as not
+    downloaded, and an offline start would fail)."""
     try:
         path = Path(model_id)
         if not path.exists():
             from huggingface_hub import snapshot_download
 
-            path = Path(snapshot_download(model_id, allow_patterns=["config.json"]))
+            from .defaults import cached_snapshot
+
+            path = cached_snapshot(model_id, ["config.json"]) or Path(snapshot_download(model_id, allow_patterns=["config.json"]))
         cfg = json.loads((path / "config.json").read_text())
     except Exception:
         return None
@@ -2180,6 +2294,68 @@ def _looping(toks: List[int], reps: int = 3, max_period: int = 256, min_span: in
         if span <= n and toks[n - span + p:] == toks[n - span:n - p]:  # the last ``span`` tokens have period p
             return True
     return False
+
+
+def _check_schemas(tools) -> Tuple[str, Dict[str, str]]:
+    """(Qwenputer) the client's tools as check_call reads them (qwenputer_c/check.c): the line of their names (given
+    for a call of a tool of none of them), and each tool's parameters, a line each: its name, the JSON types its
+    schema allows as oai.coerce reads them (a letter each: s string, i integer, n number, b boolean, o object, a array,
+    z null; none: any), r or o (required or not) and its enum's values; tab-separated, the values by 0x1f."""
+    def clean(v) -> str:
+        return " ".join(str(v).replace("\x1f", " ").split())
+
+    letter = {"string": "s", "integer": "i", "number": "n", "boolean": "b", "object": "o", "array": "a", "null": "z"}
+    names = [clean(t["function"]["name"]) for t in tools]
+    out = {}
+    for t, name in zip(tools, names):
+        params = t["function"].get("parameters") or {}
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except ValueError:
+                params = {}
+        req = params.get("required") if isinstance(params, dict) else None
+        req = {r for r in req if isinstance(r, str)} if isinstance(req, list) else set()
+        lines = []
+        for k, sc in oai.param_schemas(params).items():
+            enum = sc.get("enum") if isinstance(sc.get("enum"), list) else []
+            values = "\x1f".join(clean(v if isinstance(v, str) else json.dumps(v)) for v in enum)
+            types = oai._types(sc)
+            kinds = "" if "string" in types or not types else "".join(sorted(letter[x] for x in types if x in letter))
+            lines.append("\t".join([clean(k), kinds, "r" if k in req else "o", values]).rstrip("\t"))
+        out[name] = "\n".join(lines)
+    return "tools\t" + "\x1f".join(names), out
+
+
+def _turn_digests(msgs) -> List[bytes]:
+    """(Qwenputer) a digest of the conversation before each message, and after the last: each message's role and
+    text (a system message left out: a client may write it again, with the date)."""
+    import hashlib
+
+    out, d = [], b""
+    for m in msgs:
+        out.append(d)
+        if m.get("role") == "system":
+            continue
+        c = m.get("content")
+        text = c if isinstance(c, str) else " ".join(x.get("text") or "" for x in c if isinstance(x, dict)) if isinstance(c, list) else ""
+        d = hashlib.sha256(d + str(m.get("role")).encode() + b"\x1e" + text.strip().encode("utf-8", "surrogatepass")).digest()
+    out.append(d)
+    return out
+
+
+def _turn_key(before: bytes, content: str) -> bytes:
+    """(Qwenputer) a reply's key in Server._notes: the conversation before it (``_turn_digests``) and its content."""
+    import hashlib
+
+    return hashlib.sha256(before + b"\x1d" + content.strip().encode("utf-8", "surrogatepass")).digest()
+
+
+def _digest(content: str) -> bytes:
+    """(Qwenputer) a reply's key in Server._exchanges."""
+    import hashlib
+
+    return hashlib.sha256(content.strip().encode("utf-8", "surrogatepass")).digest()
 
 
 def _line_looping(text: str, window: int = 30, distinct: int = 6, min_len: int = 12) -> bool:
@@ -2398,6 +2574,19 @@ def _port_taken(host: str, port: int) -> Optional[str]:
     except Exception:  # noqa: BLE001
         pass
     return "another program"
+
+
+def _last_user_text(msgs) -> str:
+    """The text of the last user message (its text parts)."""
+    for m in reversed(msgs or []):
+        if m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, str):
+                return c
+            if isinstance(c, list):
+                return " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+            return ""
+    return ""
 
 
 def _load_error(model: str, e: Exception) -> Optional[str]:

@@ -1,6 +1,6 @@
 [project]
 name = "locals"
-version = "0.2.1"
+version = "0.2.2"
 description = "Run many AI agents at once on your Mac, up to 3x faster: an OpenAI- and Ollama-compatible MLX server with batched decoding, a prompt cache, and tool calls and JSON that always parse"
 readme = "README.md"
 license = "Apache-2.0"
@@ -57,7 +57,7 @@ build-backend = "setuptools.build_meta"
 packages = ["locals", "locals.models", "locals.presets"]
 
 [tool.setuptools.package-data]
-locals = ["presets/*.json"]
+locals = ["presets/*.json", "models/*.s"]
 "locals.presets" = ["*.json"]
 
 [tool.pytest.ini_options]

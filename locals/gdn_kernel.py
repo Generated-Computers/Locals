@@ -50,6 +50,19 @@ _SOURCE = r"""
         }
     }
     const bool qk_owner = (hv % (Hv / Hk)) == 0;
+    //HELD// if (held[b] != 0) {  // a row held this step (parked: it reads no token): its state as it was, output 0
+    //HELD//     for (uint i = tid; i < 2 * Dk + Dv; i += NSG * 32) {
+    //HELD//         if (i < 2 * Dk && !qk_owner) continue;
+    //HELD//         const int ch = i < Dk ? hk * Dk + i : (i < 2 * Dk ? Hk * Dk + hk * Dk + (i - Dk) : 2 * Hk * Dk + hv * Dv + (i - 2 * Dk));
+    //HELD//         for (int j = 0; j < KC - 1; j++) conv_state_out[b * (KC - 1) * C + j * C + ch] = csb[j * C + ch];
+    //HELD//     }
+    //HELD//     for (int r = 0; r < RPS; r++) {
+    //HELD//         const uint dv = sgi * RPS + r;
+    //HELD//         *((device float4*)(state_out + (base + dv) * Dk) + lane) = *((const device float4*)(state_in + (base + dv) * Dk) + lane);
+    //HELD//     }
+    //HELD//     if (sgi == 0) for (int i = 0; i < 4; i++) y[(b * S) * Hv * Dv + hv * Dv + lane * 4 + i] = static_cast<T>(0.0f);
+    //HELD//     return;
+    //HELD// }
 
     for (int t = 0; t < S; t++) {
         const device T* pr = prb + t * P;
@@ -160,15 +173,18 @@ _SOURCE = r"""
 _KERNEL = {}
 
 
-def _kernel(states: bool = False):
-    k = _KERNEL.get(states)
+def _kernel(states: bool = False, held: bool = False):
+    k = _KERNEL.get((states, held))
     if k is None:
         # the states variant also writes the state after every token (for
-        # rewinding a partially accepted draft); the line is absent from the plain one
+        # rewinding a partially accepted draft); the line is absent from the plain one.
+        # The held variant takes a flag a row: a row held keeps its state (a parked row, hybrid_batch).
         src = _SOURCE.replace("//STATES//", "" if states else "//")
-        k = _KERNEL[states] = mx.fast.metal_kernel(
-            name="locals_gdn_step2" + ("_states" if states else ""),
-            input_names=["proj", "conv_state", "conv_w", "A_log", "dt_bias", "state_in", "norm_w"],
+        lines = src.split("\n")
+        src = "\n".join(l.replace("//HELD// ", "") for l in lines) if held else "\n".join(l for l in lines if "//HELD//" not in l)
+        k = _KERNEL[(states, held)] = mx.fast.metal_kernel(
+            name="locals_gdn_step2" + ("_states" if states else "") + ("_held" if held else ""),
+            input_names=["proj", "conv_state", "conv_w", "A_log", "dt_bias", "state_in", "norm_w"] + (["held"] if held else []),
             output_names=["y", "conv_state_out", "state_out"] + (["states_out"] if states else []),
             source=src,
         )
@@ -182,9 +198,10 @@ def supported(Hk: int, Hv: int, Dk: int, Dv: int, KC: int) -> bool:
 MAX_S = 16
 
 
-def gdn_decode(proj, conv_state, conv_w, A_log, dt_bias, state, norm_w, Hk, Hv, Dk, Dv, NSG=8, states: bool = False):
+def gdn_decode(proj, conv_state, conv_w, A_log, dt_bias, state, norm_w, Hk, Hv, Dk, Dv, NSG=8, states: bool = False, held=None):
     """proj (B, S, P) -> y (B, S, Hv*Dv), new conv state, new recurrent state
-    [, the recurrent state after each token, (S, B, Hv, Dv, Dk)]."""
+    [, the recurrent state after each token, (S, B, Hv, Dv, Dk)]. ``held`` (B,) int32, a single token's step only: a
+    row with a nonzero flag keeps its conv and recurrent state, its output 0."""
     B, S = proj.shape[0], proj.shape[1]
     KC = conv_w.shape[1]
     C = conv_state.shape[-1]
@@ -193,8 +210,9 @@ def gdn_decode(proj, conv_state, conv_w, A_log, dt_bias, state, norm_w, Hk, Hv, 
     if states:
         shapes.append((S,) + tuple(state.shape))
         dtypes.append(state.dtype)
-    outs = _kernel(states)(
-        inputs=[proj, conv_state, conv_w, A_log, dt_bias, state, norm_w],
+    assert held is None or (S == 1 and not states)
+    outs = _kernel(states, held is not None)(
+        inputs=[proj, conv_state, conv_w, A_log, dt_bias, state, norm_w] + ([held] if held is not None else []),
         template=[("T", proj.dtype), ("Hk", Hk), ("Hv", Hv), ("Dk", Dk), ("Dv", Dv), ("KC", KC), ("NSG", NSG), ("S", S),
                   ("B", B)],
         grid=(32, NSG, B * Hv),
