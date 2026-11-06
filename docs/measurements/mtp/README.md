@@ -59,3 +59,33 @@ the draft logits from the tied embedding (the script now takes the model's outpu
 The 2-token step moved from run to run (1.23x to 1.39x of a 1-token step over the three runs) while the 3-token
 step stayed at 1.53x to 1.57x. The "estimate" lines at the end of each result file use that run's own times; issue #18
 has the estimate table and its assumptions.
+
+## Gap test: the layer's KV with positions missing
+
+`mtp_gap_test.py` asks how much the hit rate drops when the layer's own KV lacks positions: after a prompt-cache
+hit (the main model's cache comes back, the layer's KV does not) and after steps the layer did not run. Same Mac
+and `.venv`, 2026-11-06, at commit `6c972cc` (`locals/` the same as `f31121c`'s), Zwyrol, the best wiring, 4-bit
+layer. The server on port 8321 was running beside it, idle; this test times nothing.
+
+Teacher-forced over prompt + reply, as above. A missing key position is masked out of the layer's attention (each
+query still sees itself), and the real positions are kept. 14 prompts: the 12 above, and two long ones, the first
+5,000 characters of `locals/lookup.py` and the first 6,000 of `docs/engine/README.md` at that commit (the prompt
+changes when those files change).
+
+```
+LOCALS_DISK_CACHE=0 <repo>/.venv/bin/python mtp_gap_test.py mtp_bf16.safetensors results/gap_zwyrol.json Kaziko/Qwen3.5-4B-Zwyrol > results/gap_zwyrol.txt 2>&1
+```
+
+First draft right (`results/gap_zwyrol.txt`):
+
+| What the layer sees | All reply tokens | First 16 reply tokens | Reply tokens 48 on |
+|---|---|---|---|
+| Every earlier position (`full`) | 81.8% (1,640 / 2,005) | 87.1% (195 / 224) | 80.8% (1,106 / 1,369) |
+| No prompt position before the last one (`no-prompt`) | 76.6% (1,535 / 2,005) | 73.2% (164 / 224) | 77.3% (1,058 / 1,369) |
+| No reply position 16 to 47 (`gap32`) | 81.1% (1,626 / 2,005) | 87.1% (195 / 224) | 80.6% (1,104 / 1,369) |
+
+- Checks: `full` with a boolean mask gives the same counts as with the `causal` mask (1,640 / 2,005), and the 12
+  prompts of `mtp_test.py` give 1,343 / 1,623 again, as in `results/zwyrol.txt`.
+- By group, from `results/gap_zwyrol.json`: the 3 tool calls 96.3% (104 / 108) with every position and 76.9%
+  (83 / 108) without the prompt; the 2 long prompts 77.7% (297 / 382) and 70.2% (268 / 382).
+- The tool-call replies (31 to 40 tokens) end before token 48, so `gap32` says nothing about them.

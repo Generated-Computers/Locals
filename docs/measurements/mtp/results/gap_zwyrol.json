@@ -1,0 +1,791 @@
+{
+ "model": "Kaziko/Qwen3.5-4B-Zwyrol",
+ "totals": {
+  "causal": {
+   "reply": [
+    1640,
+    2005
+   ],
+   "first16": [
+    195,
+    224
+   ],
+   "after-gap": [
+    1106,
+    1369
+   ]
+  },
+  "full": {
+   "reply": [
+    1640,
+    2005
+   ],
+   "first16": [
+    195,
+    224
+   ],
+   "after-gap": [
+    1106,
+    1369
+   ]
+  },
+  "no-prompt": {
+   "reply": [
+    1535,
+    2005
+   ],
+   "first16": [
+    164,
+    224
+   ],
+   "after-gap": [
+    1058,
+    1369
+   ]
+  },
+  "gap32": {
+   "reply": [
+    1626,
+    2005
+   ],
+   "first16": [
+    195,
+    224
+   ],
+   "after-gap": [
+    1104,
+    1369
+   ]
+  }
+ },
+ "per_prompt": {
+  "en-explain": {
+   "prompt": 27,
+   "reply": 140,
+   "causal/reply": [
+    99,
+    139
+   ],
+   "causal/first16": [
+    12,
+    16
+   ],
+   "causal/after-gap": [
+    65,
+    91
+   ],
+   "full/reply": [
+    99,
+    139
+   ],
+   "full/first16": [
+    12,
+    16
+   ],
+   "full/after-gap": [
+    65,
+    91
+   ],
+   "no-prompt/reply": [
+    94,
+    139
+   ],
+   "no-prompt/first16": [
+    10,
+    16
+   ],
+   "no-prompt/after-gap": [
+    61,
+    91
+   ],
+   "gap32/reply": [
+    97,
+    139
+   ],
+   "gap32/first16": [
+    12,
+    16
+   ],
+   "gap32/after-gap": [
+    66,
+    91
+   ]
+  },
+  "code": {
+   "prompt": 40,
+   "reply": 192,
+   "causal/reply": [
+    166,
+    191
+   ],
+   "causal/first16": [
+    14,
+    16
+   ],
+   "causal/after-gap": [
+    123,
+    143
+   ],
+   "full/reply": [
+    166,
+    191
+   ],
+   "full/first16": [
+    14,
+    16
+   ],
+   "full/after-gap": [
+    123,
+    143
+   ],
+   "no-prompt/reply": [
+    160,
+    191
+   ],
+   "no-prompt/first16": [
+    13,
+    16
+   ],
+   "no-prompt/after-gap": [
+    120,
+    143
+   ],
+   "gap32/reply": [
+    164,
+    191
+   ],
+   "gap32/first16": [
+    14,
+    16
+   ],
+   "gap32/after-gap": [
+    122,
+    143
+   ]
+  },
+  "pl-email": {
+   "prompt": 47,
+   "reply": 151,
+   "causal/reply": [
+    111,
+    150
+   ],
+   "causal/first16": [
+    13,
+    16
+   ],
+   "causal/after-gap": [
+    70,
+    102
+   ],
+   "full/reply": [
+    111,
+    150
+   ],
+   "full/first16": [
+    13,
+    16
+   ],
+   "full/after-gap": [
+    70,
+    102
+   ],
+   "no-prompt/reply": [
+    95,
+    150
+   ],
+   "no-prompt/first16": [
+    10,
+    16
+   ],
+   "no-prompt/after-gap": [
+    63,
+    102
+   ],
+   "gap32/reply": [
+    111,
+    150
+   ],
+   "gap32/first16": [
+    13,
+    16
+   ],
+   "gap32/after-gap": [
+    69,
+    102
+   ]
+  },
+  "pl-explain": {
+   "prompt": 35,
+   "reply": 192,
+   "causal/reply": [
+    125,
+    191
+   ],
+   "causal/first16": [
+    13,
+    16
+   ],
+   "causal/after-gap": [
+    92,
+    143
+   ],
+   "full/reply": [
+    125,
+    191
+   ],
+   "full/first16": [
+    13,
+    16
+   ],
+   "full/after-gap": [
+    92,
+    143
+   ],
+   "no-prompt/reply": [
+    126,
+    191
+   ],
+   "no-prompt/first16": [
+    10,
+    16
+   ],
+   "no-prompt/after-gap": [
+    97,
+    143
+   ],
+   "gap32/reply": [
+    124,
+    191
+   ],
+   "gap32/first16": [
+    13,
+    16
+   ],
+   "gap32/after-gap": [
+    93,
+    143
+   ]
+  },
+  "json": {
+   "prompt": 40,
+   "reply": 174,
+   "causal/reply": [
+    159,
+    173
+   ],
+   "causal/first16": [
+    14,
+    16
+   ],
+   "causal/after-gap": [
+    115,
+    125
+   ],
+   "full/reply": [
+    159,
+    173
+   ],
+   "full/first16": [
+    14,
+    16
+   ],
+   "full/after-gap": [
+    115,
+    125
+   ],
+   "no-prompt/reply": [
+    155,
+    173
+   ],
+   "no-prompt/first16": [
+    12,
+    16
+   ],
+   "no-prompt/after-gap": [
+    115,
+    125
+   ],
+   "gap32/reply": [
+    156,
+    173
+   ],
+   "gap32/first16": [
+    14,
+    16
+   ],
+   "gap32/after-gap": [
+    114,
+    125
+   ]
+  },
+  "summary": {
+   "prompt": 101,
+   "reply": 99,
+   "causal/reply": [
+    72,
+    98
+   ],
+   "causal/first16": [
+    11,
+    16
+   ],
+   "causal/after-gap": [
+    41,
+    50
+   ],
+   "full/reply": [
+    72,
+    98
+   ],
+   "full/first16": [
+    11,
+    16
+   ],
+   "full/after-gap": [
+    41,
+    50
+   ],
+   "no-prompt/reply": [
+    68,
+    98
+   ],
+   "no-prompt/first16": [
+    10,
+    16
+   ],
+   "no-prompt/after-gap": [
+    39,
+    50
+   ],
+   "gap32/reply": [
+    72,
+    98
+   ],
+   "gap32/first16": [
+    11,
+    16
+   ],
+   "gap32/after-gap": [
+    40,
+    50
+   ]
+  },
+  "math": {
+   "prompt": 45,
+   "reply": 192,
+   "causal/reply": [
+    182,
+    191
+   ],
+   "causal/first16": [
+    14,
+    16
+   ],
+   "causal/after-gap": [
+    137,
+    143
+   ],
+   "full/reply": [
+    182,
+    191
+   ],
+   "full/first16": [
+    14,
+    16
+   ],
+   "full/after-gap": [
+    137,
+    143
+   ],
+   "no-prompt/reply": [
+    178,
+    191
+   ],
+   "no-prompt/first16": [
+    13,
+    16
+   ],
+   "no-prompt/after-gap": [
+    134,
+    143
+   ],
+   "gap32/reply": [
+    182,
+    191
+   ],
+   "gap32/first16": [
+    14,
+    16
+   ],
+   "gap32/after-gap": [
+    137,
+    143
+   ]
+  },
+  "code-convert": {
+   "prompt": 84,
+   "reply": 192,
+   "causal/reply": [
+    168,
+    191
+   ],
+   "causal/first16": [
+    11,
+    16
+   ],
+   "causal/after-gap": [
+    128,
+    143
+   ],
+   "full/reply": [
+    168,
+    191
+   ],
+   "full/first16": [
+    11,
+    16
+   ],
+   "full/after-gap": [
+    128,
+    143
+   ],
+   "no-prompt/reply": [
+    158,
+    191
+   ],
+   "no-prompt/first16": [
+    11,
+    16
+   ],
+   "no-prompt/after-gap": [
+    121,
+    143
+   ],
+   "gap32/reply": [
+    165,
+    191
+   ],
+   "gap32/first16": [
+    11,
+    16
+   ],
+   "gap32/after-gap": [
+    128,
+    143
+   ]
+  },
+  "tool-call": {
+   "prompt": 294,
+   "reply": 40,
+   "causal/reply": [
+    38,
+    39
+   ],
+   "causal/first16": [
+    16,
+    16
+   ],
+   "causal/after-gap": [
+    0,
+    0
+   ],
+   "full/reply": [
+    38,
+    39
+   ],
+   "full/first16": [
+    16,
+    16
+   ],
+   "full/after-gap": [
+    0,
+    0
+   ],
+   "no-prompt/reply": [
+    35,
+    39
+   ],
+   "no-prompt/first16": [
+    13,
+    16
+   ],
+   "no-prompt/after-gap": [
+    0,
+    0
+   ],
+   "gap32/reply": [
+    38,
+    39
+   ],
+   "gap32/first16": [
+    16,
+    16
+   ],
+   "gap32/after-gap": [
+    0,
+    0
+   ]
+  },
+  "chat": {
+   "prompt": 29,
+   "reply": 192,
+   "causal/reply": [
+    157,
+    191
+   ],
+   "causal/first16": [
+    15,
+    16
+   ],
+   "causal/after-gap": [
+    118,
+    143
+   ],
+   "full/reply": [
+    157,
+    191
+   ],
+   "full/first16": [
+    15,
+    16
+   ],
+   "full/after-gap": [
+    118,
+    143
+   ],
+   "no-prompt/reply": [
+    150,
+    191
+   ],
+   "no-prompt/first16": [
+    12,
+    16
+   ],
+   "no-prompt/after-gap": [
+    115,
+    143
+   ],
+   "gap32/reply": [
+    154,
+    191
+   ],
+   "gap32/first16": [
+    15,
+    16
+   ],
+   "gap32/after-gap": [
+    116,
+    143
+   ]
+  },
+  "pl-tool-screen": {
+   "prompt": 412,
+   "reply": 31,
+   "causal/reply": [
+    28,
+    30
+   ],
+   "causal/first16": [
+    14,
+    16
+   ],
+   "causal/after-gap": [
+    0,
+    0
+   ],
+   "full/reply": [
+    28,
+    30
+   ],
+   "full/first16": [
+    14,
+    16
+   ],
+   "full/after-gap": [
+    0,
+    0
+   ],
+   "no-prompt/reply": [
+    22,
+    30
+   ],
+   "no-prompt/first16": [
+    11,
+    16
+   ],
+   "no-prompt/after-gap": [
+    0,
+    0
+   ],
+   "gap32/reply": [
+    27,
+    30
+   ],
+   "gap32/first16": [
+    14,
+    16
+   ],
+   "gap32/after-gap": [
+    0,
+    0
+   ]
+  },
+  "pl-tool-note": {
+   "prompt": 422,
+   "reply": 40,
+   "causal/reply": [
+    38,
+    39
+   ],
+   "causal/first16": [
+    16,
+    16
+   ],
+   "causal/after-gap": [
+    0,
+    0
+   ],
+   "full/reply": [
+    38,
+    39
+   ],
+   "full/first16": [
+    16,
+    16
+   ],
+   "full/after-gap": [
+    0,
+    0
+   ],
+   "no-prompt/reply": [
+    26,
+    39
+   ],
+   "no-prompt/first16": [
+    12,
+    16
+   ],
+   "no-prompt/after-gap": [
+    0,
+    0
+   ],
+   "gap32/reply": [
+    38,
+    39
+   ],
+   "gap32/first16": [
+    16,
+    16
+   ],
+   "gap32/after-gap": [
+    0,
+    0
+   ]
+  },
+  "long-code": {
+   "prompt": 1316,
+   "reply": 192,
+   "causal/reply": [
+    153,
+    191
+   ],
+   "causal/first16": [
+    16,
+    16
+   ],
+   "causal/after-gap": [
+    110,
+    143
+   ],
+   "full/reply": [
+    153,
+    191
+   ],
+   "full/first16": [
+    16,
+    16
+   ],
+   "full/after-gap": [
+    110,
+    143
+   ],
+   "no-prompt/reply": [
+    143,
+    191
+   ],
+   "no-prompt/first16": [
+    15,
+    16
+   ],
+   "no-prompt/after-gap": [
+    99,
+    143
+   ],
+   "gap32/reply": [
+    154,
+    191
+   ],
+   "gap32/first16": [
+    16,
+    16
+   ],
+   "gap32/after-gap": [
+    111,
+    143
+   ]
+  },
+  "long-doc": {
+   "prompt": 1596,
+   "reply": 192,
+   "causal/reply": [
+    144,
+    191
+   ],
+   "causal/first16": [
+    16,
+    16
+   ],
+   "causal/after-gap": [
+    107,
+    143
+   ],
+   "full/reply": [
+    144,
+    191
+   ],
+   "full/first16": [
+    16,
+    16
+   ],
+   "full/after-gap": [
+    107,
+    143
+   ],
+   "no-prompt/reply": [
+    125,
+    191
+   ],
+   "no-prompt/first16": [
+    12,
+    16
+   ],
+   "no-prompt/after-gap": [
+    94,
+    143
+   ],
+   "gap32/reply": [
+    144,
+    191
+   ],
+   "gap32/first16": [
+    16,
+    16
+   ],
+   "gap32/after-gap": [
+    108,
+    143
+   ]
+  }
+ }
+}
