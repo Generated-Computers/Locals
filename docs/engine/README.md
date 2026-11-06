@@ -364,7 +364,16 @@ up to `GPU_RETRIES` (3) times:
   of writing the chunk into it, past the offset that goes back.
 * `_rewind` first checks that each full-attention buffer is where it was in memory: one MLX copied (to grow it, or
   because something else held it) was copied inside the dropped command buffer, maybe not at all. Then, and for a cache
-  kind it does not know, the error goes on as before.
+  kind it does not know, the error goes on as before. A buffer may be a view cut from a longer one (a conversation's
+  next turn starts from the previous reply's start, `_reply_entry`): numpy reads such a view's place only through its
+  first element.
+* `_read_chunk` waits for the GPU (`mx.synchronize`, about 30 µs) before each try of a chunk. `mx.eval` returns when its
+  last command buffer signals, but MLX lets go of the arrays a command buffer read (the cache's buffers, through their
+  views) only in its completion handler, later and on another thread, and it writes into a buffer only when nothing
+  else holds it: a chunk that came first was written into a copy of the whole buffer (a new address, so `_rewind`
+  refused). On an M2 Pro with 16 busy processes, 7 to 15 of 60 reads of 13 chunks met such a copy (3 or 4 of 60
+  without marks); after the wait, none of 600. Qwen3.5-4B read 4,096 tokens in 256-token chunks at 576 tokens/s with
+  it and without.
 * MLX clears its stored error once it has raised it (`Error::check`), so the next chunk runs normally.
 
 With drops simulated on chunks of a 6,000-token prompt (the chunk's results spoiled, then the error raised), LFM3 and

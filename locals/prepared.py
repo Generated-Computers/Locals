@@ -50,11 +50,12 @@ class PreparedPrompt:
         in place of the text's): not an image prompt's, whose ids hold its images' tokens, nor one with no text."""
         return not self.pictures and self.text is not None
 
-    def checkpoint_at(self, prefix: str) -> Optional[int]:
+    def checkpoint_at(self, prefix: str, chars: int = 2048, least: int = 1024) -> Optional[int]:
         """Where ``prefix``, a text prefix of the prompt, ends in its tokens (an image's tokens before it count: its
-        prefix costs the tower and their prefill), or None: no prefix, the whole prompt, or under 1024 tokens (a
-        short prefix is cheaper to read again than to keep)."""
-        if self.text is None or (len(prefix) < 2048 and not self.pictures) or not self.text.startswith(prefix):
+        prefix costs the tower and their prefill), or None: no prefix, the whole prompt, or under ``least`` tokens
+        (a short prefix is cheaper to read again than to keep; ``chars`` and ``least`` are lower on Qwenputer, whose
+        calc tool is most of each short prompt: Server._checkpoints)."""
+        if self.text is None or (len(prefix) < chars and not self.pictures) or not self.text.startswith(prefix):
             return None
         ids = self.tokenizer._tokenizer.encode(prefix, add_special_tokens=False)
         placed = self.placed or self.tokens
@@ -62,4 +63,4 @@ class PreparedPrompt:
         # (backing off a token at a time cost seconds on a 60k-token prompt)
         n = next((k for k, (a, b) in enumerate(zip(placed, ids)) if a != b), min(len(placed), len(ids)))
         at = vision.expanded_at(n, self.spans, self.pictures)
-        return at if at >= 1024 and n < len(placed) else None
+        return at if at >= least and n < len(placed) else None

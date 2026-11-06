@@ -14,6 +14,7 @@ and settings involved.
 | [Prompt cache](prompt-cache/README.md) | How conversations are kept between requests: checkpoints, the reply checkpoint, eviction, the disk cache, memory sizing |
 | [Constrained decoding](decoding/README.md) | JSON schemas and regular expressions as token automata on the GPU, forced spans, budgets, tool-call formats of each model family, thinking modes, the library API |
 | [Runtime and kernels](runtime/README.md) | Loading models, compute precision, fused layers, the Metal kernels for small batches, autotuning, model names and checks |
+| [Qwenputer](qwenputer/README.md) | Qwen3.5-4B with a computer in its weights: the checkpoint measured, the chip pack, the computer's runs on CPU cores and the GPU (rows a token touches, its sparsity kept exact), replies in a server, numbers, limits |
 | [Command line](cli/README.md) | The `locals` commands, how the background server is managed, the integrations with coding tools and editors, files and environment variables |
 | [Team of agents](agents/README.md) | `locals run`: planning, versions of each part, the check after every write, combining and repairing, the sandbox |
 | [Benchmarks](benchmarks/README.md) | Every result measured so far, in one place: speed by requests, Mac and model, other servers, agents end to end, long conversations, quality, sampling and reliability |

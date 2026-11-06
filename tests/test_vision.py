@@ -401,6 +401,7 @@ def _batch_service(monkeypatch, compiled):
     svc._compile_lock = threading.Lock()
     svc._inflight, svc._owner = {}, {}
     svc._closed = svc._unloaded = False
+    svc._calc = svc._give = svc._eos = None  # (no Qwenputer computer)
     svc.prompt_tokens = svc.tokens_out = 0
     svc._free = svc._endless = eng.Controller
     monkeypatch.setattr(eng, "LocalsController", lambda c, planner, *a: ("grammar", c))
