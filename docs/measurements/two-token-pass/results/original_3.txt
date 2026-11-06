@@ -1,0 +1,34 @@
+mac: Apple M2 Max (applegpu_g14s, 32 GB)
+macos: 27.0
+mlx: 0.32.3
+mlx_lm: 0.32.0
+commit: cdc605c
+model: mlx-community/Qwen3.5-4B-MLX-4bit
+tune_cache: <scratch>/tune/tune_v6_applegpu_g14s.json
+preset: <repo>/locals/presets/tune_v6_applegpu_g14s.json
+force: []
+tune cache says mlx 0.32.3, 235 stale shapes
+
+kernel per matmul shape (layers using it): 1 row | 2 rows | 3 rows
+  2560x4096 (32, e.g. layers.31.self_attn.o_proj): ('mlx',) | ('multi', 8, 4, 2) | ('v3', 8, 4, 2)
+  2560x9216 (32, e.g. layers.31.mlp.down_proj): ('mlx',) | ('multi', 8, 4, 2) | ('v3', 16, 4, 2)
+  10240x2560 (8, e.g. layers.31.self_attn.qkv_proj): ('mlx',) | ('multi', 8, 4, 2) | ('v3', 8, 4, 2)
+  12352x2560 (24, e.g. layers.30.linear_attn.in_proj_all): ('mlx',) | ('multi', 8, 4, 2) | ('v3', 8, 8, 2)
+  18432x2560 (32, e.g. layers.31.mlp.gate_up_proj): ('mlx',) | ('multi', 8, 4, 2) | ('v3', 8, 8, 2)
+  248320x2560 (1, e.g. embed_tokens): ('mlx',) | ('multi', 8, 4, 2) | ('v3', 8, 8, 2)
+
+cache: 191 tokens (prompt 27, reply 164)
+round 0 (t=0 s): sync S=1 10.98, S=2 12.19, S=3 15.88, S=1 11.52 ms | probe before each 1.166, 1.124, 1.112, 1.210 ms | split (build + encode + wait) S=1 1.26+1.24+7.44, S=2 1.75+1.38+8.88, S=3 1.77+1.61+12.12 | pipelined S=1 8.07, S=2 8.94, S=3 12.41
+round 1 (t=7 s): sync S=1 10.63, S=2 12.49, S=3 15.84, S=1 10.73 ms | probe before each 1.161, 1.147, 1.144, 1.126 ms | split (build + encode + wait) S=1 2.39+2.17+7.25, S=2 2.09+1.58+9.16, S=3 1.68+1.60+12.40 | pipelined S=1 7.89, S=2 8.99, S=3 12.11
+round 2 (t=13 s): sync S=1 10.41, S=2 12.74, S=3 18.14, S=1 12.48 ms | probe before each 1.142, 1.204, 1.167, 1.199 ms | split (build + encode + wait) S=1 1.50+1.55+7.52, S=2 1.85+1.49+9.01, S=3 1.89+1.70+12.31 | pipelined S=1 7.86, S=2 9.05, S=3 12.47
+round 3 (t=20 s): sync S=1 11.75, S=2 12.30, S=3 15.99, S=1 10.13 ms | probe before each 1.177, 1.181, 1.131, 1.165 ms | split (build + encode + wait) S=1 1.25+1.31+7.58, S=2 1.84+1.48+9.03, S=3 1.55+1.55+12.38 | pipelined S=1 7.79, S=2 9.08, S=3 12.19
+round 4 (t=26 s): sync S=1 10.45, S=2 12.25, S=3 16.94, S=1 11.07 ms | probe before each 1.198, 1.192, 1.112, 1.145 ms | split (build + encode + wait) S=1 1.38+1.42+7.58, S=2 1.55+1.30+9.19, S=3 1.47+1.53+12.40 | pipelined S=1 7.73, S=2 9.01, S=3 12.19
+
+over 5 rounds: mean (min to max), ms; ratio = mean / mean of S=1
+  sync      S=1: 10.52 (10.13 to 10.98), 1.00x (S=1: the lower of first and last each round)
+  sync      S=2: 12.39 (12.19 to 12.74), 1.18x
+  sync      S=3: 16.56 (15.84 to 18.14), 1.57x
+  pipelined S=1: 7.87 (7.73 to 8.07), 1.00x
+  pipelined S=2: 9.01 (8.94 to 9.08), 1.15x
+  pipelined S=3: 12.27 (12.11 to 12.47), 1.56x
+  probe: 1.160 (1.112 to 1.210) ms

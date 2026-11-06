@@ -1,0 +1,33 @@
+mac: Apple M2 Max (applegpu_g14s, 32 GB)
+macos: 27.0
+mlx: 0.32.3
+mlx_lm: 0.32.0
+commit: cdc605c
+model: Kaziko/Qwen3.5-4B-Zwyrol
+tune_cache: <scratch>/tune/tune_v6_applegpu_g14s.json
+preset: <repo>/locals/presets/tune_v6_applegpu_g14s.json
+force: ['2@248320x2560=fragh']
+tune cache says mlx 0.32.3, 235 stale shapes
+
+kernel per matmul shape (layers using it): 1 row | 2 rows | 3 rows
+  2560x4096 (32, e.g. layers.31.self_attn.o_proj): ('mlx',) | ('multi', 8, 4, 2) | ('v3', 8, 4, 2)
+  2560x9216 (32, e.g. layers.31.mlp.down_proj): ('mlx',) | ('multi', 8, 4, 2) | ('v3', 16, 4, 2)
+  10240x2560 (8, e.g. layers.31.self_attn.qkv_proj): ('mlx',) | ('multi', 8, 4, 2) | ('v3', 8, 4, 2)
+  12352x2560 (24, e.g. layers.30.linear_attn.in_proj_all): ('mlx',) | ('multi', 8, 4, 2) | ('v3', 8, 8, 2)
+  18432x2560 (32, e.g. layers.31.mlp.gate_up_proj): ('mlx',) | ('multi', 8, 4, 2) | ('v3', 8, 8, 2)
+  248320x2560 (2, e.g. language_model.lm_head): ('mlx',) | ('fragh', 4, 2, 1) | ('v3', 8, 8, 2)
+
+cache: 167 tokens (prompt 27, reply 140)
+round 0: sync S=1 9.99, S=2 12.51, S=3 15.53, S=1 9.98 ms | split (build + encode + wait) S=1 1.25+1.27+7.50, S=2 1.52+1.28+9.68, S=3 1.53+1.55+12.29 | pipelined S=1 8.07, S=2 9.55, S=3 12.17
+round 1: sync S=1 12.57, S=2 13.83, S=3 15.85, S=1 10.10 ms | split (build + encode + wait) S=1 1.19+1.24+7.56, S=2 1.54+1.30+9.61, S=3 1.55+1.56+12.43 | pipelined S=1 7.84, S=2 9.73, S=3 12.07
+round 2: sync S=1 12.40, S=2 15.37, S=3 15.69, S=1 10.02 ms | split (build + encode + wait) S=1 1.22+1.27+7.59, S=2 1.51+1.27+9.71, S=3 1.56+1.56+12.45 | pipelined S=1 7.63, S=2 9.54, S=3 12.08
+round 3: sync S=1 11.91, S=2 12.58, S=3 15.40, S=1 10.00 ms | split (build + encode + wait) S=1 1.20+1.25+7.57, S=2 3.11+2.35+9.44, S=3 1.56+1.55+12.37 | pipelined S=1 7.81, S=2 9.40, S=3 11.98
+round 4: sync S=1 12.49, S=2 12.55, S=3 15.52, S=1 10.50 ms | split (build + encode + wait) S=1 1.21+1.26+7.56, S=2 1.49+1.26+9.72, S=3 1.50+1.53+12.35 | pipelined S=1 7.98, S=2 9.66, S=3 12.08
+
+over 5 rounds: mean (min to max), ms; ratio = mean / mean of S=1
+  sync      S=1: 10.12 (9.98 to 10.50), 1.00x (S=1: the lower of first and last each round)
+  sync      S=2: 13.37 (12.51 to 15.37), 1.32x
+  sync      S=3: 15.60 (15.40 to 15.85), 1.54x
+  pipelined S=1: 7.86 (7.63 to 8.07), 1.00x
+  pipelined S=2: 9.58 (9.40 to 9.73), 1.22x
+  pipelined S=3: 12.08 (11.98 to 12.17), 1.54x
