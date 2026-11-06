@@ -75,7 +75,9 @@ for spec in a.force:
             raise SystemExit(f"--force {spec}: no tuned {fam} kernel for {key(N, Kd, M, dt)}")
         K._CHOICE[(N, Kd, M, dt)] = tuple(c)
 
-# the kernels the model's matmuls get (a forward pass at each row count fills K._CHOICE; None: not called)
+# the kernel each matmul shape has at 1, 2 and 3 rows. Runtime.load's warm-up has already chosen them (K._CHOICE) for
+# 1 to 16 rows, so the table shows each shape's choice, not that a pass used it; the passes below ran in the runs and
+# stay. None: no choice recorded
 x0 = mx.array([[100, 200, 300]])
 for S in (1, 2, 3):
     mx.eval(model(x0[:, :S], cache=make_prompt_cache(model)))
@@ -112,8 +114,7 @@ def filled(S):
     return c, x
 
 
-lm = K.text_model(model)
-head = lm.lm_head if hasattr(lm, "lm_head") else lm.model.embed_tokens
+head = K.head_module(K.text_model(model))
 xp = mx.random.normal((1, head["weight"].shape[1] * 8), key=mx.random.key(0)).astype(mx.float16)
 
 
@@ -167,21 +168,20 @@ def pipelined(S, n=30):
 
 
 sync(1)  # (warm)
+STEPS = {"1_first": 1, "2": 2, "3": 3, "1_last": 1}  # a round's sync measurements, in order: JSON key -> tokens
 rounds = []
 t_start = time.perf_counter()
 for r in range(a.rounds):
     t_round = time.perf_counter() - t_start
-    s, pr = [], []
-    for S in (1, 2, 3, 1):
-        pr.append(probe())
-        s.append(sync(S))
-    sp = {S: split(S) for S in (1, 2, 3)}
-    pp = {S: pipelined(S) for S in (1, 2, 3)}
-    rounds.append({"t_s": t_round, "sync": {"1_first": s[0], "2": s[1], "3": s[2], "1_last": s[3]},
-                   "probe_before_sync": {"1_first": pr[0], "2": pr[1], "3": pr[2], "1_last": pr[3]},
-                   "split": {str(S): v for S, v in sp.items()}, "pipelined": {str(S): v for S, v in pp.items()}})
-    print(f"round {r} (t={t_round:.0f} s): sync S=1 {s[0]:.2f}, S=2 {s[1]:.2f}, S=3 {s[2]:.2f}, S=1 {s[3]:.2f} ms"
-          f" | probe before each {pr[0]:.3f}, {pr[1]:.3f}, {pr[2]:.3f}, {pr[3]:.3f} ms | split (build + encode + wait) "
+    s, pr = {}, {}
+    for k, S in STEPS.items():
+        pr[k] = probe()
+        s[k] = sync(S)
+    sp = {S: split(int(S)) for S in ("1", "2", "3")}
+    pp = {S: pipelined(int(S)) for S in ("1", "2", "3")}
+    rounds.append({"t_s": t_round, "sync": s, "probe_before_sync": pr, "split": sp, "pipelined": pp})
+    print(f"round {r} (t={t_round:.0f} s): sync " + ", ".join(f"S={STEPS[k]} {v:.2f}" for k, v in s.items())
+          + " ms | probe before each " + ", ".join(f"{v:.3f}" for v in pr.values()) + " ms | split (build + encode + wait) "
           + ", ".join(f"S={S} {b:.2f}+{e:.2f}+{w:.2f}" for S, (b, e, w) in sp.items())
           + " | pipelined " + ", ".join(f"S={S} {v:.2f}" for S, v in pp.items()), flush=True)
 
@@ -191,19 +191,19 @@ def summary(vals):
 
 
 out = {"setup": setup, "cache_tokens": int(ids.shape[1]), "choices": choices, "rounds": rounds, "summary": {}}
-one_sync = [min(r["sync"]["1_first"], r["sync"]["1_last"]) for r in rounds]
+one = {"sync": [min(r["sync"]["1_first"], r["sync"]["1_last"]) for r in rounds],  # S=1 per round
+       "pipelined": [r["pipelined"]["1"] for r in rounds]}
 print(f"\nover {a.rounds} rounds: mean (min to max), ms; ratio = mean / mean of S=1", flush=True)
 for mode in ("sync", "pipelined"):
-    base = stt.mean(one_sync) if mode == "sync" else stt.mean(r["pipelined"]["1"] for r in rounds)
+    base = stt.mean(one[mode])
     for S in ("1", "2", "3"):
-        vals = one_sync if (mode == "sync" and S == "1") else [r[mode][S] for r in rounds]
-        sm = summary(vals)
+        sm = summary(one[mode] if S == "1" else [r[mode][S] for r in rounds])
         sm["ratio"] = sm["mean"] / base
         out["summary"][f"{mode}_S{S}"] = sm
         print(f"  {mode:9s} S={S}: {sm['mean']:.2f} ({sm['min']:.2f} to {sm['max']:.2f}), {sm['ratio']:.2f}x"
               + (" (S=1: the lower of first and last each round)" if mode == "sync" and S == "1" else ""), flush=True)
 pv = [v for r in rounds for v in r["probe_before_sync"].values()]
-out["summary"]["probe"] = summary(pv)
-print(f"  probe: {stt.mean(pv):.3f} ({min(pv):.3f} to {max(pv):.3f}) ms", flush=True)
+pm = out["summary"]["probe"] = summary(pv)
+print(f"  probe: {pm['mean']:.3f} ({pm['min']:.3f} to {pm['max']:.3f}) ms", flush=True)
 with open(a.out, "w") as f:
     json.dump(out, f, indent=1)

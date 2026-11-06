@@ -11,6 +11,11 @@ SLOW_PROBE = 1.25  # a probe this many times its median marks a slow moment (a l
 SLOW_STEP = 1.10  # a step this many times its run's median counts as slow (the same)
 Row = namedtuple("Row", "run step probe ratio")  # ratio: the step's time / that step's median in its run
 
+
+def spread(sm, f=".2f"):
+    return f"{sm['mean']:{f}} ({sm['min']:{f}} to {sm['max']:{f}})"
+
+
 runs = {}
 for path in sys.argv[1:]:
     with open(path) as f:
@@ -23,10 +28,10 @@ for path in sys.argv[1:]:
 print("run | rounds | force | sync S=1, S=2, S=3: mean (min to max) ms, S=2 / S=1 | pipelined S=1, S=2, S=3, S=2 / S=1 | probe")
 for name, d in runs.items():
     s = d["summary"]
-    sync = ", ".join(f"{s[f'sync_S{S}']['mean']:.2f} ({s[f'sync_S{S}']['min']:.2f} to {s[f'sync_S{S}']['max']:.2f})" for S in (1, 2, 3))
+    sync = ", ".join(spread(s[f"sync_S{S}"]) for S in (1, 2, 3))
     pipe = ", ".join(f"{s[f'pipelined_S{S}']['mean']:.2f}" for S in (1, 2, 3))
     print(f"{name} | {len(d['rounds'])} | {' '.join(d['setup']['force']) or '-'} | {sync}, {s['sync_S2']['ratio']:.2f}x | "
-          f"{pipe}, {s['pipelined_S2']['ratio']:.2f}x | {s['probe']['mean']:.3f} ({s['probe']['min']:.3f} to {s['probe']['max']:.3f})")
+          f"{pipe}, {s['pipelined_S2']['ratio']:.2f}x | {spread(s['probe'], '.3f')}")
 
 print("\nrun | split, the mean over rounds of each round's medians: build + encode + wait (ms) for S=1, S=2, S=3")
 for name, d in runs.items():
@@ -39,13 +44,19 @@ for name, d in runs.items():
         med = stt.median(r["sync"][k] for r in d["rounds"])
         rows += [Row(name, k, r["probe_before_sync"][k], r["sync"][k] / med) for r in d["rounds"]]
 pm = stt.median(x.probe for x in rows)
+
+
+def slow_probe(x):
+    return x.probe > SLOW_PROBE * pm
+
+
 print(f"\n{len(rows)} sync measurements in {len(runs)} runs; the probe's median {pm:.3f} ms")
-for label, group in ((f"probe more than {SLOW_PROBE}x its median", [x for x in rows if x.probe > SLOW_PROBE * pm]),
-                     (f"probe at most {SLOW_PROBE}x its median", [x for x in rows if x.probe <= SLOW_PROBE * pm])):
+for label, group in ((f"probe more than {SLOW_PROBE}x its median", [x for x in rows if slow_probe(x)]),
+                     (f"probe at most {SLOW_PROBE}x its median", [x for x in rows if not slow_probe(x)])):
     rel = [x.ratio for x in group]
     print(f"  {label}: {len(group)} measurements, step / its run's median {stt.mean(rel):.3f} on average, "
           f"{sum(r > SLOW_STEP for r in rel)} of them more than {SLOW_STEP}x")
 print(f"measurements more than {SLOW_STEP}x their run's median (run, step, probe ms, ratio; * the probe was slow too):")
 for x in sorted(rows, key=lambda x: -x.ratio):
     if x.ratio > SLOW_STEP:
-        print(f"  {x.run}, S={x.step}, probe {x.probe:.3f}{' *' if x.probe > SLOW_PROBE * pm else ''}, {x.ratio:.2f}x")
+        print(f"  {x.run}, S={x.step}, probe {x.probe:.3f}{' *' if slow_probe(x) else ''}, {x.ratio:.2f}x")

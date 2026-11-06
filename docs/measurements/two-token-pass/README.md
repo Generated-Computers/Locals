@@ -21,9 +21,9 @@ Zwyrol, 191 for the original model), and then, in each round:
 
 - **sync**: 1, 2, 3 and 1 tokens, timed as `mtp_test.py` times them: a fresh cache, 3 warm steps, 30 timed steps,
   one `mx.eval` a step. This is how a lone request's draft pass runs: the next step waits for this one's result.
-- **probe**: just before each sync measurement, 30 synchronous calls of MLX's own 4-bit matmul
-  (`mx.quantized_matmul`, no Locals code) on the output head's weights, 1 row. It tells how fast the GPU is at that
-  moment (for 35 ms of the sync measurement's 300 to 500).
+- **probe**: before each sync measurement (ahead of its fresh cache and warm steps), 30 synchronous calls of MLX's
+  own 4-bit matmul (`mx.quantized_matmul`, no Locals code) on the output head's weights, 1 row. It tells how fast the
+  GPU is at that moment (for 35 ms of the sync measurement's 300 to 500).
 - **split**: the same steps, each cut into building the graph (Python), encoding it (`mx.async_eval` returns) and
   waiting for the GPU (`mx.eval` returns). The median of 30 steps per round.
 - **pipelined**: step s+1 built and queued while step s runs, as the engines decode a batch. The CPU's time hides
@@ -63,7 +63,9 @@ The runs wrote to `<scratch>/runs/` and were copied into `results/` with the pat
 | `early_unchanged_1` to `_3`, `early_head_fragh` | `before_1` to `_3`, `head_fragh_1` | the first and third commands, with `step_timing.py` before the probe was added |
 
 Each `.txt` starts with its setup lines and its `force:` line. After the runs, `step_timing.py` changed only by a lint
-pass (`check=False` on its two `git` calls, `with open` for the JSON) and one comment.
+pass (`check=False` on its two `git` calls, `with open` for the JSON), two comments, and a cleanup that keeps every
+call and its order: how a round's and the summary's numbers are stored and printed (the same JSON and lines), and the
+output head taken with `K.head_module` (the same module for both models).
 
 ## Results
 
@@ -130,7 +132,7 @@ In 15 runs `summarize.py` counts 244 sync measurements. It divides each step's t
 and marks the probe slow when it is more than 1.25x its median (1.160 ms). Both lines are chosen here, not given by
 anything.
 
-| Probe just before | Measurements | Step / its run's median, on average | More than 1.10x |
+| Probe before | Measurements | Step / its run's median, on average | More than 1.10x |
 |---|---|---|---|
 | Slow (more than 1.25x) | 8 | 1.190 | 4 |
 | Not slow | 236 | 1.008 | 8 |
@@ -139,7 +141,7 @@ The 12 measurements more than 1.10x their run's median are 1-token passes (8), 2
 (2), in `head_frag`, `head_mma`, `head_fragh`, `original_1` and `original_3`. The worst two: a 2-token pass at 1.57x
 (`head_mma`, probe 1.444 ms, just under the line) and a 1-token pass at 1.53x (`head_frag`, probe 2.295 ms: MLX's own
 matmul, with no Locals code in it, was twice as slow at that moment). So a slow moment is not a 2-token cost. The
-probe catches 4 of the 12; it covers only 35 ms before each measurement.
+probe catches 4 of the 12; it covers only 35 ms, taken before each measurement's fresh cache and warm steps.
 
 `early_head_fragh`, the run without the probe, had such moments too: its 2-token passes ranged 12.51 to 15.37 ms, and
 its first 1-token pass in rounds 1 to 4 took 11.91 to 12.57 ms, against 9.98 to 10.50 for the last.
@@ -167,13 +169,10 @@ the unchanged runs put it: 12.07 ms sync, 8.92 ms pipelined.
 
 ## Also seen
 
-- **Two MLX versions share one tuning file.** The owner's server (`~/.local/share/uv/tools/locals`, mlx 0.32.4) and
-  this repo's `.venv` (mlx 0.32.3) both use `~/.cache/locals/tune_v6_applegpu_g14s.json`. A start under one version
-  after the other marks the shapes this Mac timed as stale (`_mark_stale` in `locals/kernels.py`). The server's log
-  says "MLX is 0.32.4 now (0.32.3 when this Mac's kernels were timed): the 420 kernel shapes timed here keep their
-  choice until they are timed again"; the file now says mlx 0.32.3 and lists 235 stale shapes (why not 420 was not
-  looked into). The choices stay, but an idle server re-times the served model's stale shapes, and the next start
-  under the other version marks them stale again. Not a cause here: the file has no Qwen3.5-4B shapes.
+- **Two MLX versions share one tuning file** ([issue #24](https://github.com/kaziko/Locals-Qwen-Vision/issues/24)).
+  The owner's server (mlx 0.32.4) and this repo's `.venv` (mlx 0.32.3) both use
+  `~/.cache/locals/tune_v6_applegpu_g14s.json`, and a start under one version marks the shapes timed under the other
+  as stale, so an idle server times them again. Not a cause here: the file has no Qwen3.5-4B shapes.
 - **Building the graph of a custom kernel costs more Python.** At 2 rows, a pass whose matmuls all take MLX's kernel
   builds its graph in 1.33 ms (`rows2_mlx`), against 1.60 to 1.86 ms with `multi` (the unchanged runs). In a sync pass
   this adds to the time; pipelined, it hides behind the GPU.
