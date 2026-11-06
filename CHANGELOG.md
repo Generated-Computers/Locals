@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.3 (unreleased)
+## 0.2.2-vision.1 (2026-11-06)
 
 - **Images, for Gemma 4 too.** Gemma 4 checkpoints read images as Qwen's do (E2B was run here; E4B's vision_config
   matches its tower, but its weights were never downloaded): `vision.family` reads
