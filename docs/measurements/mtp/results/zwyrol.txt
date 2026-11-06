@@ -1,0 +1,35 @@
+locals from <repo>/locals/__init__.py | mlx 0.32.3
+model Kaziko/Qwen3.5-4B-Zwyrol
+Fetching 11 files:   0%|          | 0/11 [00:00<?, ?it/s]Fetching 11 files:  18%|█▊        | 2/11 [00:00<00:02,  3.02it/s]Fetching 11 files:  82%|████████▏ | 9/11 [00:01<00:00,  9.42it/s]Fetching 11 files:  91%|█████████ | 10/11 [00:20<00:00,  9.42it/s]Fetching 11 files: 100%|██████████| 11/11 [00:49<00:00,  6.19s/it]Fetching 11 files: 100%|██████████| 11/11 [00:49<00:00,  4.47s/it]
+compute dtype float16 | embed dtype mlx.core.float16 | output head own lm_head
+en-explain   prompt   27 reply 140 tokens (1.5 s): 'A refrigerator works by using a refrigeration cycle to move heat from the inside'
+code         prompt   40 reply 192 tokens (2.0 s): '```python\nimport csv\nfrom typing import Optional, List, Union\n\ndef average_price'
+pl-email     prompt   47 reply 151 tokens (1.7 s): 'Oto propozycja krótkiego i uprzejмого e-maila:\n\n**Temat:** Prośba o podlewanie k'
+pl-explain   prompt   35 reply 192 tokens (2.0 s): '**Inflacja** to sytuacja, gdy ceny towarów i usług w kraju systematycznie rosną.'
+json         prompt   40 reply 174 tokens (1.9 s): '[\n  {\n    "title": "The Whispering Clocktower",\n    "author": "Elena Voss",\n    '
+summary      prompt  101 reply  99 tokens (1.2 s): '*   Residents of the old town argue that the proposed bike lanes will reduce ess'
+math         prompt   45 reply 192 tokens (2.1 s): 'To determine when the train arrives, we need to calculate the travel time and ad'
+code-convert prompt   84 reply 192 tokens (2.1 s): 'Here is the TypeScript version of your function with appropriate type definition'
+tool-call    prompt  294 reply  40 tokens (0.8 s): '<tool_call>\n<function=get_weather>\n<parameter=city>\nKraków\n</parameter>\n<paramet'
+chat         prompt   29 reply 192 tokens (2.0 s): 'Here are three quick, low-effort ideas to help you unwind tonight:\n\n1.  **The "5'
+pl-tool-screen prompt  412 reply  31 tokens (0.8 s): '<tool_call>\n<function=read_screen>\n<parameter=app>\nprzeglądarka\n</parameter>\n</f'
+pl-tool-note prompt  422 reply  40 tokens (0.9 s): '<tool_call>\n<function=save_note>\n<parameter=text>\nJutro o dziesiątej telefon do '
+precondition: teacher-forced main model = its own greedy reply on 1633 of 1635 tokens
+norm 1+w | hidden pre-norm | concat [emb, hidden]            first guess right 1331 / 1623 = 82.0%
+norm 1+w | hidden pre-norm | concat [hidden, emb]            first guess right    4 / 1623 = 0.2%
+norm 1+w | hidden post-norm | concat [emb, hidden]           first guess right 1358 / 1623 = 83.7%
+norm 1+w | hidden post-norm | concat [hidden, emb]           first guess right    4 / 1623 = 0.2%
+norm w | hidden pre-norm | concat [emb, hidden]              first guess right    0 / 1623 = 0.0%
+norm w | hidden pre-norm | concat [hidden, emb]              first guess right    2 / 1623 = 0.1%
+norm w | hidden post-norm | concat [emb, hidden]             first guess right    0 / 1623 = 0.0%
+norm w | hidden post-norm | concat [hidden, emb]             first guess right    1 / 1623 = 0.1%
+
+best variant: norm 1+w | hidden post-norm | concat [emb, hidden]
+MTP float16: first 1358/1623 = 83.7%; second given first 1010/1347 = 75.0%
+   per prompt: en-explain 73%, code 87%, pl-email 73%, pl-explain 70%, json 91%, summary 78%, math 96%, code-convert 89%, tool-call 100%, chat 82%, pl-tool-screen 93%, pl-tool-note 97%
+MTP 4-bit: first 1343/1623 = 82.7%; second given first 979/1332 = 73.5%
+   per prompt: en-explain 71%, code 87%, pl-email 74%, pl-explain 65%, json 92%, summary 73%, math 95%, code-convert 88%, tool-call 97%, chat 82%, pl-tool-screen 93%, pl-tool-note 97%
+
+main step: S=1 10.20 ms, S=2 14.05 ms, S=3 15.91 ms, S=1 10.14 ms
+MTP float16 guess: 2.02 ms = 0.20 of a main step | estimate, 1 draft: 1.15x, 2 drafts: 1.24x (with 4-bit acceptance; before the pipelining loss)
+MTP 4-bit guess: 1.57 ms = 0.15 of a main step | estimate, 1 draft: 1.19x, 2 drafts: 1.30x (with 4-bit acceptance; before the pipelining loss)
