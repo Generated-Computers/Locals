@@ -58,14 +58,18 @@ The runs wrote to `<scratch>/runs/` and were copied into `results/` with the pat
 | `original_1` to `_3` | `orig_1` to `_3` | the second command, three times |
 | `head_fragh`; `head_mlx`, `head_frag`, `head_mma` | `head_fragh_p1`; `head_mlx`, ... | the third; the others with that family and `--rounds 3` |
 | `rows2_mlx`, `rows2_fragh`, `rows2_frag`, `rows2_mma` | `all2_mlx`, ... | the fourth, with that family |
-| `neighbour_12gb` | `hold12_1` | `hold_memory.py 12 300 &` (its PID from `$!`; its output in `neighbour_12gb_holder.txt`), then the first command once it printed `holding 12.0 GB`, then that PID stopped |
+| `neighbour_12gb` | `hold12_1` | `<repo>/.venv/bin/python hold_memory.py 12 300 &` (its PID from `$!`; its output in `neighbour_12gb_holder.txt`), then the first command once it printed `holding 12.0 GB`, then that PID stopped |
 | `mtp_test_rerun` | `mtp_repro_1` | `mtp_test.py` unchanged, from `../mtp`, with the environment above: `<repo>/.venv/bin/python mtp_test.py <scratch>/mtp_bf16.safetensors <scratch>/runs/mtp_repro_1.json Kaziko/Qwen3.5-4B-Zwyrol > <scratch>/runs/mtp_repro_1.txt 2>&1` |
 | `early_unchanged_1` to `_3`, `early_head_fragh` | `before_1` to `_3`, `head_fragh_1` | the first and third commands, with `step_timing.py` before the probe was added |
 
 Each `.txt` starts with its setup lines and its `force:` line. After the runs, `step_timing.py` changed only by a lint
 pass (`check=False` on its two `git` calls, `with open` for the JSON), two comments, and a cleanup that keeps every
 call and its order: how a round's and the summary's numbers are stored and printed (the same JSON and lines), and the
-output head taken with `K.head_module` (the same module for both models).
+output head taken with `K.head_module` (the same module for both models). A review then added two checks of
+`--force`. A spec the script cannot read, or one that forces no shape, now stops the run. And a shape's key takes the
+activation dtype (`rt.dtype`, the one `K._choose` keys a choice on), not the scales' dtype. On Zwyrol, the model of
+every forced run, the two are the same: Runtime printed `compute dtype float16` (`mtp_test_rerun.txt`), and
+`set_compute_dtype` casts every bf16 array to that dtype, the scales included.
 
 ## Results
 

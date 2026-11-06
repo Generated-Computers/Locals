@@ -20,10 +20,15 @@ runs = {}
 for path in sys.argv[1:]:
     with open(path) as f:
         d = json.load(f)
-    if "rounds" in d and "probe_before_sync" in d["rounds"][0]:
+    rounds = d.get("rounds")
+    if rounds == []:
+        print(f"(skipped {os.path.basename(path)}: no rounds)")
+    elif rounds and "probe_before_sync" in rounds[0]:
         runs[os.path.basename(path)[:-5]] = d
     else:
         print(f"(skipped {os.path.basename(path)}: not a step_timing.py result with the probe)")
+if not runs:
+    sys.exit("no step_timing.py result with the probe and at least one round")
 
 print("run | rounds | force | sync S=1, S=2, S=3: mean (min to max) ms, S=2 / S=1 | pipelined S=1, S=2, S=3, S=2 / S=1 | probe")
 for name, d in runs.items():
@@ -54,8 +59,8 @@ print(f"\n{len(rows)} sync measurements in {len(runs)} runs; the probe's median 
 for label, group in ((f"probe more than {SLOW_PROBE}x its median", [x for x in rows if slow_probe(x)]),
                      (f"probe at most {SLOW_PROBE}x its median", [x for x in rows if not slow_probe(x)])):
     rel = [x.ratio for x in group]
-    print(f"  {label}: {len(group)} measurements, step / its run's median {stt.mean(rel):.3f} on average, "
-          f"{sum(r > SLOW_STEP for r in rel)} of them more than {SLOW_STEP}x")
+    avg = f", step / its run's median {stt.mean(rel):.3f} on average" if rel else ""  # (no mean of an empty group)
+    print(f"  {label}: {len(group)} measurements{avg}, {sum(r > SLOW_STEP for r in rel)} of them more than {SLOW_STEP}x")
 print(f"measurements more than {SLOW_STEP}x their run's median (run, step, probe ms, ratio; * the probe was slow too):")
 for x in sorted(rows, key=lambda x: -x.ratio):
     if x.ratio > SLOW_STEP:

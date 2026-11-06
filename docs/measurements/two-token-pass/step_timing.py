@@ -11,7 +11,8 @@ cache holds a prompt and its greedy reply (at most 192 tokens), as in mtp_test.p
             Locals code) on the output head's weights, 1 row: how fast this GPU is at that moment
 First it prints the kernel each 4-bit matmul shape gets at 1, 2 and 3 rows.
 --force M=FAMILY gives every shape at M rows that kernel family's tuned winner (mlx = MLX's own kernel);
---force M@NxK=FAMILY only the shape N x K. Repeatable. The choices are set in this process only.
+--force M@NxK=FAMILY only the shape N x K. Repeatable. The choices are set in this process only. A spec that
+cannot be read, or that forces no shape, stops the run.
 Usage: step_timing.py MODEL OUT.json [--rounds 5] [--force SPEC ...]"""
 import argparse
 import json
@@ -35,6 +36,13 @@ ap.add_argument("out")
 ap.add_argument("--rounds", type=int, default=5)
 ap.add_argument("--force", action="append", default=[])
 a = ap.parse_args()
+forces = []  # (spec, rows, "NxK" or "", family) of each --force, checked before the model loads
+for spec in a.force:
+    rows, eq, fam = spec.partition("=")
+    M, _, only = rows.partition("@")
+    if not (eq and fam and M.isdigit() and int(M) > 0):
+        raise SystemExit(f"--force {spec}: expected M=FAMILY or M@NxK=FAMILY")
+    forces.append((spec, int(M), only, fam))
 
 repo = os.path.dirname(os.path.dirname(L.__file__))
 commit = subprocess.run(["git", "-C", repo, "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=False).stdout.strip()
@@ -53,23 +61,24 @@ tune = K._load_tune()
 print(f"tune cache says mlx {tune.get('__mlx__')}, {len(tune.get('__stale__') or [])} stale shapes", flush=True)
 setup["tune_cache_mlx"] = tune.get("__mlx__")
 
+# (N, K, dtype name) -> the layers. The dtype is the one K._choose keys a choice on: the activations' (Runtime's compute
+# dtype), not the scales'
 shapes = {}
 for name, mod in model.named_modules():
     if K._tunable(mod):
-        shapes.setdefault((mod["weight"].shape[0], mod["weight"].shape[1] * 8, K._mod_dt(mod)), []).append(name)
+        shapes.setdefault((mod["weight"].shape[0], mod["weight"].shape[1] * 8, K._key_dt(rt.dtype, mod)), []).append(name)
 
 
 def key(N, Kd, M, dt):
     return f"{N}x{Kd}x{M}" + ("" if dt == "float16" else f"x{dt}")
 
 
-for spec in a.force:
-    rows, fam = spec.split("=")
-    M, _, only = rows.partition("@")
-    M = int(M)
-    for N, Kd, dt in shapes:
-        if only and only != f"{N}x{Kd}":
-            continue
+for spec, M, only, fam in forces:
+    hit = [(N, Kd, dt) for N, Kd, dt in shapes if not only or only == f"{N}x{Kd}"]
+    if not hit:
+        raise SystemExit(f"--force {spec}: no 4-bit matmul shape {only}; the shapes are "
+                         + ", ".join(sorted({f"{N}x{Kd}" for N, Kd, _ in shapes})))
+    for N, Kd, dt in hit:
         c = ("mlx",) if fam == "mlx" else tune.get(key(N, Kd, M, dt) + "|" + fam)
         if c is None:
             raise SystemExit(f"--force {spec}: no tuned {fam} kernel for {key(N, Kd, M, dt)}")
