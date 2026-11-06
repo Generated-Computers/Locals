@@ -1,0 +1,40 @@
+locals from <repo>/locals/__init__.py | mlx 0.32.3
+model Kaziko/Qwen3.5-4B-Zwyrol
+Fetching 11 files:   0%|          | 0/11 [00:00<?, ?it/s]Fetching 11 files: 100%|██████████| 11/11 [00:00<00:00, 4126.04it/s]
+output head own lm_head
+en-explain     prompt    27 reply 140 tokens (1.8 s): 'A refrigerator works by using a refrigeration cycle to move heat from '
+code           prompt    40 reply 192 tokens (2.5 s): '```python\nimport csv\nfrom typing import Optional, List, Union\n\ndef ave'
+pl-email       prompt    47 reply 151 tokens (1.8 s): 'Oto propozycja krótkiego i uprzejмого e-maila:\n\n**Temat:** Prośba o po'
+pl-explain     prompt    35 reply 192 tokens (2.2 s): '**Inflacja** to sytuacja, gdy ceny towarów i usług w kraju systematycz'
+json           prompt    40 reply 174 tokens (2.7 s): '[\n  {\n    "title": "The Whispering Clocktower",\n    "author": "Elena V'
+summary        prompt   101 reply  99 tokens (1.4 s): '*   Residents of the old town argue that the proposed bike lanes will '
+math           prompt    45 reply 192 tokens (2.3 s): 'To determine when the train arrives, we need to calculate the travel t'
+code-convert   prompt    84 reply 192 tokens (2.3 s): 'Here is the TypeScript version of your function with appropriate type '
+tool-call      prompt   294 reply  40 tokens (0.8 s): '<tool_call>\n<function=get_weather>\n<parameter=city>\nKraków\n</parameter'
+chat           prompt    29 reply 192 tokens (2.3 s): 'Here are three quick, low-effort ideas to help you unwind tonight:\n\n1.'
+pl-tool-screen prompt   412 reply  31 tokens (0.8 s): '<tool_call>\n<function=read_screen>\n<parameter=app>\nprzeglądarka\n</para'
+pl-tool-note   prompt   422 reply  40 tokens (0.9 s): '<tool_call>\n<function=save_note>\n<parameter=text>\nJutro o dziesiątej t'
+long-code      prompt  1316 reply 192 tokens (3.6 s): 'Based on the code provided, here is an explanation of the `propose` fu'
+long-doc       prompt  1596 reply 192 tokens (3.9 s): 'Here is a summary of the batch engine scheduling logic in five bullet '
+
+causal     reply 1640/2005 = 81.8% | first16 195/224 = 87.1% | after-gap 1106/1369 = 80.8%
+full       reply 1640/2005 = 81.8% | first16 195/224 = 87.1% | after-gap 1106/1369 = 80.8%
+no-prompt  reply 1535/2005 = 76.6% | first16 164/224 = 73.2% | after-gap 1058/1369 = 77.3%
+gap32      reply 1626/2005 = 81.1% | first16 195/224 = 87.1% | after-gap 1104/1369 = 80.6%
+
+per prompt, reply positions (full vs no-prompt), and after the gap (full vs gap32):
+  en-explain     prompt    27  reply  99/139 vs  94/139   after-gap  65/ 91 vs  66/ 91
+  code           prompt    40  reply 166/191 vs 160/191   after-gap 123/143 vs 122/143
+  pl-email       prompt    47  reply 111/150 vs  95/150   after-gap  70/102 vs  69/102
+  pl-explain     prompt    35  reply 125/191 vs 126/191   after-gap  92/143 vs  93/143
+  json           prompt    40  reply 159/173 vs 155/173   after-gap 115/125 vs 114/125
+  summary        prompt   101  reply  72/ 98 vs  68/ 98   after-gap  41/ 50 vs  40/ 50
+  math           prompt    45  reply 182/191 vs 178/191   after-gap 137/143 vs 137/143
+  code-convert   prompt    84  reply 168/191 vs 158/191   after-gap 128/143 vs 128/143
+  tool-call      prompt   294  reply  38/ 39 vs  35/ 39   after-gap   0/  0 vs   0/  0
+  chat           prompt    29  reply 157/191 vs 150/191   after-gap 118/143 vs 116/143
+  pl-tool-screen prompt   412  reply  28/ 30 vs  22/ 30   after-gap   0/  0 vs   0/  0
+  pl-tool-note   prompt   422  reply  38/ 39 vs  26/ 39   after-gap   0/  0 vs   0/  0
+  long-code      prompt  1316  reply 153/191 vs 143/191   after-gap 110/143 vs 111/143
+  long-doc       prompt  1596  reply 144/191 vs 125/191   after-gap 107/143 vs 108/143
+exit 0
