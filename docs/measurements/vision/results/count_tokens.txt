@@ -8,7 +8,7 @@ serving <scratch>/old/locals/__init__.py
 serving <scratch>/old/locals/__init__.py
 [new1] ready after 5s, pid 80671
 2 images 4032x3024 JPEG: count_tokens=1963 messages.usage.input_tokens=1963 count median 31 ms (min 29, max 65, n=7)
-serving /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py
+serving <repo>/locals/__init__.py
 [new2] ready after 6s, pid 80800
 2 images 4032x3024 JPEG: count_tokens=1963 messages.usage.input_tokens=1963 count median 29 ms (min 28, max 69, n=7)
-serving /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py
+serving <repo>/locals/__init__.py

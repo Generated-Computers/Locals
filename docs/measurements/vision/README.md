@@ -2,7 +2,8 @@
 
 Run on an M2 Max (32 GB), 2026-10-31, at commit `20bafe1`, with `mlx-community/Qwen3.5-4B-MLX-4bit` and
 `mlx-community/Qwen3-VL-8B-Instruct-4bit`. mlx-vlm 0.7.11 (mlx 0.32.4, transformers 5.22.1), run through `uvx`.
-Each command is run from this folder.
+Each command is run from this folder. `<repo>` is the clone's folder; in the result files, `<repo>` and
+`<scratch>` stand for the paths the run printed.
 
 ## Our answers against mlx-vlm's (`docs/server/README.md`, Images)
 

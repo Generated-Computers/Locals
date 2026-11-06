@@ -1,14 +1,14 @@
 # M2 Max (32 GB), 2026-10-31, commit 6b290df; each model run in two processes; 4 requests each, medians of runs 2-4
 # the request: ~150 lines of text, a 1280x800 and a 1024x1024 PNG, max_tokens 1
-locals from /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py mode mrope
+locals from <repo>/locals/__init__.py mode mrope
 mlx-community/Qwen3.5-4B-MLX-4bit: load 69 ms, tower 1122 ms, prefill 5461 ms, whole request 6949 ms (medians of runs 2-4)
 mlx-community/Qwen3.5-4B-MLX-4bit mrope: prompt 5666 tokens, prefill_embedded median 5461 ms (runs 2-4: 5461, 5423, 5470), layers on MRoPE: 8
-locals from /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py mode mrope
+locals from <repo>/locals/__init__.py mode mrope
 mlx-community/Qwen3.5-4B-MLX-4bit: load 69 ms, tower 1119 ms, prefill 5439 ms, whole request 6919 ms (medians of runs 2-4)
 mlx-community/Qwen3.5-4B-MLX-4bit mrope: prompt 5666 tokens, prefill_embedded median 5439 ms (runs 2-4: 5439, 5435, 5457), layers on MRoPE: 8
-locals from /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py mode mrope
+locals from <repo>/locals/__init__.py mode mrope
 mlx-community/Qwen3-VL-8B-Instruct-4bit: load 64 ms, tower 1536 ms, prefill 10507 ms, whole request 12401 ms (medians of runs 2-4)
 mlx-community/Qwen3-VL-8B-Instruct-4bit mrope: prompt 5512 tokens, prefill_embedded median 10507 ms (runs 2-4: 10507, 10496, 10538), layers on MRoPE: 36
-locals from /Volumes/Roboczy/Projekty_dev/locals-vision/locals/__init__.py mode mrope
+locals from <repo>/locals/__init__.py mode mrope
 mlx-community/Qwen3-VL-8B-Instruct-4bit: load 62 ms, tower 1532 ms, prefill 10506 ms, whole request 12396 ms (medians of runs 2-4)
 mlx-community/Qwen3-VL-8B-Instruct-4bit mrope: prompt 5512 tokens, prefill_embedded median 10506 ms (runs 2-4: 10619, 10506, 10499), layers on MRoPE: 36
