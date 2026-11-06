@@ -1,0 +1,35 @@
+locals from <repo>/locals/__init__.py | mlx 0.32.3
+model mlx-community/Qwen3.5-4B-MLX-4bit
+Fetching 10 files:   0%|          | 0/10 [00:00<?, ?it/s]Fetching 10 files: 100%|██████████| 10/10 [00:00<00:00, 4329.38it/s]
+compute dtype float16 | embed dtype mlx.core.float16 | output head tied embedding
+en-explain   prompt   27 reply 164 tokens (1.8 s): 'A refrigerator works by using a refrigeration cycle to transfer heat from the in'
+code         prompt   40 reply 192 tokens (2.1 s): '```python\nimport csv\nfrom pathlib import Path\n\ndef average_price(csv_path: str) '
+pl-email     prompt   47 reply 184 tokens (2.0 s): 'Oto propozycja krótkiego i uprzejмого e-maila:\n\n**Temat:** Prośba o podlewanie k'
+pl-explain   prompt   35 reply 192 tokens (2.1 s): '**Inflacja** to sytuacja, gdy ceny towarów i usług w kraju systematycznie rosną.'
+json         prompt   40 reply 174 tokens (2.0 s): '[\n  {\n    "title": "The Echoes of Aethelgard",\n    "author": "Elara Vance",\n    '
+summary      prompt  101 reply  97 tokens (1.2 s): '*   Residents of the old town argue that the proposed bike lanes will reduce ess'
+math         prompt   45 reply 192 tokens (2.1 s): 'To determine when the train arrives, we need to calculate the travel time and th'
+code-convert prompt   84 reply 192 tokens (2.2 s): 'Here is the TypeScript version of your function with appropriate type definition'
+tool-call    prompt  294 reply  40 tokens (0.8 s): '<tool_call>\n<function=get_weather>\n<parameter=city>\nKraków\n</parameter>\n<paramet'
+chat         prompt   29 reply 192 tokens (2.1 s): 'Here are three quick ways to unwind after a long day:\n\n1.  **The 5-4-3-2-1 Groun'
+pl-tool-screen prompt  412 reply  31 tokens (0.8 s): '<tool_call>\n<function=read_screen>\n<parameter=app>\nprzeglądarka\n</parameter>\n</f'
+pl-tool-note prompt  422 reply  40 tokens (0.9 s): '<tool_call>\n<function=save_note>\n<parameter=text>\nJutro o dziesiątej telefon do '
+precondition: teacher-forced main model = its own greedy reply on 1685 of 1690 tokens
+norm 1+w | hidden pre-norm | concat [emb, hidden]            first guess right 1418 / 1678 = 84.5%
+norm 1+w | hidden pre-norm | concat [hidden, emb]            first guess right    7 / 1678 = 0.4%
+norm 1+w | hidden post-norm | concat [emb, hidden]           first guess right 1438 / 1678 = 85.7%
+norm 1+w | hidden post-norm | concat [hidden, emb]           first guess right    9 / 1678 = 0.5%
+norm w | hidden pre-norm | concat [emb, hidden]              first guess right    2 / 1678 = 0.1%
+norm w | hidden pre-norm | concat [hidden, emb]              first guess right    3 / 1678 = 0.2%
+norm w | hidden post-norm | concat [emb, hidden]             first guess right    0 / 1678 = 0.0%
+norm w | hidden post-norm | concat [hidden, emb]             first guess right    3 / 1678 = 0.2%
+
+best variant: norm 1+w | hidden post-norm | concat [emb, hidden]
+MTP float16: first 1438/1678 = 85.7%; second given first 1086/1426 = 76.2%
+   per prompt: en-explain 75%, code 92%, pl-email 75%, pl-explain 71%, json 94%, summary 76%, math 96%, code-convert 94%, tool-call 100%, chat 85%, pl-tool-screen 93%, pl-tool-note 100%
+MTP 4-bit: first 1433/1678 = 85.4%; second given first 1063/1421 = 74.8%
+   per prompt: en-explain 74%, code 92%, pl-email 77%, pl-explain 70%, json 94%, summary 77%, math 95%, code-convert 94%, tool-call 100%, chat 85%, pl-tool-screen 93%, pl-tool-note 97%
+
+main step: S=1 10.47 ms, S=2 13.53 ms, S=3 15.53 ms, S=1 10.06 ms
+MTP float16 guess: 2.02 ms = 0.20 of a main step | estimate, 1 draft: 1.20x, 2 drafts: 1.28x (with 4-bit acceptance; before the pipelining loss)
+MTP 4-bit guess: 1.58 ms = 0.16 of a main step | estimate, 1 draft: 1.23x, 2 drafts: 1.34x (with 4-bit acceptance; before the pipelining loss)

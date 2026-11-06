@@ -1,0 +1,32 @@
+locals from <repo>/locals/__init__.py | mlx 0.32.3
+Fetching 10 files:   0%|          | 0/10 [00:00<?, ?it/s]Fetching 10 files: 100%|██████████| 10/10 [00:00<00:00, 1508.53it/s]
+compute dtype float16 | embed dtype mlx.core.float16
+en-explain   prompt   27 reply 164 tokens (1.8 s): 'A refrigerator works by using a refrigeration cycle to transfer heat from the in'
+code         prompt   40 reply 192 tokens (2.1 s): '```python\nimport csv\nfrom pathlib import Path\n\ndef average_price(csv_path: str) '
+pl-email     prompt   47 reply 184 tokens (2.1 s): 'Oto propozycja krótkiego i uprzejмого e-maila:\n\n**Temat:** Prośba o podlewanie k'
+pl-explain   prompt   35 reply 192 tokens (2.0 s): '**Inflacja** to sytuacja, gdy ceny towarów i usług w kraju systematycznie rosną.'
+json         prompt   40 reply 174 tokens (1.9 s): '[\n  {\n    "title": "The Echoes of Aethelgard",\n    "author": "Elara Vance",\n    '
+summary      prompt  101 reply  97 tokens (1.1 s): '*   Residents of the old town argue that the proposed bike lanes will reduce ess'
+math         prompt   45 reply 192 tokens (2.0 s): 'To determine when the train arrives, we need to calculate the travel time and th'
+code-convert prompt   84 reply 192 tokens (2.1 s): 'Here is the TypeScript version of your function with appropriate type definition'
+tool-call    prompt  294 reply  40 tokens (0.8 s): '<tool_call>\n<function=get_weather>\n<parameter=city>\nKraków\n</parameter>\n<paramet'
+chat         prompt   29 reply 192 tokens (2.0 s): 'Here are three quick ways to unwind after a long day:\n\n1.  **The 5-4-3-2-1 Groun'
+precondition: teacher-forced main model = its own greedy reply on 1614 of 1619 tokens
+norm 1+w | hidden pre-norm | concat [emb, hidden]            first guess right 1351 / 1609 = 84.0%
+norm 1+w | hidden pre-norm | concat [hidden, emb]            first guess right    7 / 1609 = 0.4%
+norm 1+w | hidden post-norm | concat [emb, hidden]           first guess right 1371 / 1609 = 85.2%
+norm 1+w | hidden post-norm | concat [hidden, emb]           first guess right    9 / 1609 = 0.6%
+norm w | hidden pre-norm | concat [emb, hidden]              first guess right    2 / 1609 = 0.1%
+norm w | hidden pre-norm | concat [hidden, emb]              first guess right    3 / 1609 = 0.2%
+norm w | hidden post-norm | concat [emb, hidden]             first guess right    0 / 1609 = 0.0%
+norm w | hidden post-norm | concat [hidden, emb]             first guess right    3 / 1609 = 0.2%
+
+best variant: norm 1+w | hidden post-norm | concat [emb, hidden]
+MTP float16: first 1371/1609 = 85.2%; second given first 1023/1361 = 75.2%
+   per prompt: en-explain 75%, code 92%, pl-email 75%, pl-explain 71%, json 94%, summary 76%, math 96%, code-convert 94%, tool-call 100%, chat 85%
+MTP 4-bit: first 1367/1609 = 85.0%; second given first 1004/1357 = 74.0%
+   per prompt: en-explain 74%, code 92%, pl-email 77%, pl-explain 70%, json 94%, summary 77%, math 95%, code-convert 94%, tool-call 100%, chat 85%
+
+main step: S=1 10.35 ms, S=2 12.57 ms, S=3 15.65 ms, S=1 10.25 ms
+MTP float16 guess: 2.01 ms = 0.20 of a main step | estimate, 1 draft: 1.30x, 2 drafts: 1.29x (with 4-bit acceptance; before the pipelining loss)
+MTP 4-bit guess: 1.53 ms = 0.15 of a main step | estimate, 1 draft: 1.34x, 2 drafts: 1.36x (with 4-bit acceptance; before the pipelining loss)

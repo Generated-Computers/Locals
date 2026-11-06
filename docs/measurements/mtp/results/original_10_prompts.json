@@ -1,0 +1,52 @@
+{
+ "variants": {
+  "norm 1+w | hidden pre-norm | concat [emb, hidden]": 0.8396519577377253,
+  "norm 1+w | hidden pre-norm | concat [hidden, emb]": 0.00435052827843381,
+  "norm 1+w | hidden post-norm | concat [emb, hidden]": 0.8520820385332505,
+  "norm 1+w | hidden post-norm | concat [hidden, emb]": 0.005593536357986327,
+  "norm w | hidden pre-norm | concat [emb, hidden]": 0.001243008079552517,
+  "norm w | hidden pre-norm | concat [hidden, emb]": 0.0018645121193287756,
+  "norm w | hidden post-norm | concat [emb, hidden]": 0.0,
+  "norm w | hidden post-norm | concat [hidden, emb]": 0.0018645121193287756
+ },
+ "float16": {
+  "a1": 0.8520820385332505,
+  "a2_given_a1": 0.75165319617928,
+  "per_prompt": {
+   "en-explain": 0.754601226993865,
+   "code": 0.9162303664921466,
+   "pl-email": 0.7486338797814208,
+   "pl-explain": 0.7120418848167539,
+   "json": 0.9421965317919075,
+   "summary": 0.7604166666666666,
+   "math": 0.9633507853403142,
+   "code-convert": 0.93717277486911,
+   "tool-call": 1.0,
+   "chat": 0.8481675392670157
+  }
+ },
+ "4-bit": {
+  "a1": 0.8495960223741454,
+  "a2_given_a1": 0.739867354458364,
+  "per_prompt": {
+   "en-explain": 0.7361963190184049,
+   "code": 0.9162303664921466,
+   "pl-email": 0.7650273224043715,
+   "pl-explain": 0.6963350785340314,
+   "json": 0.9364161849710982,
+   "summary": 0.7708333333333334,
+   "math": 0.9528795811518325,
+   "code-convert": 0.9424083769633508,
+   "tool-call": 1.0,
+   "chat": 0.8481675392670157
+  }
+ },
+ "timing_ms": {
+  "main_S1_first": 10.347112499099845,
+  "main_S2": 12.565881933551282,
+  "main_S3": 15.645487499811376,
+  "main_S1_last": 10.245991667034104,
+  "mtp_float16": 2.011505566770211,
+  "mtp_4-bit": 1.5342291657968115
+ }
+}
