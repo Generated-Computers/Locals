@@ -305,6 +305,32 @@ tables; with the toolbox all the primes, roman numerals, money and units are rig
 replies state the right answer and the grader reads another number (it takes the last one in bold: a row's label, the
 card number with its check digit); in the others Qwen ran out of its 1,500 tokens checking a right result by hand.
 
+## Another Qwen part: Qwen3.8-27B
+
+The computer reads and writes text only, and Qwen's part is a stock model, so another model of the Qwen3.5 family can
+be Qwen's part. Qwen3.8-27B has Qwen3.5's vocabulary and merges (it adds 7 audio tokens in ids Qwen3.5 leaves
+reserved) and the same tool-call format. `LOCALS_QWENPUTER_BASE` names it; the chip pack is the same, and its prompt
+states on disk are kept apart from the 4B's:
+
+```
+LOCALS_QWENPUTER_BASE=mlx-community/Qwen3.8-27B-4bit locals serve --model qwenputer       # or qwenputer-cpu
+```
+
+On a Mac Studio with an M5 Ultra (64-core GPU, 256 GB), `locals tune --mode full` run once for the 27B, temperature 0,
+8 questions at a time (the 4B's rows on the same Mac):
+
+| | Qwen3.8-27B alone | 27B, `qwenputer` | 27B, `qwenputer-cpu` | 4B, `qwenputer` / `qwenputer-cpu` |
+|---|---|---|---|---|
+| 60 arithmetic questions | 2 right | 59 right, 148.6 tokens/s in total | 59 right, 145.7 tokens/s | 59 right, 257.5 tokens/s |
+| The same, one at a time | | 50.1 tokens/s | | |
+| 80 toolbox questions | 49 right | 46 right | 76 right in 42 s | 80 right in 25 s |
+| 45 questions of the C tools | 36 right | | 41 right in 108 s | 42 right in 96 s |
+
+The 27B's misses above are mostly the grader's: its one arithmetic miss ends "(That's 1 followed by 38 zeros.)", and
+in all four of its toolbox misses (a text's length) the computer's count is right and the reply ends with a note such as
+"(26 letters + 3 spaces)", whose number the grader reads. `defaults.weights_gb` still counts the 4B's weights for
+Qwenputer, so the fit check does not see a larger Qwen part.
+
 ## Limits
 
 - Replies are not held to a schema or a regular expression. A request that asks for one gets an error, and calls of
