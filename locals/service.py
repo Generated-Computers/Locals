@@ -692,6 +692,8 @@ class BatchService:
             eos_ids = ()
 
         eng = HybridBatchEngine(rt.model, rt.tokenizer, n_slots=self.slots, mtp=_load_mtp(rt.model, bool(calc)))
+        if eng.mtp is not None:  # (the memory plan below counts the layer's weights with the model's)
+            self.weights_bytes += eng.mtp.nbytes
         # Qwenputer: a reply at a calc call stays in the batch, reading nothing, while its run is made (hybrid_batch's
         # parked rows); else (LOCALS_QWENPUTER_PARK=0, or layers that cannot be held) it leaves and comes back
         eng.parks = bool(calc) and os.environ.get("LOCALS_QWENPUTER_PARK", "1") != "0" and eng.can_park()

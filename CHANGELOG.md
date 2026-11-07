@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **MTP drafts, behind `LOCALS_MTP`** (issue #18). With `LOCALS_MTP` naming a file with Qwen3.5-4B's MTP layer
+  (`docs/measurements/mtp/download_mtp.py`), a request running alone gets drafts of 1 or 2 tokens
+  (`LOCALS_MTP_DRAFTS`) from that layer where prompt lookup has none (`locals/mtp.py`). The layer's KV is one more
+  entry at the end of each cache list (`docs/adr/0001-mtp-kv-in-the-cache-list.md`), so the prompt cache, the disk
+  cache (in a folder of its own) and every batch operation carry it. Off by default, and off with one line at load on
+  other models and Qwenputer. Measured on an M2 Max with Zwyrol, one request: the first draft is kept 84.2% of the
+  time, but the decode sweep gives 108 tok/s against 110 with MTP off, as each pass waits for the CPU twice
+  (`docs/measurements/mtp/README.md`, step 4). Greedy replies are the same, or first differ at a float16 tie: 3 of 14
+  prompts did (`results/greedy_check.txt`).
+
 ## 0.2.2-vision.1 (2026-11-06)
 
 - **Images, for Gemma 4 too.** Gemma 4 checkpoints read images as Qwen's do (E2B was run here; E4B's vision_config

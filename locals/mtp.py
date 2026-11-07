@@ -49,8 +49,9 @@ class Layer(nn.Module):
 
 
 def why_off(model) -> Optional[str]:
-    """Why MTP drafts cannot run on ``model`` (None: they can). The layer exists for Qwen3.5-4B only here: a
-    Qwen3.5 text model with 32 layers of width 2560 whose config names one MTP layer."""
+    """Why MTP drafts cannot run on ``model`` (None: they can). They are for Qwen3.5-4B only: a dense Qwen3.5 text
+    model with 32 layers of width 2560 (its config's MTP layer is not in mlx-lm's model arguments, so the file
+    ``LOCALS_MTP`` names is the check that the layer exists: it must load into this model's layer shapes)."""
     lm = text_model(model)
     args = getattr(lm, "args", None)
     body = getattr(lm, "model", None)
@@ -134,6 +135,13 @@ class MTP:
         out.dtype = dtype
         return out
 
+    @property
+    def nbytes(self) -> int:
+        """The layer's weights in memory."""
+        from mlx.utils import tree_flatten
+
+        return sum(v.nbytes for _, v in tree_flatten(self.layer.parameters()))
+
     # -- the entry ------------------------------------------------------------------------------------------------
     @staticmethod
     def entry() -> KVCache:
@@ -178,18 +186,19 @@ class MTP:
         """Draft logits of the layer's output: its norm, then the main model's output head."""
         return head_logits(self.lm, self.layer.norm(out))
 
-    def tokens(self, logits: mx.array, r) -> mx.array:
-        """The draft tokens of draft logits (..., V): their argmax. (A test double picks others.)"""
+    @staticmethod
+    def tokens(logits: mx.array) -> mx.array:
+        """The draft tokens of draft logits (..., V): their argmax."""
         return mx.argmax(logits, axis=-1)
 
     def draft(self, entry, out: mx.array, r, n: int) -> List[int]:
         """``n`` (1 or 2) chained drafts from ``out`` (1, 1, D), the layer's output at the entry's last slot: the first
         from its logits, the second from the layer run once more on its own output (normed) and the first draft's
         embedding, at the next slot, which is cut off again (the entry's offset stays the main cache's)."""
-        d1 = self.tokens(self.logits(out[:, -1:, :]), r).reshape(1, 1)
+        d1 = self.tokens(self.logits(out[:, -1:, :])).reshape(1, 1)
         if n < 2:
             return d1.reshape(-1).tolist()
         out2 = self.fill(entry, self.layer.norm(out[:, -1:, :]), d1, mx.ones((1, 1), dtype=mx.bool_))
-        d2 = self.tokens(self.logits(out2), r).reshape(1, 1)
+        d2 = self.tokens(self.logits(out2)).reshape(1, 1)
         entry.trim(1)
         return mx.concatenate([d1, d2], axis=1).reshape(-1).tolist()

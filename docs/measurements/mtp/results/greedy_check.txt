@@ -1,0 +1,30 @@
+en-explain     drafts=1 first diff at 39: off 1083 (24.062) on 1472 (24.078), max 24.078, gap 0.0156
+en-explain     drafts=2 first diff at 39: off 1083 (24.062) on 1472 (24.078), max 24.078, gap 0.0156
+code           drafts=1 same (192 tokens)
+code           drafts=2 same (192 tokens)
+pl-email       drafts=1 same (150 tokens)
+pl-email       drafts=2 same (150 tokens)
+pl-explain     drafts=1 same (192 tokens)
+pl-explain     drafts=2 same (192 tokens)
+json           drafts=1 same (173 tokens)
+json           drafts=2 same (173 tokens)
+summary        drafts=1 same (81 tokens)
+summary        drafts=2 same (81 tokens)
+math           drafts=1 first diff at 15: off 1179 (30.297) on 884 (30.297), max 30.297, gap 0.0000
+math           drafts=2 first diff at 15: off 1179 (30.297) on 884 (30.297), max 30.297, gap 0.0000
+code-convert   drafts=1 same (192 tokens)
+code-convert   drafts=2 same (192 tokens)
+tool-call      drafts=1 same (39 tokens)
+tool-call      drafts=2 same (39 tokens)
+chat           drafts=1 same (192 tokens)
+chat           drafts=2 same (192 tokens)
+pl-tool-screen drafts=1 same (30 tokens)
+pl-tool-screen drafts=2 same (30 tokens)
+pl-tool-note   drafts=1 same (69 tokens)
+pl-tool-note   drafts=2 same (69 tokens)
+long-code      drafts=1 same (192 tokens)
+long-code      drafts=2 same (192 tokens)
+long-doc       drafts=1 first diff at 63: off 3870 (23.641) on 3074 (23.625), max 23.641, gap 0.0156
+long-doc       drafts=2 first diff at 63: off 3870 (23.641) on 3074 (23.625), max 23.641, gap 0.0156
+drafts=1: accepted 629 of 755 = 83.3%
+drafts=2: accepted 844 of 1197 = 70.5%

@@ -638,14 +638,19 @@ class HybridBatchEngine(BatchEngine):
         h = self.lm.model(x, cache, **kw)
         e = self._entry(cache)
         if e is not None:
-            B, L = x.shape[0], x.shape[1]
-            if not nexts or not any(nexts):
-                self.mtp.holes(e, B, L)
-            else:
-                nx = mx.array([list(n[:L]) + [0] * (L - len(n[:L])) for n in nexts], dtype=mx.int32)
-                fl = mx.array([[j < len(n) for j in range(L)] for n in nexts])
-                self.mtp.fill(e, h, nx, fl)
+            self._write_entry(e, h, nexts)
         return h
+
+    def _write_entry(self, e, h: mx.array, nexts=None) -> None:
+        """The MTP entry's next L positions, for hidden states ``h`` (B, L, D): the layer's KV where ``nexts`` (per row)
+        gives the token after a position, holes elsewhere."""
+        B, L = h.shape[0], h.shape[1]
+        if not nexts or not any(nexts):
+            self.mtp.holes(e, B, L)
+            return
+        nx = mx.array([list(n[:L]) + [0] * (L - len(n[:L])) for n in nexts], dtype=mx.int32)
+        fl = mx.array([[j < len(n) for j in range(L)] for n in nexts])
+        self.mtp.fill(e, h, nx, fl)
 
     # -- prefill with prefix snapshots -------------------------------------------------
     def _prefill(self, tokens: List[int], others: List[List[int]], tail_ok: int = 0):
@@ -1201,13 +1206,19 @@ class HybridBatchEngine(BatchEngine):
             return []
         acc = getattr(r, "solo_acc", None) or []
         width = 4 if not acc else max(1, min(8, int(round(2 * sum(acc[-8:]) / len(acc[-8:]) + 1))))
+        # one token under a grammar is too often a repeated key's start
+        return self._draft_checked(r, stream[j:j + width], constrained, least=2)
+
+    def _draft_checked(self, r, draft: List[int], constrained: bool, least: int = 1) -> List[int]:
+        """A draft cut at its first end-of-sequence token; under a grammar, to the part the grammar allows (an agent's
+        tool call: its arguments), none if that is shorter than ``least``; and to the tokens the request may still
+        write."""
         eos = set(r.controller.eos_ids) or set(self.tokenizer.eos_token_ids)
-        draft = stream[j:j + width]
         for i, tok in enumerate(draft):
             if tok in eos:
                 draft = draft[:i]
                 break
-        if constrained and draft:  # only the part the grammar allows (an agent's tool call: its arguments)
+        if constrained and draft:
             cfg, kept = r.controller.config(), []
             for tok in draft:
                 cfg = r.controller.step_config(cfg, tok)
@@ -1216,7 +1227,7 @@ class HybridBatchEngine(BatchEngine):
                 kept.append(tok)
                 if r.controller.finished_at(cfg):
                     break
-            draft = kept if len(kept) >= 2 else []  # one token under a grammar is too often a repeated key's start
+            draft = kept if len(kept) >= least else []
         return draft[: max(0, r.max_tokens - len(r.out) - 1)]
 
     def _solo_verify(self, logits: mx.array, draft: List[int], temp: float, r=None) -> List[int]:
@@ -1305,33 +1316,20 @@ class HybridBatchEngine(BatchEngine):
         hidden state the last one-row step kept (_launch1): that position was a hole until x was known."""
         at = _write_at(entry)
         st, self._stash = self._stash, None
-        if getattr(r, "mtp_at", None) == at or st is None or st[0] is not entry or st[1] != at - 1:
+        if getattr(r, "mtp_at", None) == at or st is None:
+            return
+        e0, pos, h = st
+        if e0 is not entry or pos != at - 1:
             return
         entry.trim(1)
-        out = self.mtp.fill(entry, st[2], mx.array([[x]], dtype=mx.int32), mx.ones((1, 1), dtype=mx.bool_))
+        out = self.mtp.fill(entry, h, mx.array([[x]], dtype=mx.int32), mx.ones((1, 1), dtype=mx.bool_))
         r.mtp_out, r.mtp_at = out, at
 
     def _mtp_draft(self, r, entry, constrained: bool) -> List[int]:
         """The MTP layer's draft (LOCALS_MTP_DRAFTS tokens) from its output at the last position, with the checks a
-        prompt-lookup draft gets: cut at an end-of-sequence token, under a grammar at the first token it does not
-        allow (one token is enough here), and to the tokens the request may still write."""
-        draft = self.mtp.draft(entry, r.mtp_out, r, self.mtp.drafts)
-        eos = set(r.controller.eos_ids) or set(self.tokenizer.eos_token_ids)
-        for i, tok in enumerate(draft):
-            if tok in eos:
-                draft = draft[:i]
-                break
-        if constrained and draft:
-            cfg, kept = r.controller.config(), []
-            for tok in draft:
-                cfg = r.controller.step_config(cfg, tok)
-                if cfg is None:
-                    break
-                kept.append(tok)
-                if r.controller.finished_at(cfg):
-                    break
-            draft = kept
-        return draft[: max(0, r.max_tokens - len(r.out) - 1)]
+        prompt-lookup draft gets (_draft_checked), but one token under a grammar is enough (issue #18: the rule of 2
+        stays for prompt lookup only)."""
+        return self._draft_checked(r, self.mtp.draft(entry, r.mtp_out, r, self.mtp.drafts), constrained)
 
     def _solo(self, r, cache, x: int, g, temp: float, arrive, dead: set):
         """Steps for the only running row while it has a forced span or a draft to feed. Returns (requests that
@@ -1359,6 +1357,10 @@ class HybridBatchEngine(BatchEngine):
                     if getattr(r, "mtp_at", None) == _write_at(entry):
                         draft = self._mtp_draft(r, entry, constrained)
                         src = "mtp" if draft else None
+                        if not draft:  # cut to nothing (an end of sequence, the grammar): a miss, as one rejected
+                            r.solo_miss = getattr(r, "solo_miss", 0) + 1  # outright (else each token drains the
+                            r.solo_resume = len(r.out) + min(32, 1 << (r.solo_miss - 1))  # pipeline for nothing)
+                            return [], x, g
                     prime = not draft and getattr(r, "mtp_at", None) != _write_at(entry)
             if not span and not draft and not prime:
                 return [], x, g
@@ -1721,9 +1723,8 @@ class HybridBatchEngine(BatchEngine):
             h = forward(self.lm.model, x[:, None], cache, mx.array([r.prompt[e["pos"]: e["pos"] + n]]), c)
         else:  # the prompt's hidden states for its MTP entry: the token after each is known, but past a checkpoint
             h, hp = forward(self.lm.model, x[:, None], cache, mx.array([r.prompt[e["pos"]: e["pos"] + n]]), c, prompt_hidden=True)
-            known = r.prompt[e["pos"] + 1: e["pos"] + n + (1 if e["pos"] + n < stop or stop == e["end"] else 0)]  # (_nexts)
-            self.mtp.fill(ep, hp, mx.array([known + [0] * (n - len(known))], dtype=mx.int32),
-                          mx.array([[j < len(known) for j in range(n)]]))
+            upto = r.prompt[:stop + 1] if stop == e["end"] else r.prompt[:stop]
+            self._write_entry(ep, hp, [_nexts(upto, e["pos"], n)])
         if ed is not None:
             self.mtp.holes(ed, int(x.shape[0]), 1)
         out = self._pick(self._head(h), g, temp, budget)

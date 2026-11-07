@@ -1,0 +1,4 @@
+label on1; env LOCALS_DISK_CACHE=0 LOCALS_MTP=<repo>/docs/measurements/mtp/mtp_bf16.safetensors LOCALS_MTP_DRAFTS=1; model Kaziko/Qwen3.5-4B-Zwyrol; build 0fd1cbbd8ed2; commit f7efec9
+mlx 0.32.3 | mlx-lm 0.32.0 | Apple M2 Max 32 GB
+Sat Nov  7 15:26:05 CET 2026
+locals: MTP drafts on (1 a pass, the layer from <repo>/docs/measurements/mtp/mtp_bf16.safetensors)

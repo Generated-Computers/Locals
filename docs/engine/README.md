@@ -289,7 +289,7 @@ The layer's KV is one more entry at the end of every cache list the engine makes
 `docs/adr/0001-mtp-kv-in-the-cache-list.md`). It is a plain `KVCache` whose keys have one more column: 1 where the slot
 holds the layer's KV, 0 for a hole. So every copy, save, merge, filter, trim and rewind carries the entry and its holes
 with no change. `_body` runs the model's body and then writes the entry: where the next token is known, the layer's KV
-goes in (prompt reads, mixed passes), else holes (batched and pipelined steps, and the image part of an image prompt).
+goes in (prompt reads, mixed passes), else holes (batched and pipelined steps, and an image prompt from its first image on, its reply included).
 A kept cache (a checkpoint, a snapshot, a reply) never holds anything of a token past its end. In `_solo`, the entry
 gets the pass's kept positions after the verification, and the layer's output at the last one is kept on the request
 for the next draft. Entering from pipelined steps, the last one-row step's hidden state (`_stash`, kept by

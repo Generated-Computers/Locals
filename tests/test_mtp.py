@@ -310,7 +310,7 @@ def test_mtp_on_and_off_never_share_disk_cache_files(mtp_file, tmp_path):
     assert _disk_folder(tmp_path, "m/x", "float16", mtp_file) == on and off.exists()
 
 
-def _image_request(tiny, prompt, spans, n):
+def _image_row(tiny, prompt, spans, n):
     """An image prompt on the tiny model: made-up features for its image tokens (no tower), as test_vision_batch."""
     from locals import vision
     from locals.engine import Engine
@@ -335,7 +335,7 @@ def test_an_image_prompt_gets_no_mtp_drafts_and_keeps_its_reply(tiny, mtp_file):
     def run(mtp):
         lru = _lru()
         eng = _engine(tiny, mtp)
-        r = _image_request(tiny, prompt, [(5, 21)], 30)
+        r = _image_row(tiny, prompt, [(5, 21)], 30)
         waiting = [r]
         eng.serve(lambda block: [waiting.pop()] if waiting else [], lru=lru)
         return lru, eng, r
@@ -346,3 +346,17 @@ def test_an_image_prompt_gets_no_mtp_drafts_and_keeps_its_reply(tiny, mtp_file):
     assert eng.counters.get("draft_mtp_tokens", 0) == 0
     cache = lru.fetch_nearest_cache("locals", got.cache_key + got.out)[0]
     assert len(set(_offsets(cache))) == 1, _offsets(cache)
+    assert 1 not in _real(cache[-1])[5:]  # (holes from the image on)
+
+
+def test_a_draft_cut_to_nothing_backs_off(tiny, mtp_file):
+    """An MTP draft cut to nothing (here: every draft is the end-of-sequence token) counts as a miss: the row backs off
+    to pipelined steps, as after a draft rejected outright, instead of draining the pipeline for every token."""
+    (off,) = _serve(_engine(tiny), [(LONG, 40)])
+    mtp = _oracle(tiny, mtp_file, off.out, lambda k, i: False, 1)
+    type(mtp).draft = lambda self, entry, out, r, n, _d=type(mtp).draft: [EOS] * len(_d(self, entry, out, r, n))
+    eng = _engine(tiny, mtp)
+    eng._solo_draft = lambda r, cache: []  # (no prompt-lookup drafts: the tiny model's reply repeats itself)
+    (on,) = _serve(eng, [(LONG, 40)])
+    assert on.out == off.out
+    assert 0 < len(mtp.seen) <= 12, len(mtp.seen)  # (1, 2, 4, 8, ... tokens between tries: not one try a token)
