@@ -169,19 +169,19 @@ def test_the_user_file_is_per_mlx_version_unless_locals_tune_cache_names_one(tmp
     import subprocess
     import sys
 
+    import mlx.core as mx
+
     child = ("import mlx.core as mx\nfrom locals import kernels\n"
              "print(kernels._TUNE_PATH, mx.__version__, mx.device_info()['architecture'], kernels._seed()[0],"
              " sep='\\n')")
     env = {k: v for k, v in os.environ.items() if k != "LOCALS_TUNE_CACHE"}
-    import mlx.core as mx
-
-    arch = mx.device_info()["architecture"]
-    (tmp_path / f"tune_v6_{arch}.json").write_text("{}")  # (a seed, were the path not named)
+    seed = tmp_path / f"tune_v6_{mx.device_info()['architecture']}.json"
+    seed.write_text("{}")  # (a seed, were the path not named)
 
     named = subprocess.run([sys.executable, "-c", child], env=dict(env, LOCALS_TUNE_CACHE=str(tmp_path / "tune.json")),
-                           capture_output=True, text=True, check=True).stdout.split("\n")
+                           capture_output=True, text=True, check=True).stdout.splitlines()
     assert named[0] == str(tmp_path / "tune.json") and named[3] == "None"
 
-    path, version, arch, _, _ = subprocess.run([sys.executable, "-c", child], env=dict(env, HOME=str(tmp_path)),
-                                               capture_output=True, text=True, check=True).stdout.split("\n")
+    path, version, arch, _ = subprocess.run([sys.executable, "-c", child], env=dict(env, HOME=str(tmp_path)),
+                                            capture_output=True, text=True, check=True).stdout.splitlines()
     assert path == str(tmp_path / ".cache" / "locals" / f"tune_v6_{arch}_mlx{version}.json")

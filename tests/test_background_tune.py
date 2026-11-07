@@ -215,26 +215,25 @@ def test_two_saves_under_one_version_keep_a_shape_one_of_them_timed_again_off_th
 
 def _version_dir(tmp_path, monkeypatch):
     """The default cache directory, as without ``LOCALS_TUNE_CACHE``: this MLX's file is absent."""
-    arch = mx.device_info()["architecture"]
-    monkeypatch.setattr(kernels, "_TUNE_PATH", str(tmp_path / f"tune_v6_{arch}_mlx{mx.__version__}.json"))
+    monkeypatch.setattr(kernels, "_TUNE_PATH", str(tmp_path / f"{kernels._TUNE_STEM}_mlx{mx.__version__}.json"))
     monkeypatch.setattr(kernels, "_TUNE_PATH_FROM_ENV", None)
     monkeypatch.setattr(kernels, "_preset_path", lambda: None)
     monkeypatch.setattr(kernels, "_TUNE", None)
-    return arch
+    return kernels._TUNE_STEM
 
 
 def test_a_new_mlx_version_seeds_its_file_from_the_old_shared_one_all_stale(tmp_path, monkeypatch, capsys):
     import json
 
-    arch = _version_dir(tmp_path, monkeypatch)
-    old = tmp_path / f"tune_v6_{arch}.json"
+    _version_dir(tmp_path, monkeypatch)
+    old = tmp_path / kernels._TUNE_FILE
     old.write_text(json.dumps({"__mlx__": mx.__version__, "1024x512x1": ["frag", 2, 2, 1], "1024x512xP": ["dense"],
                                "__stale__": [], "__times__": {"1024x512x1": {"frag": 3.0}}}))
     before = old.read_bytes()
     tune = kernels._load_tune()
     assert tune["1024x512x1"] == ("frag", 2, 2, 1) and tune["1024x512xP"] == ("dense",)  # the choices stay
     assert tune["__stale__"] == ["1024x512x1", "1024x512xP"]  # (even one it says this MLX timed: a shared file)
-    saved = json.loads((tmp_path / f"tune_v6_{arch}_mlx{mx.__version__}.json").read_text())
+    saved = json.loads(open(kernels._TUNE_PATH).read())
     assert saved["__stale__"] == ["1024x512x1", "1024x512xP"] and saved["__mlx__"] == mx.__version__
     assert saved["1024x512x1"] == ["frag", 2, 2, 1]
     assert old.read_bytes() == before
@@ -245,9 +244,9 @@ def test_the_seed_is_the_other_version_file_written_last(tmp_path, monkeypatch):
     import json
     import os
 
-    arch = _version_dir(tmp_path, monkeypatch)
+    stem = _version_dir(tmp_path, monkeypatch)
     for i, (version, choice) in enumerate([("0.0.2", ["frag", 4, 2, 1]), ("0.0.1", ["mlx"]), (None, ["dense"])]):
-        name = f"tune_v6_{arch}_mlx{version}.json" if version else f"tune_v6_{arch}.json"
+        name = f"{stem}_mlx{version}.json" if version else f"{stem}.json"
         (tmp_path / name).write_text(json.dumps({"__mlx__": version or "0.0.0", "1024x512x1": choice}))
         os.utime(tmp_path / name, (1_000_000 + 100 * (3 - i),) * 2)  # 0.0.2's written last, the shared one first
     tune = kernels._load_tune()
@@ -258,8 +257,8 @@ def test_a_seed_that_does_not_parse_is_passed_over_for_the_next_newest(tmp_path,
     import json
     import os
 
-    arch = _version_dir(tmp_path, monkeypatch)
-    good, cut = tmp_path / f"tune_v6_{arch}.json", tmp_path / f"tune_v6_{arch}_mlx0.0.2.json"
+    stem = _version_dir(tmp_path, monkeypatch)
+    good, cut = tmp_path / f"{stem}.json", tmp_path / f"{stem}_mlx0.0.2.json"
     good.write_text(json.dumps({"__mlx__": "0.0.1", "1024x512x1": ["dense"]}))
     cut.write_text('{"1024x512x1": ["fr')  # (a write cut short)
     os.utime(good, (1_000_000,) * 2)
