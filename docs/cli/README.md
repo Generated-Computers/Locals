@@ -570,6 +570,8 @@ Variables read by the server process must be set in the environment of the comma
 | `LOCALS_DEBUG` | unset | Saves every request as received. | `server.Server.prepare`, `server.Server.prepare_text`, `server.make_handler.Handler._other_api` |
 | `LOCALS_DEBUG_DIR` | `~/.cache/locals/requests` | Where those dumps go. The folder is mode 0700 and the files 0600. | `server._dump_request` |
 | `LOCALS_SOLO` | `1` | `0`: a request running alone decodes one token a step, as with many requests (no forced spans in one pass, no prompt-lookup drafts). | `hybrid_batch.py` |
+| `LOCALS_MTP` | unset | A file with Qwen3.5-4B's MTP layer (its 15 `mtp.*` tensors; `docs/measurements/mtp/download_mtp.py` fetches them). Set: a request running alone gets drafts from that layer where prompt lookup has none. Other models, and Qwenputer, keep it off, with one line at load. | `service._load_mtp`, `mtp.py` |
+| `LOCALS_MTP_DRAFTS` | `1` | MTP drafts per pass, `1` or `2`. | `mtp.drafts_setting` |
 | `LOCALS_KEEP_THINK` | `1` | `0`: the chat template's own handling of past replies' empty think blocks (it drops them, so each new message re-read the previous turn). | `server.py` |
 | `LOCALS_PORT` | unset | The port `chat` and `generate` talk to; `locals --port N chat` sets it. | `client.connect` |
 | `LOCALS_NO_SANDBOX` | unset | `solve.run_shell` does not confine commands with `sandbox-exec`. | `solve.run_shell` |

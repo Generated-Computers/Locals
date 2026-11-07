@@ -494,6 +494,18 @@ def _cached(cache) -> int:
     return 0
 
 
+def _nexts(seq: List[int], i: int, k: int, after: Optional[int] = None) -> List[int]:
+    """The tokens after each of ``seq[i:i + k]`` that are known: the rest of ``seq``, and ``after`` past its end. The
+    MTP entry (locals/mtp.py) takes the layer's KV at the positions they cover and holes at the rest. A cache never
+    holds anything of a token past its own end where it is kept (a checkpoint, a shared-prefix snapshot, a reply):
+    that token is not in its key, so ``after`` is given only where the read ends at the token the first decode step
+    feeds."""
+    out = list(seq[i + 1 : i + k + 1])
+    if after is not None and i < len(seq) <= i + k:
+        out.append(after)
+    return out
+
+
 def chain_cache(max_size: int, max_bytes: int):
     """mlx-lm's LRUPromptCache, without the stale copies of a conversation where the cache cannot be
     cut back (a recurrent state; mlx-lm drops the prefixes a new entry extends only for trimmable
@@ -553,7 +565,8 @@ class _FreedSlot:
 
 
 class HybridBatchEngine(BatchEngine):
-    def __init__(self, model, tokenizer, n_slots: int = 16, share_prefix: bool = True, min_share: int = 64, tail_ok: int = 32):
+    def __init__(self, model, tokenizer, n_slots: int = 16, share_prefix: bool = True, min_share: int = 64, tail_ok: int = 32,
+                 mtp=None):
         # rows of a mixed pass, decode rows and prompt tokens (locals/mixed.py; 0: a new prompt is prefilled
         # while the rows wait). 1024: as fast as a prefill on its own; the rows get a token every pass (1.5 s on
         # a 4B model on an M2 Pro) instead of none for the whole prefill (12 s for 8k tokens).
@@ -596,9 +609,43 @@ class HybridBatchEngine(BatchEngine):
         self._reads: Dict[int, int] = {}  # tokens per prefill pass (power of 2) -> most bytes one needed
         self.disk = None  # a DiskPromptCache: system-prompt snapshots kept across restarts
         self.parks = False  # some controllers park their rows (see "parked rows" below): set by the service
+        # MTP drafts (locals/mtp.py): the layer's KV is one more entry at the end of every cache list this engine makes
+        # (docs/adr/0001-mtp-kv-in-the-cache-list.md); None: no entry, every cache list as the model makes it
+        self.mtp = mtp
+        self._n_main = len(make_prompt_cache(model))
+        self._stash = None  # (MTP entry, position, hidden state): the last one-row step's, for the MTP layer (_launch1)
         import threading
 
         self._woken = threading.Event()
+
+    # -- the cache list ------------------------------------------------------------------
+    def _new_cache(self) -> list:
+        """An empty cache list: the model's, and the MTP entry at its end when MTP drafts are on."""
+        cache = make_prompt_cache(self.model)
+        return cache + [self.mtp.entry()] if self.mtp is not None else cache
+
+    def _entry(self, cache):
+        """The MTP entry of a cache list (None: MTP off, or a list without one)."""
+        if self.mtp is None or cache is None or len(cache) != self._n_main + 1:
+            return None
+        return cache[-1]
+
+    def _body(self, cache, x: mx.array, nexts=None, **kw) -> mx.array:
+        """The model's body over ``x`` (B, L) into ``cache``; its hidden states after the final norm. The body's layers
+        stop at the model's last one, so the MTP entry (if the list has one) takes the L positions here: the layer's KV
+        where ``nexts`` (per row: the tokens known after its first positions, at most L) gives the next token, holes
+        elsewhere."""
+        h = self.lm.model(x, cache, **kw)
+        e = self._entry(cache)
+        if e is not None:
+            B, L = x.shape[0], x.shape[1]
+            if not nexts or not any(nexts):
+                self.mtp.holes(e, B, L)
+            else:
+                nx = mx.array([list(n[:L]) + [0] * (L - len(n[:L])) for n in nexts], dtype=mx.int32)
+                fl = mx.array([[j < len(n) for j in range(L)] for n in nexts])
+                self.mtp.fill(e, h, nx, fl)
+        return h
 
     # -- prefill with prefix snapshots -------------------------------------------------
     def _prefill(self, tokens: List[int], others: List[List[int]], tail_ok: int = 0):
@@ -619,7 +666,7 @@ class HybridBatchEngine(BatchEngine):
                 return self.snapshots[best_key], tokens[best:]
             cache = copy.deepcopy(self.snapshots[best_key])
         else:
-            cache = make_prompt_cache(self.model)
+            cache = self._new_cache()
         pos = best
         if self.share_prefix:
             lcp = max((_common(tokens, o) for o in others), default=0)
@@ -653,7 +700,7 @@ class HybridBatchEngine(BatchEngine):
             self.snapshots.move_to_end(best_key)
             cache = copy.deepcopy(self.snapshots[best_key])
         else:
-            cache = make_prompt_cache(self.model)
+            cache = self._new_cache()
         pos = best
         if self.share_prefix:
             lcp = max((_common(tokens, o) for o in others), default=0)
@@ -669,7 +716,7 @@ class HybridBatchEngine(BatchEngine):
             a = self.lm.args
             a = getattr(a, "text_config", None) or a
             get = (lambda k, d=None: a.get(k, d)) if isinstance(a, dict) else (lambda k, d=None: getattr(a, k, d))
-            caches = make_prompt_cache(self.model)
+            caches = self._new_cache()
             n_kv = sum(1 for c in caches if isinstance(c, KVCache))
             # 8-bit keys and values (locals/qkv.py): a byte each, plus a bf16 scale and bias a group of 64
             n_q = sum(1 for c in caches if getattr(c, "bits", None) == 8 and getattr(c, "group_size", None) == 64)
@@ -832,12 +879,13 @@ class HybridBatchEngine(BatchEngine):
                   f"{lru.nbytes / 1e9:.2f} GB in {len(lru)}, limit {self.memory_limit / 1e9:.2f}", flush=True)
 
     def _prefill_batch(self, prompts: List[List[int]], others: List[List[int]], chunk: Optional[int] = None, starts=None,
-                       stop=None):
+                       stop=None, afters: Optional[List[int]] = None):
         """Prefill several prompts in one right-padded batch; returns a batch
         cache. ``starts[i]``, if given, is a (cache, remaining tokens) pair; the
         list is emptied once its caches are merged (the caller hands them over:
         held there too, every prompt's KV existed twice at the join).
-        ``stop()``, asked between chunks: true gives up the prefill (returns None)."""
+        ``stop()``, asked between chunks: true gives up the prefill (returns None).
+        ``afters[i]``: the token after prompt i (its last one, fed by the first decode step), for the MTP entry."""
         chunk = chunk or self._prefill_base
         given = starts
         caches, rests = [], []
@@ -853,7 +901,8 @@ class HybridBatchEngine(BatchEngine):
             # Rows whose whole prompt is a shared snapshot (the second of two requests with one prompt)
             # have nothing to prefill: padding them to the others' length cost most of an admission
             # (8 of 10 rows, 236 tokens each). Prefill the rows that need it, then merge all.
-            sub = self._prefill_batch([prompts[i] for i in busy], others, chunk, starts=[(caches[i], rests[i]) for i in busy], stop=stop)
+            sub = self._prefill_batch([prompts[i] for i in busy], others, chunk, starts=[(caches[i], rests[i]) for i in busy], stop=stop,
+                                      afters=None if afters is None else [afters[i] for i in busy])
             if sub is None:
                 return None
             done_rows = {i: [c.extract(j) for c in sub] for j, i in enumerate(busy)}
@@ -898,7 +947,8 @@ class HybridBatchEngine(BatchEngine):
             n = prefill_chunk(done + i, len(prompts), self.prefill_tokens or chunk, self._prefill_scores, self._prefill_cap)
             a0 = mx.get_active_memory()
             _reset_peak()
-            n = self._read_chunk(cache, lambda k: self.lm.model(x[:, i : i + k], cache), n)
+            n = self._read_chunk(cache, lambda k: self._body(cache, x[:, i : i + k], [
+                _nexts(r, i, k, None if afters is None else afters[j]) for j, r in enumerate(rests)]), n)
             self._note_read(len(prompts) * n, mx.get_peak_memory() - a0)
             if i == 0 and n < L:
                 _reserve(cache, base + L)
@@ -947,16 +997,17 @@ class HybridBatchEngine(BatchEngine):
     def _sync(cache) -> None:
         mx.eval([c.state for c in cache])
 
-    def _run(self, cache, toks: List[int], chunk: int = 2048, stop=None) -> bool:
+    def _run(self, cache, toks: List[int], chunk: int = 2048, stop=None, after: Optional[int] = None) -> bool:
         """Prefill ``toks`` into ``cache``. The body only, without the output
         layer: its logits (chunk x 248k) are not needed and cost ~1 GB at 2048.
-        False if ``stop()`` (asked between chunks) gave it up."""
+        False if ``stop()`` (asked between chunks) gave it up. ``after``: the token that follows ``toks``, if it is
+        known and may be read into the cache's MTP entry (_nexts)."""
         done, i = _cached(cache), 0
         while i < len(toks):
             n = prefill_chunk(done + i, 1, self.prefill_tokens or chunk, self._prefill_scores, self._prefill_cap)
             a0 = mx.get_active_memory()
             _reset_peak()
-            n = self._read_chunk(cache, lambda k: self.lm.model(mx.array([toks[i : i + k]]), cache), n)
+            n = self._read_chunk(cache, lambda k: self._body(cache, mx.array([toks[i : i + k]]), [_nexts(toks, i, k, after)]), n)
             self._note_read(n, mx.get_peak_memory() - a0)
             if i == 0 and n < len(toks):
                 _reserve(cache, done + len(toks))
@@ -975,7 +1026,7 @@ class HybridBatchEngine(BatchEngine):
         if min(lens) < L:
             _prepare_ragged(cache, lens)
         with packed_rows(len(feeds), L, lens):
-            h = self.lm.model(x, cache)  # (B, L, D), normed
+            h = self._body(cache, x)  # (B, L, D), normed
         for c in cache:
             c.finalize()
         hl = h[mx.arange(len(feeds)), mx.array([n - 1 for n in lens])][:, None, :]
@@ -1238,6 +1289,50 @@ class HybridBatchEngine(BatchEngine):
             else:
                 c.trim(drop)
 
+    def _mtp_ok(self, r, cache) -> bool:
+        """Whether the only running row takes MTP drafts: the cache list has the MTP entry, the row's prompt holds no
+        image (the M-RoPE swap covers only the model's own layers), and it takes drafts at all (as _solo_draft's)."""
+        constrained = isinstance(r.controller, LocalsController)
+        return (self._entry(cache) is not None and r.image is None and getattr(r.controller, "drafts", True)
+                and not (hasattr(r.controller, "step_config") and not constrained) and self._solo_drafts_ok(cache))
+
+    def _mtp_wants(self, r, cache) -> bool:
+        """Whether the only running row would draft with the MTP layer now (not in the back-off after rejections)."""
+        return self._mtp_ok(r, cache) and len(r.out) >= getattr(r, "solo_resume", 0)
+
+    def _mtp_last(self, r, entry, x: int) -> None:
+        """The layer's output at the entry's last position, with ``x`` (fed next) as the token after it, from the
+        hidden state the last one-row step kept (_launch1): that position was a hole until x was known."""
+        at = _write_at(entry)
+        st, self._stash = self._stash, None
+        if getattr(r, "mtp_at", None) == at or st is None or st[0] is not entry or st[1] != at - 1:
+            return
+        entry.trim(1)
+        out = self.mtp.fill(entry, st[2], mx.array([[x]], dtype=mx.int32), mx.ones((1, 1), dtype=mx.bool_))
+        r.mtp_out, r.mtp_at = out, at
+
+    def _mtp_draft(self, r, entry, constrained: bool) -> List[int]:
+        """The MTP layer's draft (LOCALS_MTP_DRAFTS tokens) from its output at the last position, with the checks a
+        prompt-lookup draft gets: cut at an end-of-sequence token, under a grammar at the first token it does not
+        allow (one token is enough here), and to the tokens the request may still write."""
+        draft = self.mtp.draft(entry, r.mtp_out, r, self.mtp.drafts)
+        eos = set(r.controller.eos_ids) or set(self.tokenizer.eos_token_ids)
+        for i, tok in enumerate(draft):
+            if tok in eos:
+                draft = draft[:i]
+                break
+        if constrained and draft:
+            cfg, kept = r.controller.config(), []
+            for tok in draft:
+                cfg = r.controller.step_config(cfg, tok)
+                if cfg is None:
+                    break
+                kept.append(tok)
+                if r.controller.finished_at(cfg):
+                    break
+            draft = kept
+        return draft[: max(0, r.max_tokens - len(r.out) - 1)]
+
     def _solo(self, r, cache, x: int, g, temp: float, arrive, dead: set):
         """Steps for the only running row while it has a forced span or a draft to feed. Returns (requests that
         arrived meanwhile, the next token to feed, its constraint state); x None: the row is done."""
@@ -1247,13 +1342,25 @@ class HybridBatchEngine(BatchEngine):
             for c in cache:
                 if isinstance(c, ArraysCache):
                     c.held = None
+        entry = self._entry(cache)
+        main = cache[:-1] if entry is not None else cache  # (the MTP entry is written here, after each pass)
+        use = entry is not None and self._mtp_ok(r, cache)
         while True:
             got = arrive(False)
             if got:
                 return got, x, g
             span = list(r.pend)
             draft = [] if span else self._solo_draft(r, cache)
-            if not span and not draft:
+            src = "lookup" if draft else None
+            prime = False  # a pass of x alone: the MTP layer has nothing at the last position to draft from yet
+            if use:
+                self._mtp_last(r, entry, x)
+                if not span and not draft and len(r.out) >= getattr(r, "solo_resume", 0):
+                    if getattr(r, "mtp_at", None) == _write_at(entry):
+                        draft = self._mtp_draft(r, entry, constrained)
+                        src = "mtp" if draft else None
+                    prime = not draft and getattr(r, "mtp_at", None) != _write_at(entry)
+            if not span and not draft and not prime:
                 return [], x, g
             r.pend = []
             toks = [x] + span + draft
@@ -1299,13 +1406,15 @@ class HybridBatchEngine(BatchEngine):
                     break
             if draft:
                 if kept < len(draft):
-                    self._solo_rewind(cache, len(draft) - kept)
+                    self._solo_rewind(main, len(draft) - kept)
                 for c in cache:  # the per-token states (48 MB a token on Qwen3.5-4B) are not kept past the pass
                     if isinstance(c, ArraysCache):
                         c.token_states = c.token_conv = None
                 r.fed.extend(draft[:kept])
                 r.solo_acc = (getattr(r, "solo_acc", None) or []) + [kept]
                 self.counters["drafted"] = self.counters.get("drafted", 0) + kept
+                for k, v in ((f"draft_{src}_tokens", len(draft)), (f"draft_{src}_accepted", kept)):  # per draft source
+                    self.counters[k] = self.counters.get(k, 0) + v
                 # a draft step costs the pipelining of that step: after a draft rejected outright, none for 1 token,
                 # doubling up to 32 while they keep failing (a JSON list's repeated keys: 0.83x without this)
                 r.solo_miss = getattr(r, "solo_miss", 0) + 1 if kept == 0 else 0
@@ -1313,7 +1422,10 @@ class HybridBatchEngine(BatchEngine):
                     r.solo_resume = len(r.out) + min(32, 1 << (r.solo_miss - 1))
             self.tokens_out += len(r.out) - n0
             self._after_commit(r, n0, dead)
+            fed = [x] + span + draft[:kept]  # the positions this pass keeps
             if id(r) in dead:
+                if entry is not None:
+                    self.mtp.holes(entry, 1, len(fed))
                 return [], None, None
             if nxt is None:
                 nxt = picked[-1]
@@ -1325,6 +1437,14 @@ class HybridBatchEngine(BatchEngine):
                 g_after = gs
                 for tok in draft[:kept]:
                     g_after = self._advance([r], mx.array([tok], dtype=mx.int32), g_after)
+            if use:  # the layer's KV at the kept positions, and its output at the last one, to draft from next
+                at = _write_at(entry)
+                out = self.mtp.fill(entry, h[:, : len(fed), :], mx.array([fed[1:] + [nxt]], dtype=mx.int32),
+                                    mx.ones((1, len(fed)), dtype=mx.bool_))
+                r.mtp_out, r.mtp_at = out[:, -1:, :], at + len(fed)
+                mx.async_eval(entry.keys, entry.values, r.mtp_out)
+            elif entry is not None:
+                self.mtp.holes(entry, 1, len(fed))
             x = nxt
             r.fed.append(x)
             g = self._advance([r], mx.array([x], dtype=mx.int32), g_after) if constrained else g
@@ -1566,7 +1686,11 @@ class HybridBatchEngine(BatchEngine):
         return mx.stack(out)
 
     def _launch1(self, cache, x: mx.array, g, temp: float, budget=None) -> mx.array:
-        h = self.lm.model(x[:, None], cache)
+        h = self._body(cache, x[:, None])
+        e = self._entry(cache)
+        # one row: its hidden state here, for the MTP layer if the row goes on alone with drafts (_solo): the slot of
+        # this position is a hole until the token after it is known
+        self._stash = (e, _write_at(e) - 1, h[:, -1:, :]) if e is not None and int(x.shape[0]) == 1 else None
         return self._pick(self._head(h[:, -1:, :]), g, temp, budget)
 
     def _launch(self, cache, x: mx.array, g, temp: float, budget, filling: List[dict], lru, lru_key) -> mx.array:
@@ -1591,7 +1715,17 @@ class HybridBatchEngine(BatchEngine):
         # a multiple of 32 or 64 costs a whole tile more, more than the decode step the pass saves
         n = min(self.mix_chunk - int(x.shape[0]), stop - e["pos"], prefill_chunk(e["pos"], 1, self.mix_chunk, self._prefill_scores))
         n = max(n, 1)
-        h = forward(self.lm.model, x[:, None], cache, mx.array([r.prompt[e["pos"]: e["pos"] + n]]), c)
+        ed, ep = self._entry(cache), self._entry(c)
+        self._stash = None
+        if ep is None:
+            h = forward(self.lm.model, x[:, None], cache, mx.array([r.prompt[e["pos"]: e["pos"] + n]]), c)
+        else:  # the prompt's hidden states for its MTP entry: the token after each is known, but past a checkpoint
+            h, hp = forward(self.lm.model, x[:, None], cache, mx.array([r.prompt[e["pos"]: e["pos"] + n]]), c, prompt_hidden=True)
+            known = r.prompt[e["pos"] + 1: e["pos"] + n + (1 if e["pos"] + n < stop or stop == e["end"] else 0)]  # (_nexts)
+            self.mtp.fill(ep, hp, mx.array([known + [0] * (n - len(known))], dtype=mx.int32),
+                          mx.array([[j < len(known) for j in range(n)]]))
+        if ed is not None:
+            self.mtp.holes(ed, int(x.shape[0]), 1)
         out = self._pick(self._head(h), g, temp, budget)
         e["pos"] += n
         self.counters["mixed_steps"] = self.counters.get("mixed_steps", 0) + 1
@@ -1648,7 +1782,7 @@ class HybridBatchEngine(BatchEngine):
         (_image_reader). Returns the cache, how far it holds the prompt, and the reader's ending: after an
         ending the cache may also hold part of the read that ended (the request is then given up, not read on)."""
         for cp, kind in list(stops) + ([(end, None)] if end is not None else []):
-            cache = cache if cache is not None else make_prompt_cache(self.model)
+            cache = cache if cache is not None else self._new_cache()
             why = read(cache, done, cp)
             if why is not None:
                 return cache, done, why
@@ -1672,7 +1806,11 @@ class HybridBatchEngine(BatchEngine):
 
         def read(cache, start: int, end: int) -> Optional[str]:
             if end > first:
-                return r.image.read(cache, start, end)
+                why = r.image.read(cache, start, end)
+                e = self._entry(cache)
+                if e is not None:  # (the image read runs the body alone: its positions are holes in the MTP entry)
+                    self.mtp.catch_up(e, next(_write_at(c) for c in cache[:-1] if isinstance(c, (KVCache, BatchKVCache))), 1)
+                return why
             if r.image.cancelled():
                 return "cancelled"
             try:
@@ -2061,7 +2199,7 @@ class HybridBatchEngine(BatchEngine):
                     if all(self._fill_checkpoints(e, lru, lru_key, stop=left_all) for e in ready) and not left_all():
                         merged = self._prefill_batch(
                             [e["r"].prompt[:-1] for e in ready], [], starts=[(e.pop("cache"), list(e["r"].prompt[e["pos"]:e["end"]])) for e in ready],
-                            stop=left_all)
+                            stop=left_all, afters=[e["r"].prompt[-1] for e in ready])
                     if merged is not None:
                         attach([e["r"] for e in ready], merged, tp, count=False)
                     else:
@@ -2124,7 +2262,7 @@ class HybridBatchEngine(BatchEngine):
                         # meanwhile, and one batch prefills several prompts faster than passes one after another.
                         for r, (c0, rest) in zip(new, found):
                             end = len(r.prompt) - 1
-                            filling.append({"r": r, "cache": c0 if c0 is not None else make_prompt_cache(self.model),
+                            filling.append({"r": r, "cache": c0 if c0 is not None else self._new_cache(),
                                             "pos": end - len(rest), "end": end, "reserved": 0,
                                             "cps": self._stops(r, end - len(rest), end, c0, lru)})
                         new, found = [], []
@@ -2144,7 +2282,7 @@ class HybridBatchEngine(BatchEngine):
                     found = c0 = rest = None  # (the caches are handed to the prefill in starts)
                     if new and not left_all():
                         merged = self._prefill_batch([r.prompt[:-1] for r in new], [q.prompt[:-1] for q in queue], starts=starts,
-                                                     stop=left_all)
+                                                     stop=left_all, afters=[r.prompt[-1] for r in new])
                     if merged is not None:
                         attach(new, merged, tp, count=True)
                     elif new:
@@ -2240,7 +2378,8 @@ class HybridBatchEngine(BatchEngine):
             if _SOLO and len(rows) == 1 and not queue and not filling and not dead and self._solo_ok(rows[0], cache):
                 # entering costs about a step (the pipeline drains): a forced span of 3 or more tokens, or a draft (the
                 # padding read, which waits for the GPU, only with a span: the pipeline drains for it anyway)
-                solo_next = (len(rows[0].pend) >= 3 and self._solo_unpadded(cache)) or bool(self._solo_draft(rows[0], cache))
+                solo_next = ((len(rows[0].pend) >= 3 and self._solo_unpadded(cache)) or bool(self._solo_draft(rows[0], cache))
+                             or self._mtp_wants(rows[0], cache))
         mx.synchronize()
         self.active = 0
         return BatchStats(time.perf_counter() - t0, prefill_s, steps, nrows, self.tokens_out)
@@ -2311,7 +2450,7 @@ class HybridBatchEngine(BatchEngine):
             # Chain the next step before reading this one.
             nxt = None
             if not dead and not (queue and len(rows) < self.n_slots) and self._chainable(rows):
-                h = self.lm.model(y[:, None], cache)
+                h = self._body(cache, y[:, None])
                 y2 = self._pick(self._head(h[:, -1:, :]), gn, temp)
                 nxt = (y2, self._next_states(rows, y2, gn))
                 mx.async_eval(*[a for a in nxt if a is not None])

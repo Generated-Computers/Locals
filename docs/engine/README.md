@@ -277,6 +277,26 @@ Measured through the server, one request, Qwen3.5-4B, greedy, the same answers w
 
 `LOCALS_SOLO=0` turns it off.
 
+**MTP drafts** (`locals/mtp.py`, issue #18). With `LOCALS_MTP` naming a file with Qwen3.5-4B's MTP layer, a row
+alone that has no forced span and no prompt-lookup draft gets a draft of `LOCALS_MTP_DRAFTS` tokens (1 or 2) from that
+layer. Prompt lookup goes first. The layer takes the main model's hidden state at the last position (after its final norm)
+and the embedding of the token fed next, and its logits come from the main model's output head. A second draft runs the
+layer once more on its own output. An MTP draft gets the checks a lookup draft gets: it is cut at an end-of-sequence token,
+and under a grammar at the first token the grammar does not allow (one token is enough here). The same back-off applies
+after rejections. A row whose prompt holds an image gets no MTP drafts.
+
+The layer's KV is one more entry at the end of every cache list the engine makes (`_new_cache`;
+`docs/adr/0001-mtp-kv-in-the-cache-list.md`). It is a plain `KVCache` whose keys have one more column: 1 where the slot
+holds the layer's KV, 0 for a hole. So every copy, save, merge, filter, trim and rewind carries the entry and its holes
+with no change. `_body` runs the model's body and then writes the entry: where the next token is known, the layer's KV
+goes in (prompt reads, mixed passes), else holes (batched and pipelined steps, and the image part of an image prompt).
+A kept cache (a checkpoint, a snapshot, a reply) never holds anything of a token past its end. In `_solo`, the entry
+gets the pass's kept positions after the verification, and the layer's output at the last one is kept on the request
+for the next draft. Entering from pipelined steps, the last one-row step's hidden state (`_stash`, kept by
+`_launch1`) fills the hole at the last position. The memory guard counts the entry as one more attention layer.
+`counters` give `draft_lookup_tokens`, `draft_lookup_accepted`, `draft_mtp_tokens` and `draft_mtp_accepted`.
+Measurements: `docs/measurements/mtp/README.md`.
+
 ## Retiring rows
 
 At a boundary, `retire(i, r)` moves a finished row's cache into the prompt cache (if there is one) and calls `on_done(r)`. How the row is taken out depends on whether it is the only row:
@@ -404,6 +424,7 @@ Any other exception escapes `serve`, for example a Metal out-of-memory error. `B
 | `LOCALS_MAX_SNAPSHOTS` | 4 | Shared-prefix snapshots kept |
 | `LOCALS_GROWTH_TRIM` | `1` | `0` turns off the trim every 32 steps |
 | `LOCALS_SOLO` | `1` | `0`: one token per step for a request alone too (no forced spans in one pass, no drafts) |
+| `LOCALS_MTP`, `LOCALS_MTP_DRAFTS` | unset, 1 | The MTP layer's file, and its drafts per pass (below) |
 | `LOCALS_MEMLOG`, `LOCALS_MIXLOG`, `LOCALS_PREFILL_LOG` | unset (off) | Logging, described above. Any non-empty value turns them on, `0` included, because the code tests `bool(os.environ.get(...))` |
 | `PREFILL_SCORES`, `PREFILL_TOKENS` | `1 << 24`, 2048 | Module constants in `hybrid_batch.py` (a model's `prefill_scores` and `prefill_chunk_tokens` take precedence) |
 | `memory_limit` | 0 in the engine | Set by `BatchService` as above |

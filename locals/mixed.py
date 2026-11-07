@@ -53,10 +53,11 @@ def supported(body) -> bool:
     return True
 
 
-def forward(body, xd: mx.array, cache_d, xp: mx.array, cache_p) -> mx.array:
+def forward(body, xd: mx.array, cache_d, xp: mx.array, cache_p, prompt_hidden: bool = False):
     """One pass over decode tokens ``xd`` (B, 1) with the batch cache ``cache_d`` and prompt tokens
     ``xp`` (1, S) with the single-sequence cache ``cache_p``. Both caches advance; returns the final
-    normed hidden states of the decode rows, (B, 1, hidden), as ``body(xd, cache_d)`` would."""
+    normed hidden states of the decode rows, (B, 1, hidden), as ``body(xd, cache_d)`` would; with
+    ``prompt_hidden`` (Qwen3.5 only), those and the prompt tokens' (1, S, hidden), for the MTP layer."""
     from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
     if _flint(body):
@@ -82,6 +83,8 @@ def forward(body, xd: mx.array, cache_d, xp: mx.array, cache_p) -> mx.array:
         yd, yp = mixer._mix(pd, md, cd), mixer._mix(pp, mp, cp)
         h = h + getattr(mixer, out)(mx.concatenate([yd.reshape(1, B, -1), yp], axis=1))
         h = h + layer.mlp(layer.post_attention_layernorm(h))
+    if prompt_hidden:
+        return split(body.norm(h))
     return body.norm(split(h)[0])
 
 
