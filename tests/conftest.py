@@ -57,8 +57,10 @@ def _tuning_cache_copy(tmp_path_factory):
         yield
         return
     copy = tmp_path_factory.mktemp("tune") / os.path.basename(kernels._TUNE_PATH)
-    source = kernels._TUNE_PATH if os.path.exists(kernels._TUNE_PATH) else kernels._seed_path()
-    if source:  # (this MLX's file, or the one its first start would seed from: with LOCALS_TUNE_CACHE nothing seeds)
+    # this MLX's file, or the seed its first start would read; the copy then loads as this version's own file, so a
+    # seed naming this version marks nothing stale, where a first start marks all (a test tunes nothing it has)
+    source = kernels._TUNE_PATH if os.path.exists(kernels._TUNE_PATH) else kernels._seed()[0]
+    if source:
         shutil.copy(source, copy)
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(kernels, "_TUNE_PATH", str(copy))

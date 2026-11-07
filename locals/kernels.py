@@ -132,12 +132,12 @@ import time as _time
 
 MIN_M = 1
 MAX_M = 32
-_TUNE_FILE = "tune_v6_%s.json" % mx.device_info()["architecture"]  # (the shipped preset's name)
+_TUNE_STEM = "tune_v6_%s" % mx.device_info()["architecture"]
+_TUNE_FILE = _TUNE_STEM + ".json"  # (the shipped preset's name, and the user's before versioned names)
 # The user's file is per MLX version: two installs on one Mac (a uv tool and a repo's venv) shared one, and each start
 # under the other version rewrote its version and its stale shapes. LOCALS_TUNE_CACHE names one file for every version.
-_TUNE_FIXED = bool(_os.environ.get("LOCALS_TUNE_CACHE"))
-_TUNE_PATH = _os.environ.get("LOCALS_TUNE_CACHE") or _os.path.expanduser(
-    "~/.cache/locals/" + _TUNE_FILE[:-len(".json")] + "_mlx%s.json" % mx.__version__)
+_TUNE_PATH_FROM_ENV = _os.environ.get("LOCALS_TUNE_CACHE") or None
+_TUNE_PATH = _TUNE_PATH_FROM_ENV or _os.path.expanduser(f"~/.cache/locals/{_TUNE_STEM}_mlx{mx.__version__}.json")
 _TUNE = None
 _MULTI_CANDIDATES = [(8, 4, 2), (16, 4, 2), (8, 2, 2)]  # (VPT, R, NSG), M <= 4
 _V3_CANDIDATES = [(8, 8, 2), (8, 4, 2), (16, 4, 2), (16, 4, 4), (16, 2, 2)]  # (VPT, R, NSG), 3 <= M <= 6
@@ -184,8 +184,9 @@ _RETIME = False  # set while a tuner runs (the idle tuner, locals tune): stale s
 def _mark_stale(tune: dict, user: Optional[dict], seeded: bool = False) -> bool:
     """After an MLX upgrade (the user's file says another version), the shapes this Mac timed are stale: still used,
     and timed again by the idle tuner or locals tune (``__stale__``). Choices timed under an older MLX stayed for good.
-    A file this version's was seeded from (``seeded``: _seed_path) is stale whole, whatever version it says. Whether
-    anything changed (the file then gets this version). The log line comes after the save (_report_stale)."""
+    With ``seeded`` (``user`` is another file this version's file starts from: _seed), every shape in it is stale,
+    whatever version it names. Whether anything changed (the file then gets this version). The log line comes after
+    the save (_report_stale)."""
     now = mx.__version__
     was = (user or {}).get("__mlx__")
     tune["__mlx__"] = now
@@ -198,7 +199,8 @@ def _mark_stale(tune: dict, user: Optional[dict], seeded: bool = False) -> bool:
 
 
 def _report_stale(was: Optional[str], seed: Optional[str]) -> None:
-    """The log line of a version change or a seed: the stale count as saved (a merge with the file can change it)."""
+    """The log line of a version change or a seed. The count is the stale list after the save, which merges with the
+    file on disk and can change it (the list in memory, when the save failed)."""
     import sys
 
     n = len(_TUNE.get("__stale__") or ())
@@ -265,17 +267,24 @@ def _beyond_preset(data: dict) -> dict:
     return out
 
 
-def _seed_path() -> Optional[str]:
-    """The file a first start under this MLX starts from: the user file for this GPU written last, the shared one from
-    before versioned names (``tune_v6_<arch>.json``) or another version's. None with ``LOCALS_TUNE_CACHE``."""
+def _seed() -> tuple:
+    """The file a first start under this MLX starts from, and what it holds: of the user files for this GPU (the one
+    from before versioned names, ``tune_v6_<arch>.json``, and other versions'), the one written last that parses.
+    ``(None, None)`` with ``LOCALS_TUNE_CACHE``, or with none. A file that does not parse is passed over, not set
+    aside: it is another version's to deal with."""
     import glob
 
-    if _TUNE_FIXED:
-        return None
-    d, stem = _os.path.dirname(_TUNE_PATH), _TUNE_FILE[:-len(".json")]
-    found = [p for p in [_os.path.join(d, _TUNE_FILE), *glob.glob(_os.path.join(glob.escape(d), stem + "_mlx*.json"))]
-             if p != _TUNE_PATH and _os.path.isfile(p)]
-    return max(found, key=_os.path.getmtime, default=None)
+    if _TUNE_PATH_FROM_ENV:
+        return None, None
+    d = _os.path.dirname(_TUNE_PATH)
+    versions = glob.glob(_os.path.join(glob.escape(d), _TUNE_STEM + "_mlx*.json"))
+    found = [p for p in [_os.path.join(d, _TUNE_FILE), *versions] if p != _TUNE_PATH and _os.path.isfile(p)]
+    for p in sorted(found, key=_os.path.getmtime, reverse=True):
+        try:
+            return p, _read_tune(p)
+        except Exception:  # noqa: BLE001
+            continue
+    return None, None
 
 
 def _load_tune():
@@ -303,11 +312,8 @@ def _load_tune():
                         _os.replace(_TUNE_PATH, _TUNE_PATH + ".bad")
                     except OSError:
                         pass
-            elif seed := _seed_path():  # (read only: the seed file stays as it is)
-                try:
-                    user = _read_tune(seed)
-                except Exception:  # noqa: BLE001
-                    seed = None
+            else:
+                seed, user = _seed()  # (read only: the seed file stays as it is)
             for k, v in (user or {}).items():  # over the preset; a dict-valued key (__times__) entry by entry
                 tune[k] = {**tune[k], **v} if isinstance(v, dict) and isinstance(tune.get(k), dict) else v
             was = (user or {}).get("__mlx__")

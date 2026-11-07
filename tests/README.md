@@ -115,6 +115,7 @@ The check only asks whether the repository has a snapshot in the cache. It does 
 Tests that touch other user-level state redirect it themselves:
 
 - `test_background_tune.py` and `test_kernel_patching.py` monkeypatch `kernels._TUNE_PATH` to `tmp_path`.
+- `test_tune_cache.py::test_the_user_file_is_per_mlx_version_unless_locals_tune_cache_names_one` starts Python with `HOME` (or `LOCALS_TUNE_CACHE`) set to `tmp_path`, and only reads the path.
 - `test_app.py` sets `LOCALS_DIR` to `tmp_path`.
 
 One test writes outside its temporary directory on purpose. `test_harness.py::test_agent_commands_write_only_in_their_copy` writes a file named `~/.locals-sandbox-test-<pid>` to prove that a command not confined by `sandbox-exec` can write there, then deletes it. It is skipped where `sandbox-exec` is missing.

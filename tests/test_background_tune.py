@@ -217,7 +217,7 @@ def _version_dir(tmp_path, monkeypatch):
     """The default cache directory, as without ``LOCALS_TUNE_CACHE``: this MLX's file is absent."""
     arch = mx.device_info()["architecture"]
     monkeypatch.setattr(kernels, "_TUNE_PATH", str(tmp_path / f"tune_v6_{arch}_mlx{mx.__version__}.json"))
-    monkeypatch.setattr(kernels, "_TUNE_FIXED", False)
+    monkeypatch.setattr(kernels, "_TUNE_PATH_FROM_ENV", None)
     monkeypatch.setattr(kernels, "_preset_path", lambda: None)
     monkeypatch.setattr(kernels, "_TUNE", None)
     return arch
@@ -252,3 +252,17 @@ def test_the_seed_is_the_other_version_file_written_last(tmp_path, monkeypatch):
         os.utime(tmp_path / name, (1_000_000 + 100 * (3 - i),) * 2)  # 0.0.2's written last, the shared one first
     tune = kernels._load_tune()
     assert tune["1024x512x1"] == ("frag", 4, 2, 1) and tune["__stale__"] == ["1024x512x1"]
+
+
+def test_a_seed_that_does_not_parse_is_passed_over_for_the_next_newest(tmp_path, monkeypatch):
+    import json
+    import os
+
+    arch = _version_dir(tmp_path, monkeypatch)
+    good, cut = tmp_path / f"tune_v6_{arch}.json", tmp_path / f"tune_v6_{arch}_mlx0.0.2.json"
+    good.write_text(json.dumps({"__mlx__": "0.0.1", "1024x512x1": ["dense"]}))
+    cut.write_text('{"1024x512x1": ["fr')  # (a write cut short)
+    os.utime(good, (1_000_000,) * 2)
+    tune = kernels._load_tune()
+    assert tune["1024x512x1"] == ("dense",) and tune["__stale__"] == ["1024x512x1"]
+    assert cut.read_text() == '{"1024x512x1": ["fr'  # (another version's file: not set aside from here)
