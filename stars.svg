@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="480" viewBox="0 0 480 480" role="img" aria-labelledby="t d">
+<title id="t">Generated-Computers/Locals: star history</title><desc id="d">GitHub stars of Generated-Computers/Locals from Oct 12, 2026 to Nov 7, 2026: 640 stars.</desc>
+<style>text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; }</style>
+<clipPath id="box"><rect x="0.5" y="0.5" width="479" height="479" rx="6"/></clipPath>
+<rect x="0.5" y="0.5" width="479" height="479" rx="6" fill="#ffffff"/>
+<rect width="480" height="48" fill="#f6f8fa" clip-path="url(#box)"/>
+<line x1="0.0" y1="48.5" x2="480.0" y2="48.5" stroke="#d1d9e0" stroke-width="1"/>
+<rect x="0.5" y="0.5" width="479" height="479" rx="6" fill="none" stroke="#d1d9e0"/>
+<text x="16.0" y="29.0" font-size="14" fill="#1f2328" font-weight="600">Star history</text>
+<text x="464.0" y="29.0" font-size="12" fill="#59636e" text-anchor="end">Generated-Computers/Locals</text>
+<path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.751.751 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Z" transform="translate(16 71)" fill="#59636e"/>
+<text x="40" y="87"><tspan font-size="24" font-weight="600" fill="#1f2328">640</tspan><tspan dx="6" font-size="14" fill="#59636e">stars</tspan></text>
+<text x="464.0" y="87.0" font-size="12" fill="#59636e" text-anchor="end">Updated Nov 7, 2026</text>
+<text x="48.0" y="432.0" font-size="12" fill="#59636e" text-anchor="end">0</text>
+<line x1="56.0" y1="353.0" x2="464.0" y2="353.0" stroke="#d1d9e0b3" stroke-width="1"/>
+<text x="48.0" y="357.0" font-size="12" fill="#59636e" text-anchor="end">200</text>
+<line x1="56.0" y1="278.0" x2="464.0" y2="278.0" stroke="#d1d9e0b3" stroke-width="1"/>
+<text x="48.0" y="282.0" font-size="12" fill="#59636e" text-anchor="end">400</text>
+<line x1="56.0" y1="203.0" x2="464.0" y2="203.0" stroke="#d1d9e0b3" stroke-width="1"/>
+<text x="48.0" y="207.0" font-size="12" fill="#59636e" text-anchor="end">600</text>
+<line x1="56.0" y1="128.0" x2="464.0" y2="128.0" stroke="#d1d9e0b3" stroke-width="1"/>
+<text x="48.0" y="132.0" font-size="12" fill="#59636e" text-anchor="end">800</text>
+<line x1="56.0" y1="428.0" x2="464.0" y2="428.0" stroke="#d1d9e0" stroke-width="1"/>
+<line x1="154.1" y1="428.0" x2="154.1" y2="432.0" stroke="#d1d9e0" stroke-width="1"/>
+<text x="154.1" y="448.0" font-size="12" fill="#59636e" text-anchor="middle">Oct 19</text>
+<line x1="263.6" y1="428.0" x2="263.6" y2="432.0" stroke="#d1d9e0" stroke-width="1"/>
+<text x="263.6" y="448.0" font-size="12" fill="#59636e" text-anchor="middle">Oct 26</text>
+<line x1="373.2" y1="428.0" x2="373.2" y2="432.0" stroke="#d1d9e0" stroke-width="1"/>
+<text x="373.2" y="448.0" font-size="12" fill="#59636e" text-anchor="middle">Nov 2</text>
+<polyline points="56.0,428.0 62.5,427.6 69.0,427.6 75.6,427.2 82.1,427.2 88.6,424.2 95.1,423.9 101.7,423.9 108.2,423.9 114.7,419.4 121.2,419.0 127.8,419.0 134.3,418.2 140.8,418.2 147.3,417.9 153.8,417.9 160.4,417.9 166.9,417.9 173.4,417.9 179.9,417.9 186.5,416.4 193.0,416.4 199.5,413.8 206.0,371.8 212.5,333.1 219.1,318.5 225.6,314.4 232.1,312.5 238.6,311.8 245.2,311.8 251.7,304.6 258.2,299.4 264.7,297.9 271.3,296.0 277.8,295.6 284.3,295.2 290.8,294.9 297.3,294.9 303.9,283.6 310.4,270.9 316.9,266.8 323.4,264.9 330.0,264.5 336.5,263.8 343.0,263.0 349.5,263.0 356.1,262.2 362.6,261.9 369.1,261.5 375.6,261.5 382.1,260.4 388.7,260.0 395.2,259.2 401.7,259.2 408.2,259.2 414.8,259.2 421.3,229.6 427.8,207.9 434.3,197.4 440.8,193.2 447.4,190.6 453.9,188.8 460.4,188.4 464.0,188.0" fill="none" stroke="#218bff" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="464.0" cy="188.0" r="4" fill="#218bff" stroke="#ffffff" stroke-width="2"/>
+</svg>
