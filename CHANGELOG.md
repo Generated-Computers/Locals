@@ -5,8 +5,9 @@
 - **One kernel-tuning file per MLX version** (issue #24). Two installs on one Mac with two MLX versions (a uv tool
   and a repo's venv) shared `~/.cache/locals/tune_v6_<arch>.json`, and each start under the other version rewrote it.
   The file is now `tune_v6_<arch>_mlx<version>.json`; a version's first start seeds it from the user file written last
-  (the old shared one included), every choice kept and every shape stale, and leaves the seed file as it is.
-  `LOCALS_TUNE_CACHE` still names one file for every version. Also fixed: a version change in a file that already held
+  (the old shared one included), every choice kept and every shape stale (not when the seed names this MLX and never
+  saw a version change: no `__stale__` list), and leaves the seed file as it is. A shape pinned to MLX's kernel after
+  two crashes is never stale: re-timed, it could abort the server at every start. `LOCALS_TUNE_CACHE` still names one file for every version. Also fixed: a version change in a file that already held
   a `__stale__` list (even `[]`) marked no new shape stale, because the save kept only what the file listed too; the
   log line now gives the count saved.
 - **MTP drafts, behind `LOCALS_MTP`** (issue #18). With `LOCALS_MTP` naming a file with Qwen3.5-4B's MTP layer

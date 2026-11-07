@@ -186,23 +186,28 @@ def _shape_keys(tune: dict) -> set:
     return {k for k in tune if _SHAPE_KEY.fullmatch(k)}
 
 
+def _pinned(tune: dict) -> set:
+    """The shapes that stopped locals twice while timed: they keep their choice and are never stale (_crashed_shapes)."""
+    return {k for k, n in (tune.get("__crashed__") or {}).items() if n >= 2}
+
+
 def _mark_stale(tune: dict, user: Optional[dict], seeded: bool = False) -> bool:
     """After an MLX upgrade (the user's file says another version), the shapes this Mac timed are stale: still used,
     and timed again by the idle tuner or locals tune (``__stale__``). Choices timed under an older MLX stayed for good.
     With ``seeded`` (``user`` is another file this version's file starts from: _seed), every shape in it is stale,
-    whatever version it names. Whether anything changed (the file then gets this version). The log line comes after
-    the save (_report_stale)."""
+    unless it names this MLX and holds no ``__stale__`` list (only a version change writes one: a file one MLX
+    wrote all along). The shapes pinned after two crashes are never stale. Whether anything changed (the file then
+    gets this version). The log line comes after the save (_report_stale)."""
     now = mx.__version__
     was = (user or {}).get("__mlx__")
     tune["__mlx__"] = now
     if user is None:
         return False
-    if not seeded:
-        if was == now:
-            return False
-        if was is None:
-            return True  # (a file from before this: it gets the version, nothing stale)
-    tune["__stale__"] = sorted(_shape_keys(user) | set(tune.get("__stale__") or []))
+    if was == now and not (seeded and "__stale__" in user):
+        return seeded  # (a seed: this version's file is written all the same)
+    if was is None and not seeded:
+        return True  # (a file from before this: it gets the version, nothing stale)
+    tune["__stale__"] = sorted((_shape_keys(user) | set(tune.get("__stale__") or [])) - _pinned(tune))
     return True
 
 
@@ -476,7 +481,10 @@ def _crashed_shapes(tune: dict) -> bool:
         crashed = tune.setdefault("__crashed__", {})
         crashed[key] = crashed.get(key, 0) + 1
         changed = True
-        if crashed[key] >= 2 and not isinstance(tune.get(key), tuple):
+        if crashed[key] < 2:
+            continue
+        _unstale(tune, key)  # (stale, it was timed again: the abort at every start this pin is for)
+        if not isinstance(tune.get(key), tuple):
             tune[key] = ("mlx",)
             print(f"locals: timing the tuned kernels for the shape {key} stopped locals twice; that shape keeps MLX's "
                   f"kernel", file=sys.stderr, flush=True)

@@ -265,3 +265,48 @@ def test_a_seed_that_does_not_parse_is_passed_over_for_the_next_newest(tmp_path,
     tune = kernels._load_tune()
     assert tune["1024x512x1"] == ("dense",) and tune["__stale__"] == ["1024x512x1"]
     assert cut.read_text() == '{"1024x512x1": ["fr'  # (another version's file: not set aside from here)
+
+
+def test_a_shape_pinned_after_two_crashes_is_never_marked_stale(tmp_path, monkeypatch):
+    """A shape that stopped locals twice keeps MLX's kernel (_crashed_shapes). Marked stale, the idle tuner timed it
+    again under the MLX that had aborted twice, and nothing took it off the list, so the server aborted at every
+    start. Neither a version change, nor a seed, nor its second crash leaves it stale."""
+    import json
+    import subprocess
+
+    pinned, timed = "1024x512x1", "1024x512x2"
+    for seeded in (False, True):
+        if seeded:
+            _version_dir(tmp_path, monkeypatch)
+            path = tmp_path / kernels._TUNE_FILE
+        else:
+            path = _old_version_file(tmp_path, monkeypatch, None)
+        path.write_text(json.dumps({"__mlx__": "0.0.1", pinned: ["mlx"], timed: ["mlx"], "__crashed__": {pinned: 2}}))
+        assert kernels._load_tune()["__stale__"] == [timed], seeded
+    path = tmp_path / "tune.json"  # this MLX's own file lists a shape stale, and its second crash comes now
+    monkeypatch.setattr(kernels, "_TUNE_PATH", str(path))
+    monkeypatch.setattr(kernels, "_TUNE_PATH_FROM_ENV", str(path))
+    monkeypatch.setattr(kernels, "_TUNE", None)
+    path.write_text(json.dumps({"__mlx__": mx.__version__, pinned: ["frag", 2, 2, 1], timed: ["mlx"],
+                                "__stale__": [pinned, timed], "__crashed__": {pinned: 1}}))
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    (tmp_path / f"tune.json.tuning-{dead.pid}").write_text(pinned)
+    tune = kernels._load_tune()
+    assert tune["__crashed__"] == {pinned: 2} and tune["__stale__"] == [timed]
+    assert json.loads(path.read_text())["__stale__"] == [timed]
+
+
+def test_a_seed_this_mlx_wrote_that_never_saw_a_version_change_keeps_its_shapes(tmp_path, monkeypatch, capsys):
+    """One install, one MLX: the old shared file names this MLX and has no ``__stale__`` list (only a version change
+    writes one), so every shape in it was timed under this MLX. The first start under versioned names re-timed them
+    all."""
+    import json
+
+    _version_dir(tmp_path, monkeypatch)
+    (tmp_path / kernels._TUNE_FILE).write_text(json.dumps({"__mlx__": mx.__version__, "1024x512x1": ["frag", 2, 2, 1]}))
+    tune = kernels._load_tune()
+    assert tune["1024x512x1"] == ("frag", 2, 2, 1) and not tune.get("__stale__")
+    saved = json.loads(open(kernels._TUNE_PATH).read())  # (this MLX's file is written: the next start reads it)
+    assert saved["1024x512x1"] == ["frag", 2, 2, 1] and not saved.get("__stale__")
+    assert "kernel shapes" not in capsys.readouterr().err
