@@ -1,0 +1,6 @@
+n= 1 round 0 locals:   256 tokens in    2.3s =  110.2 tok/s
+n= 1 round 1 locals:   256 tokens in    2.3s =  110.1 tok/s
+
+| Requests at once | locals tok/s |
+|---|---|
+| 1 | 110 |

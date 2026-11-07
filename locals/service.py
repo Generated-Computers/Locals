@@ -134,6 +134,46 @@ def _weights_fingerprint(model_id: str) -> str:
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
 
 
+def _disk_folder(root, model_id: str, dtype, mtp_path=None):
+    """The disk cache's folder for a model: its id, compute dtype, an MTP mark when the cache lists carry the MTP
+    entry (locals/mtp.py: a list one entry longer loads without an error, so the two never share files), and the
+    weights' fingerprint. Folders of the same model, dtype and MTP file with other weights (or mlx-lm) go."""
+    import shutil
+    from pathlib import Path
+
+    from . import mtp
+
+    mark = f"+mtp{mtp.fingerprint(mtp_path)}" if mtp_path else ""
+    tag = (model_id.strip("/").replace("/", "--")[-80:] + "--" + str(dtype).split(".")[-1] + mark
+           + "--" + _weights_fingerprint(model_id))
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    stem = tag.rsplit("--", 1)[0]  # the same model and dtype, other weights or mlx-lm (or no fingerprint)
+    for old in root.iterdir():
+        if old.is_dir() and old.name != tag and (old.name == stem or old.name.startswith(stem + "--")):
+            shutil.rmtree(old, ignore_errors=True)
+    return root / tag
+
+
+def _load_mtp(model, qwenputer: bool):
+    """The MTP layer that ``LOCALS_MTP`` names, for the batch engine's drafts (locals/mtp.py); None when it is unset,
+    or, with one line saying why, for a model it does not fit (only Qwen3.5-4B; Qwenputer's rows take no drafts). A
+    file that does not load, or a bad ``LOCALS_MTP_DRAFTS``, is an error."""
+    path = os.environ.get("LOCALS_MTP")
+    if not path:
+        return None
+    from . import mtp
+
+    why = "Qwenputer's rows take no drafts" if qwenputer else mtp.why_off(model)
+    if why is not None:
+        print(f"locals: LOCALS_MTP is set, but MTP drafts are off: {why}", file=sys.stderr, flush=True)
+        return None
+    n = mtp.drafts_setting()
+    layer = mtp.MTP.load(model, path, drafts=n)
+    print(f"locals: MTP drafts on ({n} a pass, the layer from {path})", file=sys.stderr, flush=True)
+    return layer
+
+
 def memory_plan(limit: int, weights: int) -> tuple:
     """(MLX's pool of freed buffers, the memory guard's margin below the GPU limit) for a model whose weights take
     ``weights`` of ``limit``. The margin is the pool and 0.5 GB for what the admission estimate misses. It was 1.5
@@ -651,7 +691,9 @@ class BatchService:
         class Endless(Controller):  # ignore_eos
             eos_ids = ()
 
-        eng = HybridBatchEngine(rt.model, rt.tokenizer, n_slots=self.slots)
+        eng = HybridBatchEngine(rt.model, rt.tokenizer, n_slots=self.slots, mtp=_load_mtp(rt.model, bool(calc)))
+        if eng.mtp is not None:  # (the memory plan below counts the layer's weights with the model's)
+            self.weights_bytes += eng.mtp.nbytes
         # Qwenputer: a reply at a calc call stays in the batch, reading nothing, while its run is made (hybrid_batch's
         # parked rows); else (LOCALS_QWENPUTER_PARK=0, or layers that cannot be held) it leaves and comes back
         eng.parks = bool(calc) and os.environ.get("LOCALS_QWENPUTER_PARK", "1") != "0" and eng.can_park()
@@ -665,17 +707,10 @@ class BatchService:
 
             from .hybrid_batch import DiskPromptCache
 
-            tag = (self.model_id.strip("/").replace("/", "--")[-80:] + "--" + str(getattr(rt, "dtype", "")).split(".")[-1]
-                   + "--" + _weights_fingerprint(self.model_id))
             root = Path(os.environ.get("LOCALS_DISK_CACHE_DIR") or Path.home() / ".cache" / "locals" / "prompts")
             try:
-                eng.disk = DiskPromptCache(root / tag, disk_gb)
-                import shutil
-
-                stem = tag.rsplit("--", 1)[0]  # the same model and dtype, other weights or mlx-lm (or no fingerprint)
-                for old in root.iterdir():
-                    if old.is_dir() and old.name != tag and (old.name == stem or old.name.startswith(stem + "--")):
-                        shutil.rmtree(old, ignore_errors=True)
+                eng.disk = DiskPromptCache(_disk_folder(root, self.model_id, getattr(rt, "dtype", ""),
+                                                        os.environ.get("LOCALS_MTP") if eng.mtp is not None else None), disk_gb)
             except OSError:
                 eng.disk = None
         eng.top_p, eng.top_k = self.top_p, self.top_k

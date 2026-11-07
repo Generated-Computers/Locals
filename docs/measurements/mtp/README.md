@@ -89,3 +89,44 @@ First draft right (`results/gap_zwyrol.txt`):
 - By group, from `results/gap_zwyrol.json`: the 3 tool calls 96.3% (104 / 108) with every position and 76.9%
   (83 / 108) without the prompt; the 2 long prompts 77.7% (297 / 382) and 70.2% (268 / 382).
 - The tool-call replies (31 to 40 tokens) end before token 48, so `gap32` says nothing about them.
+
+## Step 4: MTP drafts in the server, one request
+
+Issue #18's step 4, with the engine at commit `f7efec9` (MTP drafts behind `LOCALS_MTP`, `locals/mtp.py`). Same M2 Max
+(30-core GPU, 32 GB), mlx 0.32.3, mlx-lm 0.32.0, Zwyrol, 2026-11-07. `step4.sh` starts a server of its own from this
+checkout on port 8399 (`LOCALS_DISK_CACHE=0`), checks that its `/health` build is the checkout's (`0fd1cbbd8ed2` in
+every run), runs the decode sweep of `docs/measurements/m2-max.md`'s appendix at 1 request (`decode_sweep.py`, with
+the port as a parameter: 256 tokens, end of text ignored, greedy, a warm-up and 2 rounds) and
+`locals bench --agents --n 1` (a warm-up and 2 rounds, the server's temperature 0.2), saves `/stats`, and stops only its
+own server. Nothing else ran on the GPU. The unchanged server (MTP off) ran twice first, as the noise floor.
+
+```
+bash step4.sh off-a && bash step4.sh off-b && bash step4.sh on1 1 && bash step4.sh on2 2
+```
+
+Each round on its own line (`results/step4/<label>_sweep.txt` and `_agents.txt`):
+
+| Run | Decode sweep, 1 request | `bench --agents --n 1` (41 tokens, 11 forced) |
+|---|---|---|
+| MTP off (`off-a`) | 110.2, 110.1 tok/s | 51, 52 tok/s |
+| MTP off (`off-b`) | 110.8, 109.7 tok/s | 51, 52 tok/s |
+| MTP on, 1 draft (`on1`) | 108.6, 108.2 tok/s | 54, 51 tok/s |
+| MTP on, 2 drafts (`on2`) | 107.5, 109.3 tok/s | 50, 50 tok/s |
+
+Drafts over each whole run (warm-ups included), from `results/step4/<label>_stats.json`:
+
+| Run | MTP drafts kept | Prompt-lookup drafts kept | Steps |
+|---|---|---|---|
+| `off-a` | | 33 of 85 | 841 |
+| `on1` | 293 of 348 (84.2%) | 39 of 72 | 536 |
+| `on2` | 360 of 567 (63.5%) | 36 of 93 | 474 |
+
+- Live, the first draft is kept as often as the teacher-forced rate above says (84.2% against 82.7%), and the steps
+  fall from 841 to 536. The time does not: a `_solo` pass reads its draft back to the CPU before it runs and its
+  picks after, so each pass waits for the CPU twice, and the pipelining of plain steps is lost. The issue's estimate
+  for this case ("full output head, each step waits for the CPU") was 1.00x for 1 draft; measured, 0.98x.
+- Greedy replies (`greedy_check.py`, in process, the 14 prompts of `tests/test_mtp_model.py`, at most 192 tokens):
+  11 are the same with MTP drafts, 3 are not (`results/greedy_check.txt`). Each of the 3 first differs where the two
+  tokens' logits, teacher-forced, are equal or one float16 step apart (24.062 / 24.078; 30.297 / 30.297; 23.641 /
+  23.625): a pass over several tokens rounds differently from a one-token step. In that run the MTP drafts were kept
+  629 of 755 times (83.3%) with 1 draft, 844 of 1,197 (70.5%) with 2.

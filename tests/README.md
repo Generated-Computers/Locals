@@ -91,6 +91,7 @@ The check only asks whether the repository has a snapshot in the cache. It does 
 | `mlx-community/Qwen2.5-1.5B-Instruct-4bit` | tokenizer (fast suite) | `test_api.py` (`TOKENIZER_MODEL`), `test_forced.py` |
 | `mlx-community/Qwen2.5-1.5B-Instruct-4bit` | weights | `test_engine_model.py`, `test_budget.py` (`MODEL`), `test_server_attention.py` (default of `LOCALS_TEST_ATTENTION_MODEL`) |
 | `mlx-community/Qwen3.5-2B-MLX-4bit` | weights, default of `LOCALS_TEST_MODEL` | `test_api.py` (model test), `test_blocks.py`, `test_lm.py`, `test_lookup.py`, `test_mixed_prefill.py`, `test_pda.py`, `test_prefix_cache.py`, `test_q35_kernels.py`, `test_request_temperature.py`, `test_server.py`, `test_walk_batch.py`, `test_table_compaction.py` |
+| `Kaziko/Qwen3.5-4B-Zwyrol` | weights, with the MTP file (`LOCALS_TEST_MTP`) | `test_mtp_model.py` |
 | `mlx-community/Qwen3.5-0.8B-MLX-4bit` | weights (`HYBRID`) | `test_budget.py::test_drip_batch_valid_under_tight_budget` |
 | Other cached models | tokenizers and chat templates only; each case skips on its own | `test_agent_requests.py` (11 repositories in `MODELS`), `test_formats.py` (format detection list, Ministral, MiniCPM5), `test_chat.py` (`gemma-4-e4b-it-4bit`, `Qwen3.5-4B-MLX-4bit`), `test_think_replay.py` (`Qwen3.8-27B-4bit`, `Qwen3.5-4B-MLX-4bit`) |
 
@@ -100,6 +101,7 @@ The check only asks whether the repository has a snapshot in the cache. It does 
 |---|---|---|
 | `LOCALS_TEST_MODEL` | `mlx-community/Qwen3.5-2B-MLX-4bit` | The model for the model tests listed above. Several of them assume a Qwen3.5 checkpoint: `test_q35_kernels.py` tests Qwen3.5 fusion and the GDN kernel, and `test_prefix_cache.py` hard-codes a Qwen turn with an empty think block. Point it at another Qwen3.5 size, as CONTRIBUTING.md does with the 4B. |
 | `LOCALS_TEST_ATTENTION_MODEL` | `mlx-community/Qwen2.5-1.5B-Instruct-4bit` | The plain-KV model for `test_server_attention.py` (Qwen2.5, Llama, Qwen3 or Mistral, per its docstring). |
+| `LOCALS_TEST_MTP` | `docs/measurements/mtp/mtp_bf16.safetensors` | The MTP layer's file for `test_mtp_model.py` (`docs/measurements/mtp/download_mtp.py` fetches it); the file skips without it. |
 | `LOCALS_DISK_CACHE` | set to `0` by `conftest.py` | Turns off the on-disk prompt cache. Outside tests, the default `1` makes `BatchService` keep system prompts under `~/.cache/locals/prompts` (or `LOCALS_DISK_CACHE_DIR`). |
 
 ## Protections in `conftest.py`

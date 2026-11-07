@@ -44,6 +44,7 @@ and [Prompt cache](../docs/prompt-cache/README.md).
 | `oai.py` | OpenAI chat messages to and from a model's native tool calling: message conversion, the reply grammar, reply parsing |
 | `service.py` | `BatchService`: one model, one batch, many concurrent clients; our engine or stock mlx-lm behind the same interface |
 | `hybrid_batch.py` | `HybridBatchEngine`: continuous batching for any mlx-lm model, recurrent and attention layers alike; admission, prefill, the memory guard, the prompt cache ([details](../docs/engine/README.md)) |
+| `mtp.py` | Qwen3.5-4B's MTP layer as a draft source for a request alone (`LOCALS_MTP`): its KV is one more entry at the end of the cache list ([ADR 0001](../docs/adr/0001-mtp-kv-in-the-cache-list.md)) |
 | `mixed.py` | Decode rows and a prompt chunk in one forward pass (Qwen3.5), so running rows keep decoding while a long prompt is read |
 | `packed.py` | `Request` and the packed multi-request forward pass the batch engine builds on |
 | `engine.py` | The single-stream generation loop with pluggable constraint controllers (`Controller`, `LocalsController`), and sampling |
