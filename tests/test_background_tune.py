@@ -164,3 +164,91 @@ def test_a_cache_from_before_versions_gets_one_and_nothing_is_stale(tmp_path, mo
     assert not tune.get("__stale__") and json.loads((tmp_path / "tune.json").read_text())["__mlx__"] == mx.__version__
     # what both processes still call stale stays stale: one that timed a shape again took it off
     assert kernels._merge_tune({"__stale__": ["a"]}, {"__stale__": ["a", "b"]})["__stale__"] == ["a"]
+
+
+def _old_version_file(tmp_path, monkeypatch, stale):
+    """A one-file cache (``LOCALS_TUNE_CACHE``) last written under another MLX, with three timed shapes."""
+    import json
+
+    path = tmp_path / "tune.json"
+    monkeypatch.setattr(kernels, "_TUNE_PATH", str(path))
+    monkeypatch.setattr(kernels, "_preset_path", lambda: None)
+    monkeypatch.setattr(kernels, "_TUNE", None)
+    data = {"__mlx__": "0.0.1", "1024x512x1": ["mlx"], "1024x512x2": ["mlx"], "1024x512xP": ["dense"]}
+    if stale is not None:
+        data["__stale__"] = stale
+    path.write_text(json.dumps(data))
+    return path
+
+
+def test_a_version_change_marks_every_timed_shape_stale_whatever_the_file_listed(tmp_path, monkeypatch, capsys):
+    """The save in the same load intersected the new marks with the file's ``__stale__`` list: a file that held one
+    (even ``[]``) kept that list, so a real MLX upgrade marked nothing new, and the log line counted shapes that
+    were not saved as stale."""
+    import json
+
+    for stale in (None, ["1024x512x2"], []):
+        path = _old_version_file(tmp_path, monkeypatch, stale)
+        tune = kernels._load_tune()
+        every = ["1024x512x1", "1024x512x2", "1024x512xP"]
+        assert tune["__stale__"] == every, stale
+        saved = json.loads(path.read_text())
+        assert saved["__stale__"] == every and saved["__mlx__"] == mx.__version__, stale
+        assert "the 3 kernel shapes" in capsys.readouterr().err, stale  # (the count that was saved)
+
+
+def test_two_saves_under_one_version_keep_a_shape_one_of_them_timed_again_off_the_stale_list(tmp_path, monkeypatch):
+    """The other process timed 1024x512x2 again and saved; this one still lists it as stale when it saves."""
+    import json
+
+    path = tmp_path / "tune.json"
+    monkeypatch.setattr(kernels, "_TUNE_PATH", str(path))
+    monkeypatch.setattr(kernels, "_PRESET", {})
+    shapes = {"1024x512x1": ["mlx"], "1024x512x2": ["frag", 2, 2, 1]}
+    path.write_text(json.dumps({"__mlx__": mx.__version__, **shapes, "__stale__": ["1024x512x1"]}))
+    monkeypatch.setattr(kernels, "_TUNE", {"__mlx__": mx.__version__, "1024x512x1": ("mlx",), "1024x512x2": ("mlx",),
+                                           "__stale__": ["1024x512x1", "1024x512x2"]})
+    kernels._save_tune()
+    assert json.loads(path.read_text())["__stale__"] == ["1024x512x1"]
+    assert kernels._TUNE["__stale__"] == ["1024x512x1"]
+
+
+def _version_dir(tmp_path, monkeypatch):
+    """The default cache directory, as without ``LOCALS_TUNE_CACHE``: this MLX's file is absent."""
+    arch = mx.device_info()["architecture"]
+    monkeypatch.setattr(kernels, "_TUNE_PATH", str(tmp_path / f"tune_v6_{arch}_mlx{mx.__version__}.json"))
+    monkeypatch.setattr(kernels, "_TUNE_FIXED", False)
+    monkeypatch.setattr(kernels, "_preset_path", lambda: None)
+    monkeypatch.setattr(kernels, "_TUNE", None)
+    return arch
+
+
+def test_a_new_mlx_version_seeds_its_file_from_the_old_shared_one_all_stale(tmp_path, monkeypatch, capsys):
+    import json
+
+    arch = _version_dir(tmp_path, monkeypatch)
+    old = tmp_path / f"tune_v6_{arch}.json"
+    old.write_text(json.dumps({"__mlx__": mx.__version__, "1024x512x1": ["frag", 2, 2, 1], "1024x512xP": ["dense"],
+                               "__stale__": [], "__times__": {"1024x512x1": {"frag": 3.0}}}))
+    before = old.read_bytes()
+    tune = kernels._load_tune()
+    assert tune["1024x512x1"] == ("frag", 2, 2, 1) and tune["1024x512xP"] == ("dense",)  # the choices stay
+    assert tune["__stale__"] == ["1024x512x1", "1024x512xP"]  # (even one it says this MLX timed: a shared file)
+    saved = json.loads((tmp_path / f"tune_v6_{arch}_mlx{mx.__version__}.json").read_text())
+    assert saved["__stale__"] == ["1024x512x1", "1024x512xP"] and saved["__mlx__"] == mx.__version__
+    assert saved["1024x512x1"] == ["frag", 2, 2, 1]
+    assert old.read_bytes() == before
+    assert "the 2 kernel shapes" in capsys.readouterr().err
+
+
+def test_the_seed_is_the_other_version_file_written_last(tmp_path, monkeypatch):
+    import json
+    import os
+
+    arch = _version_dir(tmp_path, monkeypatch)
+    for i, (version, choice) in enumerate([("0.0.2", ["frag", 4, 2, 1]), ("0.0.1", ["mlx"]), (None, ["dense"])]):
+        name = f"tune_v6_{arch}_mlx{version}.json" if version else f"tune_v6_{arch}.json"
+        (tmp_path / name).write_text(json.dumps({"__mlx__": version or "0.0.0", "1024x512x1": choice}))
+        os.utime(tmp_path / name, (1_000_000 + 100 * (3 - i),) * 2)  # 0.0.2's written last, the shared one first
+    tune = kernels._load_tune()
+    assert tune["1024x512x1"] == ("frag", 4, 2, 1) and tune["__stale__"] == ["1024x512x1"]
