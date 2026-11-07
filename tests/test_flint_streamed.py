@@ -3,6 +3,7 @@ experts stacked per layer. Its experts are read from the files (ExpertStore); th
 what the experts computed in memory give, that decoding with caches gives what one pass over the prompt gives,
 and that the attention sinks are a logit in the softmax's denominator."""
 import json
+import random
 
 import mlx.core as mx
 import numpy as np
@@ -320,28 +321,100 @@ def test_the_decode_kernels_give_what_the_experts_in_memory_give(tmp_path, monke
         assert float(mx.max(mx.abs(a - b))) <= tol * (1 + float(mx.max(mx.abs(b))))
 
 
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-def test_experts_evicted_to_the_ram_cache_come_back_from_it(tmp_path, monkeypatch, dtype):
-    """With 3 slots a layer of 32 experts, decoding evicts experts all the time; with a RAM cache they are copied
-    there first, and a later miss copies them back instead of reading the file. The logits are bit for bit those
-    of the same decode reading every expert from the file."""
+class _Purgeable:
+    """macOS's side of the RAM cache's purgeable regions, played by the test (on _RamCache._state): every region
+    stays non-volatile, out of macOS's reach whatever the memory pressure, and the cache is told what macOS would
+    tell it. ``empty(n)`` picks which of the volatile regions taken back (the n-th, from 0) macOS emptied: their
+    bytes are overwritten, so an expert copied from one would change the logits."""
+
+    def __init__(self, monkeypatch, empty=lambda n: False):
+        import ctypes
+
+        real = flint._RamCache._state
+        self.volatile = set()  # regions the cache made volatile and has not taken back
+        self.taken = self.emptied = 0
+
+        def state(cache, addr, want):
+            real(cache, addr, cache.NONVOLATILE)
+            if want == cache.VOLATILE:
+                self.volatile.add(addr)
+                return cache.NONVOLATILE
+            if addr not in self.volatile:
+                return cache.NONVOLATILE
+            self.volatile.discard(addr)
+            self.taken += 1
+            if not empty(self.taken - 1):
+                return cache.VOLATILE
+            ctypes.memset(addr, 0xFF, cache.size)
+            self.emptied += 1
+            return cache.EMPTY
+
+        monkeypatch.setattr(flint._RamCache, "_state", state)
+
+
+def _decode_with_and_without_ram_cache(tmp_path, monkeypatch, dtype):
+    """Decode 36 tokens with 3 slots a layer of 32 experts, with a RAM cache and then without: (each run's logits,
+    the RAM cache)."""
     import mlx_lm.utils as mlx_utils
 
     _save_wide(tmp_path)
     tokens = [3, 17, 42, 5, 88, 9, 61, 2, 33, 70, 11, 4] * 3
-    runs = []
+    runs, ram_cache = [], None
     for ram in ("0.5", "0"):
         monkeypatch.setenv("LOCALS_EXPERT_RAM_GB", ram)
         model, _ = mlx_utils.load_model(tmp_path)
         model.set_dtype(dtype, predicate=lambda t: t == mx.bfloat16)
         store = model.expert_store
         assert (store.ram is not None) == (ram != "0")
+        if store.ram is not None:
+            ram_cache = store.ram
         store.slots = 3
         store.reset()
         cache = model.make_cache()
         runs.append([model(mx.array([[t]]), cache=cache)[0, -1] for t in tokens])
-        if store.ram is not None:
-            assert store.ram.puts > 50 and store.ram.hits > 50
+    return runs, ram_cache
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_experts_evicted_to_the_ram_cache_come_back_from_it(tmp_path, monkeypatch, dtype):
+    """With 3 slots a layer of 32 experts, decoding evicts experts all the time; with a RAM cache they are copied
+    there first, and a later miss copies them back instead of reading the file. The logits are bit for bit those
+    of the same decode reading every expert from the file. (macOS empties none of the cache's regions here: what
+    it does under memory pressure is the next test's.)"""
+    macos = _Purgeable(monkeypatch)
+    runs, ram = _decode_with_and_without_ram_cache(tmp_path, monkeypatch, dtype)
+    assert macos.taken > 50  # (the cache's regions went through the stand-in for macOS)
+    assert ram.puts > 50 and ram.hits > 50
+    assert all(mx.array_equal(a, b).item() for a, b in zip(*runs))
+
+
+def test_an_expert_macos_emptied_from_the_ram_cache_is_read_from_the_file(tmp_path, monkeypatch):
+    """macOS empties a volatile region of the RAM cache when it needs the memory: the cache counts the expert in
+    it as purged and the store reads it from the file. Here half the volatile regions taken back (by a lookup, or
+    to be reused), picked at random, were emptied (their bytes overwritten); the others looked up still serve
+    their experts. The logits are bit for bit those of the decode with no RAM cache."""
+    pick = random.Random(0)
+    _Purgeable(monkeypatch, empty=lambda n: pick.random() < 0.5)
+    purged, reads = [False], []  # reads: for each expert found emptied, whether its slot's fill reads the file
+    get, submit = flint._RamCache.get, flint._Reader.submit
+
+    def looked_up(cache, key):
+        before = cache.purged
+        addr = get(cache, key)
+        purged[0] = cache.purged > before
+        return addr
+
+    def submitted(reader, priority, tasks, guess=False):  # (ExpertStore._take submits right after its lookup)
+        if purged[0]:
+            reads.append(any(item[0] >= 0 for task in tasks for item in task))
+            purged[0] = False
+        return submit(reader, priority, tasks, guess)
+
+    monkeypatch.setattr(flint._RamCache, "get", looked_up)
+    monkeypatch.setattr(flint._Reader, "submit", submitted)
+    runs, ram = _decode_with_and_without_ram_cache(tmp_path, monkeypatch, mx.bfloat16)
+    assert ram.purged > 20 and ram.hits > 20
+    assert len(reads) == ram.purged and all(reads)
     assert all(mx.array_equal(a, b).item() for a, b in zip(*runs))
 
 
