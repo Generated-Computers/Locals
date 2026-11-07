@@ -23,7 +23,7 @@ Zwyrol, 191 for the original model), and then, in each round:
   one `mx.eval` a step. This is how a lone request's draft pass runs: the next step waits for this one's result.
 - **probe**: before each sync measurement (ahead of its fresh cache and warm steps), 30 synchronous calls of MLX's
   own 4-bit matmul (`mx.quantized_matmul`, no Locals code) on the output head's weights, 1 row. It tells how fast the
-  GPU is at that moment (for 35 ms of the sync measurement's 300 to 500).
+  GPU is at that moment (for 35 ms of the sync measurement's 300 to 500, up to 750 in the forced runs).
 - **split**: the same steps, each cut into building the graph (Python), encoding it (`mx.async_eval` returns) and
   waiting for the GPU (`mx.eval` returns). The median of 30 steps per round.
 - **pipelined**: step s+1 built and queued while step s runs, as the engines decode a batch. The CPU's time hides
@@ -148,7 +148,7 @@ matmul, with no Locals code in it, was twice as slow at that moment). So a slow 
 probe catches 4 of the 12; it covers only 35 ms, taken before each measurement's fresh cache and warm steps.
 
 `early_head_fragh`, the run without the probe, had such moments too: its 2-token passes ranged 12.51 to 15.37 ms, and
-its first 1-token pass in rounds 1 to 4 took 11.91 to 12.57 ms, against 9.98 to 10.50 for the last.
+its first 1-token pass in rounds 1 to 4 took 11.91 to 12.57 ms, against 10.00 to 10.50 for the last.
 
 A neighbour process holding 12 GB of GPU memory and doing no GPU work (`neighbour_12gb`) left the 2-token pass where
 the unchanged runs put it: 12.07 ms sync, 8.92 ms pipelined.
