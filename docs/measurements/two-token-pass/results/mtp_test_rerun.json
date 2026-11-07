@@ -1,0 +1,56 @@
+{
+ "variants": {
+  "norm 1+w | hidden pre-norm | concat [emb, hidden]": 0.8200862600123229,
+  "norm 1+w | hidden pre-norm | concat [hidden, emb]": 0.0024645717806531116,
+  "norm 1+w | hidden post-norm | concat [emb, hidden]": 0.8367221195317314,
+  "norm 1+w | hidden post-norm | concat [hidden, emb]": 0.0024645717806531116,
+  "norm w | hidden pre-norm | concat [emb, hidden]": 0.0,
+  "norm w | hidden pre-norm | concat [hidden, emb]": 0.0012322858903265558,
+  "norm w | hidden post-norm | concat [emb, hidden]": 0.0,
+  "norm w | hidden post-norm | concat [hidden, emb]": 0.0006161429451632779
+ },
+ "float16": {
+  "a1": 0.8367221195317314,
+  "a2_given_a1": 0.7498144023756496,
+  "per_prompt": {
+   "en-explain": 0.7338129496402878,
+   "code": 0.8691099476439791,
+   "pl-email": 0.7266666666666667,
+   "pl-explain": 0.6963350785340314,
+   "json": 0.9132947976878613,
+   "summary": 0.7755102040816326,
+   "math": 0.9581151832460733,
+   "code-convert": 0.8900523560209425,
+   "tool-call": 1.0,
+   "chat": 0.8167539267015707,
+   "pl-tool-screen": 0.9333333333333333,
+   "pl-tool-note": 0.9743589743589743
+  }
+ },
+ "4-bit": {
+  "a1": 0.8274799753542822,
+  "a2_given_a1": 0.734984984984985,
+  "per_prompt": {
+   "en-explain": 0.7122302158273381,
+   "code": 0.8691099476439791,
+   "pl-email": 0.74,
+   "pl-explain": 0.6544502617801047,
+   "json": 0.9190751445086706,
+   "summary": 0.7346938775510204,
+   "math": 0.9528795811518325,
+   "code-convert": 0.8795811518324608,
+   "tool-call": 0.9743589743589743,
+   "chat": 0.8219895287958116,
+   "pl-tool-screen": 0.9333333333333333,
+   "pl-tool-note": 0.9743589743589743
+  }
+ },
+ "timing_ms": {
+  "main_S1_first": 10.3357208330029,
+  "main_S2": 12.259583334283283,
+  "main_S3": 15.888106966546426,
+  "main_S1_last": 10.361077799461782,
+  "mtp_float16": 2.068737498484552,
+  "mtp_4-bit": 1.6528110989990332
+ }
+}

@@ -1,0 +1,32 @@
+mac: Apple M2 Max (applegpu_g14s, 32 GB)
+macos: 27.0
+mlx: 0.32.3
+mlx_lm: 0.32.0
+commit: cdc605c
+model: Kaziko/Qwen3.5-4B-Zwyrol
+tune_cache: <scratch>/tune/tune_v6_applegpu_g14s.json
+preset: <repo>/locals/presets/tune_v6_applegpu_g14s.json
+force: ['2@248320x2560=mma']
+tune cache says mlx 0.32.3, 235 stale shapes
+
+kernel per matmul shape (layers using it): 1 row | 2 rows | 3 rows
+  2560x4096 (32, e.g. layers.31.self_attn.o_proj): ('mlx',) | ('multi', 8, 4, 2) | ('v3', 8, 4, 2)
+  2560x9216 (32, e.g. layers.31.mlp.down_proj): ('mlx',) | ('multi', 8, 4, 2) | ('v3', 16, 4, 2)
+  10240x2560 (8, e.g. layers.31.self_attn.qkv_proj): ('mlx',) | ('multi', 8, 4, 2) | ('v3', 8, 4, 2)
+  12352x2560 (24, e.g. layers.30.linear_attn.in_proj_all): ('mlx',) | ('multi', 8, 4, 2) | ('v3', 8, 8, 2)
+  18432x2560 (32, e.g. layers.31.mlp.gate_up_proj): ('mlx',) | ('multi', 8, 4, 2) | ('v3', 8, 8, 2)
+  248320x2560 (2, e.g. language_model.lm_head): ('mlx',) | ('mma', 8, 32, 64, 1, 4, 1) | ('v3', 8, 8, 2)
+
+cache: 167 tokens (prompt 27, reply 140)
+round 0 (t=0 s): sync S=1 13.26, S=2 21.56, S=3 18.29, S=1 10.69 ms | probe before each 1.303, 1.444, 1.587, 1.162 ms | split (build + encode + wait) S=1 1.55+1.53+7.41, S=2 2.07+1.71+9.70, S=3 2.01+1.75+12.28 | pipelined S=1 8.04, S=2 10.35, S=3 12.06
+round 1 (t=7 s): sync S=1 11.18, S=2 13.06, S=3 15.95, S=1 10.26 ms | probe before each 1.204, 1.189, 1.146, 1.202 ms | split (build + encode + wait) S=1 1.39+1.32+7.50, S=2 1.76+1.33+9.82, S=3 1.74+1.59+12.16 | pipelined S=1 7.97, S=2 9.99, S=3 12.83
+round 2 (t=14 s): sync S=1 10.67, S=2 13.72, S=3 17.27, S=1 11.89 ms | probe before each 1.305, 1.198, 1.457, 1.143 ms | split (build + encode + wait) S=1 2.59+2.27+6.98, S=2 1.72+1.35+9.78, S=3 1.99+1.65+12.34 | pipelined S=1 7.94, S=2 10.02, S=3 12.37
+
+over 3 rounds: mean (min to max), ms; ratio = mean / mean of S=1
+  sync      S=1: 10.54 (10.26 to 10.69), 1.00x (S=1: the lower of first and last each round)
+  sync      S=2: 16.11 (13.06 to 21.56), 1.53x
+  sync      S=3: 17.17 (15.95 to 18.29), 1.63x
+  pipelined S=1: 7.98 (7.94 to 8.04), 1.00x
+  pipelined S=2: 10.12 (9.99 to 10.35), 1.27x
+  pipelined S=3: 12.42 (12.06 to 12.83), 1.56x
+  probe: 1.278 (1.143 to 1.587) ms
