@@ -12,7 +12,8 @@ MXFP8 in layers 20 to 23, and everything else in bfloat16. Its maker asks for 32
   and ``--head-bits`` choose others);
 * everything else as released, the routers and the loop's gates in float32 as the model computes them.
 
-Text only: the vision tower and the bundled draft model are left out. ``--src`` is downloaded if it is not there.
+Text only: the vision tower is left out. The bundled draft model (``mtp.safetensors``, 0.64 GB) goes in as released
+unless ``--no-draft`` (``--draft-only`` adds it to a build already made). ``--src`` is downloaded if it is not there.
 """
 
 import json
@@ -25,6 +26,7 @@ import numpy as np
 
 REPO = "thinkingmachines/Inkling-2-Mini"
 WEIGHTS = "model-00001-of-00001.safetensors"
+DRAFT = "mtp.safetensors"
 SMALL = ["config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json",
          "chat_template.jinja"]
 GS = 64
@@ -88,8 +90,17 @@ def tail_nvfp4(weight: mx.array, scales: mx.array, log):
     return mx.stack(ws), mx.stack(ss), mx.stack(gs).astype(mx.float32)
 
 
+def add_draft(src: Path, out: Path, config: dict, draft_config: dict, log=print) -> None:
+    """The release's draft model as the build's last weight file, as released (bfloat16, 0.64 GB), under ``mtp.``;
+    the build's config names it (``draft_config``), and the model then has it (inkling2_loop.Model.mtp)."""
+    weights = {"mtp." + k: v for k, v in mx.load(str(src / DRAFT)).items()}
+    mx.save_safetensors(str(out / "model-draft.safetensors"), weights, metadata={"format": "mlx"})
+    config["draft_config"] = draft_config
+    log(f"wrote model-draft.safetensors: {sum(v.nbytes for v in weights.values()) / 1e9:.2f} GB")
+
+
 def convert(src: Path, out: Path, attention_bits: int = 8, head_bits: int = 8, tail: str = "nvfp4",
-            shard_bytes: float = 5e9, log=print):
+            shard_bytes: float = 5e9, log=print, draft: bool = True):
     from .models import inkling2_loop as ink
 
     t0 = time.time()
@@ -162,7 +173,9 @@ def convert(src: Path, out: Path, attention_bits: int = 8, head_bits: int = 8, t
         json.dumps({"metadata": {"total_size": total}, "weight_map": dict(sorted(weight_map.items()))}, indent=2))
 
     config.pop("vision_config", None)  # text only
-    config.pop("mtp_config", None)  # (the draft model is not in the build)
+    draft_config = config.pop("mtp_config", None)
+    if draft and draft_config and (src / DRAFT).exists():
+        add_draft(src, out, config, draft_config, log)
     bits = sorted({q["bits"] for q in quant.values()})
     common = max(bits, key=lambda b: sum(q["bits"] == b for q in quant.values())) if bits else 8
     config["quantization"] = {"group_size": GS, "bits": common, "mode": "affine",
@@ -174,7 +187,7 @@ def convert(src: Path, out: Path, attention_bits: int = 8, head_bits: int = 8, t
             shutil.copy(src / f, out / f)
     (out / "README.md").write_text(
         f"# Inkling 2 Mini, MLX, NVFP4 experts\n\nConverted from https://huggingface.co/{REPO} with Locals "
-        "(`python -m locals.convert_inkling`). Text only: the vision tower and the draft model are left out.\n\n"
+        "(`python -m locals.convert_inkling`). Text only: the vision tower is left out.\n\n"
         "- Routed experts of layers 0 to 19: NVFP4 with a scale per expert, as released, bit for bit.\n"
         + ("- Routed experts of layers 20 to 23: MXFP8, as released.\n" if tail == "mxfp8" else
            "- Routed experts of layers 20 to 23 (MXFP8 in the release): NVFP4, each block's scale the one that loses least.\n")
@@ -193,13 +206,22 @@ def main(argv=None):
     ap.add_argument("--attention-bits", type=int, default=8, choices=(4, 5, 6, 8, 16), help="16: as released (bfloat16)")
     ap.add_argument("--head-bits", type=int, default=8, choices=(4, 5, 6, 8, 16))
     ap.add_argument("--tail", default="nvfp4", choices=("nvfp4", "mxfp8"), help="the experts of layers 20 to 23")
+    ap.add_argument("--no-draft", action="store_true", help="leave the draft model (0.64 GB) out of the build")
+    ap.add_argument("--draft-only", action="store_true", help="add the draft model to a build already made")
     args = ap.parse_args(argv)
     src, out = Path(args.src).expanduser(), Path(args.out).expanduser()
     if not (src / WEIGHTS).exists():
         from huggingface_hub import snapshot_download
 
-        snapshot_download(REPO, local_dir=str(src), allow_patterns=SMALL + [WEIGHTS])
-    convert(src, out, args.attention_bits, args.head_bits, args.tail)
+        snapshot_download(REPO, local_dir=str(src), allow_patterns=SMALL + [WEIGHTS, DRAFT])
+    if args.draft_only:
+        config = json.loads((out / "config.json").read_text())
+        add_draft(src, out, config, json.loads((src / "config.json").read_text())["mtp_config"])
+        for key in ("quantization", "quantization_config"):  # (mlx-lm writes both)
+            config[key] = config["quantization"]
+        (out / "config.json").write_text(json.dumps(config, indent=2))
+        return
+    convert(src, out, args.attention_bits, args.head_bits, args.tail, draft=not args.no_draft)
 
 
 if __name__ == "__main__":

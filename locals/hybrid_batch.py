@@ -512,6 +512,10 @@ def chain_cache(max_size: int, max_bytes: int):
 
 
 _SLOT_WAIT = 4  # steps a finished row's slot waits for a request (its client's next one comes about a step later)
+# A "user" checkpoint (the start of the last message) this close after the request's cached prefix is not kept: where
+# an earlier reply renders as it was written, that prefix is the finished row of the turn before, a token or two short
+# of the checkpoint, and every request of an agent put one more copy of its state into the prompt cache for nothing.
+_CP_GAP = 32
 
 
 class _FreedSlot:
@@ -1122,27 +1126,122 @@ class HybridBatchEngine(BatchEngine):
                    and c.lengths is None for c in rec)
 
     def _solo_draft(self, r, cache) -> List[int]:
-        """A prompt-lookup draft for an unconstrained row: what followed the most recent earlier occurrence of its
-        last 3 tokens (locals/lookup.py's rule, from an index kept on the request instead of a scan of the whole
-        prompt every step); its width follows the recent acceptance."""
+        """The draft to verify in the row's next pass: a prompt-lookup draft (free to make), else the model's own
+        draft model's where it has one (Inkling 2's: locals/inkling_draft.py)."""
+        r.draft_src = None
+        draft = self._solo_lookup_draft(r, cache)
+        if self._model_drafts(r, cache):
+            # Both at hand: the one whose recent tries gained more steps (``_draft_gain``), and the other one time in
+            # 16, so neither estimate goes stale. A tool call that writes a file keeps half of its lookup drafts (its
+            # text is the prompt's with JSON's escapes) and 97% of the draft model's; a plain reply that copies its
+            # prompt keeps lookup drafts, which cost nothing to make.
+            use_model = not draft
+            if draft:
+                r.src_n = getattr(r, "src_n", 0) + 1
+                use_model = (self._draft_gain(r, "model") > self._draft_gain(r, "lookup")) != (r.src_n % 16 == 0)
+            if use_model:
+                draft, r.draft_src = self._solo_model_draft(r, cache), "model"
+        return draft
+
+    @staticmethod
+    def _draft_gain(r, src: str, add: Optional[float] = None) -> float:
+        """The mean gain in steps of the request's last tries of drafts from ``src`` (1 before it has two: tried
+        first); ``add``: a try's gain."""
+        gains = getattr(r, "src_gain", None)
+        if gains is None:
+            gains = r.src_gain = {}
+        g = gains.setdefault(src, [])
+        if add is not None:
+            g.append(add)
+            del g[:-6]
+        return sum(g) / len(g) if len(g) >= 2 else 1.0
+
+    def _drafts_allowed(self, r, cache):
+        """(whether the row may get drafts at all, whether a grammar holds it)"""
         walked = getattr(self, "_walk", None) is not None
         constrained = isinstance(r.controller, LocalsController) or (walked and type(r.controller).__name__ == "WalkController")
         if walked and not constrained:
-            return []
+            return False, constrained
         if (hasattr(r.controller, "step_config") and not constrained) or not self._solo_drafts_ok(cache):
-            return []
+            return False, constrained
         if not getattr(r.controller, "drafts", True):  # (a controller that takes no drafts: Qwenputer's)
-            return []
+            return False, constrained
         if len(r.out) < getattr(r, "solo_resume", 0):  # recent drafts were rejected: plain pipelined steps for a while
+            return False, constrained
+        return True, constrained
+
+    def _model_drafts(self, r, cache) -> bool:
+        """Whether the row's next step should try the draft model: the model has one, the row may get drafts, and
+        its recent ones paid (``_model_draft_seen``). Costs nothing: the draft itself is made in ``_solo``, once the
+        token it starts from is known."""
+        mtp = getattr(self.lm, "mtp", None)
+        if mtp is None or getattr(self.lm, "draft_off", False) or getattr(mtp, "_fold", None) is None:
+            return False
+        if not r.out or len(r.out) < getattr(r, "md_resume", 0) or r.max_tokens - len(r.out) < 3:
+            return False
+        return self._drafts_allowed(r, cache)[0]
+
+    def _solo_model_draft(self, r, cache) -> List[int]:
+        """The draft model's tokens after the row's last one, as far as it is sure of them (each token's probability
+        over ``draft_min_p``: a token it gives 0.9 is the target's nine times in ten, one it gives 0.3 seldom) and
+        as far as the row's grammar allows them."""
+        mtp = self.lm.mtp
+        got = mtp.draft(r.out[-1], cache[len(cache) - len(mtp.layers):])
+        if got is None:
             return []
-        if constrained and getattr(self.lm, "draft_token_cost", None):
-            # (under a grammar a draft of one token is dropped below; where drafts cost, the width is often one:
-            # not worth the copy of the prompt each step)
-            tried = getattr(r, "solo_tried", None) or []
-            n = sum(tried[-8:])
-            rate = sum((getattr(r, "solo_acc", None) or [])[-8:]) / n if n else 0.6
-            if rate * rate <= self.lm.draft_token_cost:
-                return []
+        toks, probs = got[0].tolist(), got[1].tolist()
+        least = getattr(self.lm, "draft_min_p", 0.7)
+        eos = set(r.controller.eos_ids) or set(self.tokenizer.eos_token_ids)
+        draft = []
+        for tok, p in zip(toks, probs):
+            if p <= least or tok in eos:
+                break
+            draft.append(tok)
+        constrained = self._drafts_allowed(r, cache)[1]
+        if constrained and draft:
+            step = getattr(r.controller, "draft_step", None) or r.controller.step_config
+            done = getattr(r.controller, "draft_finished", None) or r.controller.finished_at
+            cfg, kept = r.controller.q, []
+            for tok in draft:
+                cfg = step(cfg, tok)
+                if cfg is None:
+                    break
+                kept.append(tok)
+                if done(cfg):
+                    break
+            draft = kept
+        draft = draft[: max(0, r.max_tokens - len(r.out) - 1)]
+        if not draft:
+            self._model_draft_seen(r, 0, 0)
+        return draft
+
+    def _model_draft_seen(self, r, width: int, kept: int) -> None:
+        """What a try of the draft model gained, in steps: the tokens kept, less the draft (6.5 ms of a 28 ms step on
+        Inkling 2, measured with every draft refused), less the pass's own cost over a step's (a pass of n tokens is
+        25 + 6 n ms, kept or not). While the last tries lose, the row goes without, for 32
+        tokens and twice as long each time in a row, up to 256: prose keeps a first drafted token half the time, a
+        tool call that writes a file 6 of 7. (On recorded drafts: prose 0.99 of its speed without, code 1.1, a
+        file rewritten 1.2, a file written through a tool 1.6.)"""
+        per, made = getattr(self.lm, "draft_token_cost", None) or 0.0, getattr(self.lm, "draft_model_cost", None) or 0.0
+        gain = (kept - 0.11 - per * width if width else 0.0) - made
+        r.md_gain = (getattr(r, "md_gain", None) or [])[-7:] + [gain]
+        self._draft_gain(r, "model", gain)
+        t = getattr(r, "md_tries", None) or (0, 0, 0)  # (tries, those with no token sure enough, pauses)
+        losing = len(r.md_gain) >= 4 and sum(r.md_gain) < 0
+        r.md_tries = (t[0] + 1, t[1] + (not width), t[2] + losing)
+        if losing:
+            pause = getattr(r, "md_pause", 32)
+            r.md_resume, r.md_gain, r.md_pause = len(r.out) + pause, [], min(256, 2 * pause)
+        elif sum(r.md_gain) > 0:
+            r.md_pause = 32
+
+    def _solo_lookup_draft(self, r, cache) -> List[int]:
+        """A prompt-lookup draft for an unconstrained row: what followed the most recent earlier occurrence of its
+        last 3 tokens (locals/lookup.py's rule, from an index kept on the request instead of a scan of the whole
+        prompt every step); its width follows the recent acceptance."""
+        ok, constrained = self._drafts_allowed(r, cache)
+        if not ok:
+            return []
         stream = list(r.prompt) + r.out
         idx = getattr(r, "lk_index", None)
         if idx is None:
@@ -1158,20 +1257,31 @@ class HybridBatchEngine(BatchEngine):
         width = 4 if not acc else max(1, min(8, int(round(2 * sum(acc[-8:]) / len(acc[-8:]) + 1))))
         cost = getattr(self.lm, "draft_token_cost", None)
         if cost:
-            # A model whose drafted token costs a share of a step whether it is kept or not (Inkling 2: each token of
-            # a pass reads its own experts, 12 ms of a 30 ms step): the i-th draft token is kept with about rate^i, so
-            # the draft goes as far as that stays above the cost; none at all for a while where the rate is under it
-            # (free writing kept 31% of its drafts, and went no faster for them)
-            tried = getattr(r, "solo_tried", None) or []
-            n = sum(tried[-8:])
-            rate = sum(acc[-8:]) / n if n else 0.6
-            width, p = 0, rate
-            while width < 8 and p > cost:
-                width, p = width + 1, p * rate
-            if not width:
+            # A model whose drafted token costs a share of a step whether it is kept or not (Inkling 2: a token of a
+            # pass is 6 ms where a step is 28, and a pass takes up to 32). The i-th token of a draft is worth trying
+            # while the recent drafts that got that far kept it more often than it costs; past what they tried, twice
+            # as far as the longest one kept whole. So a reply that copies a long stretch gets 2, 4, 8 ... 31 tokens a
+            # pass, and one whose matches end after a token or two stays at 2 or 3 (doubling after every draft kept
+            # whole, it drafted 122 tokens of such a reply and kept 67; the width the mean acceptance pays for
+            # drafted 101 tokens of code in 7 passes after two long runs and kept 12).
+            tried = (getattr(r, "solo_tried", None) or [])[-12:]
+            kept = acc[-len(tried):] if tried else []
+            if len(tried) >= 4 and sum(kept[-8:]) <= cost * sum(tried[-8:]):
                 r.solo_acc, r.solo_tried = [], []
                 r.solo_resume = len(r.out) + 16
                 return []
+            most = getattr(self.lm, "draft_max", 8)
+            whole = max([w for w, k in zip(tried, kept) if k >= w], default=1)
+            width = 0
+            while width < most:
+                reached = [k > width for w, k in zip(tried, kept) if w > width]  # (drafts that tried this position)
+                if len(reached) >= 2:
+                    if sum(reached) <= (cost + 0.1) * len(reached):
+                        break
+                elif width >= 2 * whole:
+                    break
+                width += 1
+            width = max(width, 1)
         eos = set(r.controller.eos_ids) or set(self.tokenizer.eos_token_ids)
         draft = stream[j:j + width]
         for i, tok in enumerate(draft):
@@ -1345,16 +1455,24 @@ class HybridBatchEngine(BatchEngine):
                     if isinstance(c, ArraysCache):
                         c.token_states = c.token_conv = None
                 r.fed.extend(draft[:kept])
-                r.solo_acc = (getattr(r, "solo_acc", None) or []) + [kept]
-                r.solo_tried = (getattr(r, "solo_tried", None) or []) + [len(draft)]
+                if getattr(r, "draft_src", None) == "model":
+                    self._model_draft_seen(r, len(draft), kept)
+                else:
+                    r.solo_acc = (getattr(r, "solo_acc", None) or []) + [kept]
+                    r.solo_tried = (getattr(r, "solo_tried", None) or []) + [len(draft)]
+                    self._draft_gain(r, "lookup", kept - 0.11 - (getattr(self.lm, "draft_token_cost", None) or 0.0) * len(draft))
                 r.drafted = (getattr(r, "drafted", None) or (0, 0, 0))  # (tokens kept, tokens drafted, draft passes)
                 r.drafted = (r.drafted[0] + kept, r.drafted[1] + len(draft), r.drafted[2] + 1)
+                if getattr(r, "draft_src", None) == "model":  # (of those, the draft model's)
+                    m = getattr(r, "drafted_model", None) or (0, 0, 0)
+                    r.drafted_model = (m[0] + kept, m[1] + len(draft), m[2] + 1)
                 self.counters["drafted"] = self.counters.get("drafted", 0) + kept
                 # a draft step costs the pipelining of that step: after a draft rejected outright, none for 1 token,
                 # doubling up to 32 while they keep failing (a JSON list's repeated keys: 0.83x without this)
-                r.solo_miss = getattr(r, "solo_miss", 0) + 1 if kept == 0 else 0
-                if r.solo_miss:
-                    r.solo_resume = len(r.out) + min(32, 1 << (r.solo_miss - 1))
+                if getattr(r, "draft_src", None) != "model":  # (the draft model's tries have their own rule)
+                    r.solo_miss = getattr(r, "solo_miss", 0) + 1 if kept == 0 else 0
+                    if r.solo_miss:
+                        r.solo_resume = len(r.out) + min(32, 1 << (r.solo_miss - 1))
             self.tokens_out += len(r.out) - n0
             self._after_commit(r, n0, dead)
             if id(r) in dead:
@@ -2088,16 +2206,36 @@ class HybridBatchEngine(BatchEngine):
                     # every client of these prompts gone (Esc in the agent while it waits for a long prompt): the
                     # prefill stops between chunks instead of reading the prompts to their end for nobody
                     left_all = lambda: all(getattr(q, "cancel", False) for q in new)  # noqa: E731
-                    for r, (c0, rest) in zip(new, found):
+                    kept = False  # this admission put a prefix into the prompt cache: the next request looks again
+                    for k, (r, (c0, rest)) in enumerate(zip(new, found)):
                         if left_all():
                             break
-                        done = r.cached_tokens
-                        for cp, kind in sorted(getattr(r, "checkpoints", None) or []):
+                        if kept:
+                            c1, rest1 = lru.fetch_nearest_cache(lru_key, list(r.prompt[:-1]))
+                            if c1 is not None and len(rest1) < len(rest):
+                                c0, rest = c1, rest1
+                                r.cached_tokens = len(r.prompt) - 1 - len(rest)
+                            c1 = rest1 = None
+                        done, end = r.cached_tokens, len(r.prompt) - 1
+                        cps = sorted(getattr(r, "checkpoints", None) or [])
+                        if lru is not None and self.share_prefix:
+                            # Where a request waiting with this one parts from its prompt: read once to there, and kept
+                            # for it. An agent's versions of one part are asked at once with one prompt and do not part
+                            # at all: of 4,755 prompt tokens `locals run` read for a two-file task, 1,700 were read a
+                            # second, third and fourth time next to the first.
+                            # (the two longest: each is a copy of the request's state in the prompt cache)
+                            lcps = sorted({_common(r.prompt[:end], q.prompt[:-1]) for q in new[k + 1:] + queue})[-2:]
+                            cps = sorted(cps + [(n, "shared") for n in lcps if all(cp != n for cp, _ in cps)])
+                        for cp, kind in cps:
                             if kind == "reply" and lru is not None and c0 is not None and cp == done:
                                 self._keep_reply(r, cp, c0)  # the cached prefix ends there (a regenerated reply)
                                 continue
-                            if lru is None or not done < cp < len(r.prompt) - 1:
+                            if lru is None or not done < cp < end + (kind == "shared"):
                                 continue
+                            if kind == "user" and cp - done < _CP_GAP:
+                                continue  # (the cached prefix ends a few tokens before: a copy there buys nothing)
+                            if kind == "shared" and cp - done < self.min_share:
+                                continue  # (so few tokens are cheaper read twice than a copy is kept)
                             # prefill to the checkpoint, keep a copy, go on from there
                             c0 = c0 if c0 is not None else make_prompt_cache(self.model)
                             if not self._run(c0, list(r.prompt[done:cp]), stop=left_all):
@@ -2105,7 +2243,9 @@ class HybridBatchEngine(BatchEngine):
                             if kind == "reply":
                                 self._keep_reply(r, cp, c0)
                             elif self._room_for_copy(lru, len(r.prompt)):
-                                lru.insert_cache(lru_key, list(r.prompt[:cp]), copy.deepcopy(c0), cache_type=kind)
+                                lru.insert_cache(lru_key, list(r.prompt[:cp]), copy.deepcopy(c0),
+                                                 cache_type="user" if kind == "shared" else kind)
+                                kept = True
                             if kind == "system" and self.disk is not None:
                                 self.disk.save(list(r.prompt[:cp]), c0)
                             if os.environ.get("LOCALS_PREFILL_LOG"):
@@ -2214,7 +2354,8 @@ class HybridBatchEngine(BatchEngine):
                 # padding read, which waits for the GPU, only with a span: the pipeline drains for it anyway)
                 # (Inkling 2 from 2 tokens: a pass over two is 45 ms where two steps are 60)
                 span = 2 if self._inkling() else 3
-                solo_next = (len(rows[0].pend) >= span and self._solo_unpadded(cache)) or bool(self._solo_draft(rows[0], cache))
+                solo_next = ((len(rows[0].pend) >= span and self._solo_unpadded(cache)) or bool(self._solo_lookup_draft(rows[0], cache))
+                             or self._model_drafts(rows[0], cache))
         mx.synchronize()
         self.active = 0
         return BatchStats(time.perf_counter() - t0, prefill_s, steps, nrows, self.tokens_out)

@@ -382,6 +382,13 @@ class Server:
         if prefill:
             thinking = False
         msgs = oai.convert_messages(req.get("messages") or [], raw=self._raw if fmt.replay_raw else None)
+        if getattr(fmt, "restores", False):
+            # (a template that writes a turn's calls itself: the turn's reasoning and text back from the reply)
+            for i, m in enumerate(msgs):
+                if m["role"] == "assistant" and m.get("tool_calls"):
+                    was = self._raw.get(oai.id_key(m["tool_calls"][0].get("id")))
+                    if was is not None:
+                        msgs[i] = fmt.restore(m, was)
         turns = notes = None
         if self.qwenputer:
             # the conversation before each message (Server._notes's keys, with a reply), and its notes so far
@@ -932,6 +939,12 @@ class Server:
         drafted = getattr(r, "drafted", None)  # (one request alone: tokens kept of those drafted, and the passes)
         if drafted:
             usage["locals"]["drafts"] = {"kept": drafted[0], "drafted": drafted[1], "passes": drafted[2]}
+            by_model = getattr(r, "drafted_model", None)  # (the part from the model's own draft model: Inkling 2's)
+            if by_model:
+                usage["locals"]["drafts"]["model"] = {"kept": by_model[0], "drafted": by_model[1], "passes": by_model[2]}
+        tries = getattr(r, "md_tries", None)
+        if tries:  # (the draft model asked, the times it was sure of no token, the times it was set aside for a while)
+            usage["locals"].setdefault("drafts", {}).setdefault("model", {}).update({"tries": tries[0], "unsure": tries[1], "pauses": tries[2]})
         self.log(f"[{p['engine']}] prompt {len(p['prompt'])} ({job.cached} cached)  out {out_tokens} tok"
                  f"{'  forced ' + str(getattr(r, 'forced', 0)) if getattr(r, 'forced', 0) else ''}  {out_tokens / dt:.0f} tok/s"
                  f"  {calls} call(s)  finish={job.finish}" + (f"  stopped={stopped}" if stopped else "")

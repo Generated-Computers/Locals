@@ -17,12 +17,18 @@ TEXT = dict(hidden_size=64, num_hidden_layers=8, vocab_size=128, unpadded_vocab_
 LOOP = dict(core_start=3, core_end=6, num_passes=3, gate_rank=8, is_varloop=False)
 
 
-def _model(loop: bool = True, seed: int = 0, experts: str = "", fused: bool = False) -> ink.Model:
+DRAFT = dict(hidden_size=TEXT["hidden_size"], num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=2, head_dim=8,
+             intermediate_size=48, rms_norm_eps=1e-6, rope_theta=1e4, local_layer_ids=[0, 2], sliding_window_size=8,
+             block_size=8, markov_rank=8, markov_head_type="rnn_hidden", target_layer_ids=[2, 6, 11, 14])
+
+
+def _model(loop: bool = True, seed: int = 0, experts: str = "", fused: bool = False, draft: bool = False) -> ink.Model:
     """A random model in float32. ``experts``: "q" has them quantized as the release (NVFP4 with a scale an expert,
     MXFP8 in the last layer). The router's bias picks the experts, a different pair a layer: with random weights two
     scores are often a rounding apart, and a path that rounds differently would pick another."""
     mx.random.seed(seed)
-    config = {"model_type": "inkling2_loop", "text_config": {**TEXT, **({"loop_config": LOOP} if loop else {})}}
+    config = {"model_type": "inkling2_loop", "text_config": {**TEXT, **({"loop_config": LOOP} if loop else {})},
+              **({"draft_config": DRAFT} if draft else {})}
     m = ink.Model(ink.ModelArgs.from_dict(config))
     weights = []
     for k, v in tree_flatten(m.parameters()):
@@ -123,6 +129,42 @@ def test_batch_rows_decode_as_alone_with_and_without_padding(fused):
         c.filter(mx.array([1]))
     for i in range(4, 7):
         assert _close(m(mx.array([[steps[i]]]), cache=batch)[0, -1], refs[1][i]), i
+
+
+@pytest.mark.parametrize("window", [0, 6])
+def test_attentions_weights_in_one_kernel_are_the_references(window):
+    """ink.attend with inkling.soft: the bias by distance, the mask (later keys, keys past the window, a shorter
+    row's padding) and the softmax with its sink in one pass over the scores, for rows at their own positions."""
+    mx.random.seed(21)
+    B, Hq, Hkv, L, S, D, R = 2, 4, 2, 5, 13, 16, 8
+    q, k, v = mx.random.normal((B, Hq, L, D)), mx.random.normal((B, Hkv, S, D)), mx.random.normal((B, Hkv, S, D))
+    bias, sinks = mx.random.normal((B, L, Hq, R)), mx.random.normal((B, L, Hq))
+    end = mx.array([40, 9])  # (the second row holds 9 tokens: its first 4 keys are padding)
+    q_pos, k_pos = (end - L)[:, None] + mx.arange(L), (end - S)[:, None] + mx.arange(S)
+    want = ink.attend(q, k, v, bias, sinks, scale=0.25, window=window, q_pos=q_pos, k_pos=k_pos)
+    got = ink.attend(q, k, v, bias, sinks, scale=0.25, window=window, q_pos=q_pos, k_pos=k_pos, soft=inkling.soft)
+    assert _close(got, want, 1e-5)
+    one = ink.attend(q[:1], k[:1], v[:1], bias[:1], sinks[:1], scale=0.25, window=window, q_pos=mx.arange(35, 40),
+                     k_pos=mx.arange(27, 40), soft=inkling.soft)
+    assert _close(one, want[:1], 1e-5)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_a_long_chunk_in_blocks_of_queries_is_the_chunk_at_once(fused, monkeypatch):
+    """A sliding layer scores a long chunk a block of queries at a time, over the keys that block sees, and a long
+    pass is evaluated a visit at a time: the states are those of the chunk scored and evaluated at once."""
+    m = _model(seed=4, experts="q", fused=fused)
+    tokens = mx.random.randint(0, 120, (1, 60), key=mx.random.key(9))
+
+    def read(block, each):
+        monkeypatch.setattr(ink, "QUERY_BLOCK", block)
+        monkeypatch.setattr(ink, "EVAL_TOKENS", each)
+        cache = m.make_cache()
+        return mx.concatenate([m.model(tokens[:, :11], cache), m.model(tokens[:, 11:49], cache), m.model(tokens[:, 49:], cache)], axis=1)
+
+    want = read(1 << 20, 1 << 20)
+    for block in (4, 7, 16):
+        assert _close(read(block, 8), want)
 
 
 def test_route_picks_the_references_experts():
@@ -386,9 +428,15 @@ def _call(name, args, header=None):
             + json.dumps({"name": name, "args": args}, separators=(",", ":"), ensure_ascii=False) + "<|end_message|>")
 
 
+def _as_the_template(name, args):
+    """A call as the model's template writes an earlier turn's: its arguments sorted by name (``dictsort``)."""
+    return _call(name, dict(sorted(args.items())))
+
+
 def test_a_call_is_typed_by_its_tools_schema():
-    """A call's arguments are the tool's parameters, in the schema's order, the required ones there, each of its
-    type, and the JSON's name is the header's: all but the values is forced text (fed in one pass)."""
+    """A call's arguments are the tool's parameters, sorted as the model's template writes them, the required ones
+    there, each of its type, and the JSON's name is the header's: all but the values is forced text (fed in one
+    pass), and the reply is what the next request holds in its place."""
     import re
 
     from locals import formats, oai
@@ -400,18 +448,81 @@ def test_a_call_is_typed_by_its_tools_schema():
                        ("edit_file", {"path": "a", "old": "b", "new": "c", "count": 3, "tags": []}),
                        ("opt", {}), ("opt", {"b": True}), ("opt", {"a": 1, "c": None}), ("opt", {"a": 1, "b": False, "c": "s"}),
                        ("bare", {}), ("bare", {"k": [1, {"z": None}]})]:
-        assert re.fullmatch(rx, _call(name, args)), (name, args)
-    for name, args in [("edit_file", {"path": "a", "old": "b"}),  # a required one missing
-                       ("edit_file", {"old": "b", "path": "a", "new": "c"}),  # not the schema's order
-                       ("edit_file", {"path": 3, "old": "b", "new": "c"}), ("opt", {"c": 1}), ("opt", {"z": 1}),
-                       ("edit_file", {"path": "a", "old": "b", "new": "c", "mode": "c"})]:
+        assert re.fullmatch(rx, _as_the_template(name, args)), (name, args)
+    for name, args in [("edit_file", {"new": "c", "old": "b"}),  # a required one missing
+                       ("edit_file", {"path": "a", "old": "b", "new": "c"}),  # the schema's order, not the template's
+                       ("edit_file", {"new": "c", "old": "b", "path": 3}), ("opt", {"c": 1}), ("opt", {"z": 1}),
+                       ("edit_file", {"mode": "c", "new": "c", "old": "b", "path": "a"})]:
         assert not re.fullmatch(rx, _call(name, args)), (name, args)
-    assert not re.fullmatch(rx, _call("edit_file", {"path": "a", "old": "b", "new": "c"}, header="opt"))
+    assert not re.fullmatch(rx, _call("edit_file", {"new": "c", "old": "b", "path": "a"}, header="opt"))
     # the server's grammar of a reply is typed without --typed-tools, and a chosen tool is the only one
     reply = oai.reply_regex(TOOLS, "required", fmt=fmt, preamble=False)
     assert re.fullmatch(reply, _call("opt", {"a": 1}) + _call("bare", {})) and not re.fullmatch(reply, _call("opt", {"z": 1}))
     one = oai.reply_regex(TOOLS, {"type": "function", "function": {"name": "opt"}}, fmt=fmt, preamble=False)
     assert re.fullmatch(one, _call("opt", {"b": False})) and not re.fullmatch(one, _call("bare", {}))
+
+
+def test_a_turn_sent_back_is_the_reply_it_came_from():
+    """Clients send a turn with calls back without its reasoning, and its text trimmed; the model's template writes
+    an earlier turn's reasoning. From the reply the server kept, the turn is written as the model wrote it, so the
+    next request goes on from the finished row; a turn whose calls the client changed is the client's."""
+    from locals import formats
+
+    fmt = formats.FORMATS["inkling"]
+    raw = ("<|message_model|><|content_thinking|> Read it first.\n<|end_message|><|message_model|><|content_text|>Reading. <|end_message|>"
+           + _as_the_template("edit_file", {"path": "a", "old": "b", "new": {"z": 1, "a": [2]}}))
+    call = lambda args: {"id": "c1", "type": "function", "function": {"name": "edit_file", "arguments": args}}  # noqa: E731
+    sent = {"role": "assistant", "content": "Reading.", "tool_calls": [call({"path": "a", "new": {"a": [2], "z": 1}, "old": "b"})]}
+    got = fmt.restore(sent, raw)
+    assert got["reasoning_content"] == " Read it first.\n" and got["content"] == "Reading. "
+    assert list(got["tool_calls"][0]["function"]["arguments"]["new"]) == ["z", "a"] and got["tool_calls"][0]["id"] == "c1"
+    assert "reasoning_content" not in sent  # (the client's message is not written into)
+    assert fmt.restore({**sent, "reasoning_content": "Read it first."}, raw)["reasoning_content"] == " Read it first.\n"
+    for other in ({**sent, "tool_calls": [call({"path": "a2", "old": "b", "new": {"z": 1, "a": [2]}})]},  # another call
+                  {**sent, "content": "Something else."}, {**sent, "reasoning_content": "My own thought."},
+                  {**sent, "tool_calls": sent["tool_calls"] * 2}):
+        assert fmt.restore(other, raw) is other
+    bare = _as_the_template("opt", {"a": 1})  # (a reply that went straight to its call)
+    got = fmt.restore({"role": "assistant", "content": "", "tool_calls": [{"id": "c2", "function": {"name": "opt", "arguments": {"a": 1}}}]}, bare)
+    assert got["content"] == "" and "reasoning_content" not in got
+
+
+def test_requests_with_one_prompt_asked_at_once_read_it_once():
+    """An agent's versions of one part are asked at once with one prompt: the first reads it, and the prompt cache has
+    it for the others (and what two prompts share, for the second); the replies are those of requests asked alone."""
+    from mlx_lm.models.cache import LRUPromptCache
+
+    from locals.engine import Controller
+    from locals.hybrid_batch import HybridBatchEngine
+    from locals.packed import Request
+
+    class Free(Controller):
+        eos_ids = [127]
+
+    class Tok:  # (the engine writes a finished reply's text)
+        eos_token_ids = [127]
+
+        def decode(self, ids):
+            return " ".join(map(str, ids))
+
+    m = _model(seed=12, experts="q", fused=True)
+    tokens = [int(t) for t in mx.random.randint(0, 120, (60,), key=mx.random.key(3)).tolist()]
+    same, other = tokens[:40], tokens[:30] + tokens[45:60]
+
+    def serve(prompts, share=True):
+        eng = HybridBatchEngine(m, Tok(), n_slots=4, share_prefix=share, min_share=8)
+        reqs = [Request(list(p), Free(), 6) for p in prompts]
+        for r in reqs:
+            r.pend, r.fed = [], []
+        waiting = list(reqs)
+        eng.serve(lambda block: [waiting.pop(0) for _ in list(waiting)], lru=LRUPromptCache(max_size=16), lru_key="tiny")
+        return [r.out for r in reqs], eng.counters["prefill_tokens"]
+
+    alone = [serve([p], share=False)[0][0] for p in (same, other)]
+    outs, read = serve([same, same, other, same])
+    assert outs == [alone[0], alone[0], alone[1], alone[0]]
+    assert read == (len(same) - 1) + (len(other) - 1 - 30)  # the prompt once, and the other's own end
+    assert serve([same, same, other, same], share=False)[1] == 3 * (len(same) - 1) + len(other) - 1
 
 
 def test_a_fused_model_asks_for_walked_grammars():
@@ -436,3 +547,57 @@ def test_a_walked_grammar_tries_a_drafts_tokens():
     assert q is not None and ctl.draft_step(ctl.q, 1) is None and ctl.draft_step(q, 3) is None  # (the end is no draft)
     assert ctl.draft_step(q, 4) is not None and not ctl.draft_finished(q) and ctl.draft_finished(ctl.draft_step(q, 1))
     assert ctl.q == WC.dfa.start and not hasattr(ctl, "step_config")  # (the one-stream engine's sign of token tables)
+
+
+# --- the draft model (locals/inkling_draft.py) -----------------------------------------------------------------------
+
+def _draft_state(m, cache):
+    own = len(cache) - len(m.mtp.layers)
+    toks, probs = m.mtp.draft(7, cache[own:])
+    return toks.tolist(), probs
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("prompt_len", [3, 14])
+def test_the_draft_models_context_is_the_targets_passes(fused, prompt_len):
+    """The draft model reads what the target's passes left in three caches after the target's own: the same draft
+    whether the text went in as one pass, a token at a time (in kernels), or with a draft's end taken back; in a
+    window not yet full and in a full one. And the target computes what it computes without a draft model."""
+    from mlx_lm.models.cache import ArraysCache
+
+    m, plain = _model(seed=11, experts="q", fused=fused, draft=True), _model(seed=11, experts="q", fused=fused)
+    if not fused:
+        m.mtp.bind(m)
+    assert len(m.make_cache()) == len(plain.make_cache()) + 3
+    prompt = [int(t) for t in mx.random.randint(0, 120, (prompt_len,), key=mx.random.key(8)).tolist()]
+    fed, dropped = [42, 8, 77, 5], [19, 3, 101]
+    whole = _batch_of_one(m, prompt + fed)
+    steps, back = _batch_of_one(m, prompt), _batch_of_one(m, prompt)
+    for t in fed:
+        mx.eval(m(mx.array([[t]]), cache=steps))
+    for c in back:
+        if isinstance(c, ArraysCache):
+            c.want_states = True
+    mx.eval(m(mx.array([fed + dropped]), cache=back))
+    inkling.rewind(back, len(dropped))
+    assert m.mtp.draft(7, whole[len(whole) - 3:]) is None  # (a merged cache: no pass yet whose last token the head reads)
+    for c in (whole, steps, back):
+        mx.eval(m(mx.array([[9]]), cache=c))
+    want_t, want_p = _draft_state(m, whole)
+    assert len(want_t) == 7 and float(want_p.min()) > 0
+    for other in (steps, back):
+        got_t, got_p = _draft_state(m, other)
+        assert got_t == want_t and _close(got_p, want_p, 1e-3)
+    # the target computes what it computes with nothing reading its passes
+    a, b = _batch_of_one(m, prompt), _batch_of_one(m, prompt)
+    with_draft = m(mx.array([fed]), cache=a)[0]
+    m.model.language_model.taps = None
+    assert _close(with_draft, m(mx.array([fed]), cache=b)[0])
+
+
+def test_a_build_without_the_draft_model_has_none(monkeypatch):
+    m = _model(fused=True)
+    assert "mtp" not in m and getattr(m.model.language_model, "taps", None) is None
+    monkeypatch.setenv("LOCALS_INKLING_DRAFT", "0")
+    off = _model(fused=True, draft=True)
+    assert off.draft_off and len(off.make_cache()) == len(m.make_cache()) and off.model.language_model.taps is None

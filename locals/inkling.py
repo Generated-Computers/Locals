@@ -23,18 +23,19 @@ does a global layer's attention past 1024 tokens (MLX's own), and both leave the
 
 from __future__ import annotations
 
+import os
 from typing import Any, List, Optional
 
 import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache, BatchKVCache, BatchRotatingKVCache, KVCache, RotatingKVCache
-
 from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
 
+from . import inkling_experts as once
 from .models import inkling2_loop as ink
 
 _F32 = mx.float32
 _KV = (KVCache, RotatingKVCache, BatchKVCache, BatchRotatingKVCache)
-SEQ_MAX = 16  # tokens of one text a pass takes in kernels (a forced span, a draft); longer passes: the reference
+SEQ_MAX = 32  # tokens of one text a pass takes in kernels (a forced span, a draft); longer passes: the reference
 
 # Sums over a threadgroup: each lane's value summed over its simdgroup, the simdgroups' sums added by every thread.
 _HEADER = """
@@ -586,6 +587,55 @@ def attend(q, keys, values, bias, sinks, gate, idx: int, counts, scale: float, g
         grid=(keys.shape[1] * TG, M, 1), threadgroup=(TG, 1, 1), output_shapes=[(M, heads * hd)], output_dtypes=[T])[0]
 
 
+_SOFT_SRC = """
+    const uint lane = thread_index_in_simdgroup;  // (a threadgroup is one of them: a query of a head, 32 keys apart)
+    const uint id = thread_position_in_grid.y;
+    const int S = scores_shape[4], L = scores_shape[3];
+    const int l = int(id) % L, h = (int(id) / L) % HQ, b = int(id) / (L * HQ);
+    const int qp = pos[2 * b] + l, k0 = pos[2 * b + 1];
+    const float scale = prm[0];
+    const device float* sc = scores + size_t(id) * S;
+    const device T* bs = bias + (size_t(b * L + l) * HQ + h) * R;
+    const float sink = float(sinks[size_t(b * L + l) * HQ + h]);
+    float m = -INFINITY;
+    for (int j = int(lane); j < S; j += 32) {
+        const int dist = qp - (k0 + j);
+        if (dist >= 0 && k0 + j >= 0 && (WINDOW == 0 || dist < WINDOW))
+            m = max(m, sc[j] * scale + (dist < R ? float(bs[dist]) : 0.0f));
+    }
+    m = max(simd_max(m), sink);
+    float z = 0.0f;
+    for (int j = int(lane); j < S; j += 32) {
+        const int dist = qp - (k0 + j);
+        float e = 0.0f;
+        if (dist >= 0 && k0 + j >= 0 && (WINDOW == 0 || dist < WINDOW))
+            e = metal::precise::exp(sc[j] * scale + (dist < R ? float(bs[dist]) : 0.0f) - m);
+        shares[size_t(id) * S + j] = O(e);
+        z += e;
+    }
+    z = simd_sum(z) + metal::precise::exp(sink - m);  // (the sink takes weight and has no value)
+    if (lane == 0) sums[id] = z;
+"""
+
+
+def soft(scores, bias, sinks, q0, k0, scale: float, window_size: int, dtype):
+    """Attention's weights from its scores, for the reference's passes over several tokens (ink.attend): of scores
+    (B, kv_heads, G, L, S) in float32, each query's first at position ``q0`` and the keys consecutive from ``k0``
+    (numbers, or a row's each; a key before 0 is padding), with the bias by distance (B, L, heads, R) and the sink
+    logits (B, L, heads): each key's share, exp(logit - the row's largest), in ``dtype``, and the rows' sums with
+    the sink's share, (B, kv_heads, G, L, 1) in float32. One pass over the scores: MLX's take_along_axis, two
+    wheres, a concatenate, a softmax and a slice are six arrays of the scores' size (most of 163 ms of a 256-token
+    chunk's 960; 0.64 ms a token)."""
+    B, Hkv, G, L, S = scores.shape
+    pos = mx.stack([mx.broadcast_to(mx.array(q0), (B,)), mx.broadcast_to(mx.array(k0), (B,))], axis=-1).astype(mx.int32)
+    shares, sums = _kernel("soft", ["scores", "bias", "sinks", "pos", "prm"], ["shares", "sums"], _SOFT_SRC)(
+        inputs=[scores, bias, sinks, pos, _f(scale)],
+        template=[("T", bias.dtype), ("O", dtype), ("HQ", Hkv * G), ("R", bias.shape[-1]), ("WINDOW", window_size)],
+        grid=(32, B * Hkv * G * L, 1), threadgroup=(32, 1, 1),
+        output_shapes=[scores.shape, (B, Hkv, G, L, 1)], output_dtypes=[dtype, mx.float32])
+    return shares, sums
+
+
 def route(x, weight, bias, k: int, route_scale: float):
     """The router: of each row (M, D) the ``k`` experts with the highest sigmoid score plus bias, uint32, and
     their weights (the scores, normalized to sum to ``route_scale``)."""
@@ -616,6 +666,23 @@ def combine(ys, weights, state, taps, resid, seq: bool = False):
     return _kernel("combine", ["ys", "weights", "state", "taps", "resid"], ["out", "new_state"], _COMBINE_SRC)(
         inputs=[ys, weights, state, taps, resid], template=[("T", T), ("K", K), ("D", D), ("SEQ", seq)], grid=(D, M, 1),
         threadgroup=(min(256, D), 1, 1), output_shapes=[(M, D), (M, 3, D)], output_dtypes=[T, _F32])
+
+
+ONCE_MAX = 32  # rows whose experts are read once (inkling_experts.xmm: 16 rows 77 ms against MLX's 115; 64 rows 280 against 269)
+
+
+def _read_once(E) -> bool:
+    """Whether the experts are of the kind ``inkling_experts.xmm`` reads: NVFP4 with a scale an expert, the release's
+    (and a build's for every layer; MXFP8 ones, and experts not quantized, stay MLX's). ``LOCALS_INKLING_XMM=0``:
+    MLX's gather for all."""
+    ok = getattr(E, "_ink_read_once", None)
+    if ok is None:
+        ok = os.environ.get("LOCALS_INKLING_XMM", "1") != "0"
+        for lin in (E.gate_up_proj, E.down_proj):
+            ok = ok and (getattr(lin, "mode", None) == "nvfp4" and lin.bits == 4 and lin.group_size == 16 and "global_scale" in lin
+                         and lin.weight.shape[1] % 8 == 0 and lin.weight.shape[2] % 2 == 0 and "bias" not in lin)
+        object.__setattr__(E, "_ink_read_once", ok)
+    return ok
 
 
 class _Consts:
@@ -687,7 +754,8 @@ class FusedText(ink.TextModel):
             return 0
         if L != 1 and (B != 1 or L > SEQ_MAX):
             return 0
-        for kv, conv in zip(cache[0::2], cache[1::2]):
+        own = 2 * len(self.visits)  # (the draft model's caches come after)
+        for kv, conv in zip(cache[0:own:2], cache[1:own:2]):
             if not isinstance(kv, _KV) or not isinstance(conv, ArraysCache) or conv.lengths is not None:
                 return 0
         first = cache[1]
@@ -710,9 +778,15 @@ class FusedText(ink.TextModel):
         seq = mode == 2
         x = h[0] if seq else h[:, 0]  # (rows: a text's tokens, or a token of each text)
 
+        taps = getattr(self, "taps", None)  # (the draft model reads what enters some visits)
+        got, visit = {}, [0]
+
         def run(first, layers, x, blocks, bank=None):
             for i, layer in enumerate(layers):
                 messages = None if bank is None else mix(bank[1], bank[0], self.message_input.query[i])[0]
+                if taps is not None and visit[0] in taps.visits:
+                    got[visit[0]] = x
+                visit[0] += 1
                 x, blocks = self._visit(layer, consts[first + i], x, blocks, next(caches), next(caches), messages, seq)
             return x, blocks
 
@@ -725,8 +799,11 @@ class FusedText(ink.TextModel):
                 x, blocks = start
             x, blocks = run(core.start, self.layers[core.start : core.stop], x, blocks, bank)
         x, blocks = run(core.stop, self.layers[core.stop :], x, blocks)
-        return mix(x, blocks, self.final_input.query.reshape(1, -1), norm_w=self.norm.weight.reshape(1, -1), eps=self.norm.eps,
-                   shape=h.shape)[0]
+        out = mix(x, blocks, self.final_input.query.reshape(1, -1), norm_w=self.norm.weight.reshape(1, -1), eps=self.norm.eps,
+                  shape=h.shape)[0]
+        if taps is not None:
+            taps.leave([got[v].reshape(h.shape).astype(h.dtype) for v in taps.visits[:-1]] + [out], cache, 2 * visit[0])
+        return out
 
     def _visit(self, layer, c: _Consts, x, blocks, kv, conv, messages, seq: bool = False):
         """One visit of the rows ``x`` (M, D), a token of each text or (``seq``) one text's consecutive tokens: the
@@ -794,7 +871,13 @@ class FusedText(ink.TextModel):
                                    gates=c.mlp_gates if gated else None, moff=3, shape=(M, 1, 1, D), seq=seq)
         E = layer.mlp.experts
         inds, weights = route(mlp_in, c.router_w, c.router_b, layer.mlp.gate.top_k, layer.mlp.gate.route_scale)
-        if inds.size >= 64:  # by expert, as mlx-lm: MLX then reads an expert once for its tokens
+        if _read_once(E) and M <= ONCE_MAX:
+            # each expert read once for the rows routed to it (locals/inkling_experts.py): MLX's gather reads it
+            # again for every row, 8 ms a row over the 48 visits whatever the rows share
+            table = once.slots(inds, E.gate_up_proj.weight.shape[0], 1 if M == 1 else 2)
+            hidden = once.xmm(E.gate_up_proj, mlp_in.reshape(M, D), table, inds.size, inds.shape[-1], False, (E.gate_softcap, E.up_softcap))
+            ys = once.xmm(E.down_proj, hidden, table, inds.size, inds.shape[-1], True)
+        elif inds.size >= 64:  # by expert, as mlx-lm: MLX then reads an expert once for its tokens
             xs, by, back = _gather_sort(mlp_in, inds)
             hidden = act(E.gate_up_proj(xs, by, sorted_indices=True), E.gate_softcap, E.up_softcap)
             ys = _scatter_unsort(E.down_proj(hidden, by, sorted_indices=True), back, inds.shape)
@@ -821,7 +904,7 @@ def _log(v: float) -> float:
     return math.log(v) if v > 0 else float("-inf")
 
 
-PREFILL_CHUNK = 256  # tokens of a prompt read in one pass (see fuse)
+PREFILL_CHUNK = 512  # tokens of a prompt read in one pass (see fuse)
 
 
 def fuse(model) -> int:
@@ -830,15 +913,22 @@ def fuse(model) -> int:
     if not isinstance(text, ink.TextModel) or isinstance(text, FusedText):
         return 0
     text.__class__ = FusedText
-    # A prompt in chunks of 256: 265 to 290 tokens/s on an M4 Pro, against 180 to 190 in chunks of 64 (MLX's expert
-    # kernel fills its tiles from about 5 tokens an expert; 64 tokens are 4), 230 to 250 at 128, and 310 falling to
-    # 186 once the window is full at 512 (the engine's own choice was 1024). The chunk's attention is bounded by the
-    # model (MAX_SCORES), so it does not halve as the context grows.
+    for layer in text.layers:  # (the reference's passes over a prompt's chunks: attention's weights in one kernel)
+        layer.self_attn.soft = soft
+    # A prompt in chunks of 512: 322 tokens/s on an M4 Pro once the window is full, against 246 in chunks of 128 and
+    # 294 at 256 (a chunk reads every expert of a layer once, 180 ms of a chunk whatever its length, and MLX's expert
+    # kernel fills its tiles from about 5 tokens an expert), 333 at 768 and 338 at 1,024, whose passes hold 1.5 and
+    # 1.8 GB where 512 hold 1.0. Attention keeps up with the chunk: a sliding layer scores a block of queries
+    # against the keys it sees (ink.QUERY_BLOCK) and the weights come from one kernel (soft); before, chunks of 256
+    # read 272 tokens/s and longer ones no more. The chunk's attention is bounded by the model (MAX_SCORES), so it
+    # does not halve as the context grows.
     object.__setattr__(model, "prefill_chunk_tokens", PREFILL_CHUNK)
     object.__setattr__(model, "prefill_scores", None)
-    # A pass over n tokens of one text takes about 20 + 12 n ms where a step takes 30 (each token reads its own
-    # experts; attention's weights and the output layer are read once): a drafted token costs 0.4 of a step.
-    object.__setattr__(model, "draft_token_cost", 0.4)
+    # A pass over n tokens of one text takes about 25 + 6 n ms where a step takes 28 (attention's weights and the
+    # output layer are read once, and so is an expert, for the tokens that share it: 12 n with MLX's gather): a
+    # drafted token costs a quarter of a step, and a draft may be as long as a pass in kernels.
+    object.__setattr__(model, "draft_token_cost", 0.25)
+    object.__setattr__(model, "draft_max", SEQ_MAX - 1)
     # The server keeps a prompt's prefixes to start later requests from (the system part, the conversation before
     # the last message, where the reply starts) only from 1,024 tokens: shorter ones are cheaper to read again on
     # the models it was set for, at 750 tokens/s and more. At 270 a 1,000-token prompt is 4 s: `locals run`'s agents
@@ -848,6 +938,17 @@ def fuse(model) -> int:
     # over these 201,024 tokens, 3 s to make, next to 15.6 GB of weights on a 24 GB Mac. The walk kernel takes the
     # mask from the automaton each step instead (locals/walk.py; forced spans still go in one pass).
     object.__setattr__(model, "walk_constraints", True)
+    if "mtp" in model:  # the build's draft model (locals/inkling_draft.py); LOCALS_INKLING_DRAFT=0: as if it had none
+        import os
+
+        if os.environ.get("LOCALS_INKLING_DRAFT", "1") == "0":
+            text.taps = None
+            object.__setattr__(model, "draft_off", True)
+        else:
+            model.mtp.bind(model)
+            # (a draft costs a quarter of a step; its tokens are tried from this probability: hybrid_batch._model_draft_seen)
+            object.__setattr__(model, "draft_model_cost", float(os.environ.get("LOCALS_INKLING_DRAFT_COST", "0.25")))
+            object.__setattr__(model, "draft_min_p", float(os.environ.get("LOCALS_INKLING_DRAFT_P", "0.8")))
     return len(text.layers)
 
 
@@ -882,6 +983,11 @@ def rewind(cache, drop: int) -> None:
             else:
                 raise RuntimeError("a pass kept no convolution inputs to rewind to")
             c.ink_states = c.ink_windows = None
+        feats = getattr(c, "ink_feats", None)
+        if feats is not None:  # (the draft model's first cache: the pass's states, to the last token kept)
+            c.ink_feats = feats[:, : feats.shape[1] - drop]
+        if isinstance(c, ArraysCache):
+            pass
         elif isinstance(c, BatchRotatingKVCache):
             n = c.keys.shape[2] - drop
             c.keys, c.values = c.keys[..., :n, :], c.values[..., :n, :]

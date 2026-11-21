@@ -40,6 +40,8 @@ ROUTER_EPS = 1e-20
 # query-key pairs attention holds at once in a pass over several tokens: each is about 500 bytes here (24 heads,
 # float32 scores, their bias, mask and weights), so 2^21 of them is 1 GB whatever the context's length
 MAX_SCORES = 1 << 21
+QUERY_BLOCK = 256  # queries of a sliding layer's long chunk scored at once, over the keys they see (Attention._attend)
+EVAL_TOKENS = 128  # tokens of a pass from which each visit is evaluated on its own (TextModel.__call__)
 SHUT_OUT = -1e30  # the logit of a vocabulary id that is no token
 NVFP4_SCALE = 6.0 * 448.0  # the largest 4-bit value times the largest 8-bit scale
 
@@ -88,6 +90,7 @@ class ModelArgs(BaseModelArgs):
     text_config: Dict[str, Any]
     vision_config: Optional[Dict[str, Any]] = None
     image_token_id: int = 200054
+    draft_config: Optional[Dict[str, Any]] = None  # (a build with the draft model: locals.convert_inkling)
 
     def __post_init__(self):
         self.text = TextArgs.from_dict(self.text_config)
@@ -212,13 +215,22 @@ def _key_positions(cache: Any, num_keys: int, num_queries: int, end) -> mx.array
     return (end - num_keys)[:, None] + k if isinstance(end, mx.array) else k + (end - num_keys)
 
 
-def attend(q, k, v, bias, sinks, *, scale: float, window: int, q_pos, k_pos) -> mx.array:
+def attend(q, k, v, bias, sinks, *, scale: float, window: int, q_pos, k_pos, soft=None) -> mx.array:
     """Causal attention of (B, Hq, L, D) queries to (B, Hkv, S, D) keys and values at the given positions (a key
     at a negative position is padding). ``bias``: (B, L, Hq, R), added by distance where it is below R.
-    ``sinks``: (B, L, Hq), a logit of each row that takes weight and has no value. (B, L, Hq, D)."""
+    ``sinks``: (B, L, Hq), a logit of each row that takes weight and has no value. (B, L, Hq, D).
+
+    ``soft``, where the keys' positions are consecutive: a function from the scores to each key's share before it is
+    divided by the row's sum, and the sums (locals/inkling.py: the bias, the mask and the softmax in one pass over
+    the scores, where they are six arrays of the scores' size here)."""
     B, Hq, L, D = q.shape
     Hkv, S = k.shape[1], k.shape[2]
     R = bias.shape[-1]
+    if soft is not None:
+        scores = q.astype(mx.float32).reshape(B, Hkv, -1, L, D) @ k.astype(mx.float32)[:, :, None].swapaxes(-1, -2)
+        shares, sums = soft(scores, bias, sinks, q_pos[..., 0], k_pos[..., 0], scale, window, v.dtype)
+        out = ((shares @ v[:, :, None]).astype(mx.float32) / sums).astype(v.dtype)
+        return out.reshape(B, Hq, L, D).transpose(0, 2, 1, 3)
     dist = q_pos[..., :, None] - k_pos[..., None, :]
     visible = (dist >= 0) & (k_pos[..., None, :] >= 0)
     if window:
@@ -238,6 +250,8 @@ def attend(q, k, v, bias, sinks, *, scale: float, window: int, q_pos, k_pos) -> 
 class Attention(nn.Module):
     """``sliding``: over the last ``sliding_window_size`` tokens, with plain short convolutions on keys and values.
     Otherwise over everything, with dynamic ones and queries scaled by the log of the position."""
+
+    soft = None  # attention weights from scores in one kernel (set by locals/inkling.py: see attend)
 
     def __init__(self, args: TextArgs, sliding: bool):
         super().__init__()
@@ -321,10 +335,22 @@ class Attention(nn.Module):
                                                        sinks=sinks[0, 0].astype(q.dtype))
             return out.transpose(0, 2, 1, 3)
         step = max(1, MAX_SCORES // S)  # (a chunk of a prompt over a long context: a few queries at a time)
+        soft = self.soft if L > 1 else None  # (a one-token step's window is written round and round: not in order)
+        if self.window and L > QUERY_BLOCK and not isinstance(end, mx.array):
+            # A sliding layer's long chunk, a block of queries at a time over the keys that block sees: the window
+            # before its first query, to its last. All at once, each query was scored against every key the chunk
+            # holds, the window and the chunk (1.21 ms a token in chunks of 1,024 where 256 took 0.64).
+            outs = []
+            for a in range(0, L, QUERY_BLOCK):
+                n = min(QUERY_BLOCK, L - a)
+                lo, hi = max(0, S - L + a - (self.window - 1)), S - L + a + n
+                outs.append(attend(q[:, :, a : a + n], k[:, :, lo:hi], v[:, :, lo:hi], bias[:, a : a + n], sinks[:, a : a + n],
+                                   scale=self.scale, window=self.window, q_pos=q_pos[a : a + n], k_pos=k_pos[lo:hi], soft=soft))
+            return mx.concatenate(outs, axis=1)
         if L <= step:
-            return attend(q, k, v, bias, sinks, scale=self.scale, window=self.window, q_pos=q_pos, k_pos=k_pos)
+            return attend(q, k, v, bias, sinks, scale=self.scale, window=self.window, q_pos=q_pos, k_pos=k_pos, soft=soft)
         return mx.concatenate([attend(q[:, :, a : a + step], k, v, bias[:, a : a + step], sinks[:, a : a + step], scale=self.scale,
-                                      window=self.window, q_pos=q_pos[..., a : a + step], k_pos=k_pos)
+                                      window=self.window, q_pos=q_pos[..., a : a + step], k_pos=k_pos, soft=soft)
                                for a in range(0, L, step)], axis=1)
 
 
@@ -521,12 +547,25 @@ class TextModel(nn.Module):
         caches = iter(cache if cache is not None else [None] * (2 * len(self.visits)))
         conv_mask = cache[1].make_mask(h.shape[1]) if cache is not None else None  # (padding, in a batch of texts)
 
+        taps = getattr(self, "taps", None)  # (the draft model reads what enters some visits: locals/inkling_draft.py)
+        got, visit = {}, [0]
+
         def run(layers, h, blocks, bank=None):
             for i, layer in enumerate(layers):
                 messages = None if bank is None else depth_attention(*bank, self.message_input.query[i])
-                h, blocks = layer(h, blocks, next(caches), next(caches), conv_mask, messages)
+                if taps is not None and visit[0] in taps.visits:
+                    got[visit[0]] = h
+                visit[0] += 1
+                kv, conv = next(caches), next(caches)
+                h, blocks = layer(h, blocks, kv, conv, conv_mask, messages)
+                if long:  # (with what the visit left in its caches: a convolution's kept inputs hold its whole window)
+                    mx.eval(h, blocks, kv.state, conv.state)
             return h, blocks
 
+        # A prompt's chunk, a visit at a time: evaluated whole, the arrays of several visits are held at once, 1.14 GB
+        # for 256 tokens and 1.97 GB for 512 next to 16 GB of weights on a 24 GB Mac; 0.50 and 0.99 GB so, for 1.5%
+        # of the chunk's time
+        long = cache is not None and h.shape[0] * h.shape[1] >= EVAL_TOKENS
         start = run(self.layers[: core.start], h, None)
         h, blocks = start
         for loop_pass in range(self.args.loop_passes if len(core) else 0):
@@ -539,7 +578,24 @@ class TextModel(nn.Module):
             h, blocks = run(self.layers[core.start : core.stop], h, blocks, bank)
         h, blocks = run(self.layers[core.stop :], h, blocks)
         h = self.final_input(blocks, rms(h.astype(mx.float32)))[..., 0, :]
-        return self.norm(h).astype(dtype)
+        out = self.norm(h).astype(dtype)
+        if taps is not None:
+            got[visit[0]] = out
+            taps.leave([got[v] for v in taps.visits], cache, 2 * visit[0])
+        return out
+
+
+class Taps:
+    """What a pass leaves for the draft model: the stream entering ``visits`` (the count of visits: the output)."""
+
+    def __init__(self, visits, drafter=None):
+        self.visits, self.states, self.drafter = list(visits), None, drafter
+
+    def leave(self, states, cache, own: int) -> None:
+        """A pass's states (each (rows, tokens, hidden)) into the draft model's caches, the entries after ``own``."""
+        self.states = states
+        if self.drafter is not None and cache is not None and len(cache) > own:
+            self.drafter.absorb(mx.stack(states, axis=2), cache[own:])
 
 
 class _Embedding:
@@ -643,6 +699,12 @@ class Model(nn.Module):
         self.model_type = args.model_type
         self.model = Inkling2Model(args)
         self.lm_head = nn.Linear(args.text.hidden_size, args.text.vocab_size, bias=False)
+        if args.draft_config:
+            from ..inkling_draft import Drafter
+
+            t = args.text
+            self.mtp = Drafter(args.draft_config, t.vocab_size, t.unpadded_vocab_size or t.vocab_size, t.final_logit_softcapping or 0.0)
+            self.model.language_model.taps = Taps(self.mtp.visits, self.mtp)
 
     def __call__(self, inputs: mx.array, cache: Optional[List[Any]] = None,
                  input_embeddings: Optional[mx.array] = None) -> mx.array:
@@ -715,5 +777,7 @@ class Model(nn.Module):
         the last inputs of its four short convolutions. (ml-explore/mlx-lm#2086 pairs them in a CacheList; flat,
         every entry is of a kind Locals's batches already merge, pad and trim.)"""
         window = self.args.text.sliding_window_size
-        return [c for layer in self.model.language_model.visits
-                for c in (RotatingKVCache(max_size=window) if layer.sliding else KVCache(), ArraysCache(4))]
+        own = [c for layer in self.model.language_model.visits
+               for c in (RotatingKVCache(max_size=window) if layer.sliding else KVCache(), ArraysCache(4))]
+        # (then the draft model's three, where the build has it: what its attention reads of the text so far)
+        return own + (self.mtp.make_cache() if "mtp" in self and not getattr(self, "draft_off", False) else [])

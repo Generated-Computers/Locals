@@ -2,6 +2,30 @@
 
 ## 0.2.3 (unreleased)
 
+- An agent on Inkling 2 Mini reads each prompt token once. Three things had tokens read again:
+  - Typed tool calls wrote a call's arguments in the schema's order. The model's template writes an earlier turn's
+    sorted by name (`dictsort`), and the model, left to itself, writes them sorted too (`content` before `path`): a
+    finished reply was not what the next request held in its place, and every step of an agent read its step before
+    again. `formats.Inkling.typed_call` sorts them.
+  - Clients send a turn with calls back without its reasoning, and the template writes an earlier turn's. The
+    server writes such a turn from the reply it kept (`formats.Inkling.restore`: the reasoning, the text to the
+    character, the arguments in the reply's own nesting) as long as the client's calls are the reply's.
+  - Requests asked at once with one prompt, as the versions `locals run` makes of a part, each read it. The engine
+    reads once to where a waiting request's prompt parts from this one's and keeps that for it (the two longest such
+    prefixes, from 64 tokens on), and a "user" checkpoint within 32 tokens of the prefix a request was found is not
+    copied again.
+
+  `locals run`'s two-file task (4 slots, 2 versions, an M4 Pro): 4,755 prompt tokens read where the server's cache
+  had none became 1,100 to 1,600 (21 s of reading became 6 to 8), and the task 34 to 40 s from 49 to 50.
+- Inkling 2 Mini reads prompts faster. A prompt chunk's attention weights come from one kernel (`inkling.soft`: the
+  bias by distance, the mask and the softmax with its sink in one pass over the scores, six arrays of the scores'
+  size as MLX operations); a sliding layer scores a block of queries against the keys that block sees
+  (`inkling2_loop.QUERY_BLOCK`) where it scored every query against the window and the whole chunk; a pass of 128
+  tokens or more is evaluated a visit at a time (`EVAL_TOKENS`: a 256-token chunk held 1.14 GB of arrays at once and
+  holds 0.50, one of 512 holds 0.99 where it held 1.97); and chunks are 512 tokens (`inkling.PREFILL_CHUNK`, 256
+  before). Time to the first token with nothing cached, an M4 Pro: 1,471 tokens 5.35 to 4.66 s, 3,471 tokens 13.2
+  to 11.2 s, 6,997 tokens 28.1 to 23.3 s (249 to 301 tokens/s). Tried and left out: the step's attention kernel for
+  a chunk's sliding layers (a threadgroup of 1,024 threads a query: 1,096 ms a 256-token chunk against 959).
 - Locals needs mlx-lm 0.32.2 or later: Inkling 2's build keeps its experts in NVFP4 with a scale per expert, which
   mlx-lm 0.32.0 could not load. The README says how to install it and make its build.
 - Thinking Machines' Inkling 2 Mini (`thinkingmachines/Inkling-2-Mini`, a looped mixture of experts: 24 layers of
@@ -34,12 +58,42 @@
   are 900 to 1,100 tokens, start each step from the last one: a two-file task with four agents went from 63 s to 43.
   After the first token a request with tools runs at 38 to 46 tokens/s; a tool set's grammar takes 4 to 5 s the first
   time (its token table is 1.2 to 1.8 GB over 201,024 tokens, and the cache of compiled grammars holds one).
+- Inkling 2 Mini's experts are read once for the rows that share them (`locals/inkling_experts.py`, for up to 32
+  rows of a step or a pass). MLX's `gather_qmm` runs one matrix-vector product a (token, expert) pair, and at 4 bits
+  that is bound by the arithmetic of unpacking a weight (8 operations a weight, 6 of them the unpacking), so an
+  expert costs the same for every token routed to it. `slots` groups a pass's pairs by expert on the GPU and `xmm`
+  unpacks each weight word once for two tokens' dot products, with the softcapped SwiGLU applied as the gate/up
+  product is written (MLX's bits). Consecutive tokens of a text share experts (4 use 19 of their 32, 8 use 29 of
+  64) and so do different requests' rows: the experts of an 8-token pass 59 to 41 ms, of a 4-token pass 33.5 to
+  23.7, of one token 10.3 to 9.7; a pass of n tokens of one text about 25 + 6 n ms (it was 20 + 12 n), in kernels
+  up to 32 tokens (`inkling.SEQ_MAX`, 16 before). Requests at once on an M4 Pro: four 71.6 to 79.4 tokens/s, eight
+  79.5 to 94.6. `LOCALS_INKLING_XMM=0` is MLX's gather.
+- Lookup drafts on a model whose drafted tokens cost (Inkling 2): as long as the recent drafts that got that far kept
+  their i-th token more often than it costs, past that twice the longest one kept whole (2, 4, 8 ... 31 tokens over a
+  long copy), under grammars too (they were off there). Where a request has lookup drafts and the draft model, it
+  takes the one whose recent tries gained more steps (`hybrid_batch._draft_gain`) and tries the other one time in 16.
+  After the first token, on an M4 Pro, with both: a file written through a tool 75.6 tokens/s (36.9 without drafts,
+  17 on stock MLX), a new file through a tool 59.6 (37.4), a plain reply that copies from its prompt 56.4 (48.8),
+  an edit through a tool 50 to 53 (46), code 40.3 (37.6), prose 36.0 (37.4).
+- Inkling 2 Mini's draft model (the release's `mtp.safetensors`, "DSpark": three layers that draft up to 7 tokens in
+  one small pass) for a request alone: `locals/inkling_draft.py`, a part of the build (`python -m
+  locals.convert_inkling --draft-only` adds its 0.64 GB to a build already made; `LOCALS_INKLING_DRAFT=0` runs without
+  it). Its context is what the target's stream held entering three visits and at its output, for every token read:
+  the target's passes put that into three caches after its own, so prompt caches, checkpoints and rewinds carry them
+  (with the whole prompt in its context the target keeps 6.2 of its 7 tokens of a tool call that writes a file, 2.8
+  with the reply alone). The engine tries its tokens as far as it is sure of them (probability over 0.8), under the
+  request's grammar, in the pass that verifies lookup drafts, and sets it aside for a while when its tries lose
+  (`hybrid_batch._model_draft_seen`). On an M4 Pro, after the first token: a file written through a tool 36.9 to
+  63.5 tokens/s (479 of 498 drafted tokens kept), a new file through a tool 37.4 to 51.4, code in a plain reply 37.6
+  to 39.1; prose 37.4 to 35.9 (its drafts seldom pay, and a step now also feeds the draft caches). Requests at once
+  are as before (four: 72.8 and 73.4 tokens/s): drafts are for a request alone. A request's usage says what the draft
+  model did (`locals.drafts.model`: kept, drafted, passes, tries, unsure, pauses).
 - Inkling 2 Mini's grammars are walked (`walk_constraints`, a model's own choice of the server's `--walk`;
   `LOCALS_WALK=0` for the tables): the mask comes from the automaton each step, so a set of tools costs no token
   table (1.3 GB on the host and 0.4 on the GPU before), and its automaton is made in a thread of its own, not in the
   batch loop. A walked grammar's forced spans still go in one pass for a request alone (`hybrid_batch._solo_ok`,
   Inkling only), and its tool calls are typed without `--typed-tools` (`formats.Inkling.typed_call`;
-  `LOCALS_TYPED_TOOLS=0` for any JSON object): the tool's parameters in the schema's order, the required ones
+  `LOCALS_TYPED_TOOLS=0` for any JSON object): the tool's parameters sorted by name, the required ones
   there, each value of its type, the JSON's name the header's. The first request with a set of tools answers after
   2.0 s where it took 6.6 (733-token prompt, M4 Pro), a call of 75 tokens has 25 forced where it had 18, and
   requests with tools run at 45 to 52 tokens/s after the first token (38 to 46). `locals run`'s two-file task with

@@ -658,10 +658,15 @@ class Inkling(ToolFormat):
     typed_default = True  # typed calls without the server's --typed-tools
 
     def typed_call(self, specs: List[dict]) -> str:
-        """One call of one of ``specs`` with its arguments fixed: the tool's parameters in the schema's order, the
+        """One call of one of ``specs`` with its arguments fixed: the tool's parameters sorted by name, the
         required ones present, each value of its type, and the name in the JSON the header's. Everything from the
         name to the first value, and from one value to the next, is forced text then: fed in one pass with the token
-        before it (12 ms a token where a sampled one is 30), and a call cannot name a parameter the tool has not."""
+        before it (12 ms a token where a sampled one is 30), and a call cannot name a parameter the tool has not.
+
+        Sorted, because the model's template writes an earlier turn's arguments so (``dictsort``), and the model,
+        left to itself, writes them so too (``content`` before ``path``). In the schema's order a reply was not what
+        the next request held in its place: the agent's whole step was read again, where the finished row's state
+        was there to go on from."""
         from .oai import param_schemas, tool_specs
 
         out = []
@@ -671,7 +676,7 @@ class Inkling(ToolFormat):
             req = fn["parameters"].get("required") if isinstance(fn.get("parameters"), dict) else None
             required = {r for r in req if isinstance(r, str)} if isinstance(req, list) else set()
             pieces = [(re.escape(json.dumps(p, ensure_ascii=False)) + ":" + _ink_value(sc), p in required)
-                      for p, sc in params.items()]
+                      for p, sc in sorted(params.items())]
             args = r"\{" + _ink_members(pieces, 0, False) + r"\}" if pieces else json_args_regex("")
             name = re.escape(fn["name"])
             out.append(re.escape(_INK_MSG) + name + re.escape("<|content_invoke_tool_json|>") + r'\{"name":"' + name
@@ -680,6 +685,42 @@ class Inkling(ToolFormat):
 
     def calls(self, call: str, many: bool, at_least_one: bool) -> str:
         return call + ("(" + call + ")*" if self.multi and many else "")
+
+    restores = True  # (the server hands restore() a turn with calls and the reply it parsed them from)
+
+    def restore(self, msg: dict, raw: str) -> dict:
+        """An assistant turn a client sent back, as the reply it came from was written: with its reasoning, which
+        clients drop (the template writes an earlier turn's), its text to the character, and the calls' arguments in
+        the reply's own nesting. The turn then renders to the reply's text, and the request goes on from the finished
+        row. The client's turn as it is where its calls are no longer the reply's."""
+        i, thought, text = 0, None, None
+        if raw.startswith(self.think_open):
+            j = raw.find(_INK_END, len(self.think_open))
+            if j < 0:
+                return msg
+            thought, i = raw[len(self.think_open):j], j + len(_INK_END)
+        if raw.startswith(self.text_open, i):
+            j = raw.find(_INK_END, i + len(self.text_open))
+            if j < 0:
+                return msg
+            text, i = raw[i + len(self.text_open):j], j + len(_INK_END)
+        calls = self.parse_calls(raw[i:])
+        sent = [(c.get("function") or {}).get("name") for c in msg.get("tool_calls") or []]
+        args = [(c.get("function") or {}).get("arguments") for c in msg.get("tool_calls") or []]
+        if not calls or [n for n, _ in calls] != sent or [a for _, a in calls] != args:
+            return msg
+        if (msg.get("content") or "").strip() != (text or "").strip():
+            return msg
+        given = msg.get("reasoning_content")
+        if isinstance(given, str) and given.strip() and given.strip() != (thought or "").strip():
+            return msg
+        out = {**msg, "content": text or "",
+               "tool_calls": [{**c, "function": {**(c.get("function") or {}), "arguments": a}}
+                              for c, (_, a) in zip(msg["tool_calls"], calls)]}
+        out.pop("reasoning_content", None)
+        if thought:
+            out["reasoning_content"] = thought
+        return out
 
     def reply_regex(self, names, tool_choice="auto", thinking=False, preamble=True, parallel=True, call=None, specs=None):
         if not names:
