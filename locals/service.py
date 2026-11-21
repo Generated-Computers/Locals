@@ -256,7 +256,10 @@ class BatchService:
                   checkpoints=list(checkpoints or []), temp=temp, ignore_eos=ignore_eos, top_p=top_p, top_k=top_k,
                   seed=seed, internal=tuple(internal) if internal is not None else ("calc",), computer=computer)
         rt = getattr(self, "_rt", None)
-        if rt is not None and not self.walk and (schema is not None or regex is not None):
+        if rt is not None and self.walk and (schema is not None or regex is not None):
+            # (the automaton too: 1.3 s for a set of tools on Inkling 2, with every running reply stopped)
+            threading.Thread(target=self._walk_then_queue, args=(rt, job), name="locals-compile", daemon=True).start()
+        elif rt is not None and (schema is not None or regex is not None):
             # its grammar is made in a thread of its own, and the job queued once it is: made in the batch loop, a
             # JSON schema with maxItems 50 (1302 states) stopped every running reply for 8 s (31 s on a 16 GB Mac
             # next to the model)
@@ -264,6 +267,20 @@ class BatchService:
         else:
             self._q.put(job)
         return job
+
+    def _walk_then_queue(self, rt, job: "Job") -> None:
+        """The job's automaton made (the runtime keeps it by its regex: the batch loop finds it), then the job queued."""
+        try:
+            with self._compile_lock:
+                if not job.cancelled:
+                    rt.compile_walk(job.schema) if job.regex is None else rt.compile_walk(regex=job.regex)
+        except Exception:  # noqa: BLE001  # (the batch loop makes it again: this request's error)
+            pass
+        finally:
+            if self._closed:
+                self._finish(job, [], "error: the server is shutting down")
+            else:
+                self._q.put(job)
 
     def _compile_then_queue(self, rt, job: "Job") -> None:
         """The job's grammar made (or found made, or refused) for it to carry into the batch loop, then the job
@@ -449,6 +466,8 @@ class BatchService:
             self.qwenputer_tools = calc.chip.tools
         rt = Runtime.load(QP.BASE if calc else self.model_id, tune=os.environ.get("LOCALS_TUNE", "background"))
         self._rt = rt
+        if getattr(rt.model, "walk_constraints", False) and os.environ.get("LOCALS_WALK", "1") != "0":
+            self.walk = True  # (a model whose token tables would not fit beside it: Inkling 2, locals/inkling.py)
         store = getattr(rt.model, "expert_store", None)
         if store is not None:  # (experts read from the files as tokens need them: their GPU slots are made now, so
             store.reserve(getattr(mx, rt.dtype))  # the memory plan below counts them; made on first use, they were not)

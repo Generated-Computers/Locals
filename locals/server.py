@@ -424,6 +424,8 @@ class Server:
                     except Exception:  # noqa: BLE001  # (a schema it cannot read: the client's calls go unchecked)
                         pass
         think_kw = {} if style == "none" else {"enable_thinking": thinking}
+        if style == "effort":  # Inkling 2: thinking off is the least effort (it may still think a line), on its default
+            think_kw = {} if thinking else {"reasoning_effort": "none"}
         if thinking and "preserve_thinking" in formats.chat_template(tok):
             # earlier replies keep their reasoning, as the model wrote it: LFM3's template drops it from every reply
             # before the newest user message, and Claude Code's tool results come with text of their own (a user
@@ -729,6 +731,8 @@ class Server:
 
             model = getattr(getattr(self.service(engine), "_eng", None), "model", None)
             self._ckpt[engine] = model is None or any(type(c) is not KVCache for c in make_prompt_cache(model))
+            # a model that reads prompts slowly keeps shorter prefixes too (Inkling 2: locals/inkling.py)
+            self._ckpt_least = {**getattr(self, "_ckpt_least", {}), engine: getattr(model, "checkpoint_tokens", None)}
         return self._ckpt[engine]
 
     _SESSION_MARKERS = ("<env>", "Working directory:", "Current Working Directory", "Current working directory",
@@ -836,6 +840,9 @@ class Server:
         # a short prefix is cheaper to prefill again; on Qwenputer, whose questions are short and asked many at a
         # time, the calc tool's 360 tokens are most of each prompt
         chars, least = (256, 64) if self.qwenputer else (2048, 1024)
+        own = getattr(self, "_ckpt_least", {}).get("locals")
+        if own:
+            chars, least = min(chars, 2 * own), min(least, own)
         for t, kind in cands:
             if len(t) < chars or not text.startswith(t):
                 continue
@@ -922,9 +929,13 @@ class Server:
                  "prompt_tokens_details": {"cached_tokens": job.cached},
                  "locals": {"engine": p["engine"], "forced_tokens": getattr(r, "forced", 0) or 0, "passes": getattr(r, "passes", 0) or 0,
                            "constrained": p["regex"] is not None or p["schema"] is not None, "wall_s": time.perf_counter() - t0}}
+        drafted = getattr(r, "drafted", None)  # (one request alone: tokens kept of those drafted, and the passes)
+        if drafted:
+            usage["locals"]["drafts"] = {"kept": drafted[0], "drafted": drafted[1], "passes": drafted[2]}
         self.log(f"[{p['engine']}] prompt {len(p['prompt'])} ({job.cached} cached)  out {out_tokens} tok"
                  f"{'  forced ' + str(getattr(r, 'forced', 0)) if getattr(r, 'forced', 0) else ''}  {out_tokens / dt:.0f} tok/s"
-                 f"  {calls} call(s)  finish={job.finish}" + (f"  stopped={stopped}" if stopped else ""))
+                 f"  {calls} call(s)  finish={job.finish}" + (f"  stopped={stopped}" if stopped else "")
+                 + (f"  drafts {drafted[0]}/{drafted[1]} in {drafted[2]} passes" if drafted else ""))
         return usage
 
     def _guard(self, toks: List[int], text: str, fmt=None, tools: bool = True, state=None) -> Optional[str]:
@@ -1011,6 +1022,8 @@ class Server:
                 reasoning, content, calls = oai.parse_reply(text, p["tools"], fmt=p["fmt"], thinking=_in_think(p))
                 if not p["tools"]:  # no tools offered: whatever the reply looks like, it is not a call
                     reasoning, content = oai.split_reasoning(text, p["fmt"], _in_think(p))
+                    if getattr(p["fmt"], "text_open", ""):  # (Inkling 2: the text is a message between markers)
+                        content = p["fmt"].split(content)[0]
                     content, calls = content.strip(), []
                 if calls and req.get("tool_choice") == "none":  # only the stock engine can write one here
                     reasoning, content = oai.split_reasoning(text, p["fmt"], _in_think(p))

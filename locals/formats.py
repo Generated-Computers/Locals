@@ -553,6 +553,181 @@ class FlintXML(ToolFormat):
         return text if len(calls) <= n else free + part[: calls[n - 1][2]]
 
 
+_INK_MSG = "<|message_model|>"
+_INK_END = "<|end_message|>"
+_INK_CALL = re.compile(r"<\|message_model\|>([^<]*)<\|content_invoke_tool_json\|>")
+
+
+def _ink_value(schema, depth: int = 0) -> str:
+    """A JSON value of the schema's type, compact: a string, a number, an enum's values, a list of its items' type;
+    any JSON value where the schema does not say (or says an object: its keys are the model's)."""
+    from .oai import _types
+
+    free = _json_value(3 - depth, "")
+    if not isinstance(schema, dict) or not schema:
+        return free
+    if isinstance(schema.get("enum"), list) and schema["enum"]:
+        return "(" + "|".join(re.escape(json.dumps(v, ensure_ascii=False, separators=(",", ":"))) for v in schema["enum"]) + ")"
+    types = _types(schema)
+    if not types or "object" in types:
+        return free
+    alts = []
+    if "string" in types:
+        alts.append(_JSTR)
+    if "number" in types:
+        alts.append(_JNUM)
+    elif "integer" in types:
+        alts.append(r"-?(0|[1-9][0-9]*)")
+    if "boolean" in types:
+        alts.append("(true|false)")
+    if "null" in types:
+        alts.append("null")
+    if "array" in types:
+        item = _ink_value(schema.get("items"), depth + 1) if depth < 2 else _json_value(0, "")
+        alts.append(r"\[(" + item + "(," + item + r")*)?\]")
+    if not alts:
+        return free
+    return alts[0] if len(alts) == 1 else "(" + "|".join(alts) + ")"
+
+
+def _ink_members(pieces, i: int, started: bool) -> str:
+    """The members of a JSON object from ``pieces[i:]`` ((its regex, whether it must be there) each), in their
+    order with commas between those present; ``started``: one is written already."""
+    if i == len(pieces):
+        return ""
+    rx, must = pieces[i]
+    if started:
+        return ("," + rx if must else "(," + rx + ")?") + _ink_members(pieces, i + 1, True)
+    if must:
+        return rx + _ink_members(pieces, i + 1, True)
+    return "(" + rx + _ink_members(pieces, i + 1, True) + "|" + _ink_members(pieces, i + 1, False) + ")"
+
+
+class Inkling(ToolFormat):
+    """Thinking Machines' Inkling 2: a reply is messages back to back, each ``<|message_model|>``, a content marker,
+    the body and ``<|end_message|>``: its reasoning (``<|content_thinking|>``, which the model opens itself, at any
+    effort), its text (``<|content_text|>``) and its calls (``<|message_model|>NAME<|content_invoke_tool_json|>
+    {"name":"NAME","args":{...}}``, compact JSON). Without this the reply's markers were its content."""
+
+    name = "inkling"
+    opener = _INK_END  # (of a reply's text: what ends the text message; calls, if any, follow it)
+    closer = _INK_END
+    args_key = "args"
+    think_open, think_close = _INK_MSG + "<|content_thinking|>", _INK_END
+    opens_thinking = True
+    text_open = _INK_MSG + "<|content_text|>"  # (ReplyStream: the reply's text starts after it)
+    bare_start = _INK_MSG  # a reply that goes straight to its calls
+    replay_raw = False  # (the template writes a turn's calls itself, from their parsed arguments)
+
+    def prepare(self, msgs, tools):
+        """The template takes a call's arguments as an object and raises on OpenAI's JSON string."""
+        out = []
+        for m in msgs:
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                calls = []
+                for c in m["tool_calls"]:
+                    fn = dict(c.get("function") or {})
+                    if isinstance(fn.get("arguments"), str):
+                        try:
+                            fn["arguments"] = json.loads(fn["arguments"] or "{}")
+                        except ValueError:
+                            fn["arguments"] = {}
+                    if not isinstance(fn.get("arguments"), dict):
+                        fn["arguments"] = {}
+                    calls.append({**c, "function": fn})
+                m = {**m, "tool_calls": calls}
+            out.append(m)
+        return out, (tools or None)
+
+    def thought_regex(self) -> str:
+        from .oai import not_containing
+
+        return "(" + re.escape(self.think_open) + not_containing(_INK_END, _INK_MSG) + re.escape(_INK_END) + ")?"
+
+    def free_text(self) -> str:
+        from .oai import not_containing
+
+        return re.escape(self.text_open) + not_containing(_INK_END, _INK_MSG) + re.escape(_INK_END)
+
+    def call(self, names: List[str]) -> str:
+        # (the name twice, header and JSON: the JSON's is the call's; one grammar of the arguments for all names)
+        return (re.escape(_INK_MSG) + _alts(names) + re.escape("<|content_invoke_tool_json|>") + r'\{"name":"' + _alts(names)
+                + '","args":' + json_args_regex("") + r"\}" + re.escape(_INK_END))
+
+    typed = True  # (oai.reply_regex hands it the tools' schemas)
+    typed_default = True  # typed calls without the server's --typed-tools
+
+    def typed_call(self, specs: List[dict]) -> str:
+        """One call of one of ``specs`` with its arguments fixed: the tool's parameters in the schema's order, the
+        required ones present, each value of its type, and the name in the JSON the header's. Everything from the
+        name to the first value, and from one value to the next, is forced text then: fed in one pass with the token
+        before it (12 ms a token where a sampled one is 30), and a call cannot name a parameter the tool has not."""
+        from .oai import param_schemas, tool_specs
+
+        out = []
+        for t in tool_specs(specs):
+            fn = t["function"]
+            params = param_schemas(fn.get("parameters"))
+            req = fn["parameters"].get("required") if isinstance(fn.get("parameters"), dict) else None
+            required = {r for r in req if isinstance(r, str)} if isinstance(req, list) else set()
+            pieces = [(re.escape(json.dumps(p, ensure_ascii=False)) + ":" + _ink_value(sc), p in required)
+                      for p, sc in params.items()]
+            args = r"\{" + _ink_members(pieces, 0, False) + r"\}" if pieces else json_args_regex("")
+            name = re.escape(fn["name"])
+            out.append(re.escape(_INK_MSG) + name + re.escape("<|content_invoke_tool_json|>") + r'\{"name":"' + name
+                       + '","args":' + args + r"\}" + re.escape(_INK_END))
+        return "(" + "|".join(out) + ")"
+
+    def calls(self, call: str, many: bool, at_least_one: bool) -> str:
+        return call + ("(" + call + ")*" if self.multi and many else "")
+
+    def reply_regex(self, names, tool_choice="auto", thinking=False, preamble=True, parallel=True, call=None, specs=None):
+        if not names:
+            return None
+        text = self.free_text()
+        if tool_choice == "none":
+            return self.thought_regex() + text
+        chosen = names
+        if isinstance(tool_choice, dict):
+            fn = (tool_choice.get("function") or {}).get("name") or tool_choice.get("name")
+            chosen = [fn] if fn in names else names
+        one = self.typed_call([t for t in specs if (t.get("function") or t).get("name") in chosen]) if specs else self.call(chosen)
+        calls = self.calls(one, many=parallel and not isinstance(tool_choice, dict), at_least_one=True)
+        if tool_choice == "required" or isinstance(tool_choice, dict):
+            return self.thought_regex() + ("(" + text + ")?" if preamble else "") + calls
+        return self.thought_regex() + "(" + text + "(" + calls + ")?|" + calls + ")"
+
+    def split(self, text: str) -> Tuple[str, str]:
+        """(the text messages' bodies, the calls) of a reply after its reasoning."""
+        m = _INK_CALL.search(text)
+        head, part = (text, "") if m is None else (text[: m.start()], text[m.start():])
+        return head.replace(self.text_open, "").replace(_INK_END, ""), part
+
+    def parse_calls(self, part: str) -> List[Tuple[str, dict]]:
+        out = []
+        for m in _INK_CALL.finditer(part):
+            obj, _ = _json_object_at(part, m.end())
+            if isinstance(obj, dict) and (obj.get("name") or m.group(1)):
+                out.append((str(obj.get("name") or m.group(1)), _args_of(obj, self.args_key)))
+        return out
+
+    def count_complete(self, text: str) -> int:
+        part = self.split(text)[1]
+        return sum(1 for m in _INK_CALL.finditer(part) if _INK_END in part[m.end():])
+
+    def cut_after(self, text: str, n: int) -> str:
+        m = _INK_CALL.search(text)
+        if m is None:
+            return text
+        i = m.start()
+        for _ in range(n):
+            j = text.find(_INK_END, i)
+            if j < 0:
+                return text
+            i = j + len(_INK_END)
+        return text[:i]
+
+
 class Llama3JSON(ToolFormat):
     """Llama 3.x: a call is the whole reply, ``{"name": ..., "parameters": {...}}``;
     the template accepts one call per assistant turn."""
@@ -1027,11 +1202,13 @@ class MistralLegacy(MistralV3):
 
 
 FORMATS = {f.name: f for f in (QwenXML(), Hermes(), Llama3JSON(), MistralV3(), MistralLegacy(), MistralV11(), Gemma4(), MiniCPMXML(),
-                                LFM2Python(), FlintXML(), Fallback())}
+                                LFM2Python(), FlintXML(), Inkling(), Fallback())}
 
 
 def detect_from_template(template: Optional[str]) -> ToolFormat:
     t = template or ""
+    if "<|content_invoke_tool_json|>" in t:
+        return FORMATS["inkling"]
     if "<function=" in t and "<parameter=" in t:
         return FORMATS["qwen_xml"]
     if '<function name="' in t and '<param name="' in t:
@@ -1094,7 +1271,7 @@ def offers_thinking(tokenizer) -> bool:
     block (Qwen3.5), or the template has a switch and the model writes the block
     (Qwen3). Qwen3-4B-Instruct-2507's template mentions <think> but has no switch."""
     style = thinking_style(tokenizer)
-    return style in ("open", "channel", "always") or (style == "model" and "enable_thinking" in chat_template(tokenizer))
+    return style in ("open", "channel", "always", "effort") or (style == "model" and "enable_thinking" in chat_template(tokenizer))
 
 
 def thinking_style(tokenizer) -> str:
@@ -1106,6 +1283,8 @@ def thinking_style(tokenizer) -> str:
     template has no thinking switch, 'always' if the generation prompt opens
     a <think> block with thinking off too (LFM2.5: the model always thinks)."""
     t = chat_template(tokenizer)
+    if "<|content_thinking|>" in t and "reasoning_effort" in t:
+        return "effort"  # Inkling 2: no switch but an effort, 0 to 0.99, and thoughts in a message of their own
     if "<|channel>" in t and "enable_thinking" in t:
         return "channel"  # Gemma 4: the switch adds <|think|> to the system turn; thoughts go in a channel
     if "enable_thinking" not in t and "<think>" not in t:

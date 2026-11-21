@@ -26,8 +26,10 @@ import sys
 from pathlib import Path
 
 _MODULES = ("flint",  # Recursive's Flint (mlx-lm has it from ml-explore/mlx-lm#1998, unreleased)
-            "lfm3")  # Liquid's LFM3 (no mlx-lm release has it yet)
-_CONFIGS = ("lfm3",)  # model types whose config.json names remote code for AutoConfig
+            "lfm3",  # Liquid's LFM3 (no mlx-lm release has it yet)
+            "inkling2_loop")  # Thinking Machines' Inkling 2 Mini (ml-explore/mlx-lm#2086, a draft)
+_CONFIGS = ("lfm3",  # model types whose config.json names remote code for AutoConfig
+            "inkling2_loop")  # (transformers 5.19 does not know the type, and says so on every load)
 
 
 def register() -> None:

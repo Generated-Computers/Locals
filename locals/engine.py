@@ -676,7 +676,8 @@ class Engine:
         self.model = model
         self.sparse_head = sparse_head
         self.tokenizer = tokenizer  # mlx_lm TokenizerWrapper
-        self.prefill_step = prefill_step
+        # (a model may read prompts best in its own chunks: Inkling 2 in 256, locals/inkling.py)
+        self.prefill_step = min(prefill_step, getattr(model, "prefill_chunk_tokens", None) or prefill_step)
 
     def _prefill(self, cache, prompt: List[int], start: int = 0) -> None:
         i = start

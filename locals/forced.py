@@ -126,9 +126,16 @@ class ForcedPlanner:
         # as atoms. They are therefore blocks of their own in a forced string,
         # whatever the pre-tokenizer would do with their characters, and a
         # block that is an added token is always stable.
+        # A format's control tokens are text to a grammar even where the tokenizer marks them special
+        # (vocab.FORMAT_TOKENS: Inkling 2's message markers, Ministral's [TOOL_CALLS]), so they are atoms here too:
+        # split by the pre-tokenizer, a forced "<|message_model|>" was fed as "<", "|", "message", ..., which no
+        # longer read as the start of a message to the model (it wrote its tool call again and again).
         try:
+            from .vocab import FORMAT_TOKENS
+
             special = set(hf_tokenizer.all_special_ids)
-            self._added = sorted((t for t, i in hf_tokenizer.get_added_vocab().items() if i not in special and t), key=len, reverse=True)
+            self._added = sorted((t for t, i in hf_tokenizer.get_added_vocab().items()
+                                  if (i not in special or t in FORMAT_TOKENS) and t), key=len, reverse=True)
         except Exception:
             self._added = []
 

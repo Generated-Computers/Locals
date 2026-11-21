@@ -771,7 +771,9 @@ class HybridBatchEngine(BatchEngine):
         if not self.memory_limit:
             return True
         copies = _copies(r)
-        need = ((len(r.prompt) * (1 + copies) + held) * self._kv_bytes_per_token()
+        # (a checkpoint's copy holds the state that does not grow too: Inkling 2's 40 windows are 160 MB a copy,
+        # which three checkpoints a request, uncounted, took an M4 Pro with four agents to 6% of its memory free)
+        need = ((len(r.prompt) * (1 + copies) + held) * self._kv_bytes_per_token() + copies * self._row_state()
                 + self._admit_bytes(rows, tokens or len(r.prompt)) + _replies(r) * self._reply_bytes)
         return need <= self.memory_limit - (mx.get_active_memory() - (lru.nbytes if lru is not None else 0))
 
@@ -785,7 +787,8 @@ class HybridBatchEngine(BatchEngine):
         PREFILL_SCORES)."""
         if not self.memory_limit or lru is None:
             return
-        self._trim_for(lru, (tokens * (1 + copies) + held) * self._kv_bytes_per_token() + self._admit_bytes(rows, tokens))
+        self._trim_for(lru, (tokens * (1 + copies) + held) * self._kv_bytes_per_token() + copies * self._row_state()
+                       + self._admit_bytes(rows, tokens))
 
     def _trim_for(self, lru, need: int) -> None:
         """Drop prompt-cache entries (least valuable first) until ``need`` more
@@ -1058,20 +1061,29 @@ class HybridBatchEngine(BatchEngine):
     # rejected ones are rewound. Without a span or a draft, the row goes back to the pipelined steps.
 
     def _solo_ok(self, r, cache) -> bool:
-        if not _SOLO or cache is None or getattr(self, "_walk", None) is not None or getattr(r.controller, "parked", False):
+        if not _SOLO or cache is None or getattr(r.controller, "parked", False):
             return False
-        if any(type(c) not in (BatchKVCache, ArraysCache) for c in cache):
+        family = type(getattr(self.lm, "model", None)).__module__.rsplit(".", 1)[-1]
+        name = type(r.controller).__name__
+        if getattr(self, "_walk", None) is not None or name == "WalkController":
+            # (Inkling 2's grammars are walked, and their forced spans and drafts still go in one pass)
+            if family != "inkling2_loop" or getattr(self, "_walk", None) is None:
+                return False
+            return name == "WalkController" and all(type(c) in (BatchKVCache, ArraysCache, BatchRotatingKVCache) for c in cache)
+        if family == "inkling2_loop":  # (its windows are rewound: locals/inkling.py)
+            if any(type(c) not in (BatchKVCache, ArraysCache, BatchRotatingKVCache) for c in cache):
+                return False
+        elif any(type(c) not in (BatchKVCache, ArraysCache) for c in cache):
             # sliding-window layers (Gemma, Flint) and 8-bit ones (locals/qkv.py) are not rewound, which a draft needs
             # and a forced span does not: those get their spans in one pass, and no drafts (_solo_drafts_ok)
             from .qkv import BatchQuantizedKVCache
 
-            if type(getattr(self.lm, "model", None)).__module__.rsplit(".", 1)[-1] != "flint":
+            if family != "flint":
                 return False  # (Flint's only: Gemma's sliding-window layers keep their spans a token at a time)
             if any(type(c) not in (BatchKVCache, ArraysCache, BatchRotatingKVCache, BatchQuantizedKVCache) for c in cache):
                 return False
             if self._solo_drafts_ok(cache):
                 return False
-        name = type(r.controller).__name__
         return name not in ("WalkController", "PDAController")
 
     def _solo_unpadded(self, cache) -> bool:
@@ -1084,9 +1096,17 @@ class HybridBatchEngine(BatchEngine):
         rings = [c.left_padding for c in cache if type(c) is BatchRotatingKVCache and c.left_padding is not None]
         return not rings or int(mx.max(mx.concatenate([mx.reshape(p, (-1,)) for p in rings])).item()) <= 0
 
+    def _inkling(self) -> bool:
+        return type(getattr(self.lm, "model", None)).__module__.rsplit(".", 1)[-1] == "inkling2_loop"
+
     def _solo_drafts_ok(self, cache) -> bool:
         """Drafts need the per-token recurrent states the fused Gated DeltaNet kernel records (to rewind)."""
         from . import fuse
+
+        if self._inkling():  # (Inkling 2 keeps a pass's convolution inputs instead, and its windows in order)
+            from . import inkling
+
+            return inkling.drafts_ok(cache)
 
         n = getattr(self, "_solo_gdn", None)
         if n is None:  # the fused GDN layers, or 0 when any layer cannot record its states
@@ -1105,13 +1125,24 @@ class HybridBatchEngine(BatchEngine):
         """A prompt-lookup draft for an unconstrained row: what followed the most recent earlier occurrence of its
         last 3 tokens (locals/lookup.py's rule, from an index kept on the request instead of a scan of the whole
         prompt every step); its width follows the recent acceptance."""
-        constrained = isinstance(r.controller, LocalsController)
+        walked = getattr(self, "_walk", None) is not None
+        constrained = isinstance(r.controller, LocalsController) or (walked and type(r.controller).__name__ == "WalkController")
+        if walked and not constrained:
+            return []
         if (hasattr(r.controller, "step_config") and not constrained) or not self._solo_drafts_ok(cache):
             return []
         if not getattr(r.controller, "drafts", True):  # (a controller that takes no drafts: Qwenputer's)
             return []
         if len(r.out) < getattr(r, "solo_resume", 0):  # recent drafts were rejected: plain pipelined steps for a while
             return []
+        if constrained and getattr(self.lm, "draft_token_cost", None):
+            # (under a grammar a draft of one token is dropped below; where drafts cost, the width is often one:
+            # not worth the copy of the prompt each step)
+            tried = getattr(r, "solo_tried", None) or []
+            n = sum(tried[-8:])
+            rate = sum((getattr(r, "solo_acc", None) or [])[-8:]) / n if n else 0.6
+            if rate * rate <= self.lm.draft_token_cost:
+                return []
         stream = list(r.prompt) + r.out
         idx = getattr(r, "lk_index", None)
         if idx is None:
@@ -1125,6 +1156,22 @@ class HybridBatchEngine(BatchEngine):
             return []
         acc = getattr(r, "solo_acc", None) or []
         width = 4 if not acc else max(1, min(8, int(round(2 * sum(acc[-8:]) / len(acc[-8:]) + 1))))
+        cost = getattr(self.lm, "draft_token_cost", None)
+        if cost:
+            # A model whose drafted token costs a share of a step whether it is kept or not (Inkling 2: each token of
+            # a pass reads its own experts, 12 ms of a 30 ms step): the i-th draft token is kept with about rate^i, so
+            # the draft goes as far as that stays above the cost; none at all for a while where the rate is under it
+            # (free writing kept 31% of its drafts, and went no faster for them)
+            tried = getattr(r, "solo_tried", None) or []
+            n = sum(tried[-8:])
+            rate = sum(acc[-8:]) / n if n else 0.6
+            width, p = 0, rate
+            while width < 8 and p > cost:
+                width, p = width + 1, p * rate
+            if not width:
+                r.solo_acc, r.solo_tried = [], []
+                r.solo_resume = len(r.out) + 16
+                return []
         eos = set(r.controller.eos_ids) or set(self.tokenizer.eos_token_ids)
         draft = stream[j:j + width]
         for i, tok in enumerate(draft):
@@ -1132,13 +1179,15 @@ class HybridBatchEngine(BatchEngine):
                 draft = draft[:i]
                 break
         if constrained and draft:  # only the part the grammar allows (an agent's tool call: its arguments)
-            cfg, kept = r.controller.config(), []
+            step = getattr(r.controller, "draft_step", None) or r.controller.step_config  # (a walked grammar's)
+            done = getattr(r.controller, "draft_finished", None) or r.controller.finished_at
+            cfg, kept = r.controller.q, []
             for tok in draft:
-                cfg = r.controller.step_config(cfg, tok)
+                cfg = step(cfg, tok)
                 if cfg is None:
                     break
                 kept.append(tok)
-                if r.controller.finished_at(cfg):
+                if done(cfg):
                     break
             draft = kept if len(kept) >= 2 else []  # one token under a grammar is too often a repeated key's start
         return draft[: max(0, r.max_tokens - len(r.out) - 1)]
@@ -1184,6 +1233,19 @@ class HybridBatchEngine(BatchEngine):
     def _solo_masked(self, r, logits: mx.array, g, draft: List[int]) -> mx.array:
         """Logits at the sampled position and each draft position under the grammar's state there (as _pick
         masks one-token steps): the state after the fed tokens, then after each draft token."""
+        if getattr(self, "_walk", None) is not None:
+            # (a walked grammar: the states from the host's automaton, their rows in one run of the walk kernel)
+            table, acc, cover, tlen, eos, offs, packed = self._walk
+            q, qs = r.controller.q, []
+            for tok in [None] + list(draft):
+                if tok is not None:
+                    nq = r.controller.draft_step(q, tok)
+                    q = q if nq is None else nq
+                qs.append(q)
+            G = mx.array(qs, dtype=mx.int32) + offs[id(r.controller.wc)]
+            rows = self._walk_rows(G)
+            m = ((rows != -1) | (acc[G][:, None] & eos[None, :])) & (tlen[None, :] >= cover[G][:, None])
+            return mx.where(m, logits, NEG_INF)
         states = [g]
         for tok in draft:
             states.append(self._advance([r], mx.array([tok], dtype=mx.int32), states[-1]))
@@ -1200,6 +1262,10 @@ class HybridBatchEngine(BatchEngine):
     def _solo_rewind(self, cache, drop: int) -> None:
         """Drop the last ``drop`` fed tokens of a batch-of-one cache (recurrent layers: the state the fused
         kernel recorded after the last kept token)."""
+        if self._inkling():
+            from . import inkling
+
+            return inkling.rewind(cache, drop)
         for c in cache:
             if isinstance(c, ArraysCache):
                 ts = getattr(c, "token_states", None)
@@ -1217,7 +1283,7 @@ class HybridBatchEngine(BatchEngine):
         """Steps for the only running row while it has a forced span or a draft to feed. Returns (requests that
         arrived meanwhile, the next token to feed, its constraint state); x None: the row is done."""
         t_r = temp if getattr(r, "temp", None) is None else r.temp
-        constrained = isinstance(r.controller, LocalsController)
+        constrained = isinstance(r.controller, LocalsController) or type(r.controller).__name__ == "WalkController"
         if self.parks:
             for c in cache:
                 if isinstance(c, ArraysCache):
@@ -1280,6 +1346,9 @@ class HybridBatchEngine(BatchEngine):
                         c.token_states = c.token_conv = None
                 r.fed.extend(draft[:kept])
                 r.solo_acc = (getattr(r, "solo_acc", None) or []) + [kept]
+                r.solo_tried = (getattr(r, "solo_tried", None) or []) + [len(draft)]
+                r.drafted = (getattr(r, "drafted", None) or (0, 0, 0))  # (tokens kept, tokens drafted, draft passes)
+                r.drafted = (r.drafted[0] + kept, r.drafted[1] + len(draft), r.drafted[2] + 1)
                 self.counters["drafted"] = self.counters.get("drafted", 0) + kept
                 # a draft step costs the pipelining of that step: after a draft rejected outright, none for 1 token,
                 # doubling up to 32 while they keep failing (a JSON list's repeated keys: 0.83x without this)
@@ -2143,7 +2212,9 @@ class HybridBatchEngine(BatchEngine):
             if _SOLO and len(rows) == 1 and not queue and not filling and not dead and self._solo_ok(rows[0], cache):
                 # entering costs about a step (the pipeline drains): a forced span of 3 or more tokens, or a draft (the
                 # padding read, which waits for the GPU, only with a span: the pipeline drains for it anyway)
-                solo_next = (len(rows[0].pend) >= 3 and self._solo_unpadded(cache)) or bool(self._solo_draft(rows[0], cache))
+                # (Inkling 2 from 2 tokens: a pass over two is 45 ms where two steps are 60)
+                span = 2 if self._inkling() else 3
+                solo_next = (len(rows[0].pend) >= span and self._solo_unpadded(cache)) or bool(self._solo_draft(rows[0], cache))
         mx.synchronize()
         self.active = 0
         return BatchStats(time.perf_counter() - t0, prefill_s, steps, nrows, self.tokens_out)

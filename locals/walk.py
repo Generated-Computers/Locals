@@ -162,6 +162,25 @@ class WalkController(Controller):
     def finished(self):
         return bool(self.wc.only_eos[self.q])
 
+    # a draft's tokens, tried on the host (the batch engine's prompt-lookup drafts for the only running row; not
+    # the table controller's names: the one-stream engine takes a controller with step_config for one with tables)
+    def draft_step(self, cfg, token: int):
+        """The state after ``token`` from ``cfg``, or None if the grammar does not allow it there."""
+        if token in self.eos_ids:
+            return None
+        b = self.wc.vocab.token_bytes[token]
+        nq = self.wc.dfa.run(b, cfg) if b else DEAD
+        if nq == DEAD:
+            return None
+        if self.canonical:
+            cov = self.planner.cover_rule(cfg)
+            if cov and len(b) < cov:
+                return None
+        return nq
+
+    def draft_finished(self, cfg) -> bool:
+        return bool(self.wc.only_eos[cfg])
+
     def may_force(self):
         return self.use_forced
 

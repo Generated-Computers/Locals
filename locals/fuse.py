@@ -388,6 +388,10 @@ _PLAIN_ATTN = {"Attention"}  # Llama/Qwen2-style attention modules (no q/k norms
 def fuse_model(model) -> int:
     """Fuse in place. Returns the number of layers changed."""
     model = getattr(model, "language_model", model)
+    if type(model).__module__.rsplit(".", 1)[-1] == "inkling2_loop":  # (its own layers and its own steps: inkling.py)
+        from . import inkling
+
+        return inkling.fuse(model)
     body = getattr(model, "model", None)
     if body is None or not hasattr(body, "layers"):
         return 0

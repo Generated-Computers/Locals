@@ -28,6 +28,7 @@ pays for.
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -265,7 +266,9 @@ def reply_regex(tools: List[dict], tool_choice: Any = "auto", thinking: bool = F
     those after ``</think>`` (formats.think_gap)."""
     names = [t["function"]["name"] for t in tool_specs(tools)]
     if fmt is not None and fmt.name != "qwen_xml":
-        if typed and getattr(fmt, "typed", False):  # a format with typed calls of its own (Flint's)
+        # a format with typed calls of its own (Flint's; Inkling 2's are typed without being asked)
+        if (typed or (getattr(fmt, "typed_default", False) and os.environ.get("LOCALS_TYPED_TOOLS", "1") != "0")) \
+                and getattr(fmt, "typed", False):
             return fmt.reply_regex(names, tool_choice, thinking, preamble=preamble, parallel=parallel, specs=tool_specs(tools))
         return fmt.reply_regex(names, tool_choice, thinking, preamble=preamble, parallel=parallel)
     free = not_containing(*FREE_TEXT, *(THINK_TAGS if sealed else ()))
@@ -683,9 +686,12 @@ class ReplyStream:
         # models without tool training write calls as JSON blocks: from a fence (or a JSON
         # reply's first brace) on, text is held back until the reply shows what it is
         self.loose = bool(getattr(fmt, "loose_calls", False))
+        self.text_open = getattr(fmt, "text_open", "")
         if not calls:  # no tools offered: nothing to hold back as a possible call (a JSON answer streamed nothing
             # until it was complete on Llama and Mistral formats, nor text after a code fence on others)
             self.at_start, self.bare, self.loose, self.opener, self.after_text = False, None, False, "\x00", "\x00"
+            if self.text_open:
+                self.opener = fmt.opener  # (the text is still a message that ends)
         self.content_sent = ""  # content emitted so far
 
     @staticmethod
@@ -738,6 +744,13 @@ class ReplyStream:
         if self.mode == "content":
             while self.sent == self.base and self.sent < len(text) and text[self.sent] == "\n":
                 self.sent = self.base = self.sent + 1  # the blank lines after </think> are not content
+            if self.text_open and self.sent == self.base:  # Inkling 2: the text is a message with a marker of its own
+                head = text[self.base:]
+                if head.startswith(self.text_open):
+                    self.sent = self.base = self.base + len(self.text_open)
+                    self.bare = None
+                elif self.text_open.startswith(head):
+                    return out
             if self.at_start:
                 head = text[self.base:].lstrip()
                 if not head:

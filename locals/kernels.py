@@ -1131,13 +1131,17 @@ def post_logits(lm, out: mx.array) -> mx.array:
     projection: soft-capping (Gemma 2, 3n, 4), a logit scale (Cohere), a
     logits scaling divisor (Granite). Monotonic, so greedy and constrained
     choices never depend on it; sampling at temperature > 0 does."""
+    mod = type(lm).__module__.rsplit(".", 1)[-1]
+    if mod == "inkling2_loop":  # a softcap, and the padded end of its vocabulary shut out
+        from .models.inkling2_loop import post_logits as inkling_logits
+
+        return inkling_logits(lm.args, out)
     args = getattr(lm, "args", None)
     cap = getattr(lm, "final_logit_softcapping", None)
     if cap is None:
         cap = getattr(args, "final_logit_softcapping", None)
     if cap:
         out = mx.tanh(out / cap) * cap
-    mod = type(lm).__module__.rsplit(".", 1)[-1]
     if mod in ("cohere", "cohere2"):
         out = out * lm.model.args.logit_scale
     if mod.startswith("granite") and getattr(lm, "logits_scaling", None):
