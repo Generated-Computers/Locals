@@ -30,9 +30,9 @@
 > mixture of experts whose middle layers loop: 48 layer passes a token from 24
 > layers of weights. Locals makes a 15.6 GB build of it that fits a 24 GB Mac
 > (its makers ask for 32 GB) and runs each pass in kernels of its own: 34.5
-> tokens/s for one request, twice stock MLX on the same build, and four
-> `locals run` agents finish a coding task in 55 s instead of 170 s (M4 Pro,
-> 24 GB). [How to install it](#inkling-2-mini).
+> tokens/s for one request, twice stock MLX on the same build, and `locals run`
+> finishes a coding task with four agents at a time in 55 s instead of 170 s
+> (M4 Pro, 24 GB). [How to install it](#inkling-2-mini).
 
 > **New: Qwenputer runs in Locals.** [Qwenputer](docs/qwenputer/README.md) is
 > Qwen3.5-4B with a RISC-V computer compiled into its weights that runs the
