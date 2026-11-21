@@ -775,9 +775,7 @@ class HybridBatchEngine(BatchEngine):
         if not self.memory_limit:
             return True
         copies = _copies(r)
-        # (a checkpoint's copy holds the state that does not grow too: Inkling 2's 40 windows are 160 MB a copy,
-        # which three checkpoints a request, uncounted, took an M4 Pro with four agents to 6% of its memory free)
-        need = ((len(r.prompt) * (1 + copies) + held) * self._kv_bytes_per_token() + copies * self._row_state()
+        need = ((len(r.prompt) * (1 + copies) + held) * self._kv_bytes_per_token() + self._copies_state(copies)
                 + self._admit_bytes(rows, tokens or len(r.prompt)) + _replies(r) * self._reply_bytes)
         return need <= self.memory_limit - (mx.get_active_memory() - (lru.nbytes if lru is not None else 0))
 
@@ -791,8 +789,14 @@ class HybridBatchEngine(BatchEngine):
         PREFILL_SCORES)."""
         if not self.memory_limit or lru is None:
             return
-        self._trim_for(lru, (tokens * (1 + copies) + held) * self._kv_bytes_per_token() + copies * self._row_state()
+        self._trim_for(lru, (tokens * (1 + copies) + held) * self._kv_bytes_per_token() + self._copies_state(copies)
                        + self._admit_bytes(rows, tokens))
+
+    def _copies_state(self, copies: int) -> int:
+        """(Inkling 2 only) Bytes ``copies`` checkpoint copies hold of the state that does not grow: its 40 windows
+        are 160 MB a copy, which three checkpoints a request, uncounted, took an M4 Pro with four agents to 6% of its
+        memory free. Every other model counts its copies' keys and values alone, as before."""
+        return copies * self._row_state() if copies and self._inkling() else 0
 
     def _trim_for(self, lru, need: int) -> None:
         """Drop prompt-cache entries (least valuable first) until ``need`` more
@@ -1158,7 +1162,7 @@ class HybridBatchEngine(BatchEngine):
 
     def _drafts_allowed(self, r, cache):
         """(whether the row may get drafts at all, whether a grammar holds it)"""
-        walked = getattr(self, "_walk", None) is not None
+        walked = getattr(self, "_walk", None) is not None and self._inkling()  # (drafts under walked grammars: Inkling 2's)
         constrained = isinstance(r.controller, LocalsController) or (walked and type(r.controller).__name__ == "WalkController")
         if walked and not constrained:
             return False, constrained
@@ -1393,7 +1397,7 @@ class HybridBatchEngine(BatchEngine):
         """Steps for the only running row while it has a forced span or a draft to feed. Returns (requests that
         arrived meanwhile, the next token to feed, its constraint state); x None: the row is done."""
         t_r = temp if getattr(r, "temp", None) is None else r.temp
-        constrained = isinstance(r.controller, LocalsController) or type(r.controller).__name__ == "WalkController"
+        constrained = isinstance(r.controller, LocalsController) or (self._inkling() and type(r.controller).__name__ == "WalkController")
         if self.parks:
             for c in cache:
                 if isinstance(c, ArraysCache):
@@ -1461,11 +1465,12 @@ class HybridBatchEngine(BatchEngine):
                     r.solo_acc = (getattr(r, "solo_acc", None) or []) + [kept]
                     r.solo_tried = (getattr(r, "solo_tried", None) or []) + [len(draft)]
                     self._draft_gain(r, "lookup", kept - 0.11 - (getattr(self.lm, "draft_token_cost", None) or 0.0) * len(draft))
-                r.drafted = (getattr(r, "drafted", None) or (0, 0, 0))  # (tokens kept, tokens drafted, draft passes)
-                r.drafted = (r.drafted[0] + kept, r.drafted[1] + len(draft), r.drafted[2] + 1)
-                if getattr(r, "draft_src", None) == "model":  # (of those, the draft model's)
-                    m = getattr(r, "drafted_model", None) or (0, 0, 0)
-                    r.drafted_model = (m[0] + kept, m[1] + len(draft), m[2] + 1)
+                if self._inkling():  # (Inkling 2's usage says what its drafts did: locals.drafts)
+                    r.drafted = (getattr(r, "drafted", None) or (0, 0, 0))  # (tokens kept, tokens drafted, draft passes)
+                    r.drafted = (r.drafted[0] + kept, r.drafted[1] + len(draft), r.drafted[2] + 1)
+                    if getattr(r, "draft_src", None) == "model":  # (of those, the draft model's)
+                        m = getattr(r, "drafted_model", None) or (0, 0, 0)
+                        r.drafted_model = (m[0] + kept, m[1] + len(draft), m[2] + 1)
                 self.counters["drafted"] = self.counters.get("drafted", 0) + kept
                 # a draft step costs the pipelining of that step: after a draft rejected outright, none for 1 token,
                 # doubling up to 32 while they keep failing (a JSON list's repeated keys: 0.83x without this)
@@ -2206,6 +2211,9 @@ class HybridBatchEngine(BatchEngine):
                     # every client of these prompts gone (Esc in the agent while it waits for a long prompt): the
                     # prefill stops between chunks instead of reading the prompts to their end for nobody
                     left_all = lambda: all(getattr(q, "cancel", False) for q in new)  # noqa: E731
+                    # (Inkling 2 only: a prompt that waiting requests share read once, and no "user" checkpoint within
+                    # _CP_GAP of the cached prefix; every other model admits as before)
+                    ink = self._inkling()
                     kept = False  # this admission put a prefix into the prompt cache: the next request looks again
                     for k, (r, (c0, rest)) in enumerate(zip(new, found)):
                         if left_all():
@@ -2218,7 +2226,7 @@ class HybridBatchEngine(BatchEngine):
                             c1 = rest1 = None
                         done, end = r.cached_tokens, len(r.prompt) - 1
                         cps = sorted(getattr(r, "checkpoints", None) or [])
-                        if lru is not None and self.share_prefix:
+                        if ink and lru is not None and self.share_prefix:
                             # Where a request waiting with this one parts from its prompt: read once to there, and kept
                             # for it. An agent's versions of one part are asked at once with one prompt and do not part
                             # at all: of 4,755 prompt tokens `locals run` read for a two-file task, 1,700 were read a
@@ -2232,7 +2240,7 @@ class HybridBatchEngine(BatchEngine):
                                 continue
                             if lru is None or not done < cp < end + (kind == "shared"):
                                 continue
-                            if kind == "user" and cp - done < _CP_GAP:
+                            if ink and kind == "user" and cp - done < _CP_GAP:
                                 continue  # (the cached prefix ends a few tokens before: a copy there buys nothing)
                             if kind == "shared" and cp - done < self.min_share:
                                 continue  # (so few tokens are cheaper read twice than a copy is kept)
@@ -2245,7 +2253,7 @@ class HybridBatchEngine(BatchEngine):
                             elif self._room_for_copy(lru, len(r.prompt)):
                                 lru.insert_cache(lru_key, list(r.prompt[:cp]), copy.deepcopy(c0),
                                                  cache_type="user" if kind == "shared" else kind)
-                                kept = True
+                                kept = ink
                             if kind == "system" and self.disk is not None:
                                 self.disk.save(list(r.prompt[:cp]), c0)
                             if os.environ.get("LOCALS_PREFILL_LOG"):

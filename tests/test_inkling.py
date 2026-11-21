@@ -405,8 +405,48 @@ def test_a_forced_marker_is_fed_as_its_token(monkeypatch):
 
     assert marker not in pieces("x" + marker + "call")  # a special token is no text to a grammar...
     monkeypatch.setattr(vocab, "FORMAT_TOKENS", vocab.FORMAT_TOKENS | {marker})
-    got = pieces("x" + marker + "call")  # ...unless it is a format's own
+    assert marker not in pieces("x" + marker + "call")  # (another format's, Gemma 4's say: as before)
+    monkeypatch.setattr(vocab, "INKLING_TOKENS", vocab.INKLING_TOKENS | {marker})
+    got = pieces("x" + marker + "call")  # ...unless it is Inkling's own
     assert marker in got and tok.encode(marker, add_special_tokens=False) == [tok.convert_tokens_to_ids(marker)]
+
+
+def test_other_models_are_served_as_before_inkling():
+    """What the engine does for Inkling 2 alone: a prompt that requests waiting together share is read once, a
+    checkpoint's copy counts the windows it holds, and usage says what drafts did. A Qwen3.5 (gated delta and
+    attention layers) reads each request's prompt and counts its copies as it did before."""
+    from mlx_lm.models import qwen3_5
+    from mlx_lm.models.cache import LRUPromptCache
+
+    from locals.engine import Controller
+    from locals.hybrid_batch import HybridBatchEngine
+    from locals.packed import Request
+
+    class Free(Controller):
+        eos_ids = [127]
+
+    class Tok:
+        eos_token_ids = [127]
+
+        def decode(self, ids):
+            return " ".join(map(str, ids))
+
+    text = dict(model_type="qwen3_5_text", hidden_size=64, intermediate_size=128, num_hidden_layers=4, num_attention_heads=4,
+                num_key_value_heads=2, head_dim=16, vocab_size=128, linear_num_value_heads=4, linear_num_key_heads=2,
+                linear_key_head_dim=16, linear_value_head_dim=16, full_attention_interval=2, tie_word_embeddings=True)
+    m = qwen3_5.Model(qwen3_5.ModelArgs.from_dict({"model_type": "qwen3_5", "text_config": text}))
+    mx.eval(m.parameters())
+    tokens = [int(t) for t in mx.random.randint(0, 120, (120,), key=mx.random.key(3)).tolist()]
+    same, other = tokens[:100], tokens[:70] + tokens[100:120]
+    eng = HybridBatchEngine(m, Tok(), n_slots=4, min_share=8)
+    reqs = [Request(list(p), Free(), 6) for p in (same, same, other, same)]
+    for r in reqs:
+        r.pend, r.fed = [], []
+    waiting = list(reqs)
+    eng.serve(lambda block: [waiting.pop(0) for _ in list(waiting)], lru=LRUPromptCache(max_size=16), lru_key="tiny")
+    assert eng.counters["prefill_tokens"] == 3 * (len(same) - 1) + len(other) - 1
+    assert not eng._inkling() and eng._copies_state(3) == 0
+    assert HybridBatchEngine(_model(fused=True), Tok(), n_slots=4)._copies_state(3) > 0
 
 
 # --- grammars: walked, and tool calls typed --------------------------------------------------------------------------

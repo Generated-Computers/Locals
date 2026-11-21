@@ -10,8 +10,8 @@
   - Clients send a turn with calls back without its reasoning, and the template writes an earlier turn's. The
     server writes such a turn from the reply it kept (`formats.Inkling.restore`: the reasoning, the text to the
     character, the arguments in the reply's own nesting) as long as the client's calls are the reply's.
-  - Requests asked at once with one prompt, as the versions `locals run` makes of a part, each read it. The engine
-    reads once to where a waiting request's prompt parts from this one's and keeps that for it (the two longest such
+  - Requests asked at once with one prompt, as the versions `locals run` makes of a part, each read it. On Inkling 2
+    (other models admit requests as before) the engine reads once to where a waiting request's prompt parts from this one's and keeps that for it (the two longest such
     prefixes, from 64 tokens on), and a "user" checkpoint within 32 tokens of the prefix a request was found is not
     copied again.
 
@@ -43,12 +43,12 @@
   at 4 bits (96.4%, 1 ms).
 - A grammar may write Inkling's message markers as the tokens they are (`vocab.FORMAT_TOKENS`). Spelled letter by
   letter, as a special token otherwise is, the model answered a tool's result by calling the tool again.
-- A span the grammar forces is fed with a format's control tokens as the tokens they are, where the tokenizer marks
-  them special too (`forced.ForcedPlanner`, which split only the added tokens that are not special). A forced
+- A span the grammar forces is fed with Inkling's message markers as the tokens they are, though its tokenizer marks
+  them special (`forced.ForcedPlanner` with `vocab.INKLING_TOKENS`; it split only the added tokens that are not
+  special). A forced
   `<|message_model|>` went to Inkling as `<`, `|`, `message`, ..., after which the model no longer saw the start of
   a message: it wrote its tool call two or three times (the server cut the turn as a repeated call: 139 tokens for a
-  call of 58) or lost the thread after a tool's result. Formats whose control tokens are special are read the same
-  way now (Ministral's `[TOOL_CALLS]`).
+  call of 58) or lost the thread after a tool's result. Other models' special tokens are split as before.
 - Inkling 2 Mini for agents, on an M4 Pro: prompts are read in chunks of 256 tokens (270 tokens/s; 150 in the
   engine's 1,024, 190 in 64); a request alone gets its forced spans in one pass and drafts of what followed the same
   three tokens before (its windows and convolutions go back to the last token kept: `inkling.rewind`), a pass over
@@ -91,7 +91,7 @@
 - Inkling 2 Mini's grammars are walked (`walk_constraints`, a model's own choice of the server's `--walk`;
   `LOCALS_WALK=0` for the tables): the mask comes from the automaton each step, so a set of tools costs no token
   table (1.3 GB on the host and 0.4 on the GPU before), and its automaton is made in a thread of its own, not in the
-  batch loop. A walked grammar's forced spans still go in one pass for a request alone (`hybrid_batch._solo_ok`,
+  batch loop (other models' walked grammars are made in the batch loop, as before). A walked grammar's forced spans still go in one pass for a request alone (`hybrid_batch._solo_ok`,
   Inkling only), and its tool calls are typed without `--typed-tools` (`formats.Inkling.typed_call`;
   `LOCALS_TYPED_TOOLS=0` for any JSON object): the tool's parameters sorted by name, the required ones
   there, each value of its type, the JSON's name the header's. The first request with a set of tools answers after
@@ -102,11 +102,12 @@
   window's keys and values are read once instead of three times: 5.1 to 3.7 ms of a step for one request, 26.8 to
   11.3 for eight. Requests at once on an M4 Pro, each writing 320 tokens: 35 tokens/s for one, 54 for two, 73 for
   four, 81 for eight (the experts are 8 ms a row and step: each row reads its own).
-- A request's admission counts the state its checkpoints copy besides the keys and values (`hybrid_batch._fits`,
-  `_make_room`): a model's sliding windows and convolution states, 160 MB a copy on Inkling 2 Mini, which four agents
-  with three checkpoints each held uncounted (an M4 Pro with 24 GB went to 6% free).
-- The server's line for a request says how many drafted tokens were kept (`drafts 97/105 in 90 passes`), and its
-  usage has them (`locals.drafts`).
+- On Inkling 2 Mini a request's admission counts the state its checkpoints copy besides the keys and values
+  (`hybrid_batch._copies_state`, in `_fits` and `_make_room`): its sliding windows and convolution states, 160 MB a
+  copy, which four agents with three checkpoints each held uncounted (an M4 Pro with 24 GB went to 6% free). Other
+  models count their copies as before.
+- On Inkling 2 Mini the server's line for a request says how many drafted tokens were kept (`drafts 97/105 in 90
+  passes`), and its usage has them (`locals.drafts`).
 - `Engine` (`locals chat --local`) reads prompts in a model's own chunk where it has one.
 
 - On a busy Mac, a prompt chunk now and then went into a copy of the cache's key and value buffers instead of the

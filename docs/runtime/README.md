@@ -582,12 +582,13 @@ before again:
   reasoning, the text to the character, the arguments in the reply's nesting. A turn whose calls, text or reasoning
   the client changed is written as the client sent it.
 
-Requests asked at once with one prompt (`locals run` asks for each part's versions so) each read it. At admission the
-engine now reads once to where a waiting request's prompt parts from this one's, and keeps that state in the prompt
+Requests asked at once with one prompt (`locals run` asks for each part's versions so) each read it. At admission
+Inkling 2's engine now reads once to where a waiting request's prompt parts from this one's, and keeps that state in the prompt
 cache for it (`hybrid_batch.serve`: the two longest such prefixes, from `min_share` = 64 tokens; the next request of
 the admission looks in the cache again). A "user" checkpoint within 32 tokens of the request's cached prefix is not
 copied (`_CP_GAP`): with replies rendering as written that prefix is the finished row of the turn before, and each
-request put one more copy of its state (160 MB of windows) into the prompt cache for nothing.
+request put one more copy of its state (160 MB of windows) into the prompt cache for nothing. Both are Inkling 2's
+only (`hybrid_batch._inkling`): every other model admits requests as before.
 
 `locals run`'s two-file task, 4 slots and 2 versions: 4,755 prompt tokens read past the cache in 21 s became 1,100
 to 1,600 in 6 to 8 s, and the task 34 to 40 s from 49 to 50 (it was 63 s before the prefixes from 192 tokens). What

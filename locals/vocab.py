@@ -30,16 +30,16 @@ _BYTE_DECODER = {c: b for b, c in _bytes_to_unicode().items()}
 
 # Control tokens of tool-call and thinking formats (locals.formats): kept in the
 # vocabulary with their text even when special, so grammars can place them.
+# Inkling 2's messages: a reply is nothing but them (spelled letter by letter, as a grammar otherwise had it, the
+# model no longer knew what it was writing). Forced spans take them as atoms too (forced.ForcedPlanner).
+INKLING_TOKENS = frozenset({"<|message_model|>", "<|end_message|>", "<|content_thinking|>", "<|content_text|>",
+                            "<|content_invoke_tool_json|>"})
 FORMAT_TOKENS = frozenset({"[TOOL_CALLS]", "[ARGS]", "[CALL_ID]", "<|python_tag|>", "<tool_call>", "</tool_call>",
                            "<think>", "</think>", "<|tool_call>", "<tool_call|>", '<|"|>', "<|channel>", "<channel|>",
                            "<|think|>", "[THINK]", "[/THINK]",
                            # MiniCPM5 writes its calls with special tokens: kept out, its calls could only be spelled
                            # letter by letter, which it never does (it answered in prose instead of calling)
-                           "<function", "</function>", "<param", "</param>",
-                           # Inkling 2's messages: a reply is nothing but them (spelled letter by letter, as a
-                           # grammar otherwise had it, the model no longer knew what it was writing)
-                           "<|message_model|>", "<|end_message|>", "<|content_thinking|>", "<|content_text|>",
-                           "<|content_invoke_tool_json|>"})
+                           "<function", "</function>", "<param", "</param>"}) | INKLING_TOKENS
 
 
 def _is_byte_level(hf_tokenizer, pieces) -> bool:

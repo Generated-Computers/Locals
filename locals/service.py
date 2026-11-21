@@ -256,10 +256,12 @@ class BatchService:
                   checkpoints=list(checkpoints or []), temp=temp, ignore_eos=ignore_eos, top_p=top_p, top_k=top_k,
                   seed=seed, internal=tuple(internal) if internal is not None else ("calc",), computer=computer)
         rt = getattr(self, "_rt", None)
-        if rt is not None and self.walk and (schema is not None or regex is not None):
-            # (the automaton too: 1.3 s for a set of tools on Inkling 2, with every running reply stopped)
+        if (rt is not None and self.walk and getattr(rt.model, "walk_constraints", False)
+                and (schema is not None or regex is not None)):
+            # (Inkling 2's automaton too: 1.3 s for a set of tools, with every running reply stopped; other models'
+            # walked grammars are made in the batch loop, as before)
             threading.Thread(target=self._walk_then_queue, args=(rt, job), name="locals-compile", daemon=True).start()
-        elif rt is not None and (schema is not None or regex is not None):
+        elif rt is not None and not self.walk and (schema is not None or regex is not None):
             # its grammar is made in a thread of its own, and the job queued once it is: made in the batch loop, a
             # JSON schema with maxItems 50 (1302 states) stopped every running reply for 8 s (31 s on a 16 GB Mac
             # next to the model)
