@@ -44,7 +44,10 @@ import numpy as np
 
 REPO = "divagr1925/Qwen3.5-4B-Qwenputer"
 REVISION = "2d9068508f2b680badb7abcded96fdd107e9ba5d"  # the checkpoint the chip pack is made from
-BASE = "mlx-community/Qwen3.5-4B-MLX-4bit"  # Qwen's part: its 32 layers, quantized, are this model's bit for bit
+DEFAULT_BASE = "mlx-community/Qwen3.5-4B-MLX-4bit"  # Qwen's part: its 32 layers, quantized, are this model's bit for bit
+# LOCALS_QWENPUTER_BASE: another model of the Qwen3.5 family as Qwen's part (the computer reads and writes text only, so
+# one with Qwen3.5's vocabulary and tool-call format works), e.g. mlx-community/Qwen3.8-27B-4bit
+BASE = os.environ.get("LOCALS_QWENPUTER_BASE", DEFAULT_BASE)
 # The authors' reference package (their RV32 machine, circuit compiler, text bridge): it loads the firmware into a
 # chip pack, and drafts the computer's runs while Locals serves (``chipformer()``).
 CHIPFORMER = "ca13310e2f9f788d1dd3feeea8213c1b0c23913c"
