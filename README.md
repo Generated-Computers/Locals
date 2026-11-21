@@ -26,6 +26,14 @@
   <a href="https://arxiv.org/abs/2610.09139"><b>Paper</b></a>
 </p>
 
+> **New: Thinking Machines' Inkling 2 Mini runs in Locals.** A 26.4-billion-parameter
+> mixture of experts whose middle layers loop: 48 layer passes a token from 24
+> layers of weights. Locals makes a 15.6 GB build of it that fits a 24 GB Mac
+> (its makers ask for 32 GB) and runs each pass in kernels of its own: 34.5
+> tokens/s for one request, twice stock MLX on the same build, and four
+> `locals run` agents finish a coding task in 55 s instead of 170 s (M4 Pro,
+> 24 GB). [How to install it](#inkling-2-mini).
+
 > **New: Qwenputer runs in Locals.** [Qwenputer](docs/qwenputer/README.md) is
 > Qwen3.5-4B with a RISC-V computer compiled into its weights that runs the
 > model's `calc` tool exactly. Locals runs that computer in C on the Mac's
@@ -69,8 +77,6 @@
 > Typed tool calls (`--typed-tools`) keep every call to its tool's schema, and
 > 8-bit keys and values (`LOCALS_KV_BITS=8`) take requests of 67,584 tokens on a
 > 24 GB Mac. Flint needs 24 GB or more. [All the measurements](https://github.com/Generated-Computers/Locals/blob/main/docs/benchmarks/README.md#11-recursives-flint-m4-pro-24-gb).
-> It comes to PyPI with the next release; until then, install Locals from GitHub:\
-> `uv tool install --python 3.12 git+https://github.com/Generated-Computers/Locals`
 
 ```bash
 curl -LsSf https://raw.githubusercontent.com/Generated-Computers/Locals/main/install.sh | sh
@@ -491,6 +497,37 @@ on a 16 GB Mac, a few hundred pages of text. On the M2 Pro, reading a
 questions about it start in 2 seconds. OpenCode is set up for 32,000 tokens,
 and OpenClaw, Hermes Agent and Kilo Code for 64,000, which keeps each of their
 steps quick.
+
+### Inkling 2 Mini
+
+Thinking Machines' [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
+needs a Mac with 24 GB of memory or more, and about 36 GB of free disk while
+its build is made. For now it needs Locals from GitHub (this also updates an
+installed Locals):
+
+```bash
+uv tool install --python 3.12 git+https://github.com/Generated-Computers/Locals
+```
+
+Make its build once. This downloads the 19.5 GB release to
+`~/models/Inkling-2-Mini` and writes the 15.6 GB build to
+`~/models/Inkling-2-Mini-MLX-nvfp4`; the release's folder can be deleted
+afterwards:
+
+```bash
+uvx --python 3.12 --from git+https://github.com/Generated-Computers/Locals python -m locals.convert_inkling
+```
+
+Then use it like any model, by its folder (`locals/inkling-2-mini-mlx-nvfp4`
+in your editor):
+
+```bash
+locals code ~/my-project --model ~/models/Inkling-2-Mini-MLX-nvfp4
+```
+
+A 24 GB Mac gives the GPU 16 GB unless told otherwise, less than the build and
+its caches need; `locals start` says how to raise that, until the next restart.
+[How Locals runs it](docs/runtime/README.md#inkling-2-mini-modelsinkling2_looppy-inklingpy).
 
 ## Using it from your own code
 

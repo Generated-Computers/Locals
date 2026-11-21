@@ -2,6 +2,8 @@
 
 ## 0.2.3 (unreleased)
 
+- Locals needs mlx-lm 0.32.2 or later: Inkling 2's build keeps its experts in NVFP4 with a scale per expert, which
+  mlx-lm 0.32.0 could not load. The README says how to install it and make its build.
 - Thinking Machines' Inkling 2 Mini (`thinkingmachines/Inkling-2-Mini`, a looped mixture of experts: 24 layers of
   weights, 48 layer visits a token, 26.4B parameters) runs on Locals. `python -m locals.convert_inkling` makes its build
   for a 24 GB Mac from the release (15.6 GB: the experts of layers 0 to 19 as released, NVFP4, bit for bit; those of

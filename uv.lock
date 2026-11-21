@@ -224,6 +224,45 @@ wheels = [
 ]
 
 [[package]]
+name = "locals"
+version = "0.2.2"
+source = { editable = "." }
+dependencies = [
+    { name = "huggingface-hub" },
+    { name = "llguidance" },
+    { name = "mlx" },
+    { name = "mlx-lm" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "outlines-core" },
+    { name = "rich" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "build" },
+    { name = "pytest" },
+]
+menubar = [
+    { name = "rumps" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "build", marker = "extra == 'dev'", specifier = ">=1.2" },
+    { name = "huggingface-hub", specifier = ">=0.30" },
+    { name = "llguidance", specifier = ">=1.8" },
+    { name = "mlx", specifier = ">=0.32,<0.34" },
+    { name = "mlx-lm", specifier = ">=0.32.2,<0.33" },
+    { name = "numpy", specifier = ">=1.26" },
+    { name = "outlines-core", specifier = ">=0.2,<0.3" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
+    { name = "rich", specifier = ">=13" },
+    { name = "rumps", marker = "extra == 'menubar'", specifier = ">=0.4" },
+]
+provides-extras = ["dev", "menubar"]
+
+[[package]]
 name = "markdown-it-py"
 version = "4.2.0"
 source = { registry = "https://pypi.org/simple" }
@@ -426,7 +465,7 @@ wheels = [
 
 [[package]]
 name = "mlx-lm"
-version = "0.32.0"
+version = "0.32.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jinja2" },
@@ -438,9 +477,9 @@ dependencies = [
     { name = "sentencepiece" },
     { name = "transformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/96/6f/c87a4e092194c77b39e65de7979147314e4486d9451e873b4124ba2d6dcd/mlx_lm-0.32.0.tar.gz", hash = "sha256:035ca44b08c3476630a205d2c9bdea26825a6a8359f974944d4985230e41859f", size = 412082, upload-time = "2026-10-01T04:44:42.681Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e1/46/eff1c17019b82912020d4d716527e6fcf4ac392b55cddef03eeb60566ab4/mlx_lm-0.32.2.tar.gz", hash = "sha256:1af8a92f6a141c3e2bf5b0369ac4464203a8e2189c47b9e40d3e921e5b3a1fe9", size = 449827, upload-time = "2026-10-16T02:49:34.781Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/88/ed/99cd7d36a1671851b41df06b59b73825bb95b8ab8b388ac871ddf9ae1523/mlx_lm-0.32.0-py3-none-any.whl", hash = "sha256:9a0f3843135fd88d36ad791f0d82210cdc4130c5c1cb5416f5f0c4b56a135778", size = 513667, upload-time = "2026-10-01T04:44:40.74Z" },
+    { url = "https://files.pythonhosted.org/packages/d1/4f/000eefdeb41388782b47e7f39904cf2d9e7e49a60df5e172097c358dba8e/mlx_lm-0.32.2-py3-none-any.whl", hash = "sha256:5c0991248cfff5872503d74f466d2532dd8cb7fb3670cb9be7a06d7305dadc04", size = 546040, upload-time = "2026-10-16T02:49:33.32Z" },
 ]
 
 [[package]]
@@ -1032,45 +1071,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/58/15/8b3609fd3830ef7b2
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e0/f9/0595336914c5619e5f28a1fb793285925a8cd4b432c9da0a987836c7f822/shellingham-1.5.4-py2.py3-none-any.whl", hash = "sha256:7ecfff8f2fd72616f7481040475a65b2bf8af90a56c89140852d1120324e8686", size = 9755, upload-time = "2023-10-24T04:13:38.866Z" },
 ]
-
-[[package]]
-name = "locals"
-version = "0.2.1"
-source = { editable = "." }
-dependencies = [
-    { name = "huggingface-hub" },
-    { name = "llguidance" },
-    { name = "mlx" },
-    { name = "mlx-lm" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "outlines-core" },
-    { name = "rich" },
-]
-
-[package.optional-dependencies]
-dev = [
-    { name = "build" },
-    { name = "pytest" },
-]
-menubar = [
-    { name = "rumps" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "build", marker = "extra == 'dev'", specifier = ">=1.2" },
-    { name = "huggingface-hub", specifier = ">=0.30" },
-    { name = "llguidance", specifier = ">=1.8" },
-    { name = "mlx", specifier = ">=0.32,<0.34" },
-    { name = "mlx-lm", specifier = ">=0.32,<0.33" },
-    { name = "numpy", specifier = ">=1.26" },
-    { name = "outlines-core", specifier = ">=0.2,<0.3" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
-    { name = "rich", specifier = ">=13" },
-    { name = "rumps", marker = "extra == 'menubar'", specifier = ">=0.4" },
-]
-provides-extras = ["dev", "menubar"]
 
 [[package]]
 name = "tokenizers"
