@@ -10,7 +10,7 @@ jobs:
   fast:
     # The fast suite needs MLX (Apple silicon) and one tokenizer; model tests
     # (marked `model`) need cached weights and run locally: `pytest -m model`.
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     strategy:
       fail-fast: false
