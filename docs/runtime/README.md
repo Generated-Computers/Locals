@@ -698,9 +698,20 @@ one saved (`disk_checkpoint_tokens`; `DiskPromptCache.save(kind="user")`), and g
 checkpoint when a request starts with it and the memory holds less. After a restart a 7k-token conversation answers
 after 0.5 to 0.8 s where reading it took 22; the save is 0.2 s of that first reading and 0.48 GB of the disk cache's
 4 GB. This is oMLX's cold tier (github.com/jundot/omlx: cache blocks moved to the SSD when its memory tier fills, and
-restored instead of computed again) on the checkpoints Locals already makes. Reading itself is where it was, 300
-to 320 tokens/s: a token is 3.1 G multiply-adds of experts alone, 1.1 ms at the GPU's rate where a chunk now takes
-1.4 and the 180 ms it spends reading every expert once.
+restored instead of computed again) on the checkpoints Locals already makes. A 32k-token conversation's state is 1.4
+GB, more than the prompt cache holds, so the engine takes such a snapshot as the request's own cache
+(`DiskPromptCache.load`). Reading itself is where it was: a token is 3.1 G multiply-adds of experts alone, 1.1 ms at
+the GPU's rate where a chunk now takes 1.4 and the 180 ms it spends reading every expert once, and the eight full
+layers score each query against every key before it, which is what the longer conversation pays.
+
+| a conversation of, M4 Pro with 24 GB | first reading | a later request, before | a later request, now | memory free |
+|---|---|---|---|---|
+| 7k tokens | 22 s (300 tokens/s) | 21 s every other request; 22 s after a restart | 0.5 to 0.8 s | 12% |
+| 32k tokens | 142 s (226 tokens/s) | 142 to 154 s, every request | 1.0 to 1.2 s | 12 to 14% |
+| 96k tokens | refused: 64,512 tokens fit beside the weights on this Mac (`context_length_exceeded`, at once) | | | |
+
+Between 32k and that limit nothing was run: a 60k-token conversation's state is 2.5 GB and its reading takes
+another, which would leave this Mac a few percent of its memory.
 
 Prose loses 4%: its tries seldom pay, and every step also feeds the draft caches. `LOCALS_INKLING_DRAFT=0` runs
 without the draft model; `LOCALS_INKLING_DRAFT_P` sets the probability. MLX's expert kernel reads an expert once per

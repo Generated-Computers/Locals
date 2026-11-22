@@ -12,7 +12,8 @@
   tier (github.com/jundot/omlx), on the checkpoints Locals already makes. A 32k-token conversation's state is 1.4
   GB, more than the 1.25 GB prompt cache holds, so it is the request's own cache straight from the disk
   (`DiskPromptCache.load`): its requests answered after 142 to 154 s each, every one reading it all again (226
-  tokens/s at that length), and answer after 1.0 to 1.2 s once it is saved.
+  tokens/s at that length), and answer after 1.0 to 1.2 s once it is saved. A 96k-token prompt is refused at once
+  on this Mac, where 64,512 tokens fit beside the weights; the docs have the table by length.
 - `python -m locals.convert_inkling` downloads only what the release's folder lacks: `--draft-only` gets the draft
   model's 0.64 GB alone (a folder from a build without it has no `mtp.safetensors`, and one deleted after the build
   had the whole 19.5 GB downloaded again), and a build made again gets the draft model's file.
