@@ -692,6 +692,16 @@ swap, so where the weights leave the engine under 5 GB Inkling asks for 1.25 GB 
 sets another): 12% free, the prefix a request went on from and its last reply kept, and the conversation's third
 request answers after 0.6 s.
 
+What does not fit in that cache is on the SSD (Inkling 2 only): the engine's disk cache, which kept system prompts
+alone, also takes a conversation's state at the start of its last message, every 2,048 tokens read past the last
+one saved (`disk_checkpoint_tokens`; `DiskPromptCache.save(kind="user")`), and gives it back as a conversation's
+checkpoint when a request starts with it and the memory holds less. After a restart a 7k-token conversation answers
+after 0.5 to 0.8 s where reading it took 22; the save is 0.2 s of that first reading and 0.48 GB of the disk cache's
+4 GB. This is oMLX's cold tier (github.com/jundot/omlx: cache blocks moved to the SSD when its memory tier fills, and
+restored instead of computed again) on the checkpoints Locals already makes. Reading itself is where it was, 300
+to 320 tokens/s: a token is 3.1 G multiply-adds of experts alone, 1.1 ms at the GPU's rate where a chunk now takes
+1.4 and the 180 ms it spends reading every expert once.
+
 Prose loses 4%: its tries seldom pay, and every step also feeds the draft caches. `LOCALS_INKLING_DRAFT=0` runs
 without the draft model; `LOCALS_INKLING_DRAFT_P` sets the probability. MLX's expert kernel reads an expert once per
 token routed to it, though consecutive tokens share experts (4 tokens use 19 of 32, 8 use 29 of 64): reading each

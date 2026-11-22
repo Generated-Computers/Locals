@@ -2,6 +2,17 @@
 
 ## 0.2.3 (unreleased)
 
+- Inkling 2 Mini keeps a long conversation's prefix on the SSD too (Inkling 2 only; the disk cache kept system
+  prompts alone): the state at the start of the last message, every 2,048 tokens read past the last one saved
+  (`disk_checkpoint_tokens`), back into the prompt cache as a conversation's checkpoint when a request starts with
+  it and the memory holds less. The prompt cache has room for two or three such states beside the weights on a 24 GB
+  Mac, and one that fell out of it, or a restarted server, read the conversation again at 300 tokens/s. A 7k-token
+  conversation after a restart, on an M4 Pro: the first token after 0.5 to 0.8 s where it took 22; saving it took
+  0.2 s of the first reading, and 0.48 GB of the disk cache's 4 (`LOCALS_DISK_CACHE_GB`). The idea is oMLX's cold
+  tier (github.com/jundot/omlx), on the checkpoints Locals already makes. A 32k-token conversation's state is 1.4
+  GB, more than the 1.25 GB prompt cache holds, so it is the request's own cache straight from the disk
+  (`DiskPromptCache.load`): its requests answered after 142 to 154 s each, every one reading it all again (226
+  tokens/s at that length), and answer after 1.0 to 1.2 s once it is saved.
 - `python -m locals.convert_inkling` downloads only what the release's folder lacks: `--draft-only` gets the draft
   model's 0.64 GB alone (a folder from a build without it has no `mtp.safetensors`, and one deleted after the build
   had the whole 19.5 GB downloaded again), and a build made again gets the draft model's file.

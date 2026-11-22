@@ -932,6 +932,9 @@ def fuse(model) -> int:
     # a conversation's state is 0.25 GB at 1k tokens and 0.48 GB at 7k (40 windows and the rest), so that is the
     # prefix a request went on from, its last reply and the system prompt (service.BatchService).
     object.__setattr__(model, "prompt_cache_bytes", int(1.25 * (1 << 30)))
+    # What does not fit there goes to the SSD (the engine's disk cache, which kept system prompts alone): a
+    # conversation's prefix every 2,048 tokens read, 7 s of reading for about half a second of writing.
+    object.__setattr__(model, "disk_checkpoint_tokens", 2048)
     # A pass over n tokens of one text takes about 25 + 6 n ms where a step takes 28 (attention's weights and the
     # output layer are read once, and so is an expert, for the tokens that share it: 12 n with MLX's gather): a
     # drafted token costs a quarter of a step, and a draft may be as long as a pass in kernels.

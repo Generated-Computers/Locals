@@ -51,3 +51,34 @@ def test_the_disk_cache_is_private_and_forgets_a_file_that_does_not_load(tmp_pat
     lru = chain_cache(max_size=10, max_bytes=1 << 30)
     assert disk.restore(lru, "m", [1, 2, 3, 4]) == 0
     assert "abc" not in disk.index and not (d / "abc.safetensors").exists()  # not tried again on every request
+
+
+def test_a_conversations_prefix_comes_back_from_the_disk_as_one(tmp_path):
+    """Inkling 2 saves a long conversation's prefix too (hybrid_batch.serve): from the disk it goes back into the
+    prompt cache as a conversation's checkpoint, not as a system prompt, and a new server finds it."""
+    from locals.hybrid_batch import DiskPromptCache
+
+    disk = DiskPromptCache(tmp_path / "prompts", 1.0)
+    disk.save([1, 2, 3], _state())
+    disk.save([1, 2, 3, 4, 5, 6], _state(), kind="user")
+    assert disk.longest([1, 2, 3, 4, 5, 6, 7]) == 6 and disk.longest([1, 2, 3, 4]) == 3 and disk.longest([9]) == 0
+    again = DiskPromptCache(tmp_path / "prompts", 1.0)  # (after a restart)
+    lru = chain_cache(max_size=10, max_bytes=1 << 30)
+    assert again.restore(lru, "m", [1, 2, 3, 4, 5, 6, 7, 8]) == 6
+    assert lru.stats_by_type()["user"]["n_sequences"] == 1 and lru.stats_by_type()["system"]["n_sequences"] == 0
+    assert again.restore(lru, "m", [1, 2, 3, 9]) == 3 and lru.stats_by_type()["system"]["n_sequences"] == 1
+
+
+def test_a_snapshot_larger_than_the_prompt_cache_is_a_requests_own(tmp_path):
+    """A 32k-token conversation's state is larger than Inkling 2's prompt cache on a 24 GB Mac: put into it from the
+    disk, it went out again at once and the conversation was read again (145 s). The engine takes it as the request's
+    cache (``load``), and ``restore`` leaves it where it is."""
+    from locals.hybrid_batch import DiskPromptCache
+
+    disk = DiskPromptCache(tmp_path / "prompts", 1.0)
+    disk.save([1, 2, 3, 4, 5, 6], _state(), kind="user")
+    small = chain_cache(max_size=10, max_bytes=8)
+    assert disk.restore(small, "m", [1, 2, 3, 4, 5, 6, 7]) == 0 and len(small) == 0
+    cache, n = disk.load([1, 2, 3, 4, 5, 6, 7])
+    assert n == 6 and cache[0][0].shape == (1, 4)
+    assert disk.load([1, 2, 3, 4, 5, 6, 7], least=6) is None and disk.load([9, 9]) is None

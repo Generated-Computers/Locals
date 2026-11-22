@@ -364,7 +364,11 @@ class DiskPromptCache:
 
         return hashlib.sha1(json.dumps(list(tokens)).encode()).hexdigest()[:20]
 
-    def save(self, tokens, cache) -> None:
+    def longest(self, prompt) -> int:
+        """The length of the longest saved snapshot the prompt starts with (0: none)."""
+        return max((len(t) for t in self.index.values() if len(t) < len(prompt) and tuple(prompt[: len(t)]) == t), default=0)
+
+    def save(self, tokens, cache, kind: str = "system") -> None:
         """Never raises: a snapshot that cannot be saved is only a slower restart. (The folder deleted under a running
         server, by the user or by another server's pruning, raised out of the engine: every request in flight
         failed, half the prompt cache went, and again at each new system prompt.)"""
@@ -396,6 +400,8 @@ class DiskPromptCache:
             _fsync(tmps[1])
             os.chmod(tmps[1], 0o600)
             os.replace(tmps[1], self.dir / f"{name}.tokens.json")
+            if kind != "system":  # (a conversation's prefix: back into the prompt cache as one, not as a system prompt)
+                (self.dir / f"{name}.kind").write_text(kind)
             self.index[name] = tuple(tokens)
             self._prune()
         except Exception as e:  # noqa: BLE001  # a cache that cannot be saved is only a slower restart
@@ -421,7 +427,7 @@ class DiskPromptCache:
             _, size, f = files.pop(0)
             total -= size
             name = f.name[: -len(".safetensors")]
-            for g in (f, f.parent / f"{name}.tokens.json"):
+            for g in (f, f.parent / f"{name}.tokens.json", f.parent / f"{name}.kind"):
                 g.unlink(missing_ok=True)
             if f.parent == self.dir:
                 self.index.pop(name, None)
@@ -441,17 +447,46 @@ class DiskPromptCache:
         if len(res.exact or res.shorter or []) >= n:
             return 0
         try:
+            if (self.dir / f"{best}.safetensors").stat().st_size > lru.max_bytes:
+                return 0  # (larger than the whole prompt cache: put in, it went out again at once; see ``load``)
+        except OSError:
+            pass
+        try:
             from mlx_lm.models.cache import load_prompt_cache
 
             cache = load_prompt_cache(str(self.dir / f"{best}.safetensors"))
-            lru.insert_cache(key, list(prompt[:n]), cache, cache_type="system")
+            kind = self.dir / f"{best}.kind"
+            lru.insert_cache(key, list(prompt[:n]), cache, cache_type=kind.read_text() if kind.exists() else "system")
             (self.dir / f"{best}.safetensors").touch()
             return n
         except Exception:  # noqa: BLE001  # a file that does not load (cut short, an older format): forgotten
-            for g in (self.dir / f"{best}.safetensors", self.dir / f"{best}.tokens.json"):
+            for g in (self.dir / f"{best}.safetensors", self.dir / f"{best}.tokens.json", self.dir / f"{best}.kind"):
                 g.unlink(missing_ok=True)
             self.index.pop(best, None)
             return 0
+
+
+    def load(self, prompt, least: int = 0):
+        """The longest saved snapshot the prompt starts with, longer than ``least`` tokens, as a request's own cache
+        and its length; None if there is none (or its file does not load: forgotten). For a state the prompt cache
+        cannot hold: a 32k-token conversation's is 1.4 GB on Inkling 2, whose prompt cache on a 24 GB Mac is 1.25."""
+        best, n = None, least
+        for name, toks in self.index.items():
+            if n < len(toks) < len(prompt) and tuple(prompt[: len(toks)]) == toks:
+                best, n = name, len(toks)
+        if best is None:
+            return None
+        try:
+            from mlx_lm.models.cache import load_prompt_cache
+
+            cache = load_prompt_cache(str(self.dir / f"{best}.safetensors"))
+            (self.dir / f"{best}.safetensors").touch()
+            return cache, n
+        except Exception:  # noqa: BLE001
+            for g in (self.dir / f"{best}.safetensors", self.dir / f"{best}.tokens.json", self.dir / f"{best}.kind"):
+                g.unlink(missing_ok=True)
+            self.index.pop(best, None)
+            return None
 
 
 def prefill_chunk(done: int, rows: int = 1, base: int = 2048, scores: Optional[int] = PREFILL_SCORES,
@@ -2214,6 +2249,13 @@ class HybridBatchEngine(BatchEngine):
                             self.disk.restore(lru, lru_key, list(r.prompt[:-1]))
                         c0, rest = (lru.fetch_nearest_cache(lru_key, list(r.prompt[:-1])) if lru is not None else (None, list(r.prompt[:-1])))
                         r.cached_tokens = len(r.prompt) - 1 - len(rest) if c0 is not None else 0
+                        if self.disk is not None and getattr(self.lm, "disk_checkpoint_tokens", None) and self._inkling():
+                            # (Inkling 2 only) a conversation's prefix from the SSD where the memory has less: as the
+                            # request's own cache, since one of 32k tokens is larger than the prompt cache
+                            got = self.disk.load(list(r.prompt[:-1]), r.cached_tokens)
+                            if got is not None:
+                                c0, rest = got[0], list(r.prompt[got[1]:-1])
+                                r.cached_tokens = got[1]
                         found.append((c0, rest))
                     # each request's cached prefix is a lazy copy, made during the prefill: the whole prompt counts
                     self._make_room(lru, sum(len(r.prompt) + len(rest) * _copies(r)
@@ -2285,6 +2327,14 @@ class HybridBatchEngine(BatchEngine):
                                 kept = ink
                             if kind == "system" and self.disk is not None:
                                 self.disk.save(list(r.prompt[:cp]), c0)
+                            elif ink and self.disk is not None and kind in ("user", "shared"):
+                                # (Inkling 2 only) A long conversation's prefix on the SSD too, every
+                                # ``disk_checkpoint_tokens`` read past the last one saved: the prompt cache holds two
+                                # or three such states beside the weights on a 24 GB Mac, and one that fell out of it
+                                # was read again at 300 tokens/s (7k tokens: 22 s; from the disk, under a second).
+                                every = getattr(self.lm, "disk_checkpoint_tokens", None)
+                                if every and cp - self.disk.longest(list(r.prompt[:cp]) + [-1]) >= every:
+                                    self.disk.save(list(r.prompt[:cp]), c0, kind="user")
                             if os.environ.get("LOCALS_PREFILL_LOG"):
                                 print(f"[checkpoint] {kind} at {cp} (disk {'on' if self.disk is not None else 'off'})", flush=True)
                             done, rest = cp, list(r.prompt[cp:-1])
