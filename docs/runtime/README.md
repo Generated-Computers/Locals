@@ -719,6 +719,20 @@ token routed to it, though consecutive tokens share experts (4 tokens use 19 of 
 once for the tokens that share it (`inkling_experts.py`, above) took a pass of n tokens from 20 + 12 n ms to about
 25 + 6 n, which is what makes the wide drafts in the first table pay.
 
+**Direction adapters** (`convert_inkling --adapter FILE.gguf --base BUILD --out DIR`). Some adapters for this model
+are a rank-1 LoRA at every place a layer writes (attention's output weights, each expert's output weights, the
+embedding) whose B is one unit direction d a layer and whose A is minus d times the weights, so that W + BA = (1 -
+dd')W: the layer's output without its part along d. AtomicChat's Inkling-2-Mini-Uncensored-LoRA (44 MB, 49 sites) is
+one, made from the bfloat16 weights; against this build's 8-bit attention weights its A is -d'W to a cosine of
+0.99997. Nothing of it is added to weights it was not made from: the converter writes attention's output weights
+and the embedding again without their direction (8-bit as they were, in the build's own types; 1% of the direction
+is left, the rounding), and the experts, 4-bit as released, are not touched: each layer keeps its direction
+(`mlp.ablate`) and the experts' sum is cleared of it where it is made, in `combine`'s variant for such builds (a
+threadgroup a token, since the part along d is a sum over all 2,304 dimensions; as six MLX operations a visit it
+cost 2 ms a step, as a kernel of its own 1.5). The new build links the base's weight files and adds 0.7 GB; through
+the server it runs within a few percent of the base (a file written through a tool 70.9 against 73.7 tokens/s,
+prose 34.7 against 35.1). The model is another model: what the adapter does to its answers was not measured here.
+
 Others' numbers for this model, none measured here: EXO Labs reported 210 tokens/s on a 96 GB M5 Ultra and 125 on a
 48 GB M5 Max for "an upcoming Apple Silicon inference engine, with DSpark" (posted on X; engine, quantization and
 method unpublished as of 2026-11-21); oMLX 83 tokens/s on an M5 Ultra with the draft model and 40 on an M3 Ultra

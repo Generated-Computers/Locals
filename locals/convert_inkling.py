@@ -99,6 +99,143 @@ def add_draft(src: Path, out: Path, config: dict, draft_config: dict, log=print)
     log(f"wrote model-draft.safetensors: {sum(v.nbytes for v in weights.values()) / 1e9:.2f} GB")
 
 
+def read_gguf(path) -> tuple:
+    """(metadata, {name: float32 array}) of a GGUF file whose tensors are plain floats, as an adapter's are. GGUF
+    lists a tensor's dimensions innermost first; the arrays have them the other way round, as weights do."""
+    import struct
+
+    scalars = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
+    floats = {0: np.float32, 1: np.float16}
+    with open(path, "rb") as f:
+        if f.read(4) != b"GGUF":
+            raise ValueError(f"{path} is no GGUF file")
+        _, n_tensors, n_meta = struct.unpack("<IQQ", f.read(20))
+
+        def text():
+            return f.read(struct.unpack("<Q", f.read(8))[0]).decode("utf-8", "replace")
+
+        def value(kind):
+            if kind == 8:
+                return text()
+            if kind == 9:
+                item, n = struct.unpack("<IQ", f.read(12))
+                return [value(item) for _ in range(n)]
+            return struct.unpack("<" + scalars[kind], f.read(struct.calcsize(scalars[kind])))[0]
+
+        meta = {}
+        for _ in range(n_meta):
+            key = text()
+            meta[key] = value(struct.unpack("<I", f.read(4))[0])
+        table = []
+        for _ in range(n_tensors):
+            name = text()
+            n_dims = struct.unpack("<I", f.read(4))[0]
+            dims = struct.unpack("<" + "Q" * n_dims, f.read(8 * n_dims))
+            kind, offset = struct.unpack("<IQ", f.read(12))
+            if kind not in floats:
+                raise ValueError(f"{name}: tensor type {kind} (only float32 and float16 adapters are read)")
+            table.append((name, dims, kind, offset))
+        align = meta.get("general.alignment", 32)
+        base = (f.tell() + align - 1) // align * align
+        tensors = {}
+        for name, dims, kind, offset in table:
+            f.seek(base + offset)
+            n = int(np.prod(dims)) if dims else 1
+            a = np.frombuffer(f.read(n * np.dtype(floats[kind]).itemsize), dtype=floats[kind])
+            tensors[name] = a.reshape(tuple(reversed(dims))).astype(np.float32)
+    return meta, tensors
+
+
+def add_adapter(base: Path, adapter: Path, out: Path, log=print) -> None:
+    """A build with an adapter that takes one direction out of what each layer writes, made beside ``base`` (its
+    weight files linked, not copied: 0.7 GB more).
+
+    Such an adapter is a rank-1 LoRA (GGUF, llama.cpp's names) on every layer's attention output and experts' output
+    and on the embedding, whose B is a unit direction d, the same for a layer's attention and its 128 experts, and
+    whose A is minus d times the weights: W + B A = (1 - d d') W, the layer's output without its part along d.
+    (AtomicChat's Inkling-2-Mini-Uncensored-LoRA is one: against this build's own 8-bit attention weights its A is
+    -d'W to a cosine of 0.99997.) So nothing of it need be added to weights it was not made from:
+
+    * attention's output weights and the embedding are written again without the direction, at their own bits;
+    * the experts stay as they are, 4-bit as released, and their summed output is cleared of the direction as the
+      model runs (``inkling2_loop.without``; the direction is each layer's ``mlp.ablate``).
+
+    An adapter of another shape is refused."""
+    meta, T = read_gguf(adapter)
+    if meta.get("general.architecture") != "inkling2_loop" or meta.get("adapter.type") != "lora":
+        raise ValueError(f"{adapter}: not a LoRA adapter for inkling2_loop")
+    config = json.loads((base / "config.json").read_text())
+    files = sorted(base.glob("model*.safetensors"))
+    weights = {}
+    for f in files:
+        weights.update(mx.load(str(f)))  # (lazy)
+    n_layers = config["text_config"]["num_hidden_layers"] if "text_config" in config else config["num_hidden_layers"]
+    alpha = float(meta.get("adapter.lora_alpha", 1.0))
+
+    def unit(name):
+        b = T[name].reshape(-1)
+        if abs(float(np.linalg.norm(b)) * alpha - 1.0) > 1e-3:
+            raise ValueError(f"{name}: not a unit direction (norm {np.linalg.norm(b):.4f}): another kind of adapter")
+        return b / np.linalg.norm(b)
+
+    group = int(config["quantization"]["group_size"])
+
+    def requantized(prefix, direction, on_output: bool, want, rows=16384):
+        """``prefix``'s quantized matrix without ``direction``, and the cosine of what is taken out with the
+        adapter's A (``want``): out of its outputs ((1 - dd')W) or out of its rows (an embedding's)."""
+        w, sc, bi = (weights[f"{prefix}.{k}"] for k in ("weight", "scales", "biases"))
+        bits = 32 * w.shape[1] // (sc.shape[1] * group)
+        d, ref = mx.array(direction), mx.array(want.reshape(-1))
+        outs, dot, n1, n2 = [], 0.0, 0.0, 0.0
+        for a in range(0, w.shape[0], w.shape[0] if on_output else rows):  # (the embedding a few rows at a time)
+            b = w.shape[0] if on_output else a + rows
+            W = mx.dequantize(w[a:b], sc[a:b], bi[a:b], group_size=group, bits=bits).astype(mx.float32)
+            part = d @ W if on_output else W @ d  # (along d: of each input's output, or of each row)
+            r = ref if on_output else ref[a:b]
+            dot, n1, n2 = dot + float((part * r).sum()), n1 + float((part * part).sum()), n2 + float((r * r).sum())
+            W = W - (d[:, None] * part[None, :] if on_output else part[:, None] * d[None, :])
+            # (scales and biases in the build's own type: in float32 the layer's output is float32, and from the
+            # embedding on the whole model ran so, a quarter slower)
+            q = mx.quantize(W, group_size=group, bits=bits)
+            outs.append((q[0], q[1].astype(sc.dtype), q[2].astype(bi.dtype)))
+            mx.eval(outs[-1])
+        return [mx.concatenate([o[i] for o in outs]) for i in range(3)], dot / (n1 * n2) ** 0.5
+
+    new, t0 = {}, time.time()
+    for i in range(n_layers):
+        d = unit(f"blk.{i}.attn_output.weight.lora_b")
+        eb = T[f"blk.{i}.ffn_down_exps.weight.lora_b"].reshape(-1, d.shape[0])
+        if float(np.abs(eb @ d - 1.0).max()) > 1e-3:
+            raise ValueError(f"layer {i}: the experts' direction is not attention's: another kind of adapter")
+        prefix = f"model.language_model.layers.{i}.self_attn.o_proj"
+        (w, sc, bi), cos = requantized(prefix, d, True, T[f"blk.{i}.attn_output.weight.lora_a"])
+        if cos > -0.99:
+            raise ValueError(f"layer {i}: the adapter's A is not minus its direction times this build's weights (cosine {cos:.3f})")
+        new.update({f"adapted.{prefix}.weight": w, f"adapted.{prefix}.scales": sc, f"adapted.{prefix}.biases": bi,
+                    f"model.language_model.layers.{i}.mlp.ablate": mx.array(d)})
+    log(f"attention's output weights of {n_layers} layers without their direction ({time.time() - t0:.0f} s)")
+    prefix = "model.language_model.embed_tokens"
+    (w, sc, bi), cos = requantized(prefix, unit("token_embd.weight.lora_b"), False, T["token_embd.weight.lora_a"])
+    if cos > -0.99:
+        raise ValueError(f"the embedding: the adapter's A is not minus the rows' part along its direction (cosine {cos:.3f})")
+    new.update({f"adapted.{prefix}.weight": w, f"adapted.{prefix}.scales": sc, f"adapted.{prefix}.biases": bi})
+    log(f"the embedding without its direction ({time.time() - t0:.0f} s)")
+
+    out.mkdir(parents=True, exist_ok=True)
+    for f in base.iterdir():
+        if f.name == "config.json" or f.name.startswith("."):
+            continue
+        link = out / f.name
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(f.resolve())
+    mx.save_safetensors(str(out / "model-adapter.safetensors"), new, metadata={"format": "mlx"})
+    config["adapter"] = {"kind": "direction", "name": meta.get("general.name"), "file": adapter.name, "base": base.name,
+                         "layers": n_layers}
+    (out / "config.json").write_text(json.dumps(config, indent=2))
+    log(f"wrote {out} ({sum(v.nbytes for v in new.values()) / 1e9:.2f} GB of its own; the rest is {base}'s)")
+
+
 def convert(src: Path, out: Path, attention_bits: int = 8, head_bits: int = 8, tail: str = "nvfp4",
             shard_bytes: float = 5e9, log=print, draft: bool = True):
     from .models import inkling2_loop as ink
@@ -208,8 +345,13 @@ def main(argv=None):
     ap.add_argument("--tail", default="nvfp4", choices=("nvfp4", "mxfp8"), help="the experts of layers 20 to 23")
     ap.add_argument("--no-draft", action="store_true", help="leave the draft model (0.64 GB) out of the build")
     ap.add_argument("--draft-only", action="store_true", help="add the draft model to a build already made")
+    ap.add_argument("--adapter", help="a direction adapter (GGUF LoRA): makes --out from the build in --base, without that direction")
+    ap.add_argument("--base", default="~/models/Inkling-2-Mini-MLX-nvfp4", help="with --adapter: the build it is applied to")
     args = ap.parse_args(argv)
     src, out = Path(args.src).expanduser(), Path(args.out).expanduser()
+    if args.adapter:
+        add_adapter(Path(args.base).expanduser(), Path(args.adapter).expanduser(), out)
+        return
     # only what the release's folder lacks: a folder downloaded for a build without the draft model has no
     # mtp.safetensors, and --draft-only needs its 0.64 GB alone, not the 19.5 GB of weights again
     want = [DRAFT] if args.draft_only else [WEIGHTS] + ([] if args.no_draft else [DRAFT])

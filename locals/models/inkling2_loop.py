@@ -91,6 +91,7 @@ class ModelArgs(BaseModelArgs):
     vision_config: Optional[Dict[str, Any]] = None
     image_token_id: int = 200054
     draft_config: Optional[Dict[str, Any]] = None  # (a build with the draft model: locals.convert_inkling)
+    adapter: Optional[Dict[str, Any]] = None  # (a build with a direction taken out of each layer's output: --adapter)
 
     def __post_init__(self):
         self.text = TextArgs.from_dict(self.text_config)
@@ -396,6 +397,15 @@ class Router(nn.Module):
         return inds, weights / (weights.sum(axis=-1, keepdims=True) + ROUTER_EPS) * self.route_scale
 
 
+def without(y: mx.array, direction: Optional[mx.array]) -> mx.array:
+    """``y`` (float32) with its part along a unit ``direction`` taken out: what a rank-1 adapter whose B is the
+    direction and whose A is minus the direction times the layer's weights does to the layer's output."""
+    if direction is None:
+        return y
+    d = direction.astype(mx.float32)
+    return y - (y @ d)[..., None] * d
+
+
 class SparseMoeBlock(nn.Module):
     def __init__(self, args: TextArgs):
         super().__init__()
@@ -404,8 +414,9 @@ class SparseMoeBlock(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         inds, weights = self.gate(x)
-        y = self.experts(x, inds).astype(mx.float32) * weights[..., None]
-        return y.sum(axis=-2).astype(x.dtype)
+        y = (self.experts(x, inds).astype(mx.float32) * weights[..., None]).sum(axis=-2)
+        # (a build with an adapter has ``ablate``: the direction the experts' output is cleared of, Model.__init__)
+        return without(y, getattr(self, "ablate", None)).astype(x.dtype)
 
 
 class DepthInput(nn.Module):
@@ -705,6 +716,12 @@ class Model(nn.Module):
             t = args.text
             self.mtp = Drafter(args.draft_config, t.vocab_size, t.unpadded_vocab_size or t.vocab_size, t.final_logit_softcapping or 0.0)
             self.model.language_model.taps = Taps(self.mtp.visits, self.mtp)
+        if args.adapter:
+            # A direction taken out of what each layer writes (locals.convert_inkling --adapter): attention's output
+            # weights and the embedding carry it already, at their 8 bits; the experts, 4-bit as released, are
+            # cleared of it as they are summed.
+            for layer in self.model.language_model.layers:
+                layer.mlp.ablate = mx.zeros((args.text.hidden_size,), dtype=mx.float32)
 
     def __call__(self, inputs: mx.array, cache: Optional[List[Any]] = None,
                  input_embeddings: Optional[mx.array] = None) -> mx.array:
@@ -737,6 +754,8 @@ class Model(nn.Module):
                     out[f"{name}.weight"] = v.view(mx.uint32)
             else:
                 out[k] = v.astype(mx.float32) if k.endswith(_FLOAT32) else v
+        for k in [k for k in out if k.startswith("adapted.")]:  # (an adapter's own weights in place of the build's)
+            out[k[len("adapted."):]] = out.pop(k)
         if queries:  # the release has (query, experts) and (key, value) rows of each looped layer
             dims = queries["q"].shape[-1]
             q, kv = queries["q"].reshape(-1, 2, dims), queries["kv"].reshape(-1, 2, dims)

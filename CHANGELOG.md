@@ -2,6 +2,18 @@
 
 ## 0.2.3 (unreleased)
 
+- `python -m locals.convert_inkling --adapter FILE.gguf --out DIR` makes an Inkling 2 Mini build with a direction
+  adapter applied, beside the build it is applied to (`--base`; its weight files are linked, the new build is 0.7 GB
+  of its own). A direction adapter is a rank-1 LoRA on every layer's attention output and experts' output and on
+  the embedding whose B is one unit direction a layer and whose A is minus that direction times the weights: the
+  layer's output without its part along the direction. AtomicChat's Inkling-2-Mini-Uncensored-LoRA is one (its A is
+  minus the direction times this build's own 8-bit attention weights to a cosine of 0.99997). Attention's output
+  weights and the embedding are written again without the direction at their 8 bits (1% of it left, their
+  rounding); the experts stay 4-bit as released and their summed output is cleared of it as the model runs, in the
+  kernel that sums them (`inkling.combine`, `inkling2_loop.without`). On an M4 Pro, after the first token, against
+  the build without it: a file written through a tool 70.9 tokens/s (73.7), a new file 60.6 (57.2), prose 34.7
+  (35.1). An adapter of another shape is refused. What the adapter does to the model's answers was not measured
+  here; its makers report MMLU 79.15% against 80.65%.
 - Inkling 2 Mini keeps a long conversation's prefix on the SSD too (Inkling 2 only; the disk cache kept system
   prompts alone): the state at the start of the last message, every 2,048 tokens read past the last one saved
   (`disk_checkpoint_tokens`), back into the prompt cache as a conversation's checkpoint when a request starts with

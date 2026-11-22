@@ -446,6 +446,57 @@ _COMBINE_SRC = """
     out[size_t(row) * D + d] = T(resid[size_t(row) * D + d] + h);
 """
 
+# combine for a build with an adapter: the experts' sum without its part along a direction (ink.without), which is a
+# sum over all of D, so a threadgroup of 1,024 takes a token and a thread the dimensions 1,024 apart. As a kernel of
+# its own before combine it was one more link in the step's chain, 1.5 ms a step over the 48 visits.
+_COMBINE_WITHOUT_SRC = """
+    constexpr int NS = TG / 32;
+    constexpr int P = (D + TG - 1) / TG;
+    const uint t = thread_position_in_threadgroup.x;
+    const uint row = threadgroup_position_in_grid.y;
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    threadgroup float buf[4][NS];
+    threadgroup float red[4];
+    float ysum[4][P];
+    float part[4], along[4];
+    for (int j = 0; j < 4; j++) {
+        const int r = int(row) - 3 + j;
+        part[j] = 0.0f;
+        for (int c = 0; c < P; c++) {
+            const int d = int(t) + c * TG;
+            ysum[j][c] = 0.0f;
+            if (d >= D || r < 0 || (j < 3 && !SEQ)) continue;
+            float y = 0.0f;
+            for (int k = 0; k < K; k++) y += float(ys[(size_t(r) * K + k) * D + d]) * weights[size_t(r) * K + k];
+            ysum[j][c] = y;
+            part[j] += y * dir[d];
+        }
+    }
+    REDUCE2(4, part, along)
+    for (int c = 0; c < P; c++) {
+        const int d = int(t) + c * TG;
+        if (d >= D) continue;
+        float yv[4];
+        for (int j = 0; j < 4; j++) yv[j] = float(T(ysum[j][c] - along[j] * dir[d]));
+        const float y = yv[3];
+        const size_t so = size_t(row) * 3 * D + d, to = size_t(d) * 4;
+        float s0, s1, s2;
+        if (SEQ) {
+            const int r = int(row);
+            s0 = r >= 3 ? yv[0] : state[size_t(r) * D + d];
+            s1 = r >= 2 ? yv[1] : state[size_t(r + 1) * D + d];
+            s2 = r >= 1 ? yv[2] : state[size_t(r + 2) * D + d];
+        } else {
+            s0 = state[so]; s1 = state[so + D]; s2 = state[so + 2 * D];
+        }
+        float h = (taps[to] * s0 + taps[to + 1] * s1 + taps[to + 2] * s2 + taps[to + 3] * y + y) * 0.4472135955f;
+        h = float(T(h));
+        new_state[so] = s1; new_state[so + D] = s2; new_state[so + 2 * D] = y;
+        out[size_t(row) * D + d] = T(resid[size_t(row) * D + d] + h);
+    }
+"""
+
 _kernels: dict = {}
 
 
@@ -657,12 +708,17 @@ def act(gate_up, gate_cap: float, up_cap: float):
         threadgroup=(min(256, n), 1, 1), output_shapes=[shape], output_dtypes=[gate_up.dtype])[0]
 
 
-def combine(ys, weights, state, taps, resid, seq: bool = False):
+def combine(ys, weights, state, taps, resid, seq: bool = False, direction=None):
     """The experts' outputs (M, k, ..., D) summed by their weights, the short convolution of that (state (M, 3, D), taps
-    (D, 4)) and the residual (M, D) float32: the visit's output (M, D) and the convolution's new state."""
+    (D, 4)) and the residual (M, D) float32: the visit's output (M, D) and the convolution's new state.
+    ``direction`` (D,) float32, a build with an adapter: the sum without its part along it."""
     M, D = resid.shape
     K = ys.size // (M * D)
     T = ys.dtype
+    if direction is not None:
+        return _kernel("combine_without", ["ys", "weights", "state", "taps", "resid", "dir"], ["out", "new_state"], _COMBINE_WITHOUT_SRC)(
+            inputs=[ys, weights, state, taps, resid, direction], template=[("T", T), ("K", K), ("D", D), ("SEQ", seq), ("TG", 1024)],
+            grid=(1024, M, 1), threadgroup=(1024, 1, 1), output_shapes=[(M, D), (M, 3, D)], output_dtypes=[T, _F32])
     return _kernel("combine", ["ys", "weights", "state", "taps", "resid"], ["out", "new_state"], _COMBINE_SRC)(
         inputs=[ys, weights, state, taps, resid], template=[("T", T), ("K", K), ("D", D), ("SEQ", seq)], grid=(D, M, 1),
         threadgroup=(min(256, D), 1, 1), output_shapes=[(M, D), (M, 3, D)], output_dtypes=[T, _F32])
@@ -883,7 +939,8 @@ class FusedText(ink.TextModel):
             ys = _scatter_unsort(E.down_proj(hidden, by, sorted_indices=True), back, inds.shape)
         else:
             ys = E.down_proj(act(E.gate_up_proj(mlp_in, inds), E.gate_softcap, E.up_softcap), inds)
-        x, ms = combine(ys, weights, st[3], c.mlp_taps, resid, seq)
+        # (a build with an adapter: the experts' sum without its layer's direction, ``mlp.ablate``)
+        x, ms = combine(ys, weights, st[3], c.mlp_taps, resid, seq, getattr(layer.mlp, "ablate", None))
         states = (ks, vs, cs, ms)
         for i, a in enumerate(states):  # (of a text's tokens: the state after each; the last is the cache's)
             conv[i] = a[M - 1 :] if seq else a

@@ -22,18 +22,22 @@ DRAFT = dict(hidden_size=TEXT["hidden_size"], num_hidden_layers=3, num_attention
              block_size=8, markov_rank=8, markov_head_type="rnn_hidden", target_layer_ids=[2, 6, 11, 14])
 
 
-def _model(loop: bool = True, seed: int = 0, experts: str = "", fused: bool = False, draft: bool = False) -> ink.Model:
+def _model(loop: bool = True, seed: int = 0, experts: str = "", fused: bool = False, draft: bool = False,
+           adapter: bool = False) -> ink.Model:
     """A random model in float32. ``experts``: "q" has them quantized as the release (NVFP4 with a scale an expert,
     MXFP8 in the last layer). The router's bias picks the experts, a different pair a layer: with random weights two
     scores are often a rounding apart, and a path that rounds differently would pick another."""
     mx.random.seed(seed)
     config = {"model_type": "inkling2_loop", "text_config": {**TEXT, **({"loop_config": LOOP} if loop else {})},
-              **({"draft_config": DRAFT} if draft else {})}
+              **({"draft_config": DRAFT} if draft else {}), **({"adapter": {"kind": "direction"}} if adapter else {})}
     m = ink.Model(ink.ModelArgs.from_dict(config))
     weights = []
     for k, v in tree_flatten(m.parameters()):
         if k.endswith(("norm.weight", "l2_clip.scale")):
             v = 1 + 0.1 * mx.random.normal(v.shape)
+        elif k.endswith(".mlp.ablate"):  # (a unit direction, each layer its own)
+            v = mx.random.normal(v.shape)
+            v = v / mx.linalg.norm(v)
         elif k.endswith("e_score_correction_bias"):
             v = mx.array([(i * 7 + len(k)) % 4 * 10.0 for i in range(4)])
         else:
@@ -693,3 +697,55 @@ def test_the_build_downloads_only_what_its_folder_lacks(tmp_path, monkeypatch):
     (src / conv.WEIGHTS).unlink(), (src / conv.DRAFT).unlink()
     conv.main(["--src", str(src), "--out", str(out), "--draft-only"])
     assert asked[-1] == conv.SMALL + [conv.DRAFT]  # (the weights deleted after the build: not downloaded again)
+
+
+@pytest.mark.parametrize("rows", [1, 2])
+def test_a_build_with_an_adapter_clears_the_experts_output_of_its_direction(rows):
+    """A build made with --adapter has a direction a layer (``mlp.ablate``): the experts' summed output is without
+    it, in the reference and in the kernels (combine's own variant), a token at a time and a few tokens a pass."""
+    ref, fused = _model(experts="q", adapter=True), _model(experts="q", adapter=True, fused=True)
+    plain = _model(experts="q")
+    layer = ref.model.language_model.layers[2]
+    x = mx.random.normal((1, 3, 64))
+    d = layer.mlp.ablate
+    assert float(mx.abs(layer.mlp(x) @ d).max()) < 1e-4 < float(mx.abs(plain.model.language_model.layers[2].mlp(x) @ d).max())
+    toks = mx.random.randint(0, 120, (rows, 24), key=mx.random.key(8))
+    a, b = ref.make_cache(), fused.make_cache()
+    assert _close(fused(toks[:, :5], cache=b), ref(toks[:, :5], cache=a))
+    assert not _close(plain(toks[:, :5]), ref(toks[:, :5]))  # (it is another model than the one without)
+    for i in range(5, 14):
+        assert _close(fused(toks[:, i:i + 1], cache=b), ref(toks[:, i:i + 1], cache=a)), i
+    if rows == 1:  # (a text's few tokens in one pass of the kernels)
+        assert _close(fused(toks[:, 14:20], cache=b), ref(toks[:, 14:20], cache=a))
+
+
+def test_an_adapter_file_is_read_and_one_of_another_shape_refused(tmp_path):
+    """convert_inkling reads a GGUF adapter's metadata and float tensors (dimensions the other way round, as weights
+    have them), and ``add_adapter`` takes only a LoRA for this architecture."""
+    import struct
+
+    import numpy as np
+
+    from locals import convert_inkling as conv
+
+    def text(t):
+        return struct.pack("<Q", len(t)) + t.encode()
+
+    def gguf(arch):
+        a, b = np.arange(6, dtype=np.float32), np.ones(4, dtype=np.float16)
+        head = b"GGUF" + struct.pack("<IQQ", 3, 2, 2)
+        head += text("general.architecture") + struct.pack("<I", 8) + text(arch)
+        head += text("adapter.type") + struct.pack("<I", 8) + text("lora")
+        head += text("x.lora_a") + struct.pack("<IQQIQ", 2, 3, 2, 0, 0)  # (GGUF: 3 wide, 2 rows)
+        head += text("x.lora_b") + struct.pack("<IQIQ", 1, 4, 1, 32)
+        pad = (-len(head)) % 32
+        return head + b"\0" * pad + a.tobytes() + b"\0" * 8 + b.tobytes()
+
+    path = tmp_path / "a.gguf"
+    path.write_bytes(gguf("inkling2_loop"))
+    meta, tensors = conv.read_gguf(path)
+    assert meta["adapter.type"] == "lora" and tensors["x.lora_a"].shape == (2, 3) and tensors["x.lora_a"][1, 2] == 5
+    assert tensors["x.lora_b"].dtype == np.float32 and tensors["x.lora_b"].tolist() == [1, 1, 1, 1]
+    path.write_bytes(gguf("llama"))
+    with pytest.raises(ValueError, match="not a LoRA adapter for inkling2_loop"):
+        conv.add_adapter(tmp_path, path, tmp_path / "out")
