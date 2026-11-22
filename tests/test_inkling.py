@@ -413,11 +413,13 @@ def test_a_forced_marker_is_fed_as_its_token(monkeypatch):
 
 def test_other_models_are_served_as_before_inkling():
     """What the engine does for Inkling 2 alone: a prompt that requests waiting together share is read once, a
-    checkpoint's copy counts the windows it holds, and usage says what drafts did. A Qwen3.5 (gated delta and
-    attention layers) reads each request's prompt and counts its copies as it did before."""
+    checkpoint's copy counts the windows it holds, usage says what drafts did, room is kept for a read of its size
+    and the prompt cache is smaller beside its weights. A Qwen3.5 (gated delta and attention layers) reads each
+    request's prompt, counts its copies and keeps room as it did before."""
     from mlx_lm.models import qwen3_5
     from mlx_lm.models.cache import LRUPromptCache
 
+    from locals import hybrid_batch
     from locals.engine import Controller
     from locals.hybrid_batch import HybridBatchEngine
     from locals.packed import Request
@@ -445,8 +447,10 @@ def test_other_models_are_served_as_before_inkling():
     waiting = list(reqs)
     eng.serve(lambda block: [waiting.pop(0) for _ in list(waiting)], lru=LRUPromptCache(max_size=16), lru_key="tiny")
     assert eng.counters["prefill_tokens"] == 3 * (len(same) - 1) + len(other) - 1
-    assert not eng._inkling() and eng._copies_state(3) == 0
-    assert HybridBatchEngine(_model(fused=True), Tok(), n_slots=4)._copies_state(3) > 0
+    assert not eng._inkling() and eng._copies_state(3) == 0 and not hybrid_batch._reads_by_size(eng)
+    assert getattr(eng.lm, "prompt_cache_bytes", None) is None  # (its prompt cache is sized as before)
+    ink_eng = HybridBatchEngine(_model(fused=True), Tok(), n_slots=4)
+    assert ink_eng._copies_state(3) > 0 and hybrid_batch._reads_by_size(ink_eng)
 
 
 # --- grammars: walked, and tool calls typed --------------------------------------------------------------------------
@@ -657,3 +661,35 @@ def test_a_build_without_the_draft_model_has_none(monkeypatch):
     monkeypatch.setenv("LOCALS_INKLING_DRAFT", "0")
     off = _model(fused=True, draft=True)
     assert off.draft_off and len(off.make_cache()) == len(m.make_cache()) and off.model.language_model.taps is None
+
+
+def test_the_build_downloads_only_what_its_folder_lacks(tmp_path, monkeypatch):
+    """A release folder downloaded for a build without the draft model has no mtp.safetensors: --draft-only gets its
+    0.64 GB alone (a folder deleted after the build too), and a build made again gets the draft model's file."""
+    import json
+
+    import huggingface_hub
+
+    from locals import convert_inkling as conv
+
+    asked = []
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo, local_dir, allow_patterns: asked.append(allow_patterns))
+    monkeypatch.setattr(conv, "add_draft", lambda *a, **k: None)
+    monkeypatch.setattr(conv, "convert", lambda *a, **k: None)
+    src, out = tmp_path / "release", tmp_path / "build"
+    src.mkdir(), out.mkdir()
+    (src / "config.json").write_text(json.dumps({"mtp_config": {}}))
+    (out / "config.json").write_text(json.dumps({"quantization": {}}))
+    (src / conv.WEIGHTS).write_bytes(b"")
+    conv.main(["--src", str(src), "--out", str(out), "--draft-only"])
+    assert asked[-1] == conv.SMALL + [conv.DRAFT]
+    conv.main(["--src", str(src), "--out", str(out)])
+    assert asked[-1] == conv.SMALL + [conv.DRAFT]
+    (src / conv.DRAFT).write_bytes(b"")
+    n = len(asked)
+    conv.main(["--src", str(src), "--out", str(out), "--draft-only"])
+    conv.main(["--src", str(src), "--out", str(out)])
+    assert len(asked) == n  # (all there: nothing downloaded)
+    (src / conv.WEIGHTS).unlink(), (src / conv.DRAFT).unlink()
+    conv.main(["--src", str(src), "--out", str(out), "--draft-only"])
+    assert asked[-1] == conv.SMALL + [conv.DRAFT]  # (the weights deleted after the build: not downloaded again)

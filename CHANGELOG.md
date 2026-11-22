@@ -2,6 +2,9 @@
 
 ## 0.2.3 (unreleased)
 
+- `python -m locals.convert_inkling` downloads only what the release's folder lacks: `--draft-only` gets the draft
+  model's 0.64 GB alone (a folder from a build without it has no `mtp.safetensors`, and one deleted after the build
+  had the whole 19.5 GB downloaded again), and a build made again gets the draft model's file.
 - Inkling 2 Mini over long conversations, on a 24 GB Mac. A request that went on from a cached 6,666-token prefix
   with 40 tokens to read was given room to read 2,048, and the prompt cache was emptied for it, the prefix the next
   request went on from included: every other request of a 7k-token conversation read it again, 21 s. Three causes:

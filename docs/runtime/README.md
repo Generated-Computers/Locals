@@ -529,7 +529,9 @@ barriers made no difference), so the step's floor is its number of kernels.
 
 **Speed** (M4 Pro, 24 GB, the 15.6 GB build, one request unless said): the reference path 18.5 tokens/s; with the
 kernels 34 (29.5 ms a token); on the server, each request writing 320 tokens, 35 tokens/s for one, 54 for two, 73
-for four and 81 for eight. Rows add less than on a dense model: each reads its own experts, 8 ms a row and step,
+for four and 81 for eight with MLX's expert kernel, and 79 for four and 95 for eight with each expert read once for
+the rows that share it (`inkling_experts.py`, below). With MLX's kernel rows add less than on a dense model: each
+reads its own experts, 8 ms a row and step,
 while attention's projections (4.5 ms for one row, 9.7 for eight) and the output layer are read once. `attend`
 takes the three query heads of a key/value head in one threadgroup (the keys and values read once: 26.8 to 11.3 ms
 at eight rows). A pass that reads a prompt and steps the rows together (`mixed.py`) would save little here, since
@@ -691,9 +693,10 @@ sets another): 12% free, the prefix a request went on from and its last reply ke
 request answers after 0.6 s.
 
 Prose loses 4%: its tries seldom pay, and every step also feeds the draft caches. `LOCALS_INKLING_DRAFT=0` runs
-without the draft model; `LOCALS_INKLING_DRAFT_P` sets the probability. What would make drafts pay more: MLX's expert
-kernel reads an expert once per token routed to it, and consecutive tokens share experts (4 tokens use 19 of 32, 8
-use 29 of 64), so a pass of n tokens costs 20 + 12 n ms where one read per expert would make it about 20 + 9 n at 4.
+without the draft model; `LOCALS_INKLING_DRAFT_P` sets the probability. MLX's expert kernel reads an expert once per
+token routed to it, though consecutive tokens share experts (4 tokens use 19 of 32, 8 use 29 of 64): reading each
+once for the tokens that share it (`inkling_experts.py`, above) took a pass of n tokens from 20 + 12 n ms to about
+25 + 6 n, which is what makes the wide drafts in the first table pay.
 
 Others' numbers for this model, none measured here: EXO Labs reported 210 tokens/s on a 96 GB M5 Ultra and 125 on a
 48 GB M5 Max for "an upcoming Apple Silicon inference engine, with DSpark" (posted on X; engine, quantization and

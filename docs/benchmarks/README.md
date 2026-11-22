@@ -674,6 +674,52 @@ sliding window: the same top token at every position, logits within 0.001, and t
 cache filled in two chunks. In float16 the top token is the same at 99.7% of positions, in bfloat16 at 97.4% (PyTorch's
 own bfloat16: 97.2%). Liquid's 8-bit build: 96.3%; its 4-bit build: 78.8%.
 
+## 13. Thinking Machines' Inkling 2 Mini (M4 Pro, 24 GB)
+
+Inkling 2 Mini (`thinkingmachines/Inkling-2-Mini`: 26.4B, a mixture of experts whose middle layers loop, 48 layer
+passes a token from 24 layers of weights) in Locals's build (`python -m locals.convert_inkling`: 15.6 GB, 16.2 with
+its draft model) on a MacBook Pro with an M4 Pro and 24 GB, November 2026, MLX 0.32 and mlx-lm 0.32.2. Stock MLX is
+the same build and model code without Locals's kernels and engine. How each part works, and more numbers:
+[Runtime and kernels](../runtime/README.md#inkling-2-mini-modelsinkling2_looppy-inklingpy).
+
+**Requests at once** (through the server, each request writing 320 tokens; tokens per second all requests write
+together):
+
+| Requests at once | Stock MLX | Locals, MLX's expert kernel | Locals, each expert read once for the rows that share it |
+|---|---|---|---|
+| 1 | 17.1 | 35 | |
+| 2 | 30 | 54 | |
+| 4 | 50 | 73 | 79 |
+| 8 | 48 | 81 | 95 |
+
+**A request alone, by what it writes** (tokens per second after the first token; drafts are for a request alone):
+
+| | No drafts, MLX's expert kernel | The draft model | Experts read once, and wide lookup drafts too |
+|---|---|---|---|
+| A file written through a tool (620 tokens, a copy with one name changed) | 36.9 | 63.5 | 75.6 |
+| A new file through a tool (600 tokens) | 37.4 | 51.4 | 59.6 |
+| Code in a plain reply | 37.6 | 39.1 | 40.3 |
+| Prose | 37.4 | 35.9 | 36.0 |
+
+Stock MLX writes the first of them at 17 tokens/s.
+
+**In a conversation** (a file read in an earlier turn, then one question; tokens per second after the first token,
+without the draft model and with it):
+
+| | 0.9k tokens before | 3k | 7k |
+|---|---|---|---|
+| Thinking about the code (300 tokens) | 37.5 / 55.8 | 34.4 / 45.6 | 37.3 / 64.8 |
+| The function written out again (900 tokens) | 50.9 / 62.2 | 54.2 / 59.6 | 55.6 / 58.0 |
+| An edit through a tool (180 tokens) | 39.1 / 65.5 | | 36.2 / 61.5 |
+| A file written through a tool (900 tokens) | 44.0 / 59.9 | 42.0 / 69.9 | |
+| A short call (120 tokens) | 40.5 / 51.1 | | 38.6 / 44.8 |
+
+**Agents and long conversations.** `locals run`'s two-file task with 4 slots and 2 versions: 34 to 40 s, reading 1,100
+to 1,600 prompt tokens past the cache (49 to 50 s and 4,755 tokens before an agent's step was read once). A
+7,000-token conversation's third request answers after 0.6 s (21 s before the prompt cache kept its prefix on a 24 GB
+Mac). The first request with a set of tools: 2.0 s to the first token (733-token prompt). Reading a prompt with
+nothing cached: 300 to 320 tokens/s (6,997 tokens in 23.3 s).
+
 ## How the measurements were made
 
 - **Decode speed**: n requests at once, 256 tokens each with the end-of-text token

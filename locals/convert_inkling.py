@@ -210,10 +210,14 @@ def main(argv=None):
     ap.add_argument("--draft-only", action="store_true", help="add the draft model to a build already made")
     args = ap.parse_args(argv)
     src, out = Path(args.src).expanduser(), Path(args.out).expanduser()
-    if not (src / WEIGHTS).exists():
+    # only what the release's folder lacks: a folder downloaded for a build without the draft model has no
+    # mtp.safetensors, and --draft-only needs its 0.64 GB alone, not the 19.5 GB of weights again
+    want = [DRAFT] if args.draft_only else [WEIGHTS] + ([] if args.no_draft else [DRAFT])
+    missing = [f for f in want if not (src / f).exists()]
+    if missing or not (src / "config.json").exists():
         from huggingface_hub import snapshot_download
 
-        snapshot_download(REPO, local_dir=str(src), allow_patterns=SMALL + [WEIGHTS, DRAFT])
+        snapshot_download(REPO, local_dir=str(src), allow_patterns=SMALL + missing)
     if args.draft_only:
         config = json.loads((out / "config.json").read_text())
         add_draft(src, out, config, json.loads((src / "config.json").read_text())["mtp_config"])
