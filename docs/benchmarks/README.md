@@ -720,6 +720,19 @@ to 1,600 prompt tokens past the cache (49 to 50 s and 4,755 tokens before an age
 Mac). The first request with a set of tools: 2.0 s to the first token (733-token prompt). Reading a prompt with
 nothing cached: 300 to 320 tokens/s (6,997 tokens in 23.3 s).
 
+**Long conversations, kept on the SSD** (a conversation's prefix in the disk cache every 2,048 tokens read):
+
+| A conversation of | First reading | A later request, before | A later request, now | Memory free |
+|---|---|---|---|---|
+| 7k tokens | 22 s (300 tokens/s) | 21 s every other request; 22 s after a restart | 0.5 to 0.8 s | 12% |
+| 32k tokens | 142 s (226 tokens/s) | 142 to 154 s, every request | 1.0 to 1.2 s | 12 to 14% |
+
+A 96k-token prompt is refused at once: 64,512 tokens fit beside the weights on a 24 GB Mac.
+
+**With a direction adapter** (`convert_inkling --adapter`, AtomicChat's Inkling-2-Mini-Uncensored-LoRA; tokens per
+second after the first token, the build without it in brackets): a file written through a tool 70.9 (73.7), a new
+file through a tool 60.6 (57.2), prose 34.7 (35.1). What the adapter does to the answers was not measured here.
+
 ## How the measurements were made
 
 - **Decode speed**: n requests at once, 256 tokens each with the end-of-text token

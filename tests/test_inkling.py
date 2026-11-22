@@ -749,3 +749,28 @@ def test_an_adapter_file_is_read_and_one_of_another_shape_refused(tmp_path):
     path.write_bytes(gguf("llama"))
     with pytest.raises(ValueError, match="not a LoRA adapter for inkling2_loop"):
         conv.add_adapter(tmp_path, path, tmp_path / "out")
+
+
+def test_an_adapter_build_leaves_the_base_build_as_it_is(tmp_path):
+    """The new build links the base build's files: written into the base's own folder (--out left at the build's
+    default), each link took the place of the file it linked, and the build's weights were gone. Such an --out is
+    refused before anything is read, and so is one with files of its own where the base's are linked."""
+    from locals import convert_inkling as conv
+
+    base, adapter = tmp_path / "build", tmp_path / "a.gguf"
+    base.mkdir()
+    (base / "model-00001-of-00004.safetensors").write_bytes(b"weights")
+    (base / "config.json").write_text("{}")
+    adapter.write_bytes(b"not read")
+    for out in (base, tmp_path / "build" / ".." / "build"):
+        with pytest.raises(ValueError, match="needs a folder of its own"):
+            conv.add_adapter(base, adapter, out)
+    taken = tmp_path / "taken"
+    taken.mkdir()
+    (taken / "model-00001-of-00004.safetensors").write_bytes(b"other")
+    with pytest.raises(ValueError, match="files of its own"):
+        conv.add_adapter(base, adapter, taken)
+    with pytest.raises(SystemExit):
+        conv.main(["--adapter", str(adapter), "--base", str(base)])  # (no --out: its default is a build's folder)
+    assert (base / "model-00001-of-00004.safetensors").read_bytes() == b"weights"
+    assert (taken / "model-00001-of-00004.safetensors").read_bytes() == b"other"

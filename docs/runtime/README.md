@@ -708,10 +708,10 @@ layers score each query against every key before it, which is what the longer co
 |---|---|---|---|---|
 | 7k tokens | 22 s (300 tokens/s) | 21 s every other request; 22 s after a restart | 0.5 to 0.8 s | 12% |
 | 32k tokens | 142 s (226 tokens/s) | 142 to 154 s, every request | 1.0 to 1.2 s | 12 to 14% |
-| 96k tokens | refused: 64,512 tokens fit beside the weights on this Mac (`context_length_exceeded`, at once) | | | |
+| 96k tokens | refused: 64,512 tokens fit beside the weights on a 24 GB Mac (`context_length_exceeded`, at once) | | | |
 
 Between 32k and that limit nothing was run: a 60k-token conversation's state is 2.5 GB and its reading takes
-another, which would leave this Mac a few percent of its memory.
+another, which would leave a 24 GB Mac a few percent of its memory.
 
 Prose loses 4%: its tries seldom pay, and every step also feeds the draft caches. `LOCALS_INKLING_DRAFT=0` runs
 without the draft model; `LOCALS_INKLING_DRAFT_P` sets the probability. MLX's expert kernel reads an expert once per

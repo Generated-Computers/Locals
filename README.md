@@ -540,7 +540,26 @@ and 95 tokens/s with four and eight requests at once (50 and 48). The draft
 model guesses the next tokens for a request alone, and Locals checks them all in
 one pass: in a conversation of 7,000 tokens, thinking about code went from 37 to
 65 tokens/s with it. An agent's next request there starts answering after 0.6 s.
-`LOCALS_INKLING_DRAFT=0` runs without the draft model.
+`LOCALS_INKLING_DRAFT=0` runs without the draft model. Long conversations are
+kept on the SSD too: on that M4 Pro, each next request of a 32,000-token
+conversation answers after about 1 s, where it read the whole conversation
+again for 142 to 154 s.
+
+`--adapter` makes a second build with a direction adapter applied, for example
+AtomicChat's uncensored one (`Inkling-2-Mini-Uncensored-LoRA.gguf`, 44 MB, in
+[AtomicChat/Inkling-2-Mini-Uncensored-GGUF](https://huggingface.co/AtomicChat/Inkling-2-Mini-Uncensored-GGUF)).
+The new build links the first one's files, adds 0.7 GB and writes within a few
+percent of its speed; the first build stays as it is:
+
+```bash
+uvx --from huggingface_hub hf download AtomicChat/Inkling-2-Mini-Uncensored-GGUF Inkling-2-Mini-Uncensored-LoRA.gguf --local-dir ~/models
+```
+
+```bash
+uvx --python 3.12 --from git+https://github.com/Generated-Computers/Locals python -m locals.convert_inkling --adapter ~/models/Inkling-2-Mini-Uncensored-LoRA.gguf --out ~/models/Inkling-2-Mini-Uncensored-MLX-nvfp4
+```
+
+Then use it by its folder, `--model ~/models/Inkling-2-Mini-Uncensored-MLX-nvfp4`.
 
 A 24 GB Mac gives the GPU 16 GB unless told otherwise, less than the build and
 its caches need; `locals start` says how to raise that, until the next restart.

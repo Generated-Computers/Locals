@@ -82,3 +82,14 @@ def test_a_snapshot_larger_than_the_prompt_cache_is_a_requests_own(tmp_path):
     cache, n = disk.load([1, 2, 3, 4, 5, 6, 7])
     assert n == 6 and cache[0][0].shape == (1, 4)
     assert disk.load([1, 2, 3, 4, 5, 6, 7], least=6) is None and disk.load([9, 9]) is None
+
+
+def test_a_system_prompts_snapshot_comes_back_as_before(tmp_path):
+    """Only a conversation's snapshot (Inkling 2's) larger than the prompt cache stays on the disk: every model's system
+    prompt snapshots come back as they did, whatever their size."""
+    from locals.hybrid_batch import DiskPromptCache
+
+    disk = DiskPromptCache(tmp_path / "prompts", 1.0)
+    disk.save([1, 2, 3, 4, 5, 6], _state())
+    small = chain_cache(max_size=10, max_bytes=8)
+    assert disk.restore(small, "m", [1, 2, 3, 4, 5, 6, 7]) == 6

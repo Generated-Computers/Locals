@@ -446,8 +446,9 @@ class DiskPromptCache:
         res = lru._trie.search(key, prompt)  # what memory holds, without copying it
         if len(res.exact or res.shorter or []) >= n:
             return 0
+        kind = self.dir / f"{best}.kind"  # (a conversation's prefix: Inkling 2's alone; a system prompt has none)
         try:
-            if (self.dir / f"{best}.safetensors").stat().st_size > lru.max_bytes:
+            if kind.exists() and (self.dir / f"{best}.safetensors").stat().st_size > lru.max_bytes:
                 return 0  # (larger than the whole prompt cache: put in, it went out again at once; see ``load``)
         except OSError:
             pass
@@ -455,7 +456,6 @@ class DiskPromptCache:
             from mlx_lm.models.cache import load_prompt_cache
 
             cache = load_prompt_cache(str(self.dir / f"{best}.safetensors"))
-            kind = self.dir / f"{best}.kind"
             lru.insert_cache(key, list(prompt[:n]), cache, cache_type=kind.read_text() if kind.exists() else "system")
             (self.dir / f"{best}.safetensors").touch()
             return n

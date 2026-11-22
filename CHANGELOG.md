@@ -12,7 +12,8 @@
   rounding); the experts stay 4-bit as released and their summed output is cleared of it as the model runs, in the
   kernel that sums them (`inkling.combine`, `inkling2_loop.without`). On an M4 Pro, after the first token, against
   the build without it: a file written through a tool 70.9 tokens/s (73.7), a new file 60.6 (57.2), prose 34.7
-  (35.1). An adapter of another shape is refused. What the adapter does to the model's answers was not measured
+  (35.1). An adapter of another shape is refused, and so is an `--out` that is the base build's folder or holds
+  files of its own where the base's are linked. What the adapter does to the model's answers was not measured
   here; its makers report MMLU 79.15% against 80.65%.
 - Inkling 2 Mini keeps a long conversation's prefix on the SSD too (Inkling 2 only; the disk cache kept system
   prompts alone): the state at the start of the last message, every 2,048 tokens read past the last one saved
@@ -25,7 +26,7 @@
   GB, more than the 1.25 GB prompt cache holds, so it is the request's own cache straight from the disk
   (`DiskPromptCache.load`): its requests answered after 142 to 154 s each, every one reading it all again (226
   tokens/s at that length), and answer after 1.0 to 1.2 s once it is saved. A 96k-token prompt is refused at once
-  on this Mac, where 64,512 tokens fit beside the weights; the docs have the table by length.
+  on a 24 GB Mac, where 64,512 tokens fit beside the weights; the docs have the table by length.
 - `python -m locals.convert_inkling` downloads only what the release's folder lacks: `--draft-only` gets the draft
   model's 0.64 GB alone (a folder from a build without it has no `mtp.safetensors`, and one deleted after the build
   had the whole 19.5 GB downloaded again), and a build made again gets the draft model's file.

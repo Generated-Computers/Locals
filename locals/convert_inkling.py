@@ -160,7 +160,17 @@ def add_adapter(base: Path, adapter: Path, out: Path, log=print) -> None:
     * the experts stay as they are, 4-bit as released, and their summed output is cleared of the direction as the
       model runs (``inkling2_loop.without``; the direction is each layer's ``mlp.ablate``).
 
-    An adapter of another shape is refused."""
+    An adapter of another shape is refused, and so is an ``out`` that is ``base`` or has files of its own where
+    ``base``'s are linked (a link put in a file's place deleted the file: ``--out`` left as the base build's folder
+    took its weights)."""
+    if out.resolve() == base.resolve():
+        raise ValueError(f"{out} is the base build: the new build links its files, so it needs a folder of its own")
+    if out.exists():
+        own = [f.name for f in base.iterdir() if f.name != "config.json" and not f.name.startswith(".")
+               and (out / f.name).exists() and not (out / f.name).is_symlink()]
+        if own:
+            raise ValueError(f"{out} has files of its own where the base build's are linked ({', '.join(own[:3])}): "
+                             "give --out a new folder")
     meta, T = read_gguf(adapter)
     if meta.get("general.architecture") != "inkling2_loop" or meta.get("adapter.type") != "lora":
         raise ValueError(f"{adapter}: not a LoRA adapter for inkling2_loop")
@@ -339,7 +349,8 @@ def main(argv=None):
 
     ap = argparse.ArgumentParser(prog="python -m locals.convert_inkling", description=__doc__.split("\n\n")[0])
     ap.add_argument("--src", default="~/models/Inkling-2-Mini", help="the release's folder (downloaded if missing)")
-    ap.add_argument("--out", default="~/models/Inkling-2-Mini-MLX-nvfp4", help="the build's folder")
+    ap.add_argument("--out", help="the build's folder (default ~/models/Inkling-2-Mini-MLX-nvfp4; with --adapter a new "
+                                  "folder, which it needs)")
     ap.add_argument("--attention-bits", type=int, default=8, choices=(4, 5, 6, 8, 16), help="16: as released (bfloat16)")
     ap.add_argument("--head-bits", type=int, default=8, choices=(4, 5, 6, 8, 16))
     ap.add_argument("--tail", default="nvfp4", choices=("nvfp4", "mxfp8"), help="the experts of layers 20 to 23")
@@ -348,7 +359,9 @@ def main(argv=None):
     ap.add_argument("--adapter", help="a direction adapter (GGUF LoRA): makes --out from the build in --base, without that direction")
     ap.add_argument("--base", default="~/models/Inkling-2-Mini-MLX-nvfp4", help="with --adapter: the build it is applied to")
     args = ap.parse_args(argv)
-    src, out = Path(args.src).expanduser(), Path(args.out).expanduser()
+    if args.adapter and not args.out:
+        ap.error("--adapter makes a new build: give its folder with --out (the base build stays as it is)")
+    src, out = Path(args.src).expanduser(), Path(args.out or "~/models/Inkling-2-Mini-MLX-nvfp4").expanduser()
     if args.adapter:
         add_adapter(Path(args.base).expanduser(), Path(args.adapter).expanduser(), out)
         return
