@@ -924,6 +924,14 @@ def fuse(model) -> int:
     # does not halve as the context grows.
     object.__setattr__(model, "prefill_chunk_tokens", PREFILL_CHUNK)
     object.__setattr__(model, "prefill_scores", None)
+    # A pass over a prompt is evaluated a visit at a time (ink.EVAL_TOKENS), so what it holds goes by its tokens:
+    # 0.24 GB for 128, 0.50 for 256, 0.99 for 512. The engine keeps room for a read of its size, not for the
+    # largest read it has seen (hybrid_batch._read_bytes): an agent's step reads a tool's result, a few dozen tokens.
+    object.__setattr__(model, "read_room_by_size", True)
+    # Where the weights leave the engine under 5 GB (the 15.6 GB build on a 24 GB Mac), a prompt cache of 1.25 GB:
+    # a conversation's state is 0.25 GB at 1k tokens and 0.48 GB at 7k (40 windows and the rest), so that is the
+    # prefix a request went on from, its last reply and the system prompt (service.BatchService).
+    object.__setattr__(model, "prompt_cache_bytes", int(1.25 * (1 << 30)))
     # A pass over n tokens of one text takes about 25 + 6 n ms where a step takes 28 (attention's weights and the
     # output layer are read once, and so is an expert, for the tokens that share it: 12 n with MLX's gather): a
     # drafted token costs a quarter of a step, and a draft may be as long as a pass in kernels.

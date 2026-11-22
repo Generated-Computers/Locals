@@ -570,6 +570,22 @@ def test_a_fused_model_asks_for_walked_grammars():
     assert getattr(_model(fused=True), "walk_constraints", False) and not getattr(_model(), "walk_constraints", False)
 
 
+def test_a_fused_model_says_what_its_prompts_need():
+    """The engine reads its prompts in the model's chunk, keeps room for a read of its size (a long conversation's
+    next request has a few dozen tokens to read) and, where the weights leave little, a small prompt cache."""
+    from locals.hybrid_batch import HybridBatchEngine
+
+    m = _model(fused=True)
+    assert m.prefill_chunk_tokens == inkling.PREFILL_CHUNK and m.read_room_by_size and m.prompt_cache_bytes < 2 << 30
+    eng = HybridBatchEngine(m, None, n_slots=2)
+    eng._note_read(40, 100 << 20), eng._note_read(inkling.PREFILL_CHUNK, 900 << 20), eng._note_read(2048, 2900 << 20)
+    assert eng._read_bytes(40) < eng._read_bytes(6000) == (900 << 20) * 7 // 6  # (a chunk at most, whatever is left)
+    cache, seen = m.make_cache(), []
+    eng._read_chunk = lambda cache, feed, n: seen.append(n) or n
+    eng._run(cache, list(range(3 * inkling.PREFILL_CHUNK)))
+    assert seen == [inkling.PREFILL_CHUNK] * 3
+
+
 def test_a_walked_grammar_tries_a_drafts_tokens():
     from locals.regex import DEAD, compile_dfa
     from locals.walk import WalkController

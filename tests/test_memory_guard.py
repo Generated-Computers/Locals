@@ -39,6 +39,26 @@ def test_room_for_reading_is_learned_from_the_reads(monkeypatch):
     assert e._read_bytes(10) == hb.PREFILL_RESERVE  # LOCALS_PREFILL_RESERVE_GB: fixed
 
 
+def test_a_model_with_its_own_chunk_gets_room_for_a_read_of_its_size(monkeypatch):
+    """Inkling 2 reads 512 tokens a pass at most and its passes hold memory by their size: a request with 40 tokens
+    left to read is given what a read of about 40 needed, not what the largest read seen did (which emptied the
+    prompt cache at every admission of a long conversation)."""
+    import types
+
+    monkeypatch.setattr(hb, "_RESERVE_ENV", None)
+    e = _engine()
+    e._chunk_own, e.lm = 512, types.SimpleNamespace(read_room_by_size=True)
+    e._note_read(40, 150 << 20)
+    e._note_read(512, 990 << 20)
+    e._note_read(2048, 2900 << 20)  # (four requests' chunks in one pass)
+    assert e._read_bytes(40) == max((150 << 20) * 7 // 6, hb.PREFILL_RESERVE // 6)
+    assert e._read_bytes(6707) == (990 << 20) * 7 // 6  # one request: a chunk at most
+    assert e._read_bytes(6707, rows=4) == (2900 << 20) * 7 // 6
+    assert e._read_bytes(100) == (990 << 20) * 7 // 6  # no read of that size seen: the next size's
+    e.lm = types.SimpleNamespace()  # (a model that does not say so: the most a read as large or larger needed, as before)
+    assert e._read_bytes(40) == (2900 << 20) * 7 // 6 and e._read_bytes(6707) == (2900 << 20) * 7 // 6
+
+
 def test_each_new_request_brings_its_state(monkeypatch):
     monkeypatch.setattr(hb, "_RESERVE_ENV", None)
     e = _engine(row_state=154 << 20, kv=66 << 10)  # a 27B's recurrent state and KV per token

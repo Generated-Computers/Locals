@@ -2,6 +2,29 @@
 
 ## 0.2.3 (unreleased)
 
+- Inkling 2 Mini over long conversations, on a 24 GB Mac. A request that went on from a cached 6,666-token prefix
+  with 40 tokens to read was given room to read 2,048, and the prompt cache was emptied for it, the prefix the next
+  request went on from included: every other request of a 7k-token conversation read it again, 21 s. Three causes:
+  - A prompt read up to a checkpoint went in chunks of 2,048 tokens whatever chunk the model sets (`_run`; Inkling
+    sets 512 for what a pass holds: 1.0 GB against 2.9).
+  - A read was recorded under its chunk's size, not under the tokens it read (`_note_read`), so a prompt's last 40
+    tokens stood for a whole chunk.
+  - Room was kept for the largest read seen. A model may say that its passes hold memory by their size
+    (`read_room_by_size`: Inkling's are evaluated a visit at a time) and is then given the room of the nearest
+    recorded size, for the tokens the prompt cache does not have (`_read_bytes`, `_make_room`).
+
+  With them the cache keeps what it is for, and fills: 2.4 GB, 6% of the Mac's memory free and 3 GB in swap after a
+  7k-token conversation. Where the weights leave the engine under 5 GB, Inkling asks for a prompt cache of 1.25 GB
+  (`prompt_cache_bytes`; `--cache-gb` sets another): 12% free, and the third request of that conversation starts
+  after 0.6 s where it took 21.
+- Inkling 2 Mini's draft model against none, a request alone after 0.9k, 3k and 7k tokens of conversation (a file
+  read in an earlier turn; tokens/s after the first, an M4 Pro): thinking about the code 37.5 to 55.8, 34.4 to 45.6
+  and 37.3 to 64.8; the function written out again 50.9 to 62.2, 54.2 to 59.6 and 55.6 to 58.0; an edit through a
+  tool 39.1 to 65.5 at 0.9k and 36.2 to 61.5 at 7k; a 900-token file written through a tool 44.0 to 59.9 at 0.9k and
+  42.0 to 69.9 at 3k. Replies with and without it part where a pass rounds otherwise, so some cases are not the same
+  text and are left out. Timed in the engine's loop, a pass with a draft is about 38 + 7.3 n ms and the draft
+  model's draft 12 ms, where the rules that decide when to draft count 25 + 6 n and 7: set by the timed numbers
+  they measured worse in the one run made, on a Mac short of memory at the time, so they are as they were.
 - An agent on Inkling 2 Mini reads each prompt token once. Three things had tokens read again:
   - Typed tool calls wrote a call's arguments in the schema's order. The model's template writes an earlier turn's
     sorted by name (`dictsort`), and the model, left to itself, writes them sorted too (`content` before `path`): a
@@ -73,8 +96,10 @@
   long copy), under grammars too (they were off there). Where a request has lookup drafts and the draft model, it
   takes the one whose recent tries gained more steps (`hybrid_batch._draft_gain`) and tries the other one time in 16.
   After the first token, on an M4 Pro, with both: a file written through a tool 75.6 tokens/s (36.9 without drafts,
-  17 on stock MLX), a new file through a tool 59.6 (37.4), a plain reply that copies from its prompt 56.4 (48.8),
-  an edit through a tool 50 to 53 (46), code 40.3 (37.6), prose 36.0 (37.4).
+  17 on stock MLX), a new file through a tool 59.6 (37.4), an edit through a tool 50 to 53 (46), code 40.3 (37.6),
+  prose 36.0 (37.4). (A "plain reply that copies from its prompt", 56.4 against 48.8, stood here: that request asked
+  for a tool it was not given, and the reply was a call of no tool and then one argument over and over. The drafts
+  were of that loop. Real copies are in the entry on long conversations.)
 - Inkling 2 Mini's draft model (the release's `mtp.safetensors`, "DSpark": three layers that draft up to 7 tokens in
   one small pass) for a request alone: `locals/inkling_draft.py`, a part of the build (`python -m
   locals.convert_inkling --draft-only` adds its 0.64 GB to a build already made; `LOCALS_INKLING_DRAFT=0` runs without

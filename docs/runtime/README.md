@@ -651,11 +651,44 @@ time up to 256 (`_model_draft_seen`). Lookup drafts come first: they cost nothin
 |---|---|---|---|
 | a file written through a tool (620 tokens, a copy with one name changed) | 36.9 tok/s | 63.5 | 75.6 |
 | a new file through a tool (600 tokens) | 37.4 | 51.4 | 59.6 |
-| a plain reply that copies from its prompt | 48.8 | 40 | 56.4 |
 | code in a plain reply | 37.6 | 39.1 | 40.3 |
 | prose | 37.4 | 35.9 | 36.0 |
 | four requests at once | 72.8 | 73.4 | 79.4 |
 | eight requests at once | 79.5 | | 94.6 |
+
+(A row "a plain reply that copies from its prompt", 48.8, 40 and 56.4, stood in this table. Its request asked for a
+tool it was not given: the reply was a call of no tool, then one argument over and over, and the drafts were of that
+loop.)
+
+With the draft model and without, a request alone at three lengths of conversation (a file read in an earlier turn,
+then one question; tokens/s after the first token; each reply looked at, since with and without the draft model a
+reply parts where a pass rounds otherwise, and a pair that became different texts is left out):
+
+| after the first token, M4 Pro | 0.9k tokens before | 3k | 7k |
+|---|---|---|---|
+| thinking about the code (300 tokens) | 37.5 → 55.8 | 34.4 → 45.6 | 37.3 → 64.8 |
+| the function written out again (900 tokens) | 50.9 → 62.2 | 54.2 → 59.6 | 55.6 → 58.0 |
+| an edit through a tool (180 tokens) | 39.1 → 65.5 | | 36.2 → 61.5 |
+| a file written through a tool (900 tokens) | 44.0 → 59.9 | 42.0 → 69.9 | |
+| a short call (120 tokens) | 40.5 → 51.1 | | 38.6 → 44.8 |
+
+Timed in the engine's loop (46 passes of 6.7 tokens with the draft model on), a pass's body is 78 ms, its output
+layer 9 and the draft model's draft 12: about 38 + 7.3 n ms a pass, where the rules above count 25 + 6 n and 7 ms a
+draft. Set by the timed numbers (and the source chosen by time a token) the rules measured worse in the one run made,
+on a Mac that was short of memory during it, so they are as they were; that is open.
+
+**Long conversations on a 24 GB Mac.** A conversation's state is 0.25 GB at 1k tokens and 0.48 GB at 7k (40 windows
+of 1,024 keys, the eight full layers' keys, the draft model's), and the engine has 4 GB beside the weights. Three
+things made its memory guard empty the prompt cache at every admission of a 7k-token conversation, so that every
+other request read 6.4k tokens again (21 s): prompts read up to a checkpoint went in chunks of 2,048 tokens whatever
+the model's own chunk (2.9 GB a pass against 1.0 at 512); a read was recorded under its chunk's size, not under the
+tokens it read; and room was kept for the largest read seen, for a request with 40 tokens left to read too. Reads go
+in the model's chunk now, are recorded under what they read, and a model whose passes hold memory by their size
+(`read_room_by_size`) gets the room of the nearest recorded size for the tokens the cache does not have
+(`hybrid_batch._read_bytes`). The cache then fills to its 2.4 GB, which left 6% of the Mac's memory free and 3 GB in
+swap, so where the weights leave the engine under 5 GB Inkling asks for 1.25 GB (`prompt_cache_bytes`; `--cache-gb`
+sets another): 12% free, the prefix a request went on from and its last reply kept, and the conversation's third
+request answers after 0.6 s.
 
 Prose loses 4%: its tries seldom pay, and every step also feeds the draft caches. `LOCALS_INKLING_DRAFT=0` runs
 without the draft model; `LOCALS_INKLING_DRAFT_P` sets the probability. What would make drafts pay more: MLX's expert

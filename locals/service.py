@@ -530,6 +530,12 @@ class BatchService:
             # guard empties the prompt cache for running rows as they need it.
             longest = (self.context_fit() or 0) * eng._kv_bytes_per_token()
             self.cache_bytes = int(min(max(free, longest, 1.5 * (1 << 30)), 16 << 30))
+            # A model may ask for less where its weights leave no such room (Inkling 2's build on a 24 GB Mac: with
+            # the 2.4 GB above, a 7k-token conversation's states filled the cache, 6% of the Mac's memory was free
+            # and 3 GB of it in swap; with 1.25 GB, the request's prefix and its last reply are kept).
+            own = getattr(eng.lm, "prompt_cache_bytes", None)
+            if own and free <= 0:
+                self.cache_bytes = min(self.cache_bytes, int(own))
         lru = chain_cache(max_size=256, max_bytes=self.cache_bytes)
         self._lru = lru
         owner = {}

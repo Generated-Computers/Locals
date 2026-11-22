@@ -475,6 +475,15 @@ def _cached(cache) -> int:
     return 0
 
 
+def _reads_by_size(engine) -> bool:
+    """(Inkling 2 only) Whether the model's passes over a prompt hold memory by their size alone, which it says
+    itself (``read_room_by_size``: its passes are evaluated a visit at a time). Its prompts are then read in its own
+    chunk up to a checkpoint too, a read is recorded under the tokens it read, and an admission keeps the room of the
+    nearest recorded size for the tokens the prompt cache does not have. Every other model reads and keeps room as
+    before."""
+    return bool(getattr(getattr(engine, "lm", None), "read_room_by_size", False))
+
+
 def chain_cache(max_size: int, max_bytes: int):
     """mlx-lm's LRUPromptCache, without the stale copies of a conversation where the cache cannot be
     cut back (a recurrent state; mlx-lm drops the prefixes a new entry extends only for trimmable
@@ -579,6 +588,7 @@ class HybridBatchEngine(BatchEngine):
         self._row_bytes = None  # fixed state bytes per request (_row_state)
         self._next_trim = 0  # the step of the next growth trim (_growth_trim)
         self._reads: Dict[int, int] = {}  # tokens per prefill pass (power of 2) -> most bytes one needed
+        self._chunk_own = getattr(self.lm, "prefill_chunk_tokens", None)  # the model's own chunk, if it sets one
         self.disk = None  # a DiskPromptCache: system-prompt snapshots kept across restarts
         self.parks = False  # some controllers park their rows (see "parked rows" below): set by the service
         import threading
@@ -710,14 +720,25 @@ class HybridBatchEngine(BatchEngine):
             b *= 2
         self._reads[b] = max(self._reads.get(b, 0), need)
 
-    def _read_bytes(self, tokens: int) -> int:
-        """Room for reading ``tokens`` prompt tokens: the most a recorded read of as many tokens or more needed,
-        with a sixth more; PREFILL_RESERVE where none was recorded (or LOCALS_PREFILL_RESERVE_GB is set)."""
+    def _read_bytes(self, tokens: int, rows: int = 1) -> int:
+        """Room for reading ``tokens`` prompt tokens of ``rows`` requests: the most a recorded read of as many tokens
+        or more needed, with a sixth more; PREFILL_RESERVE where none was recorded (or LOCALS_PREFILL_RESERVE_GB is
+        set). Inkling 2 only (``_reads_by_size``): a row reads its chunk a pass at most, and the room is that of the
+        nearest recorded size. Its 6,707-token request with 40 tokens left to read was given 3.4 GB, what a
+        2,048-token pass had needed, and the prompt cache was emptied for it, the prefix the next request went on
+        from included (21 s to read it again)."""
         if _RESERVE_ENV:
             return PREFILL_RESERVE
         t = min(max(tokens, 1), PREFILL_TOKENS)
-        seen = [v for b, v in self._reads.items() if b >= t]
-        return max(seen) * 7 // 6 if seen else PREFILL_RESERVE
+        by_size = _reads_by_size(self)
+        if by_size and getattr(self, "_chunk_own", None):
+            t = min(t, max(rows, 1) * self._chunk_own)
+        seen = sorted((b, v) for b, v in self._reads.items() if b >= t)
+        if not seen:
+            return PREFILL_RESERVE
+        if by_size:
+            return max(seen[0][1] * 7 // 6, PREFILL_RESERVE // 6)
+        return max(v for _, v in seen) * 7 // 6
 
     def _admit_bytes(self, rows: int, tokens: int) -> int:
         """Memory ``rows`` new requests need besides their KV: each one's fixed state, held 2.2 times over while the
@@ -726,7 +747,7 @@ class HybridBatchEngine(BatchEngine):
         (256 positions); and reading ``tokens`` of their prompts. Measured at the admission instead, the cost read
         52 MB a request (no step in flight yet: half of what decoding holds), so it is not learned there."""
         per_row = int(2.2 * self._row_state()) + 256 * self._kv_bytes_per_token()
-        return rows * per_row + self._read_bytes(tokens)
+        return rows * per_row + self._read_bytes(tokens, rows)
 
     def _merge_tokens(self, rows, new_lens: List[int]) -> int:
         """KV positions that merging new rows (prompt lengths ``new_lens``) into
@@ -779,18 +800,18 @@ class HybridBatchEngine(BatchEngine):
                 + self._admit_bytes(rows, tokens or len(r.prompt)) + _replies(r) * self._reply_bytes)
         return need <= self.memory_limit - (mx.get_active_memory() - (lru.nbytes if lru is not None else 0))
 
-    def _make_room(self, lru, tokens: int, copies: int, held: int, rows: int = 1) -> None:
+    def _make_room(self, lru, tokens: int, copies: int, held: int, rows: int = 1, read: Optional[int] = None) -> None:
         """Drop least-valuable prompt-cache entries until an admission fits under
         ``memory_limit``: a Metal out-of-memory error fails every request in
         flight, a cache miss only costs a prefill. The admission needs KV for
         ``tokens`` new prompt tokens plus ``copies`` checkpoint copies of them,
         ``held`` more positions (the merge into the running batch:
         _merge_tokens) and the prefill transient (attention scores, bounded by
-        PREFILL_SCORES)."""
+        PREFILL_SCORES) of the ``read`` tokens not found in the prompt cache (all of them where not given)."""
         if not self.memory_limit or lru is None:
             return
         self._trim_for(lru, (tokens * (1 + copies) + held) * self._kv_bytes_per_token() + self._copies_state(copies)
-                       + self._admit_bytes(rows, tokens))
+                       + self._admit_bytes(rows, tokens if read is None else read))
 
     def _copies_state(self, copies: int) -> int:
         """(Inkling 2 only) Bytes ``copies`` checkpoint copies hold of the state that does not grow: its 40 windows
@@ -891,7 +912,9 @@ class HybridBatchEngine(BatchEngine):
             a0 = mx.get_active_memory()
             _reset_peak()
             n = self._read_chunk(cache, lambda k: self.lm.model(x[:, i : i + k], cache), n)
-            self._note_read(len(prompts) * n, mx.get_peak_memory() - a0)
+            # (Inkling 2 only: under the tokens it read. A prompt's last 40 went down as a read of the whole chunk's
+            # size, so the room of a read of 40 was never learned)
+            self._note_read(len(prompts) * (min(n, L - i) if _reads_by_size(self) else n), mx.get_peak_memory() - a0)
             if i == 0 and n < L:
                 _reserve(cache, base + L)
             i += n
@@ -938,12 +961,17 @@ class HybridBatchEngine(BatchEngine):
         layer: its logits (chunk x 248k) are not needed and cost ~1 GB at 2048.
         False if ``stop()`` (asked between chunks) gave it up."""
         done, i = _cached(cache), 0
+        # (Inkling 2 only: its own chunk here too. A prompt read up to a checkpoint went in chunks of 2,048 where it
+        # sets 512 for what a pass holds, 2.9 GB against 1.0 beside 16 GB of weights on a 24 GB Mac)
+        by_size = _reads_by_size(self)
+        if by_size:
+            chunk = min(chunk, getattr(self, "_chunk_own", None) or chunk)
         while i < len(toks):
             n = prefill_chunk(done + i, 1, self.prefill_tokens or chunk, self._prefill_scores, self._prefill_cap)
             a0 = mx.get_active_memory()
             _reset_peak()
             n = self._read_chunk(cache, lambda k: self.lm.model(mx.array([toks[i : i + k]]), cache), n)
-            self._note_read(n, mx.get_peak_memory() - a0)
+            self._note_read(min(n, len(toks) - i) if by_size else n, mx.get_peak_memory() - a0)
             if i == 0 and n < len(toks):
                 _reserve(cache, done + len(toks))
             i += n
@@ -2192,7 +2220,8 @@ class HybridBatchEngine(BatchEngine):
                                              + _replies(r) * self._reply_bytes // max(1, self._kv_bytes_per_token())
                                              for r, (_, rest) in zip(new, found)), 0,
                                     self._merge_tokens(rows, [len(e["r"].prompt) for e in filling] + [len(r.prompt) for r in new]),
-                                    rows=len(new))
+                                    rows=len(new),
+                                    read=sum(len(rest) for _, rest in found) if _reads_by_size(self) else None)
                     if self._mix_ok and rows and sum(len(rest) for _, rest in found) > self.mix_chunk:
                         # the running rows decode on while these prompts are prefilled, a chunk in each step. Prompts
                         # that fit one pass are prefilled together at once instead: the rows would get a single token
