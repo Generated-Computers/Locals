@@ -142,6 +142,27 @@ def _dump_request(req: dict, kind: str = "") -> None:
         json.dump(req, fh, indent=1, ensure_ascii=False)
 
 
+def _repeated_call(text: str, fmt=None, limit: int = 3) -> bool:
+    """Whether ``text`` holds one complete tool call ``limit`` times or more: the loop of
+    Generated-Computers/Locals #12, where the model writes the same calc call over and over inside
+    its think block until the token budget runs out, while the reply's own calls part stays empty.
+    Qwen3.5's XML calls only: another format's calls are read by its own parser, which this does not
+    reproduce. A call cut before its close is not complete, so it never counts. The limit is three,
+    not two: one write is the call, a second is one retry after an error, a third is the loop."""
+    if not text or (fmt is not None and fmt.name != "qwen_xml"):
+        return False
+    i = text.find(oai.TOOL_OPEN)
+    if i < 0:
+        return False
+    counts: Dict[str, int] = {}
+    for n, a, _ in oai.qwen_calls(text[i:]):
+        key = json.dumps([n, a], sort_keys=True)
+        counts[key] = counts.get(key, 0) + 1
+        if counts[key] >= limit:
+            return True
+    return False
+
+
 class Server:
     def __init__(self, model: str = DEFAULT_MODEL, engines=("locals", "mlx"), preload=("locals",), slots: int = 16,
                  temp: float = 0.2, max_tokens: int = 4096, thinking: bool = False, cache_gb: Optional[float] = None, seed: int = 0,
@@ -1175,8 +1196,15 @@ class Server:
                 text = tok.decode(toks)
                 if stopped is None:
                     if not p.get("ignore_eos"):  # a benchmark's reply runs to its length, loops too
-                        seen = oai.split_reasoning(text, p.get("fmt"), _in_think(p))[1] if p["tools"] else ""  # drafts in thoughts are not calls
+                        # drafts in thoughts are not calls
+                        reasoning, seen = oai.split_reasoning(text, p.get("fmt"), _in_think(p)) if p["tools"] else ("", "")
                         stopped = self._guard(toks, seen, p.get("fmt"), bool(p["tools"]), state=job)
+                        if stopped is None and _repeated_call(reasoning, p.get("fmt")):
+                            # the same call three times inside the think block is the loop of #12: the
+                            # reply's own calls part stays empty, so the guard above never sees it. The
+                            # turn ends as "duplicate_call", which _run already dedupes and finishes
+                            # with "stop" instead of running to the token budget.
+                            stopped = "duplicate_call"
                     cut = _stop_cut(text, stops)
                     if cut is not None:
                         stopped, text = "stop", text[:cut]

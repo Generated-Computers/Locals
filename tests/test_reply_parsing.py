@@ -5,7 +5,7 @@ data is not a loop, and Ollama histories keep their call ids."""
 import json
 
 from locals import apis, oai
-from locals.server import _looping
+from locals.server import _looping, _repeated_call
 
 TOOLS = [{"type": "function", "function": {"name": "write", "parameters": {"type": "object", "properties": {
     "path": {"type": "string"}, "content": {"type": "string"},
@@ -45,6 +45,25 @@ def test_calls_to_tools_not_offered_are_not_calls():
 def test_repeated_data_is_not_a_loop():
     assert not _looping([15, 11] * 40)  # "0, 0, 0, ..." in a reply
     assert _looping([15, 11] * 150) and _looping(list(range(45)) * 3)
+
+
+def test_a_call_repeated_in_thinking_is_a_loop_only_on_the_third_time():
+    """#12: 30 identical calc calls inside the think block, no answer. One write is the call, a
+    second is one retry after an error, a third is the loop."""
+    call = ("<tool_call>\n<function=calc>\n<parameter=expression>\n200 / 2\n</parameter>\n</function>\n</tool_call>")
+    other = call.replace("200 / 2", "200 / 4")
+
+    def think(*calls):
+        return "<think>\n" + "\n".join(calls) + "\n</think>"
+
+    assert not _repeated_call(think(call))
+    assert not _repeated_call(think(call, call))  # a retry: deliberation, not a loop
+    assert _repeated_call(think(call, call, call))
+    assert not _repeated_call(think(call, other, call))  # two different calls, no repeat of either
+    assert not _repeated_call("")
+    assert not _repeated_call(think(call, call, call), fmt=type("F", (), {"name": "hermes"})())
+    cut = call[: call.index("</function>")]  # a third write cut before its close never counts
+    assert not _repeated_call(think(call, call, cut))
 
 
 def test_ollama_call_ids_are_stable_and_results_pair_by_position():
