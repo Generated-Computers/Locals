@@ -642,6 +642,14 @@ If you use Locals in your research, please cite the paper:
 }
 ```
 
+## Also from Generated Computers
+
+[Sequential NOR on Random and Smoothed Instances](Sequential_NOR_on_Random_and_Smoothed_Instances.pdf)
+(Generated Computers, 2026) studies a P-complete recurrence on random inputs and under smoothing:
+an errorless logspace algorithm above noise 3/4, hardness below noise 4/9 unless P is in BPNC,
+and lower bounds for the natural parallel iterations. It is one standalone paper that merges the
+Generated Computers manuscripts on random and smoothed Sequential NOR.
+
 ## License
 
 Locals is released under the Apache License 2.0. It is made by
