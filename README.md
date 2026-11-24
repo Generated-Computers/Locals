@@ -648,7 +648,8 @@ If you use Locals in your research, please cite the paper:
 (Generated Computers, 2026) studies a P-complete recurrence on random inputs and under smoothing:
 an errorless logspace algorithm above noise 3/4, hardness below noise 4/9 unless P is in BPNC,
 and lower bounds for the natural parallel iterations. It is one standalone paper that merges the
-Generated Computers manuscripts on random and smoothed Sequential NOR.
+Generated Computers manuscripts on random and smoothed Sequential NOR. The deterministic lemmas behind its
+embeddings are checked in Lean in [`sequential-nor-lean/`](sequential-nor-lean/).
 
 ## License
 
