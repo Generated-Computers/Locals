@@ -322,6 +322,26 @@ def test_a_reply_is_its_reasoning_its_text_and_its_calls():
     assert fmt.count_complete(REPLY) == 1 and fmt.cut_after(REPLY + REPLY[REPLY.index("<|message_model|>get"):], 1) == REPLY
 
 
+def test_a_reply_cut_to_its_message_header_is_empty_not_the_marker():
+    """A turn ended at the message marker itself (a max_tokens of one) is no text at all.
+
+    The marker was the reply's whole content then, shown raw to the client under a length stop.
+    """
+    from locals import formats, oai
+
+    fmt = formats.FORMATS["inkling"]
+    # with tools offered (parse_reply) and without (server.py's no-tools path takes split() too)
+    assert oai.parse_reply("<|message_model|>", WEATHER, fmt) == ("", "", [])
+    assert oai.parse_reply("<|message_model|>", None, fmt) == ("", "", [])
+    assert fmt.split("<|message_model|>")[0] == ""
+    # a header the model wrote before its text without the content marker, cut or careless
+    assert fmt.split("<|message_model|>Paris.")[0] == "Paris."
+    # and a stream, which holds the header back: nothing is shown, nothing flushed at its end
+    stream = oai.ReplyStream(False, fmt, calls=False)
+    assert stream.feed("<|message_model|>") == []
+    assert stream.unsent("") == ""
+
+
 @pytest.mark.parametrize("calls", [True, False])
 def test_a_stream_shows_the_text_without_its_markers(calls):
     import re
