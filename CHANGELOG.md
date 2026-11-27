@@ -2,6 +2,18 @@
 
 ## 0.2.3 (unreleased)
 
+- Inkling 2 Mini's passes of several tokens (a draft, a forced span) past 1,024 tokens of context go through MLX's
+  attention kernel in the eight global visits, as a one-token step does, 4 queries a call (`inkling.attend_past`,
+  passes of up to 16 tokens). They went through the reference's attention, which turns every key to float32 and
+  transposes them at each visit: 8.0 ms a visit at 32k keys whatever the pass held, where a step takes 1.2, so a
+  6-token pass paid 64 ms for those visits where six steps pay 58, and more the longer the conversation. A
+  visit of a 6-token pass on an M4 Pro: 2.0 to 1.0 ms at 8k keys, 8.0 to 2.8 at 32k, 14.2 to 5.0 at 64k; of a
+  16-token pass 8.5 to 6.6 at 32k. The kernel takes one sink a head, so each query's row of the mask has its sink
+  less the call's first query's taken off. In float32 the same attention to 1e-6; in bfloat16 the mask is rounded
+  once more than a step's (0.9% of the output on random scores, where the bias's own rounding is 1.1%); on the
+  build, 580 of 592 greedy tokens are those of one-token steps after 6k tokens, 579 with the reference's pass. A
+  coding agent's turns replayed at 27k to 64k tokens: 25.3 to 29.6 tokens/s after the first token over four turns,
+  two runs each (one of the eight no faster). `LOCALS_INKLING_PAST=0`: as before.
 - `python -m locals.convert_inkling --adapter FILE.gguf --out DIR` makes an Inkling 2 Mini build with a direction
   adapter applied, beside the build it is applied to (`--base`; its weight files are linked, the new build is 0.7 GB
   of its own). A direction adapter is a rank-1 LoRA on every layer's attention output and experts' output and on

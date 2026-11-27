@@ -201,6 +201,31 @@ def test_attend_reads_a_window_written_round_and_round():
     assert float(mx.abs(got - want).max()) < 1e-5
 
 
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_a_pass_past_the_window_in_mlxs_kernel_is_the_references(dtype, monkeypatch):
+    """inkling.attend_past against the reference's attention in float32: passes of 1 to 16 queries, 4 and 3 a call
+    of MLX's kernel, over the pass's own keys alone, over fewer keys than the bias reaches (8) and over many more.
+    In float32 it is the reference's. In bfloat16 the mask holds the bias less a sink's difference, rounded again
+    to the 8 bits the bias already has: 1.2e-2 at most here, where the reference's own pass is within 2e-3."""
+    f = lambda x: x.astype(mx.float32)
+    Hq, Hkv, D, R = 4, 2, 16, 8
+    worst = 0.0
+    for a_call in (4, 3):
+        monkeypatch.setattr(inkling, "PAST_QUERIES", a_call)
+        for L in (1, 2, 4, 5, 9, 16):
+            for S in sorted({L, max(L, 12), 23, 130, 400}):
+                mx.random.seed(31 + S + L)
+                q, k, v = mx.random.normal((1, Hq, L, D)), mx.random.normal((1, Hkv, S, D)), mx.random.normal((1, Hkv, S, D))
+                bias, sinks = mx.random.normal((L, Hq, R)), mx.random.normal((L, Hq)) * 2
+                q, k, v, bias, sinks = (x.astype(dtype) for x in (q, k, v, bias, sinks))
+                want = ink.attend(f(q), f(k), f(v), f(bias)[None], f(sinks)[None], scale=0.25, window=0,
+                                  q_pos=mx.arange(S - L, S), k_pos=mx.arange(S))
+                got = inkling.attend_past(q, k, v, bias, sinks, 0.25)
+                assert got.shape == (1, L, Hq, D) and got.dtype == dtype
+                worst = max(worst, float(mx.abs(f(got) - want).max()) / (1 + float(mx.abs(want).max())))
+    assert worst <= (1e-5 if dtype == mx.float32 else 2e-2), worst
+
+
 def test_sanitize_takes_the_releases_names_and_its_experts():
     """The release's layout: experts as bytes of 4-bit pairs with an amax and a denominator each, conv taps as
     (C, 1, K), the loop's queries in two tables, the routers in bfloat16."""
@@ -352,11 +377,36 @@ def test_a_span_in_one_pass_is_its_tokens_one_at_a_time(fused):
         assert _close(m(mx.array([[t]]), cache=one)[0, -1], m(mx.array([[t]]), cache=drip)[0, -1])
 
 
+@pytest.mark.parametrize("n", [2, 7, 16, 17])
+def test_a_pass_past_the_kernels_window_is_the_references(n, monkeypatch):
+    """One text's tokens in one pass once the global layers hold more keys than attend() takes (128 for these
+    heads): up to PAST_MAX tokens their attention is MLX's kernel a few queries a call (inkling.attend_past), and the
+    pass gives the logits of the reference's pass it replaces (LOCALS_INKLING_PAST=0) and of one-token steps, and
+    leaves a cache they go on from. A longer pass is the reference's as before."""
+    m = _model(seed=9, experts="q", fused=True)
+    prompt = [int(t) for t in mx.random.randint(0, 120, (150,), key=mx.random.key(3)).tolist()]
+    span = [int(t) for t in mx.random.randint(0, 120, (n,), key=mx.random.key(4)).tolist()]
+    taken, real = [], inkling.attend_past
+    monkeypatch.setattr(inkling, "attend_past", lambda q, *rest: taken.append(q.shape[2]) or real(q, *rest))
+    new, old, drip = _batch_of_one(m, prompt), _batch_of_one(m, prompt), _batch_of_one(m, prompt)
+    got = m(mx.array([span]), cache=new)[0]
+    mx.eval(got)
+    assert taken == ([n] * 4 if n <= inkling.PAST_MAX else [])  # (the two global layers' four visits)
+    monkeypatch.setattr(inkling, "PAST", False)
+    assert _close(got, m(mx.array([span]), cache=old)[0])
+    assert len(taken) == (4 if n <= inkling.PAST_MAX else 0)
+    assert _close(got, mx.concatenate([m(mx.array([[t]]), cache=drip)[:, -1] for t in span]))
+    for t in (5, 99, 30):
+        want = m(mx.array([[t]]), cache=drip)[0, -1]
+        assert _close(m(mx.array([[t]]), cache=new)[0, -1], want) and _close(m(mx.array([[t]]), cache=old)[0, -1], want)
+
+
 @pytest.mark.parametrize("fused", [False, True])
-@pytest.mark.parametrize("prompt_len", [3, 14])
+@pytest.mark.parametrize("prompt_len", [3, 14, 150])
 def test_a_drafts_end_is_taken_back(fused, prompt_len):
     """A pass feeds a token and a draft after it; the model confirms part of the draft and the rest is taken back
-    (inkling.rewind): what follows is as if the rest had never been fed, in a window not yet full and in a full one."""
+    (inkling.rewind): what follows is as if the rest had never been fed, in a window not yet full, in a full one
+    and with the global layers past the kernel's window (150 tokens: inkling.attend_past)."""
     from mlx_lm.models.cache import ArraysCache
 
     from locals.hybrid_batch import HybridBatchEngine

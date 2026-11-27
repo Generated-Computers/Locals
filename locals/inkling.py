@@ -18,7 +18,8 @@ Here each stretch between two weight reads is one kernel:
 
 The weight reads stay MLX's (8-bit matrix-vector products, gather_qmm on NVFP4): on one row they run at the memory's
 speed already. A step is taken this way for one token a row; a prompt, and a batch's rows still padded, run the reference, as
-does a global layer's attention past 1024 tokens (MLX's own), and both leave the same cache.
+does a global layer's attention past 1024 tokens (MLX's own; attend_past for one text's few tokens), and both leave
+the same cache.
 """
 
 from __future__ import annotations
@@ -669,6 +670,45 @@ _SOFT_SRC = """
 """
 
 
+PAST = os.environ.get("LOCALS_INKLING_PAST", "1") != "0"  # (0: the reference's pass, as before attend_past)
+PAST_MAX = 16  # tokens of a pass attend_past takes: its time grows with the queries, the reference's pass's hardly
+PAST_QUERIES = 4  # queries a call of MLX's attention: what its one-query kernel takes, the one a step already uses
+
+
+def attend_past(q, keys, values, bias, sinks, scale: float) -> mx.array:
+    """Attention of one text's newest L tokens over a global layer's keys past attend()'s window, in MLX's attention
+    kernel, as a one-token step there already is (ink.Attention._attend). ``q`` (1, heads, L, hd); ``keys`` and
+    ``values`` (1, kv_heads, S, hd), in order, the pass's own last; ``bias`` (L, heads, R) and ``sinks`` (L, heads).
+    Returns (1, L, heads, hd).
+
+    The reference's pass (ink.attend with soft) turns every key to float32 and transposes them, at each of a pass's
+    eight global visits: 8.0 ms a visit at 32k keys whatever the pass holds, where a one-token step takes 1.2 (M4
+    Pro). The kernel reads the keys as they lie: 2.8 ms for 6 queries, 6.6 for 16. Its mask is the bias by distance,
+    as in a one-token step, built over the R + L - 1 newest keys (farther ones have none), and minus infinity on
+    the keys after a query. It takes one sink a head and a pass has one a query: a softmax is the same with a number
+    added to every logit of a row, so each query's row has its sink less the call's first query's taken off, and
+    the kernel gets that one's. The mask is in the queries' type (the kernel takes no wider one): in bfloat16 the
+    bias less that difference is rounded again to the 8 bits the bias has, where a one-token step's is not."""
+    H, L = q.shape[1], q.shape[2]
+    S, R = keys.shape[2], bias.shape[-1]
+    T = min(S, R + L - 1)
+    dist = (mx.arange(L)[:, None] + (T - L)) - mx.arange(T)[None, :]  # (L, T): from each query back to each near key
+    near = mx.take_along_axis(bias.astype(_F32).transpose(1, 0, 2), mx.broadcast_to(mx.clip(dist, 0, R - 1)[None], (H, L, T)), axis=-1)
+    near = mx.where((dist < R)[None], near, 0.0)
+    seen = (dist >= 0)[None]
+    sinks = sinks.astype(_F32)
+    outs = []
+    for a in range(0, L, PAST_QUERIES):
+        b = min(L, a + PAST_QUERIES)
+        shift = (sinks[a:b] - sinks[a : a + 1]).T[:, :, None]  # (heads, queries, 1)
+        mask = mx.where(seen[:, a:b], near[:, a:b] - shift, -mx.inf).astype(q.dtype)
+        if S > T:
+            mask = mx.concatenate([mx.broadcast_to((-shift).astype(q.dtype), (H, b - a, S - T)), mask], axis=-1)
+        outs.append(mx.fast.scaled_dot_product_attention(q[:, :, a:b], keys, values, scale=scale, mask=mask[None],
+                                                         sinks=sinks[a].astype(q.dtype)))
+    return (outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)).transpose(0, 2, 1, 3)
+
+
 def soft(scores, bias, sinks, q0, k0, scale: float, window_size: int, dtype):
     """Attention's weights from its scores, for the reference's passes over several tokens (ink.attend): of scores
     (B, kv_heads, G, L, S) in float32, each query's first at position ``q0`` and the keys consecutive from ``k0``
@@ -911,7 +951,9 @@ class FusedText(ink.TextModel):
             a = attend(qo, keys, values, bias, sinks, gate, idx, counts, A.scale, gate_at, A.window, seq)
         else:  # a global layer past the kernel's window: MLX's attention
             g = gate[:, gate_at : gate_at + qo.shape[1] * qo.shape[2]]
-            if seq:
+            if seq and PAST and M <= PAST_MAX:
+                a = attend_past(qo.transpose(1, 0, 2)[None], keys, values, bias, sinks, A.scale)
+            elif seq:
                 a = A._attend(qo.transpose(1, 0, 2)[None], keys, values, bias[None], sinks[None], kv)
             else:
                 a = A._attend(qo[:, :, None, :], keys, values, bias[:, None], sinks[:, None], kv)

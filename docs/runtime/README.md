@@ -518,7 +518,8 @@ own kernels). `inkling.py` makes each stretch between two weight reads one kerne
 | `combine` | the experts' weighted sum, its convolution, the residual |
 
 In float32 a step in kernels is the reference's to 1e-5, and either continues the other's cache. A prompt, a batch's
-rows while they are still padded, and a global layer's attention past 1024 tokens run the reference.
+rows while they are still padded, and a global layer's attention past 1024 tokens run the reference (MLX's attention
+kernel for a one-token step, and for one text's pass of up to 16 tokens: `attend_past`, below).
 
 Two things cost most of the time writing these, and are worth knowing for the next model. A GPU thread takes 25 to
 45 ns an iteration of a loop, and a step is one chain of kernels, each waiting for the one before: a kernel timed as
@@ -561,7 +562,7 @@ a query: 1,096 ms a 256-token chunk against the reference's 959), nor do the ste
 
 **One request alone** (`hybrid_batch._solo`). A pass over n consecutive tokens of one text takes about 20 + 12 n ms
 where a step takes 30: every token reads its own experts, the rest is read once. The kernels take such a pass up to
-16 tokens (`seq`: a row's convolutions read the rows before it, a query the keys up to its own), so a span the grammar
+32 tokens (`inkling.SEQ_MAX`; `seq`: a row's convolutions read the rows before it, a query the keys up to its own), so a span the grammar
 forces goes in one pass from 2 tokens, and so does a draft of what followed the last three tokens earlier in the
 conversation. A draft's end the model does not confirm is taken back (`inkling.rewind`): a window is cut (a pass
 leaves it in order, with the keys it would have pushed out), a convolution goes back to the state after the last
@@ -569,6 +570,49 @@ token kept. Since a drafted token costs 0.4 of a step whether it is kept or not,
 acceptance pays for (`draft_token_cost`): copying code kept 75% of 263 drafted tokens (54 tokens/s over those
 stretches), free writing 31%, where it now drafts little. In bfloat16 a pass gives the tokens of one-token steps (40
 of 40 on a text, mean KL 0.0004, the same as the reference's own passes).
+
+**A pass past 1,024 tokens** (`inkling.attend_past`). Past the kernel's window a global layer's attention was MLX's
+attention kernel for a one-token step, with the bias by distance as its mask, and the reference's `attend` (with
+`soft`) for a pass, which turns every key to float32 and transposes them, at each of a pass's eight global visits:
+8.0 ms a visit at 32k keys whatever the pass holds, where a step takes 1.2. A pass of 6 tokens there spent 64 ms on
+those visits, where six steps spend 58. A pass of up to 16 tokens (`PAST_MAX`) now goes through the kernel a step
+uses, 4 queries a call (`PAST_QUERIES`: what MLX's one-query kernel takes; from 9 queries its matrix kernel takes
+as long as the reference's pass). The mask is built over the newest R + L - 1 keys (farther ones have no bias). The kernel
+takes one sink a head and a pass has one a query; a softmax is the same with a number added to every logit of a
+row, so each query's row has its sink less the call's first query's taken off, and the kernel gets that one's.
+
+| a global visit, ms (M4 Pro, MLX 0.32.5) | 2 tokens | 4 | 6 | 8 | 12 | 16 | a one-token step |
+|---|---|---|---|---|---|---|---|
+| 8k keys, the reference's pass → `attend_past` | 2.0 → 0.5 | 2.4 → 0.9 | 2.0 → 1.0 | 2.4 → 1.2 | 3.0 → 1.9 | 2.2 → 2.1 | 0.4 |
+| 32k keys | 7.4 → 1.2 | 7.8 → 2.0 | 8.0 → 2.8 | 8.1 → 3.6 | 8.2 → 5.4 | 8.5 → 6.6 | 1.2 |
+| 64k keys | 16.0 → 2.1 | 16.2 → 3.5 | 14.2 → 5.0 | 13.5 → 6.1 | 14.6 → 9.4 | 16.2 → 13.2 | 2.7 |
+
+(The fastest of 60 runs of each, taken in turn, on random keys of the build's shapes; the Mac was not idle.) Longer
+passes stay the reference's: in calls of 4 they take as long as it. In float32 `attend_past` is
+the reference's attention to 1e-6. In bfloat16 it is not: the kernel takes no mask wider than its queries, so the
+bias less a sink's difference is rounded again to the 8 bits of mantissa the bias already has. On random scores,
+with a bias as large as the build's (up to 14) and sinks as far from a pass's first (0.9 RMS), the output is 0.9%
+(RMS) from that of one-token steps, where a step is itself 1.1% from the same attention with the bias not yet
+rounded. `LOCALS_INKLING_PAST=0` takes the reference's
+pass.
+
+On the build, 592 tokens of a text in 80 passes of 2 to 16 after 6k tokens of it: 580 greedy tokens are those of
+one-token steps (579 with the reference's pass), and the mean KL from them is 0.0029 (0.0040); longer contexts were
+not compared this way. Turns of a coding agent's session replayed at their context (thinking, then a tool call;
+temperature 1.0, two replies of up to 400 tokens a turn, tokens/s after the first token, an M4 Pro with 48 GB, two
+runs each way):
+
+| tokens before | the reference's pass | `attend_past` |
+|---|---|---|
+| 27k | 26.3, 29.6 | 33.1, 33.9 |
+| 36k | 27.3, 27.9 | 31.4, 31.0 |
+| 53k | 23.7, 23.4 | 23.6, 31.9 |
+| 64k | 22.1, 21.8 | 27.1, 25.1 |
+
+25.3 to 29.6 over the four. A way's two runs wrote the same replies; the two ways' replies part where a pass rounds
+otherwise, so a pair also differs in how much of it was drafted (the 53k turn's greedy reply is the same text both
+ways: 29.9 and 29.4 against 23.1 and 33.7). That turn's first run with `attend_past` was slow for all three of its
+replies, with the tokens of the second run; why was not found.
 
 **Agents.** The server keeps a prompt's prefixes from 192 tokens for this model (`checkpoint_tokens`; 1,024 otherwise):
 at 300 tokens/s a 1,000-token prompt is over 3 s. An agent's next request is its last prompt, the reply and a tool's
