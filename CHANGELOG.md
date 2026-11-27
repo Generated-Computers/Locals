@@ -2,6 +2,11 @@
 
 ## 0.2.3 (unreleased)
 
+- Qwenputer: a call written again right after the computer answered it with an error gets no run, and its error says
+  what to change (`CalcController._again`): for `calc`'s `/` with a decimal in it, how to write the decimal as a
+  fraction ("write 0.4 as 2/5"), and the time after, to work it out without the computer. With thinking on, the model
+  wrote such a calc call 30 times at temperature 0, its error a bare "error" each time, until the server's loop guard
+  ended the reply with no answer (issue #12).
 - Inkling 2 Mini's passes of several tokens (a draft, a forced span) past 1,024 tokens of context go through MLX's
   attention kernel in the eight global visits, as a one-token step does, 4 queries a call (`inkling.attend_past`,
   passes of up to 16 tokens). They went through the reference's attention, which turns every key to float32 and

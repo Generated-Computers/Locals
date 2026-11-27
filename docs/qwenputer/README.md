@@ -249,6 +249,12 @@ starts with `\b` starts only at word boundaries. Finding where a parameter ends 
   pattern over `regex`'s) counts as cut too: it took a minute to fail, and the model wrote another program, and
   another. After two such runs in a reply, a toolbox call gets an error at once, without a run, and `calc` still
   runs.
+- **A call written again as it failed.** The same call right after the computer answered it with an error (or cut
+  its run) gets no run: its error comes back with what to change, then, the next time, "work it out without the
+  computer" (`CalcController._again`). `calc` answers a `/` with a decimal in it with a bare "error" (it divides
+  integers and fractions; its decimals are for `+ - *`), so that error says how to write the decimal ("write 0.4 as
+  2/5"). With thinking on, the model wrote such a call 30 times at temperature 0 until the server's loop guard ended
+  the reply, with no answer. Another call, or the same one after a call that worked, runs as before.
 - **Notes.** The server keeps the notes calls (remember, forget) a reply's computer ran by the conversation before
   the reply and its content, so another conversation never gets them; the next request's computer gets the notes
   they left (the newest that fit its 2,048 bytes, and the call), with its first notes call.

@@ -516,6 +516,52 @@ def _response(tok, value):
     return [V0 + 7] + tok.encode(f"\n<tool_response>\n{value}\n</tool_response>\n<think>\n\n</think>\n\n", add_special_tokens=False)
 
 
+def test_a_call_written_again_as_it_failed_gets_its_error_without_a_run(tok, monkeypatch):
+    """calc answers a / of decimals with a bare "error", and with thinking on the model wrote that call 30 times until
+    its budget ran out (issue #12). The same call right after it failed gets no run: its error says what to change,
+    then to work it out without the computer. Another call, or the same one after a call that worked, runs."""
+    import numpy as np
+
+    from locals.models import qwenputer_walk as W
+
+    read = []
+
+    class Comp:  # (the computer: what it reads, a run's first token after it)
+        def __init__(self, dev):
+            pass
+
+        def start(self, prompt, cuts=()):
+            pass
+
+        def read(self, tokens):
+            read.append(tok.decode(tokens))
+            return np.array([-1] * (len(tokens) - 1) + [V0 + 7])
+
+    monkeypatch.setattr(W, "Computer", Comp)
+    ctl = _stub_controller(tok)
+    ctl.on_park = lambda: None
+
+    def call(expr, value=None):
+        for t in tok.encode(CALL.replace("1+1", expr), add_special_tokens=False):
+            ctl.accept(t)
+        assert ctl.parked
+        first = ctl.read_call()
+        if first < 0:
+            return tok.decode(ctl.ran([]))
+        return tok.decode(ctl.ran(_response(tok, value)))
+
+    bad = "0.4 * 200 / 2 + 20 + 200 / 2"
+    assert "\nerror\n" in call(bad, "error") and len(read) == 1
+    again = call(bad)
+    assert len(read) == 1 and "error (the same call failed just before: calc divides integers and fractions, not " \
+        "decimals: write 0.4 as 2/5)" in again
+    assert "error (the same call failed again: work it out without the computer)" in call(bad) and len(read) == 1
+    assert "\n3\n" in call("1+2", "3") and len(read) == 2  # (another call: a run)
+    assert "\nerror\n" in call(bad, "error") and len(read) == 3  # (after one that worked: a run again)
+    assert "write it another way" not in call(bad)  # (the decimal's fraction again, the count started over)
+    assert "\nerror\n" in call("1/0", "error") and "write it another way" in call("1/0")
+
+
 def test_a_clients_call_waits_for_the_computers_check(tok):
     """With the client's tools' schemas (the server's "checks"), a call of the client's is held at its </tool_call>
     while the computer checks it: one that is right goes to the client as written, and the model goes on after it; one

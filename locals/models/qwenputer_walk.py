@@ -2002,6 +2002,12 @@ class CalcController(_controller_base()):
         # runs cut at MAX_RUN in this reply, or that used up their work (``_SPENT``): after CUTS of them, a toolbox
         # call gets an error without a run (``refused``): the model had asked again and again, at minutes a run
         self.cut_runs, self.refused = 0, False
+        # a call written again as it was, right after the computer answered it with an error, gets the error again
+        # without a run, saying what to change (``_again``): calc answers a / of decimals with a bare "error", and at
+        # temperature 0 the model wrote that call 30 times until its budget ran out, with no answer
+        self.call_text: Optional[str] = None  # the latest call's text
+        self.failed: Optional[str] = None  # the text of the call before it, if the computer answered it with an error
+        self.again, self.refused_again = 0, False
         self.split, self.held = split, False
         self.tool: Optional[str] = None  # the function of the latest call
         self.parts: List[List[int]] = []  # a long toolbox call's parts the computer has not read (``_parts``)
@@ -2025,7 +2031,8 @@ class CalcController(_controller_base()):
             self.call.append(token)
             if (self.split or self.park) and token == self.tcc:
                 body, self.call = self.call[:-1], None
-                name = _called(self.tok.decode(body))
+                self.call_text = self.tok.decode(body)
+                name = _called(self.call_text)
                 self.tool = name
                 # a call of the client's the presenter holds (one with a name, outside the reasoning), when the
                 # computer can read it with its schema (a longer call goes as written)
@@ -2052,7 +2059,8 @@ class CalcController(_controller_base()):
     def forced(self, token: int):
         if token != self.tcc or self.call is None or self.split or self.park:
             return [], False
-        name, self.call = _called(self.tok.decode(self.call)), None
+        self.call_text, self.call = self.tok.decode(self.call), None
+        name = _called(self.call_text)
         self.tool = name
         if name not in self.internal:
             return [], False
@@ -2076,6 +2084,12 @@ class CalcController(_controller_base()):
         if self.cut_runs >= CUTS and self.checking is None and self.tool not in (None, "calc") and not self.parts:
             # (no run: the computer made again at the next call, from the reply so far, this call in it)
             self.comp, self.unread, self.notes_given, self.note, self.refused = None, [], False, None, True
+            return -1
+        if (self.failed is not None and self.call_text == self.failed and self.checking is None and not self.parts
+                and self.tool in self.internal):
+            # (the call that just failed, written again: no run, its error with what to change; the computer made
+            # again at the next call, as above)
+            self.comp, self.unread, self.notes_given, self.note, self.refused_again = None, [], False, None, True
             return -1
         if self.comp is None:  # (a computer made again after a cut run: the reply so far as part of its prompt)
             self.comp = Computer(self.dev)
@@ -2135,6 +2149,10 @@ class CalcController(_controller_base()):
             self.refused = False
             return self._error("the computer's runs went past its limit twice in this reply: work it out without "
                                "the computer")
+        if self.refused_again:  # (the call that just failed, written again: no run)
+            self.refused_again = False
+            self.again += 1
+            return self._error(self._again())
         if run and run[-1] == -5:  # cut at MAX_RUN: an error for the model, and a computer made again for the rest
             return self._cut(run)
         if run and run[-1] < 0:
@@ -2175,10 +2193,28 @@ class CalcController(_controller_base()):
             if self.note is not None and value.startswith(("remembered", "updated", "forgot")):
                 self.note_ops.append(self.note)
         self.note = None
+        self.failed, self.again = (self.call_text if value == "error" or value.startswith("error (") else None), 0
         if self.tool != "calc":
             echo = self._as_text(echo)
         self.seen += echo
         return echo
+
+    def _again(self) -> str:
+        """The error of a call written again as it just failed: the first time, what to change (calc divides integers
+        and fractions, its decimals are for + - * alone: a decimal in a division as the fraction it is); then, to go
+        on without the computer."""
+        import re
+        from fractions import Fraction
+
+        if self.again > 1:
+            return "the same call failed again: work it out without the computer"
+        why = "the same call failed just before: "
+        m = re.search(r"<parameter=expression>\n?(.*?)\n?</parameter>", self.failed or "", re.S)
+        expr = m.group(1) if m else ""
+        dec = re.search(r"\d*\.\d+", expr)
+        if self.tool == "calc" and "/" in expr and dec:
+            return why + f"calc divides integers and fractions, not decimals: write {dec.group(0)} as {Fraction(dec.group(0))}"
+        return why + "write it another way"
 
     def _cut(self, run: List[int]) -> List[int]:
         """A run cut at MAX_RUN, its computer mid-program: the computer is made again from the reply so far (its notes
@@ -2193,6 +2229,7 @@ class CalcController(_controller_base()):
             with self.lock:
                 self._show(self.pres.checked_call(True), False)
             return []
+        self.failed, self.again = self.call_text, 0  # (written again, it would run as long again)
         return self._error("the computer's run went past its limit: give it a smaller job")
 
     def _error(self, why: str) -> List[int]:
