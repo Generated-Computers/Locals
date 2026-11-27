@@ -742,7 +742,9 @@ class Inkling(ToolFormat):
         """(the text messages' bodies, the calls) of a reply after its reasoning."""
         m = _INK_CALL.search(text)
         head, part = (text, "") if m is None else (text[: m.start()], text[m.start():])
-        return head.replace(self.text_open, "").replace(_INK_END, ""), part
+        # a ``<|message_model|>`` left in the head opened a message the reply was cut in (a max_tokens of one
+        # ended the turn at the marker, which was then the reply's whole content, shown raw to the client)
+        return head.replace(self.text_open, "").replace(_INK_MSG, "").replace(_INK_END, ""), part
 
     def parse_calls(self, part: str) -> List[Tuple[str, dict]]:
         out = []
