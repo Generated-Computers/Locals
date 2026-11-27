@@ -2,6 +2,10 @@
 
 ## 0.2.3 (unreleased)
 
+- Inkling 2: a reply the token limit ended at a message's header (`<|message_model|>`) is empty, where the marker was
+  its content under a finish of `length`: a request with a `max_tokens` of 1, which some agent harnesses send to keep
+  their prompt cache warm, or a reply cut right after its reasoning. The header comes off a reply's text with or
+  without its content marker (`Inkling.split`).
 - Qwenputer: a call written again right after the computer answered it with an error gets no run, and its error says
   what to change (`CalcController._again`): for `calc`'s `/` with a decimal in it, how to write the decimal as a
   fraction ("write 0.4 as 2/5"), and the time after, to work it out without the computer. With thinking on, the model
