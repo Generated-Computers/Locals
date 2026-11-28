@@ -1,0 +1,40 @@
+L43 eps=0.460 R=42 log2n=12..24
+   TJ mean: 41.3 79.7 108.0 150.0 194.0 230.5 276.5 | TJ max: 49 87 110 157 198 232 277 | maxD mean: 52.0 94.3 125.0 166.0 218.7 250.0 297.5
+   increments per x4: 38 28 42 44 36 46 | ratios: 1.93 1.36 1.39 1.29 1.19 1.20
+   fits: log 19.5*log2n-197 (rel.rms 0.050); log^2 (0.83*(log2n-3.6))^2 (rel.rms 0.076); power n^0.217 (rel.rms 0.149); local exponent at the last step 0.131
+L43 eps=0.600 R=42 log2n=12..24
+   TJ mean: 33.0 48.0 70.3 95.3 115.7 141.0 164.5 | TJ max: 36 50 72 101 117 148 170 | maxD mean: 38.7 54.7 79.3 104.0 127.0 150.5 174.0
+   increments per x4: 15 22 25 20 25 24 | ratios: 1.45 1.46 1.36 1.21 1.22 1.17
+   fits: log 11.2*log2n-106 (rel.rms 0.060); log^2 (0.60*(log2n-2.2))^2 (rel.rms 0.038); power n^0.193 (rel.rms 0.095); local exponent at the last step 0.111
+H49 eps=0.460 R=48 log2n=12..24
+   TJ mean: 28.0 62.3 138.0 239.3 385.0 523.5 716.0 | TJ max: 31 68 145 285 422 532 717 | maxD mean: 33.7 70.0 153.0 267.0 414.0 580.5 799.5
+   increments per x4: 34 76 101 146 138 192 | ratios: 2.23 2.22 1.73 1.61 1.36 1.37
+   fits: log 57.7*log2n-740 (rel.rms 1.034); log^2 (1.83*(log2n-9.4))^2 (rel.rms 0.094); power n^0.387 (rel.rms 0.218); local exponent at the last step 0.226
+H49 eps=0.600 R=48 log2n=12..24
+   TJ mean: 23.3 41.7 62.7 93.3 122.0 153.5 184.0 | TJ max: 29 49 72 103 139 157 186 | maxD mean: 29.7 49.0 75.3 106.7 139.0 172.5 202.5
+   increments per x4: 18 21 31 29 32 30 | ratios: 1.79 1.50 1.49 1.31 1.26 1.20
+   fits: log 13.7*log2n-149 (rel.rms 0.139); log^2 (0.74*(log2n-5.2))^2 (rel.rms 0.038); power n^0.244 (rel.rms 0.137); local exponent at the last step 0.131
+S49 eps=0.460 R=48 log2n=12..24
+   TJ mean: 37.0 86.7 175.3 284.3 432.7 594.5 741.0 | TJ max: 47 92 202 306 444 598 751 | maxD mean: 43.7 100.7 200.3 320.7 478.7 626.5 802.0
+   increments per x4: 50 89 109 148 162 146 | ratios: 2.34 2.02 1.62 1.52 1.37 1.25
+   fits: log 60.4*log2n-752 (rel.rms 0.662); log^2 (1.81*(log2n-8.7))^2 (rel.rms 0.034); power n^0.354 (rel.rms 0.233); local exponent at the last step 0.159
+S49 eps=0.600 R=48 log2n=12..24
+   TJ mean: 25.7 45.0 74.0 102.0 134.7 167.5 201.5 | TJ max: 29 52 80 111 141 174 208 | maxD mean: 33.0 54.7 88.0 121.7 159.7 189.0 223.5
+   increments per x4: 19 29 28 33 33 34 | ratios: 1.75 1.64 1.38 1.32 1.24 1.20
+   fits: log 14.9*log2n-161 (rel.rms 0.120); log^2 (0.77*(log2n-5.1))^2 (rel.rms 0.050); power n^0.242 (rel.rms 0.146); local exponent at the last step 0.133
+H49 eps=0.500 R=48 log2n=12..24
+   TJ mean: 26.3 62.3 103.0 178.0 253.3 347.0 422.5 | TJ max: 32 66 106 191 259 352 428 | maxD mean: 32.7 71.3 118.0 198.7 280.0 378.0 458.5
+   increments per x4: 36 41 75 75 94 76 | ratios: 2.37 1.65 1.73 1.42 1.37 1.22
+   fits: log 34.1*log2n-414 (rel.rms 0.472); log^2 (1.31*(log2n-8.0))^2 (rel.rms 0.037); power n^0.326 (rel.rms 0.212); local exponent at the last step 0.142
+L160,L106,L318,L54 eps=0.460 R=52 log2n=14..26
+   TJ mean: 79.7 176.3 323.0 503.3 695.5 939.5 1212.0 | TJ max: 88 203 335 527 719 956 1212 | maxD mean: 89.0 201.7 358.7 553.0 760.5 1006.0 1326.0
+   increments per x4: 97 147 180 192 244 272 | ratios: 2.21 1.83 1.56 1.38 1.35 1.29
+   fits: log 94.6*log2n-1330 (rel.rms 0.415); log^2 (2.16*(log2n-9.8))^2 (rel.rms 0.025); power n^0.316 (rel.rms 0.200); local exponent at the last step 0.184
+L160,L106,L318,L54 eps=0.500 R=52 log2n=14..24
+   TJ mean: 59.3 125.0 218.7 326.7 410.5 536.5 | TJ max: 63 129 251 354 421 564 | maxD mean: 70.0 141.7 241.3 349.3 445.0 567.0
+   increments per x4: 66 94 108 84 126 | ratios: 2.11 1.75 1.49 1.26 1.31
+   fits: log 47.9*log2n-630 (rel.rms 0.140); log^2 (1.54*(log2n-8.7))^2 (rel.rms 0.066); power n^0.309 (rel.rms 0.175); local exponent at the last step 0.193
+L160,L106,L318,L54 eps=0.600 R=52 log2n=14..24
+   TJ mean: 50.7 82.0 110.7 150.7 193.5 238.5 | TJ max: 58 95 126 170 202 255 | maxD mean: 56.0 87.3 117.7 157.3 201.0 246.0
+   increments per x4: 31 29 40 43 45 | ratios: 1.62 1.35 1.36 1.28 1.23
+   fits: log 18.8*log2n-219 (rel.rms 0.066); log^2 (0.83*(log2n-5.2))^2 (rel.rms 0.021); power n^0.219 (rel.rms 0.075); local exponent at the last step 0.151

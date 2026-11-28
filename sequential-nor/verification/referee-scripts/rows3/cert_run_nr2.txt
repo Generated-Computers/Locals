@@ -1,0 +1,4 @@
+  eps [0.455000,0.455250] d [0.33865,0.45833]: 63 boxes of d (3 searches, 718 rounds so far)
+  eps [0.455250,0.455500] d [0.33866,0.45831]: 63 boxes of d (6 searches, 1369 rounds so far)
+PROVED for eps in [0.455000, 0.455500] with theta = 0.999000 and K = 8; 126 boxes, largest |c| = 2.005, 55579 applications of T
+$S/cert2 0.455 0.4555 0.999 8 0.0005 0.002  72.79s user 0.04s system 99% cpu 1:13.10 total

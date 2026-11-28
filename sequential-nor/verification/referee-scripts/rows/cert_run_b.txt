@@ -1,0 +1,5 @@
+  eps [0.900000,0.902500] d [0.36578,0.40252]: 6 boxes of d (10 searches, 157 rounds so far)
+  eps [0.902500,0.905000] d [0.36607,0.40211]: 5 boxes of d (12 searches, 199 rounds so far)
+  eps [0.905000,0.907500] d [0.36636,0.40169]: 5 boxes of d (22 searches, 382 rounds so far)
+  eps [0.907500,0.910000] d [0.36665,0.40128]: 5 boxes of d (24 searches, 422 rounds so far)
+PROVED for eps in [0.900000, 0.910000] with theta = 0.999000 and K = 8; 21 boxes, largest |c| = 2.290, 359919 applications of T

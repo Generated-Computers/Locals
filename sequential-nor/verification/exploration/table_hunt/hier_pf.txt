@@ -1,0 +1,10 @@
+H49 n=16384 eps=0.460 R=48 pf=0.50 m=0 seeds=2 | TJ mean 32.0 max 32 | maxD mean 37.5 max 40 | dens 0.327
+H49 n=65536 eps=0.460 R=48 pf=0.50 m=0 seeds=2 | TJ mean 70.0 max 79 | maxD mean 88.0 max 95 | dens 0.327
+H49 n=262144 eps=0.460 R=48 pf=0.50 m=0 seeds=2 | TJ mean 171.0 max 179 | maxD mean 187.0 max 203 | dens 0.327
+H49 n=1048576 eps=0.460 R=48 pf=0.50 m=0 seeds=2 | TJ mean 199.5 max 200 | maxD mean 220.5 max 237 | dens 0.327
+H49 n=4194304 eps=0.460 R=48 pf=0.50 m=0 seeds=2 | TJ mean 344.5 max 382 | maxD mean 377.0 max 401 | dens 0.327
+H49 n=16384 eps=0.460 R=48 pf=0.90 m=0 seeds=2 | TJ mean 16.5 max 20 | maxD mean 18.0 max 21 | dens 0.272
+H49 n=65536 eps=0.460 R=48 pf=0.90 m=0 seeds=2 | TJ mean 30.0 max 37 | maxD mean 33.5 max 38 | dens 0.271
+H49 n=262144 eps=0.460 R=48 pf=0.90 m=0 seeds=2 | TJ mean 62.0 max 65 | maxD mean 72.0 max 78 | dens 0.271
+H49 n=1048576 eps=0.460 R=48 pf=0.90 m=0 seeds=2 | TJ mean 106.0 max 131 | maxD mean 125.0 max 142 | dens 0.270
+H49 n=4194304 eps=0.460 R=48 pf=0.90 m=0 seeds=2 | TJ mean 127.0 max 147 | maxD mean 149.5 max 176 | dens 0.270
