@@ -185,6 +185,8 @@ def test_code_run_end_to_end_with_stand_ins(tmp_path, monkeypatch, capsys):
     real_run = subprocess.run
 
     def run(cmd, **kw):
+        if cmd == ["/bin/echo", "--help"]:
+            return subprocess.CompletedProcess(cmd, 0, "--model Model to use", "")
         if cmd[0] == "/bin/echo" and "--version" in cmd:
             return real_run(["echo", "1.18.32"], **kw)
         calls.append(("opencode", cmd[1:]))
@@ -261,8 +263,12 @@ def test_code_with_opencode_2_gives_the_model_in_its_config_content(tmp_path, mo
     monkeypatch.setattr(app, "_space_opencode_starts", lambda: None)
     monkeypatch.setenv("OPENCODE_CONFIG_CONTENT", '{"theme": "mine", "model": "openai/gpt-5"}')
     real_run = subprocess.run
-    monkeypatch.setattr(app.subprocess, "run", lambda cmd, **kw: real_run(["echo", "opencode v2.1.2"], **kw)
-                        if "--version" in cmd else subprocess.CompletedProcess(cmd, 0, "", ""))
+    def run(cmd, **kw):
+        if "--version" in cmd:
+            return real_run(["echo", "opencode v2.1.2"], **kw)
+        return subprocess.CompletedProcess(cmd, 0, "--standalone Run with a private server", "")
+
+    monkeypatch.setattr(app.subprocess, "run", run)
     launched = []
     monkeypatch.setattr(app.os, "execve", lambda exe, argv, env: launched.append((argv, env)) or sys.exit(0))
     runs = []
@@ -275,15 +281,17 @@ def test_code_with_opencode_2_gives_the_model_in_its_config_content(tmp_path, mo
     with pytest.raises(SystemExit):
         app.cmd_code(args)
     argv, env = launched[0]
-    assert argv == ["/bin/echo", "--standalone", str(project), "--print-logs"] and "-m" not in argv
-    assert json.loads(env["OPENCODE_CONFIG_CONTENT"]) == {"theme": "mine", "model": "locals/locals/qwen3.5-4b",
-                                                          "default_agent": "coder"}
+    assert argv == ["/bin/echo", str(project), "--standalone", "--print-logs"] and "-m" not in argv
+    overlay = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    assert overlay["theme"] == "mine" and overlay["default_agent"] == "coder"
+    assert overlay["model"] == {"providerID": "locals", "model": "locals/qwen3.5-4b"}
+    assert overlay["agents"]["coder"]["model"] == overlay["model"]
     assert env["PWD"] == str(project) and "Shift+Tab the agent" in capsys.readouterr().out
     with pytest.raises(SystemExit):
         app.cmd_code(argparse.Namespace(**{**vars(args), "run": "write primes.py", "cont": True}))
     cmd, env = runs[0]
     assert cmd[1:] == ["run", "--standalone", "--format", "json", "-m", "locals/locals/qwen3.5-4b", "-c", "write primes.py"]
-    assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["model"] == "locals/locals/qwen3.5-4b"
+    assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["model"] == {"providerID": "locals", "model": "locals/qwen3.5-4b"}
 
 
 def test_opencode_2_messages_read_as_version_1s():
