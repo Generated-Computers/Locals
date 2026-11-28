@@ -1,0 +1,16 @@
+L160,L106,L318,L54 n=16384 eps=0.360 R=52 pf=0.00 m=0 seeds=2 | TJ mean 129.0 max 137 | maxD mean 133.5 max 145 | dens 0.377
+L160,L106,L318,L54 n=65536 eps=0.360 R=52 pf=0.00 m=0 seeds=2 | TJ mean 472.0 max 496 | maxD mean 477.0 max 505 | dens 0.379
+L160,L106,L318,L54 n=262144 eps=0.360 R=52 pf=0.00 m=0 seeds=2 | TJ mean 1599.0 max 1659 | maxD mean 1642.5 max 1678 | dens 0.379
+L160,L106,L318,L54 n=1048576 eps=0.360 R=52 pf=0.00 m=0 seeds=2 | TJ mean 4645.5 max 4817 | maxD mean 4853.5 max 5000 | dens 0.379
+L160,L106,L318,L54 n=16384 eps=0.400 R=52 pf=0.00 m=0 seeds=2 | TJ mean 90.5 max 92 | maxD mean 109.0 max 115 | dens 0.379
+L160,L106,L318,L54 n=65536 eps=0.400 R=52 pf=0.00 m=0 seeds=2 | TJ mean 311.5 max 330 | maxD mean 333.5 max 362 | dens 0.379
+L160,L106,L318,L54 n=262144 eps=0.400 R=52 pf=0.00 m=0 seeds=2 | TJ mean 838.0 max 896 | maxD mean 879.5 max 958 | dens 0.380
+L160,L106,L318,L54 n=1048576 eps=0.400 R=52 pf=0.00 m=0 seeds=2 | TJ mean 1700.5 max 1744 | maxD mean 1813.0 max 1828 | dens 0.380
+L160,L106,L318,L54 n=16384 eps=0.430 R=52 pf=0.00 m=0 seeds=2 | TJ mean 90.0 max 96 | maxD mean 99.5 max 101 | dens 0.381
+L160,L106,L318,L54 n=65536 eps=0.430 R=52 pf=0.00 m=0 seeds=2 | TJ mean 226.0 max 250 | maxD mean 251.0 max 264 | dens 0.380
+L160,L106,L318,L54 n=262144 eps=0.430 R=52 pf=0.00 m=0 seeds=2 | TJ mean 449.5 max 454 | maxD mean 522.0 max 533 | dens 0.380
+L160,L106,L318,L54 n=1048576 eps=0.430 R=52 pf=0.00 m=0 seeds=2 | TJ mean 780.5 max 796 | maxD mean 874.0 max 883 | dens 0.380
+L160,L106,L318,L54 n=16384 eps=0.445 R=52 pf=0.00 m=0 seeds=2 | TJ mean 91.0 max 92 | maxD mean 100.5 max 101 | dens 0.379
+L160,L106,L318,L54 n=65536 eps=0.445 R=52 pf=0.00 m=0 seeds=2 | TJ mean 212.5 max 216 | maxD mean 247.0 max 263 | dens 0.380
+L160,L106,L318,L54 n=262144 eps=0.445 R=52 pf=0.00 m=0 seeds=2 | TJ mean 396.5 max 410 | maxD mean 447.0 max 457 | dens 0.380
+L160,L106,L318,L54 n=1048576 eps=0.445 R=52 pf=0.00 m=0 seeds=2 | TJ mean 648.0 max 670 | maxD mean 721.5 max 751 | dens 0.380

@@ -646,10 +646,14 @@ If you use Locals in your research, please cite the paper:
 
 [Sequential NOR on Random and Smoothed Instances](Sequential_NOR_on_Random_and_Smoothed_Instances.pdf)
 (Generated Computers, 2026) studies a P-complete recurrence on random inputs and under smoothing:
-an errorless logspace algorithm above noise 3/4, hardness below noise 4/9 unless P is in BPNC,
-and lower bounds for the natural parallel iterations. It is one standalone paper that merges the
-Generated Computers manuscripts on random and smoothed Sequential NOR. The deterministic lemmas behind its
-embeddings are checked in Lean in [`sequential-nor-lean/`](sequential-nor-lean/).
+an errorless logspace algorithm above noise 3/4, a parallel iteration that is fast on every
+base above noise 0.7288, hardness up to noise 0.4468 unless P is in BPNC, and lower bounds for
+the natural parallel iterations. On bases in which every gate reads a fixed large distance back
+it is fast from noise 0.30 on, which is below the hardness level. It is one standalone paper
+that merges the Generated Computers manuscripts on random and smoothed Sequential NOR. Its source, the
+programs behind its computer-assisted proofs and the records of automated referees are in
+[`sequential-nor/`](sequential-nor/), and the deterministic lemmas behind its embeddings are
+checked in Lean in [`sequential-nor-lean/`](sequential-nor-lean/).
 
 ## License
 

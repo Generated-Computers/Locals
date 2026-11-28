@@ -1,0 +1,7 @@
+period <= 7 (5374 words x 11 eps x 3 d): largest ratio 0.925096 at eps 0.4550 d 0.33875, period 7, word 1010212
+period <= 8 (17406 words x 11 eps x 3 d): largest ratio 0.925096 at eps 0.4550 d 0.33875, period 7, word 1010212
+period <= 9 (56318 words x 11 eps x 3 d): largest ratio 0.944051 at eps 0.4550 d 0.33875, period 9, word 101010212
+restart 16: local best 0.952495; largest ratio 0.952495 at eps 0.4550 d 0.33875, period 26, word 10101010212101010101010212
+restart 17: local best 0.936876; largest ratio 0.952495 at eps 0.4550 d 0.33875, period 26, word 10101010212101010101010212
+restart 18: local best 0.944625; largest ratio 0.952495 at eps 0.4550 d 0.33875, period 26, word 10101010212101010101010212
+restart 19: local best 0.944051; largest ratio 0.952495 at eps 0.4550 d 0.33875, period 26, word 10101010212101010101010212

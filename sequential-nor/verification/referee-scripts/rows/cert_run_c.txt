@@ -1,0 +1,2 @@
+  FAILED on eps [0.455000,0.455016]
+NOT PROVED for eps in [0.455000, 0.457000] with theta = 0.900000 and K = 8; 0 boxes, largest |c| = 0.000, 112930 applications of T

@@ -1,0 +1,4 @@
+box eps [0.45500000000000002, 0.45600000000000002] d [0.3384644553921935, 0.3394644553921935] theta 0.999 K 8 mode full
+C1 holds: 65952 operator applications, 45568 leaves, largest final value 0.000e+00
+C2 holds: 20376 operator applications, 14080 leaves, least final value -0.000e+00
+RESULT AGREES (C1, C2, C3 hold exactly on the box)

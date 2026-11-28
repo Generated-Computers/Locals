@@ -1,0 +1,11 @@
+box eps [0.41999999999999993, 0.42199999999999999] d [0.33729624801905844, 0.34129624801905845] theta 0.999 K 8 mode prune
+C3 holds: |c| <= 4 (largest 2.264862), c = 0 on the 8 closed states
+self test passed (integers = fractions; plain expectations at points of the box lie inside)
+  C1 z_K=0 done, 496 applications so far
+  C1 z_K=1 done, 664 applications so far
+  C1 z_K=2 done, 1052 applications so far
+  C1 z_K=3 done, 1348 applications so far
+C1 holds: 1348 operator applications, 925 leaves, largest final value 0.000e+00
+C2 holds: 14 operator applications, 11 leaves, least final value -0.000e+00
+RESULT AGREES (C1, C2, C3 hold exactly on the box)
+python3 -I cert_exact3.py cert_dump_042.txt 0.999 8 prune  4.07s user 0.01s system 99% cpu 4.085 total
